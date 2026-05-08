@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::CoreConfig;
 use crate::runtime::{CoreStatus, ReloadDecision, RuntimeState};
+use crate::service::{CoreService, ListenerStatus};
 use crate::traffic::TrafficDelta;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -19,12 +20,14 @@ pub enum CoreResponse {
     Applied {
         decision: String,
         status: CoreStatus,
+        listeners: Vec<ListenerStatus>,
     },
     Traffic {
         records: Vec<TrafficDelta>,
     },
     Status {
         status: CoreStatus,
+        listeners: Vec<ListenerStatus>,
     },
     Stopped,
     Error {
@@ -32,43 +35,97 @@ pub enum CoreResponse {
     },
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct CoreController {
     runtime: RuntimeState,
+    service: Option<CoreService>,
 }
 
 impl CoreController {
     pub fn new() -> Self {
         Self {
             runtime: RuntimeState::new(),
+            service: None,
         }
     }
 
     pub fn handle(&mut self, command: CoreCommand) -> CoreResponse {
         match command {
-            CoreCommand::ApplyConfig { config } => match RuntimeState::plan(config) {
-                Ok(plan) => {
-                    let decision = self.runtime.apply_plan(plan);
-                    CoreResponse::Applied {
-                        decision: decision_name(decision).to_string(),
-                        status: self.runtime.status().clone(),
-                    }
-                }
-                Err(error) => CoreResponse::Error {
-                    message: error.to_string(),
-                },
-            },
+            CoreCommand::ApplyConfig { config } => self.apply_config(config),
             CoreCommand::DrainTraffic { minimum_bytes } => CoreResponse::Traffic {
-                records: self.runtime.drain_traffic(minimum_bytes),
+                records: self.drain_traffic(minimum_bytes),
             },
             CoreCommand::Status => CoreResponse::Status {
                 status: self.runtime.status().clone(),
+                listeners: self.listeners(),
             },
             CoreCommand::Stop => {
+                if let Some(service) = &mut self.service {
+                    service.stop();
+                }
+                self.service = None;
                 self.runtime.stop();
                 CoreResponse::Stopped
             }
         }
+    }
+
+    fn apply_config(&mut self, config: CoreConfig) -> CoreResponse {
+        let plan = match RuntimeState::plan(config.clone()) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.runtime.fail(error.to_string());
+                return CoreResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+        };
+
+        if !self.runtime.needs_reload(&plan) {
+            let decision = self.runtime.apply_plan(plan);
+            return CoreResponse::Applied {
+                decision: decision_name(decision).to_string(),
+                status: self.runtime.status().clone(),
+                listeners: self.listeners(),
+            };
+        }
+
+        if let Some(service) = &mut self.service {
+            service.stop();
+        }
+        self.service = None;
+
+        let service = match CoreService::start(config) {
+            Ok(service) => service,
+            Err(error) => {
+                self.runtime.fail(error.to_string());
+                return CoreResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+        };
+
+        self.service = Some(service);
+        let decision = self.runtime.apply_plan(plan);
+        CoreResponse::Applied {
+            decision: decision_name(decision).to_string(),
+            status: self.runtime.status().clone(),
+            listeners: self.listeners(),
+        }
+    }
+
+    fn drain_traffic(&mut self, minimum_bytes: u64) -> Vec<TrafficDelta> {
+        match &self.service {
+            Some(service) => service.drain_traffic(minimum_bytes),
+            None => self.runtime.drain_traffic(minimum_bytes),
+        }
+    }
+
+    fn listeners(&self) -> Vec<ListenerStatus> {
+        self.service
+            .as_ref()
+            .map(CoreService::listeners)
+            .unwrap_or_default()
     }
 }
 
@@ -76,5 +133,112 @@ fn decision_name(decision: ReloadDecision) -> &'static str {
     match decision {
         ReloadDecision::Noop => "noop",
         ReloadDecision::Reloaded => "reloaded",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+
+    use crate::config::{
+        CoreConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig, TransportConfig,
+    };
+    use crate::control::{CoreCommand, CoreController, CoreResponse};
+    use crate::protocol::Protocol;
+    use crate::runtime::CoreStatus;
+    use crate::user::CoreUser;
+
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .expect("bind free port")
+            .local_addr()
+            .expect("free port addr")
+            .port()
+    }
+
+    fn config(protocol: Protocol) -> CoreConfig {
+        CoreConfig {
+            instance_id: "node-a".to_string(),
+            log_level: "info".to_string(),
+            inbounds: vec![InboundConfig {
+                tag: "panel|proxy|1".to_string(),
+                protocol,
+                listen: "127.0.0.1".to_string(),
+                port: free_port(),
+                users: vec![CoreUser {
+                    id: 1,
+                    uuid: "user-a".to_string(),
+                    password: None,
+                    email: None,
+                    speed_limit: 0,
+                    device_limit: 0,
+                }],
+                transport: TransportConfig::default(),
+                tls: None,
+                sniffing: SniffingConfig::default(),
+            }],
+            outbounds: vec![OutboundConfig {
+                tag: "direct".to_string(),
+                protocol: "freedom".to_string(),
+                address: None,
+                port: None,
+            }],
+            routes: Vec::new(),
+            stats: StatsConfig::default(),
+        }
+    }
+
+    #[test]
+    fn apply_config_starts_real_service_and_noops_same_fingerprint() {
+        let config = config(Protocol::Socks);
+        let mut controller = CoreController::new();
+
+        let first = controller.handle(CoreCommand::ApplyConfig {
+            config: config.clone(),
+        });
+        let second = controller.handle(CoreCommand::ApplyConfig { config });
+
+        match first {
+            CoreResponse::Applied {
+                decision,
+                status,
+                listeners,
+            } => {
+                assert_eq!(decision, "reloaded");
+                assert_eq!(status, CoreStatus::Running);
+                assert_eq!(listeners.len(), 1);
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
+        match second {
+            CoreResponse::Applied {
+                decision,
+                status,
+                listeners,
+            } => {
+                assert_eq!(decision, "noop");
+                assert_eq!(status, CoreStatus::Running);
+                assert_eq!(listeners.len(), 1);
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
+        assert!(matches!(
+            controller.handle(CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+    }
+
+    #[test]
+    fn apply_config_reports_unimplemented_protocol_errors() {
+        let mut controller = CoreController::new();
+
+        let response = controller.handle(CoreCommand::ApplyConfig {
+            config: config(Protocol::Vless),
+        });
+
+        match response {
+            CoreResponse::Error { message } => assert!(message.contains("not implemented")),
+            response => panic!("unexpected response: {response:?}"),
+        }
     }
 }

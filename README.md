@@ -25,7 +25,7 @@ Implemented in this first skeleton:
 - Go-compatible user traffic keys using `<node-tag>|<user-uuid>`.
 - Traffic registry with minimum-threshold draining.
 - Runtime planning with deterministic config fingerprints.
-- Apply/noop reload decisions.
+- Apply/noop reload decisions wired to real listener startup.
 - Transport-neutral control commands for apply config, drain traffic, status, and stop.
 - SOCKS5 TCP CONNECT inbound with username/password authentication.
 - Per-user SOCKS5 TCP upload/download accounting.
@@ -40,6 +40,7 @@ Not implemented yet:
 - DNS/routing execution.
 - Realtime integration.
 - Hot user patching.
+- Concurrent connection worker pool.
 - Production packaging.
 
 ## Relationship To Existing Projects

@@ -23,7 +23,7 @@ The control boundary accepts transport-neutral commands:
 - Read status.
 - Stop.
 
-This lets `kelinode-rs` later use an in-process adapter, a Unix socket, or another local transport without changing the core model.
+`ApplyConfig` now starts the real `CoreService` for implemented protocols. This lets `kelinode-rs` later use an in-process adapter, a Unix socket, or another local transport without changing the core model.
 
 ## Protocol Placement
 

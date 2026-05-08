@@ -64,6 +64,14 @@ impl RuntimeState {
         ReloadDecision::Reloaded
     }
 
+    pub fn needs_reload(&self, plan: &CorePlan) -> bool {
+        self.active_fingerprint.as_deref() != Some(plan.fingerprint.as_str())
+    }
+
+    pub fn fail(&mut self, message: impl Into<String>) {
+        self.status = CoreStatus::Failed(message.into());
+    }
+
     pub fn stop(&mut self) {
         self.active_fingerprint = None;
         self.status = CoreStatus::Stopped;

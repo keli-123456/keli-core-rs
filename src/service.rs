@@ -6,13 +6,15 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::{CoreConfig, InboundConfig, ValidationError};
 use crate::http_proxy::{HttpProxyServer, HttpProxyServerConfig};
 use crate::protocol::Protocol;
 use crate::socks5::{Socks5Server, Socks5ServerConfig};
 use crate::traffic::{TrafficDelta, TrafficRegistry};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerStatus {
     pub tag: String,
     pub protocol: Protocol,
