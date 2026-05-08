@@ -37,6 +37,7 @@ Implemented in this first skeleton:
 - Shadowsocks AEAD TCP inbound for aes-128-gcm, aes-256-gcm, and chacha20-ietf-poly1305.
 - VLESS TCP inbound for non-TLS, non-transport TCP CONNECT.
 - Trojan TCP inbound for non-TLS TCP CONNECT.
+- AnyTLS TCP frame inbound with password authentication and TCP stream forwarding.
 - Concurrent per-listener connection worker threads with stop-time joining.
 - Local JSON-line TCP control socket for process status, traffic drain, and stop commands.
 - CLI with `version`, `health`, `check-config`, and `run-config`.
@@ -44,7 +45,7 @@ Implemented in this first skeleton:
 Not implemented yet:
 
 - SOCKS5 UDP associate.
-- VMess/Hysteria2/TUIC/AnyTLS data paths, built-in TLS, and advanced transports.
+- VMess/Hysteria2/TUIC data paths, built-in TLS, AnyTLS UDP-over-TCP, and advanced transports.
 - Advanced DNS/routing execution and custom outbounds.
 - Realtime integration.
 - Hot user patching.

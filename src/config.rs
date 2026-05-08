@@ -214,6 +214,21 @@ impl InboundConfig {
                 )));
             }
         }
+        if self.protocol == Protocol::AnyTls {
+            let network = self.transport.network.trim();
+            if network != "tcp" || self.tls.is_some() {
+                return Err(ValidationError::new(format!(
+                    "{} anytls currently supports only plain tcp framing",
+                    self.tag
+                )));
+            }
+            if self.users.is_empty() {
+                return Err(ValidationError::new(format!(
+                    "{} anytls requires at least one user",
+                    self.tag
+                )));
+            }
+        }
 
         Ok(())
     }
@@ -391,5 +406,26 @@ mod tests {
             .expect_err("shadowsocks cipher should be required");
 
         assert!(error.to_string().contains("cipher is required"));
+    }
+
+    #[test]
+    fn rejects_anytls_without_users() {
+        let inbound = InboundConfig {
+            tag: "panel|anytls|1".to_string(),
+            protocol: Protocol::AnyTls,
+            listen: "0.0.0.0".to_string(),
+            port: 8443,
+            users: Vec::new(),
+            cipher: None,
+            transport: TransportConfig::default(),
+            tls: None,
+            sniffing: SniffingConfig::default(),
+        };
+
+        let error = inbound
+            .validate()
+            .expect_err("anytls users should be required");
+
+        assert!(error.to_string().contains("requires at least one user"));
     }
 }
