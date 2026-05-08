@@ -35,6 +35,7 @@ Implemented in this first skeleton:
 - Per-user device_limit enforcement for SOCKS5 and HTTP proxy connections.
 - Per-user speed_limit enforcement for SOCKS5 and HTTP proxy traffic.
 - VLESS TCP inbound for non-TLS, non-transport TCP CONNECT.
+- Trojan TCP inbound for non-TLS TCP CONNECT.
 - Concurrent per-listener connection worker threads with stop-time joining.
 - Local JSON-line TCP control socket for process status, traffic drain, and stop commands.
 - CLI with `version`, `health`, `check-config`, and `run-config`.
@@ -42,7 +43,7 @@ Implemented in this first skeleton:
 Not implemented yet:
 
 - SOCKS5 UDP associate.
-- Encrypted protocol data paths and VLESS TLS/Reality/WS/gRPC transports.
+- Encrypted protocol data paths, built-in TLS, and VLESS/Trojan advanced transports.
 - Advanced DNS/routing execution and custom outbounds.
 - Realtime integration.
 - Hot user patching.

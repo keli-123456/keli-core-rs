@@ -14,6 +14,7 @@ use crate::limits::{UserBandwidthLimiters, UserSessionTracker};
 use crate::protocol::Protocol;
 use crate::socks5::{Socks5Server, Socks5ServerConfig};
 use crate::traffic::{TrafficDelta, TrafficRegistry};
+use crate::trojan::{TrojanServer, TrojanServerConfig};
 use crate::vless::{VlessServer, VlessServerConfig};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +98,13 @@ impl CoreService {
                     sessions.clone(),
                     bandwidth.clone(),
                 )?,
+                Protocol::Trojan => start_trojan_listener(
+                    &inbound,
+                    config.routes.clone(),
+                    traffic.clone(),
+                    sessions.clone(),
+                    bandwidth.clone(),
+                )?,
                 _ => {
                     return Err(CoreServiceError::UnsupportedProtocol {
                         tag: inbound.tag,
@@ -143,6 +151,85 @@ impl Drop for CoreService {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn start_trojan_listener(
+    inbound: &InboundConfig,
+    routes: Vec<crate::RouteRule>,
+    traffic: Arc<Mutex<TrafficRegistry>>,
+    sessions: UserSessionTracker,
+    bandwidth: UserBandwidthLimiters,
+) -> Result<ListenerHandle, CoreServiceError> {
+    let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
+        CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        }
+    })?;
+    let server = TrojanServer::with_shared_limits(
+        TrojanServerConfig {
+            node_tag: inbound.tag.clone(),
+            listen,
+            users: inbound.users.clone(),
+            routes,
+            connect_timeout: Duration::from_secs(10),
+        },
+        traffic,
+        sessions,
+        bandwidth,
+    );
+    let listener = server.bind().map_err(|source| CoreServiceError::Bind {
+        tag: inbound.tag.clone(),
+        source,
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = stop.clone();
+    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers_for_thread = workers.clone();
+    let join = thread::spawn(move || {
+        while !stop_for_thread.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let server = server.clone();
+                    let worker = thread::spawn(move || {
+                        let _ = server.handle_tcp_client(stream);
+                    });
+                    workers_for_thread
+                        .lock()
+                        .expect("worker list lock poisoned")
+                        .push(worker);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok(ListenerHandle {
+        status: ListenerStatus {
+            tag: inbound.tag.clone(),
+            protocol: Protocol::Trojan,
+            local_addr,
+        },
+        stop,
+        workers,
+        join: Some(join),
+    })
 }
 
 fn start_vless_listener(
@@ -546,6 +633,20 @@ mod tests {
 
         assert_eq!(listeners.len(), 1);
         assert_eq!(listeners[0].protocol, Protocol::Vless);
+        service.stop();
+    }
+
+    #[test]
+    fn starts_trojan_listener_from_core_config() {
+        let mut config = config(free_port());
+        config.inbounds[0].tag = "panel|trojan|1".to_string();
+        config.inbounds[0].protocol = Protocol::Trojan;
+
+        let mut service = CoreService::start(config).expect("service start");
+        let listeners = service.listeners();
+
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].protocol, Protocol::Trojan);
         service.stop();
     }
 

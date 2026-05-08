@@ -11,6 +11,7 @@ pub mod service;
 pub mod socks5;
 pub mod stream;
 pub mod traffic;
+pub mod trojan;
 pub mod user;
 pub mod vless;
 
@@ -32,6 +33,7 @@ pub use runtime::{CorePlan, CoreStatus, ReloadDecision, RuntimeState};
 pub use service::{CoreService, CoreServiceError, ListenerStatus};
 pub use socks5::{Socks5Server, Socks5ServerConfig, SocksTarget};
 pub use traffic::{TrafficDelta, TrafficKey, TrafficRegistry};
+pub use trojan::{trojan_password_hash, TrojanServer, TrojanServerConfig};
 pub use user::CoreUser;
 pub use vless::{VlessServer, VlessServerConfig};
 

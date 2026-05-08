@@ -174,6 +174,15 @@ impl InboundConfig {
                 )));
             }
         }
+        if self.protocol == Protocol::Trojan {
+            let network = self.transport.network.trim();
+            if network != "tcp" || self.tls.is_some() {
+                return Err(ValidationError::new(format!(
+                    "{} trojan currently supports only plain tcp without tls",
+                    self.tag
+                )));
+            }
+        }
 
         Ok(())
     }
@@ -297,6 +306,33 @@ mod tests {
         let error = inbound
             .validate()
             .expect_err("vless tls should not be accepted yet");
+
+        assert!(error.to_string().contains("plain tcp"));
+    }
+
+    #[test]
+    fn rejects_trojan_tls_until_data_path_supports_it() {
+        let inbound = InboundConfig {
+            tag: "panel|trojan|1".to_string(),
+            protocol: Protocol::Trojan,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![user()],
+            transport: TransportConfig::default(),
+            tls: Some(TlsConfig {
+                server_name: "example.com".to_string(),
+                cert_file: None,
+                key_file: None,
+                alpn: Vec::new(),
+                reject_unknown_sni: false,
+                reality: None,
+            }),
+            sniffing: SniffingConfig::default(),
+        };
+
+        let error = inbound
+            .validate()
+            .expect_err("trojan tls should not be accepted yet");
 
         assert!(error.to_string().contains("plain tcp"));
     }
