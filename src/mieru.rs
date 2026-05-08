@@ -1,8 +1,10 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,9 +14,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
-use crate::limits::{
-    BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
-};
+use crate::limits::{BandwidthLimiter, UserBandwidthLimiters, UserSessionTracker};
 use crate::socks5::SocksTarget;
 use crate::stream::copy_count_best_effort_limited;
 use crate::traffic::TrafficRegistry;
@@ -120,6 +120,30 @@ struct MieruWriter {
 }
 
 #[derive(Debug)]
+struct MieruSessionReader {
+    rx: Receiver<MieruSegment>,
+    pending: VecDeque<u8>,
+    closed: bool,
+    stop: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Debug)]
+struct MieruSessionWriter {
+    inner: Arc<Mutex<MieruWriter>>,
+    session_id: u32,
+}
+
+trait MieruOutput: Write {
+    fn shutdown_session(&mut self);
+}
+
+trait MieruInput: Read + Send {
+    fn stop_handle(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
+}
+
+#[derive(Debug)]
 enum SegmentAttempt {
     Complete {
         segment: MieruSegment,
@@ -192,97 +216,95 @@ impl MieruServer {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let mut reader = MieruReader::accept(client.try_clone()?, &self.active_users())?;
         let user = reader.user().clone();
-        let initial = reader.take_initial_segment().ok_or_else(|| {
-            io::Error::new(
+        let mut writer = MieruWriter::server(client, &user, reader.session_id())?;
+        let Some(initial) = reader.take_initial_segment() else {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "missing mieru open session request",
-            )
-        })?;
+            ));
+        };
         if initial.metadata.protocol_type != OPEN_SESSION_REQUEST {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "first mieru segment is not an open session request",
             ));
         }
-        let mut request_bytes = initial.payload;
-        let request = read_socks_request_from_mieru(&mut reader, &mut request_bytes)?;
-        let initial_payload = request_bytes.split_off(request.consumed);
-        let _session = self.acquire_user_session(&user, client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(Some(&user));
 
-        if request.command == MieruSocksCommand::UdpAssociate {
-            let mut writer = MieruWriter::server(client, &user, reader.session_id())?;
-            writer.write_open_response()?;
-            writer.write_all(&SOCKS_CONNECT_SUCCESS)?;
-            let (upload, download) = relay_mieru_udp_associate(
-                reader,
-                writer,
-                initial_payload,
-                &self.router,
-                self.config.connect_timeout,
-                bandwidth,
-            )?;
-            self.traffic
-                .lock()
-                .expect("traffic registry lock poisoned")
-                .add_with_ip(
-                    self.config.node_tag.clone(),
-                    user.uuid,
-                    upload,
-                    download,
-                    client_ip,
-                );
-            return Ok(());
+        reader.set_poll_timeout(Duration::from_millis(100))?;
+        writer.set_session_id(initial.metadata.session_id);
+        let writer = Arc::new(Mutex::new(writer));
+        let mut sessions = HashMap::<u32, Sender<MieruSegment>>::new();
+        let mut workers = Vec::new();
+        let (done_tx, done_rx) = mpsc::channel();
+        spawn_mieru_session(
+            initial,
+            user,
+            client_ip,
+            writer.clone(),
+            MieruSessionRuntime {
+                node_tag: self.config.node_tag.clone(),
+                router: self.router.clone(),
+                traffic: self.traffic.clone(),
+                sessions: self.sessions.clone(),
+                bandwidth: self.bandwidth.clone(),
+                timeout: self.config.connect_timeout,
+            },
+            done_tx.clone(),
+            &mut sessions,
+            &mut workers,
+        )?;
+
+        let mut first_error = None::<(io::ErrorKind, String)>;
+        loop {
+            while let Ok((session_id, result)) = done_rx.try_recv() {
+                sessions.remove(&session_id);
+                if let Err(error) = result {
+                    first_error.get_or_insert(error);
+                    close_mieru_underlay(&writer);
+                }
+            }
+            if first_error.is_some() || sessions.is_empty() {
+                break;
+            }
+
+            match reader.read_segment() {
+                Ok(Some(segment)) => {
+                    dispatch_mieru_segment(
+                        segment,
+                        &reader.user,
+                        client_ip,
+                        writer.clone(),
+                        MieruSessionRuntime {
+                            node_tag: self.config.node_tag.clone(),
+                            router: self.router.clone(),
+                            traffic: self.traffic.clone(),
+                            sessions: self.sessions.clone(),
+                            bandwidth: self.bandwidth.clone(),
+                            timeout: self.config.connect_timeout,
+                        },
+                        done_tx.clone(),
+                        &mut sessions,
+                        &mut workers,
+                    )?;
+                }
+                Ok(None) => break,
+                Err(error) if is_timeout_error(&error) => continue,
+                Err(error) => return Err(error),
+            }
         }
 
-        let protocol_labels = route_protocol_labels("tcp", &initial_payload);
-        let mut remote = match self.router.decide_target(
-            &request.target.host,
-            request.target.port,
-            &protocol_labels,
-        ) {
-            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
-            RouteDecision::Outbound(outbound) => {
-                connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
-            }
-            RouteDecision::Block => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target blocked by route",
-                ));
-            }
-            RouteDecision::UnsupportedOutbound(tag) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("outbound route {tag} is not implemented"),
-                ));
-            }
-        };
-
-        let mut writer = MieruWriter::server(client, &user, reader.session_id())?;
-        writer.write_open_response()?;
-        writer.write_all(&SOCKS_CONNECT_SUCCESS)?;
-        let mut upload = 0u64;
-        if !initial_payload.is_empty() {
-            if let Some(limiter) = bandwidth.as_deref() {
-                limiter.wait_for(initial_payload.len());
-            }
-            remote.write_all(&initial_payload)?;
-            upload = initial_payload.len() as u64;
+        drop(sessions);
+        for worker in workers {
+            let _ = worker.join();
         }
-
-        let (relayed_upload, download) = relay_mieru_streams(reader, writer, remote, bandwidth)?;
-        upload = upload.saturating_add(relayed_upload);
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_ip(
-                self.config.node_tag.clone(),
-                user.uuid,
-                upload,
-                download,
-                client_ip,
-            );
+        while let Ok((_, result)) = done_rx.try_recv() {
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some((kind, message)) = first_error {
+            return Err(io::Error::new(kind, message));
+        }
         Ok(())
     }
 
@@ -304,16 +326,193 @@ impl MieruServer {
             .expect("mieru users lock poisoned")
             .clone()
     }
+}
 
-    fn acquire_user_session(
-        &self,
-        user: &CoreUser,
-        client_ip: Option<IpAddr>,
-    ) -> io::Result<Option<UserSessionGuard>> {
-        self.sessions
-            .try_acquire_for_ip(Some(user), client_ip)
-            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))
+#[derive(Clone)]
+struct MieruSessionRuntime {
+    node_tag: String,
+    router: RouteMatcher,
+    traffic: Arc<Mutex<TrafficRegistry>>,
+    sessions: UserSessionTracker,
+    bandwidth: UserBandwidthLimiters,
+    timeout: Duration,
+}
+
+fn dispatch_mieru_segment(
+    segment: MieruSegment,
+    user: &CoreUser,
+    client_ip: Option<IpAddr>,
+    writer: Arc<Mutex<MieruWriter>>,
+    runtime: MieruSessionRuntime,
+    done_tx: Sender<(u32, Result<(), (io::ErrorKind, String)>)>,
+    sessions: &mut HashMap<u32, Sender<MieruSegment>>,
+    workers: &mut Vec<thread::JoinHandle<()>>,
+) -> io::Result<()> {
+    match segment.metadata.protocol_type {
+        OPEN_SESSION_REQUEST => spawn_mieru_session(
+            segment,
+            user.clone(),
+            client_ip,
+            writer,
+            runtime,
+            done_tx,
+            sessions,
+            workers,
+        ),
+        DATA_CLIENT_TO_SERVER | ACK_CLIENT_TO_SERVER => {
+            let session_id = segment.metadata.session_id;
+            if let Some(tx) = sessions.get(&session_id) {
+                let _ = tx.send(segment);
+            } else {
+                write_mieru_close_response(&writer, session_id);
+            }
+            Ok(())
+        }
+        CLOSE_SESSION_REQUEST | CLOSE_SESSION_RESPONSE => {
+            let session_id = segment.metadata.session_id;
+            if let Some(tx) = sessions.remove(&session_id) {
+                let _ = tx.send(segment);
+            } else {
+                write_mieru_close_response(&writer, session_id);
+            }
+            Ok(())
+        }
+        OPEN_SESSION_RESPONSE | DATA_SERVER_TO_CLIENT | ACK_SERVER_TO_CLIENT => Ok(()),
+        _ => Ok(()),
     }
+}
+
+fn spawn_mieru_session(
+    initial: MieruSegment,
+    user: CoreUser,
+    client_ip: Option<IpAddr>,
+    writer: Arc<Mutex<MieruWriter>>,
+    runtime: MieruSessionRuntime,
+    done_tx: Sender<(u32, Result<(), (io::ErrorKind, String)>)>,
+    sessions: &mut HashMap<u32, Sender<MieruSegment>>,
+    workers: &mut Vec<thread::JoinHandle<()>>,
+) -> io::Result<()> {
+    let session_id = initial.metadata.session_id;
+    if session_id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mieru session id 0 is reserved",
+        ));
+    }
+    if sessions.contains_key(&session_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("mieru session id {session_id} is already open"),
+        ));
+    }
+
+    let (tx, rx) = mpsc::channel();
+    sessions.insert(session_id, tx);
+    workers.push(thread::spawn(move || {
+        let result = handle_mieru_session(initial, rx, writer.clone(), user, client_ip, runtime)
+            .map_err(|error| (error.kind(), error.to_string()));
+        if result.is_err() {
+            close_mieru_underlay(&writer);
+        }
+        let _ = done_tx.send((session_id, result));
+    }));
+    Ok(())
+}
+
+fn handle_mieru_session(
+    initial: MieruSegment,
+    rx: Receiver<MieruSegment>,
+    writer: Arc<Mutex<MieruWriter>>,
+    user: CoreUser,
+    client_ip: Option<IpAddr>,
+    runtime: MieruSessionRuntime,
+) -> io::Result<()> {
+    let session_id = initial.metadata.session_id;
+    let mut reader = MieruSessionReader::new(initial.payload, rx);
+    let mut writer = MieruSessionWriter::new(writer, session_id);
+    let mut request_bytes = Vec::new();
+    let request = read_socks_request_from_mieru(&mut reader, &mut request_bytes)?;
+    let initial_payload = request_bytes.split_off(request.consumed);
+    let _session = runtime
+        .sessions
+        .try_acquire_for_ip(Some(&user), client_ip)
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))?;
+    let bandwidth = runtime.bandwidth.limiter_for(Some(&user));
+
+    let (upload, download) = if request.command == MieruSocksCommand::UdpAssociate {
+        writer.write_open_response()?;
+        writer.write_all(&SOCKS_CONNECT_SUCCESS)?;
+        relay_mieru_udp_associate(
+            reader,
+            writer,
+            initial_payload,
+            &runtime.router,
+            runtime.timeout,
+            bandwidth,
+        )?
+    } else {
+        let protocol_labels = route_protocol_labels("tcp", &initial_payload);
+        let mut remote = match runtime.router.decide_target(
+            &request.target.host,
+            request.target.port,
+            &protocol_labels,
+        ) {
+            RouteDecision::Direct => connect_target(&request.target, runtime.timeout)?,
+            RouteDecision::Outbound(outbound) => {
+                connect_tcp_outbound(&outbound, &request.target, runtime.timeout)?
+            }
+            RouteDecision::Block => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target blocked by route",
+                ));
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
+        writer.write_open_response()?;
+        writer.write_all(&SOCKS_CONNECT_SUCCESS)?;
+        let mut upload = 0u64;
+        if !initial_payload.is_empty() {
+            if let Some(limiter) = bandwidth.as_deref() {
+                limiter.wait_for(initial_payload.len());
+            }
+            remote.write_all(&initial_payload)?;
+            upload = initial_payload.len() as u64;
+        }
+        let (relayed_upload, download) = relay_mieru_streams(reader, writer, remote, bandwidth)?;
+        (upload.saturating_add(relayed_upload), download)
+    };
+
+    runtime
+        .traffic
+        .lock()
+        .expect("traffic registry lock poisoned")
+        .add_with_ip(runtime.node_tag, user.uuid, upload, download, client_ip);
+    Ok(())
+}
+
+fn write_mieru_close_response(writer: &Arc<Mutex<MieruWriter>>, session_id: u32) {
+    if let Ok(mut writer) = writer.lock() {
+        let _ = writer.write_close_response_for_session(session_id);
+    }
+}
+
+fn close_mieru_underlay(writer: &Arc<Mutex<MieruWriter>>) {
+    if let Ok(mut writer) = writer.lock() {
+        writer.close_underlay();
+    }
+}
+
+fn is_timeout_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
 }
 
 impl MieruReader {
@@ -384,6 +583,10 @@ impl MieruReader {
 
     fn session_id(&self) -> u32 {
         self.session_id
+    }
+
+    fn set_poll_timeout(&self, timeout: Duration) -> io::Result<()> {
+        self.stream.set_read_timeout(Some(timeout))
     }
 
     fn take_initial_segment(&mut self) -> Option<MieruSegment> {
@@ -473,6 +676,66 @@ impl Read for MieruReader {
     }
 }
 
+impl MieruInput for MieruReader {}
+
+impl MieruSessionReader {
+    fn new(initial_payload: Vec<u8>, rx: Receiver<MieruSegment>) -> Self {
+        Self {
+            rx,
+            pending: initial_payload.into_iter().collect(),
+            closed: false,
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Read for MieruSessionReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        while self.pending.is_empty() && !self.closed {
+            if self.stop.load(Ordering::Relaxed) {
+                self.closed = true;
+                break;
+            }
+            match self.rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(segment) => match segment.metadata.protocol_type {
+                    DATA_CLIENT_TO_SERVER | DATA_SERVER_TO_CLIENT => {
+                        self.pending.extend(segment.payload);
+                    }
+                    CLOSE_SESSION_REQUEST | CLOSE_SESSION_RESPONSE => {
+                        self.closed = true;
+                    }
+                    ACK_CLIENT_TO_SERVER
+                    | ACK_SERVER_TO_CLIENT
+                    | OPEN_SESSION_REQUEST
+                    | OPEN_SESSION_RESPONSE => {}
+                    _ => {}
+                },
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => self.closed = true,
+            }
+        }
+
+        let mut written = 0;
+        while written < output.len() {
+            let Some(byte) = self.pending.pop_front() else {
+                break;
+            };
+            output[written] = byte;
+            written += 1;
+        }
+        Ok(written)
+    }
+}
+
+impl MieruInput for MieruSessionReader {
+    fn stop_handle(&self) -> Option<Arc<AtomicBool>> {
+        Some(self.stop.clone())
+    }
+}
+
 impl MieruWriter {
     fn server(stream: TcpStream, user: &CoreUser, session_id: u32) -> io::Result<Self> {
         let username = mieru_username(user);
@@ -491,10 +754,19 @@ impl MieruWriter {
         })
     }
 
+    fn set_session_id(&mut self, session_id: u32) {
+        self.session_id = session_id;
+    }
+
+    #[cfg(test)]
     fn write_open_response(&mut self) -> io::Result<()> {
+        self.write_open_response_for_session(self.session_id)
+    }
+
+    fn write_open_response_for_session(&mut self, session_id: u32) -> io::Result<()> {
         let metadata = MieruMetadata {
             protocol_type: OPEN_SESSION_RESPONSE,
-            session_id: self.session_id,
+            session_id,
             sequence: self.sequence,
             status_code: STATUS_OK,
             payload_len: 0,
@@ -506,9 +778,13 @@ impl MieruWriter {
     }
 
     fn write_close_response(&mut self) -> io::Result<()> {
+        self.write_close_response_for_session(self.session_id)
+    }
+
+    fn write_close_response_for_session(&mut self, session_id: u32) -> io::Result<()> {
         let metadata = MieruMetadata {
             protocol_type: CLOSE_SESSION_RESPONSE,
-            session_id: self.session_id,
+            session_id,
             sequence: self.sequence,
             status_code: STATUS_OK,
             payload_len: 0,
@@ -520,9 +796,17 @@ impl MieruWriter {
     }
 
     fn write_data_segment(&mut self, payload: &[u8]) -> io::Result<()> {
+        self.write_data_segment_for_session(self.session_id, payload)
+    }
+
+    fn write_data_segment_for_session(
+        &mut self,
+        session_id: u32,
+        payload: &[u8],
+    ) -> io::Result<()> {
         let metadata = MieruMetadata {
             protocol_type: DATA_SERVER_TO_CLIENT,
-            session_id: self.session_id,
+            session_id,
             sequence: self.sequence,
             status_code: STATUS_OK,
             payload_len: payload.len(),
@@ -547,6 +831,10 @@ impl MieruWriter {
         let _ = self.write_close_response();
         let _ = self.stream.shutdown(Shutdown::Write);
     }
+
+    fn close_underlay(&mut self) {
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
 }
 
 impl Write for MieruWriter {
@@ -562,6 +850,61 @@ impl Write for MieruWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         self.stream.flush()
+    }
+}
+
+impl MieruOutput for MieruWriter {
+    fn shutdown_session(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl MieruSessionWriter {
+    fn new(inner: Arc<Mutex<MieruWriter>>, session_id: u32) -> Self {
+        Self { inner, session_id }
+    }
+
+    fn write_open_response(&mut self) -> io::Result<()> {
+        self.inner
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "mieru writer lock poisoned"))?
+            .write_open_response_for_session(self.session_id)
+    }
+
+    fn write_close_response(&mut self) -> io::Result<()> {
+        self.inner
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "mieru writer lock poisoned"))?
+            .write_close_response_for_session(self.session_id)
+    }
+}
+
+impl Write for MieruSessionWriter {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if input.is_empty() {
+            return Ok(0);
+        }
+        let mut writer = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "mieru writer lock poisoned"))?;
+        for chunk in input.chunks(MAX_TCP_FRAGMENT_LEN) {
+            writer.write_data_segment_for_session(self.session_id, chunk)?;
+        }
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "mieru writer lock poisoned"))?
+            .flush()
+    }
+}
+
+impl MieruOutput for MieruSessionWriter {
+    fn shutdown_session(&mut self) {
+        let _ = self.write_close_response();
     }
 }
 
@@ -1032,14 +1375,18 @@ fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStre
     crate::dns::connect_tcp(&target.host, target.port, timeout)
 }
 
-fn relay_mieru_udp_associate(
-    mut reader: MieruReader,
-    mut writer: MieruWriter,
+fn relay_mieru_udp_associate<R, W>(
+    mut reader: R,
+    mut writer: W,
     mut pending: Vec<u8>,
     router: &RouteMatcher,
     timeout: Duration,
     limiter: Option<Arc<BandwidthLimiter>>,
-) -> io::Result<(u64, u64)> {
+) -> io::Result<(u64, u64)>
+where
+    R: Read,
+    W: MieruOutput,
+{
     let mut upload = 0u64;
     let mut download = 0u64;
     while let Some(packet) = read_mieru_udp_frame(&mut reader, &mut pending)? {
@@ -1080,7 +1427,7 @@ fn relay_mieru_udp_associate(
         let framed = encode_mieru_udp_frame(&response_packet)?;
         writer.write_all(&framed)?;
     }
-    writer.shutdown();
+    writer.shutdown_session();
     Ok((upload, download))
 }
 
@@ -1279,15 +1626,20 @@ fn socket_addr_to_target(addr: SocketAddr) -> SocksTarget {
     }
 }
 
-fn relay_mieru_streams(
-    mut reader: MieruReader,
-    mut writer: MieruWriter,
+fn relay_mieru_streams<R, W>(
+    mut reader: R,
+    mut writer: W,
     remote: TcpStream,
     limiter: Option<Arc<BandwidthLimiter>>,
-) -> io::Result<(u64, u64)> {
+) -> io::Result<(u64, u64)>
+where
+    R: MieruInput + 'static,
+    W: MieruOutput,
+{
     let mut remote_read = remote.try_clone()?;
     let mut remote_write = remote;
     let upload_limiter = limiter.clone();
+    let stop_upload = reader.stop_handle();
     let upload_thread = thread::spawn(move || {
         let upload = copy_count_best_effort_limited(
             &mut reader,
@@ -1299,7 +1651,10 @@ fn relay_mieru_streams(
     });
     let download =
         copy_count_best_effort_limited(&mut remote_read, &mut writer, limiter.as_deref());
-    writer.shutdown();
+    if let Some(stop) = stop_upload {
+        stop.store(true, Ordering::Relaxed);
+    }
+    writer.shutdown_session();
     let upload = upload_thread
         .join()
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "mieru upload thread panicked"))?;
@@ -1319,8 +1674,8 @@ mod tests {
     use crate::mieru::{
         apply_nonce_user_hint, derive_mieru_key, encode_mieru_udp_frame, encode_segment_body,
         encode_socks_udp_packet, parse_socks_request, parse_socks_udp_packet, read_mieru_udp_frame,
-        rounded_unix_time, MieruMetadata, MieruReader, MieruServer, MieruServerConfig,
-        MieruSocksCommand, MieruWriter, SocksParseResult, DATA_CLIENT_TO_SERVER,
+        rounded_unix_time, MieruMetadata, MieruReader, MieruSegment, MieruServer,
+        MieruServerConfig, MieruSocksCommand, MieruWriter, SocksParseResult, DATA_CLIENT_TO_SERVER,
         DATA_SERVER_TO_CLIENT, OPEN_SESSION_REQUEST, OPEN_SESSION_RESPONSE,
         SOCKS_CMD_UDP_ASSOCIATE, SOCKS_CONNECT_SUCCESS, STATUS_OK,
     };
@@ -1537,6 +1892,107 @@ mod tests {
     }
 
     #[test]
+    fn server_proxies_multiplexed_mieru_tcp_sessions() {
+        let echo_a = TcpListener::bind("127.0.0.1:0").expect("echo a bind");
+        let echo_a_addr = echo_a.local_addr().expect("echo a addr");
+        let echo_a_thread = thread::spawn(move || {
+            let (mut stream, _) = echo_a.accept().expect("echo a accept");
+            let mut bytes = [0u8; 3];
+            stream.read_exact(&mut bytes).expect("echo a read");
+            assert_eq!(&bytes, b"one");
+            stream.write_all(b"eno").expect("echo a write");
+        });
+        let echo_b = TcpListener::bind("127.0.0.1:0").expect("echo b bind");
+        let echo_b_addr = echo_b.local_addr().expect("echo b addr");
+        let echo_b_thread = thread::spawn(move || {
+            let (mut stream, _) = echo_b.accept().expect("echo b accept");
+            let mut bytes = [0u8; 3];
+            stream.read_exact(&mut bytes).expect("echo b read");
+            assert_eq!(&bytes, b"two");
+            stream.write_all(b"owt").expect("echo b write");
+        });
+
+        let server = MieruServer::new(MieruServerConfig {
+            node_tag: "panel|mieru|1".to_string(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            users: vec![user()],
+            routes: Vec::new(),
+            connect_timeout: Duration::from_secs(5),
+        });
+        let listener = server.bind().expect("server bind");
+        let listen_addr = listener.local_addr().expect("listen addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            server.handle_tcp_client(stream).expect("handle");
+            server.drain_traffic(1)
+        });
+
+        let client = TcpStream::connect(listen_addr).expect("connect");
+        let mut writer = test_client_writer(client.try_clone().expect("clone"), &user(), 31);
+        writer
+            .write_client_segment_for_session(
+                31,
+                OPEN_SESSION_REQUEST,
+                &socks_connect_request(echo_a_addr),
+            )
+            .expect("open a");
+        writer
+            .write_client_segment_for_session(
+                32,
+                OPEN_SESSION_REQUEST,
+                &socks_connect_request(echo_b_addr),
+            )
+            .expect("open b");
+
+        let mut reader = MieruReader::accept(client, &[user()]).expect("client reader");
+        let mut opened = Vec::new();
+        let mut socks_ok = Vec::new();
+        while opened.len() < 2 || socks_ok.len() < 2 {
+            let segment = next_mieru_segment(&mut reader).expect("session setup segment");
+            match segment.metadata.protocol_type {
+                OPEN_SESSION_RESPONSE => opened.push(segment.metadata.session_id),
+                DATA_SERVER_TO_CLIENT if segment.payload == SOCKS_CONNECT_SUCCESS => {
+                    socks_ok.push(segment.metadata.session_id)
+                }
+                _ => {}
+            }
+        }
+        opened.sort_unstable();
+        socks_ok.sort_unstable();
+        assert_eq!(opened, vec![31, 32]);
+        assert_eq!(socks_ok, vec![31, 32]);
+
+        writer
+            .write_client_segment_for_session(31, DATA_CLIENT_TO_SERVER, b"one")
+            .expect("data a");
+        writer
+            .write_client_segment_for_session(32, DATA_CLIENT_TO_SERVER, b"two")
+            .expect("data b");
+
+        let mut responses = Vec::new();
+        while responses.len() < 2 {
+            let segment = next_mieru_segment(&mut reader).expect("response segment");
+            if segment.metadata.protocol_type == DATA_SERVER_TO_CLIENT
+                && segment.payload != SOCKS_CONNECT_SUCCESS
+            {
+                responses.push((segment.metadata.session_id, segment.payload));
+            }
+        }
+        responses.sort_by_key(|(session_id, _)| *session_id);
+        assert_eq!(responses[0], (31, b"eno".to_vec()));
+        assert_eq!(responses[1], (32, b"owt".to_vec()));
+
+        writer.shutdown_write();
+        drop(reader);
+        echo_a_thread.join().expect("echo a thread");
+        echo_b_thread.join().expect("echo b thread");
+        let records = server_thread.join().expect("server thread");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].upload, 6);
+        assert_eq!(records[0].download, 6);
+    }
+
+    #[test]
     fn block_route_rejects_mieru_tcp_connect() {
         let server = MieruServer::new(MieruServerConfig {
             node_tag: "panel|mieru|1".to_string(),
@@ -1741,14 +2197,15 @@ mod tests {
     }
 
     impl TestClientWriter {
-        fn write_client_segment(
+        fn write_client_segment_for_session(
             &mut self,
+            session_id: u32,
             protocol_type: u8,
             payload: &[u8],
         ) -> std::io::Result<()> {
             let metadata = MieruMetadata {
                 protocol_type,
-                session_id: self.inner.session_id,
+                session_id,
                 sequence: self.inner.sequence,
                 status_code: STATUS_OK,
                 payload_len: payload.len(),
@@ -1757,6 +2214,18 @@ mod tests {
             };
             self.inner.sequence += 1;
             self.inner.write_segment(metadata, payload)
+        }
+
+        fn write_client_segment(
+            &mut self,
+            protocol_type: u8,
+            payload: &[u8],
+        ) -> std::io::Result<()> {
+            self.write_client_segment_for_session(self.inner.session_id, protocol_type, payload)
+        }
+
+        fn shutdown_write(&mut self) {
+            let _ = self.inner.stream.shutdown(std::net::Shutdown::Write);
         }
     }
 
@@ -1842,6 +2311,15 @@ mod tests {
         let mut reply = [0u8; 10];
         reader.read_exact(&mut reply).expect("socks success reply");
         assert_eq!(reply, SOCKS_CONNECT_SUCCESS);
+    }
+
+    fn next_mieru_segment(reader: &mut MieruReader) -> std::io::Result<MieruSegment> {
+        if let Some(segment) = reader.take_initial_segment() {
+            return Ok(segment);
+        }
+        reader
+            .read_segment()?
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no segment"))
     }
 
     #[test]

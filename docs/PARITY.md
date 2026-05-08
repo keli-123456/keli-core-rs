@@ -44,7 +44,7 @@ keliboard -> kelinode-rs -> keli-core-rs
 | Hysteria2 | Rendered by `kelinode-rs` | Partial | QUIC listener, password auth, TCP relay, UDP relay, salamander obfs, bandwidth options, per-user traffic, speed/device limits | Real-client matrix and production soak |
 | TUIC | Rendered by `kelinode-rs` when 0-RTT is absent | Partial | QUIC listener, UUID/token auth, TCP relay, UDP relay, cubic/bbr/new_reno congestion selection, per-user traffic, speed/device limits | zero-RTT, real-client matrix |
 | Naive | Sidecar plan only | Sidecar | Explicitly rejected by native core validation | Concrete Caddy forward_proxy deployment integration |
-| Mieru | Rendered by `kelinode-rs` for `keli-core-rs`; sidecar for Xray | Partial | TCP listener, documented key derivation, XChaCha20-Poly1305 segments, SOCKS CONNECT relay, per-user traffic, speed/device limits | UDP, multiplexing, traffic-pattern tuning, real-client matrix |
+| Mieru | Rendered by `kelinode-rs` for `keli-core-rs`; sidecar for Xray | Partial | TCP listener, stream underlay session demux, documented key derivation, XChaCha20-Poly1305 segments, SOCKS CONNECT relay, UDP ASSOCIATE over TCP underlay, per-user traffic, speed/device limits | UDP underlay transport, traffic-pattern tuning, broader real-client matrix |
 
 ## Transport Matrix
 

@@ -50,6 +50,7 @@ Implemented in this first skeleton:
 - Hysteria2 QUIC TCP and UDP data paths, including salamander obfs validation.
 - TUIC QUIC TCP and UDP data paths, including cubic/bbr/new_reno congestion selection.
 - VLESS REALITY config validation, client ClientHello authentication, fallback routing, dest ServerHello validation, dest handshake capture, temporary certificate generation, REALITY certificate signature embedding, rustls TLS accept, and VLESS/Vision handoff.
+- Mieru stream-underlay session demux so multiple TCP sessions can share one encrypted underlay connection.
 
 Not implemented yet:
 
