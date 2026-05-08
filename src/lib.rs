@@ -16,6 +16,7 @@ pub mod traffic;
 pub mod trojan;
 pub mod user;
 pub mod vless;
+pub mod websocket;
 
 pub use anytls::{AnyTlsServer, AnyTlsServerConfig};
 pub use config::{

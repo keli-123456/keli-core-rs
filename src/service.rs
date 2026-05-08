@@ -374,13 +374,22 @@ fn start_trojan_listener(
     let stop_for_thread = stop.clone();
     let workers = Arc::new(Mutex::new(Vec::new()));
     let workers_for_thread = workers.clone();
+    let network = inbound.transport.network.trim().to_string();
+    let websocket_path = inbound.transport.path.clone();
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let server = server.clone();
+                    let network = network.clone();
+                    let websocket_path = websocket_path.clone();
                     let worker = thread::spawn(move || {
-                        let _ = server.handle_tcp_client(stream);
+                        let result = if network == "ws" {
+                            server.handle_websocket_client(stream, websocket_path.as_deref())
+                        } else {
+                            server.handle_tcp_client(stream)
+                        };
+                        let _ = result;
                     });
                     workers_for_thread
                         .lock()
@@ -453,13 +462,22 @@ fn start_vless_listener(
     let stop_for_thread = stop.clone();
     let workers = Arc::new(Mutex::new(Vec::new()));
     let workers_for_thread = workers.clone();
+    let network = inbound.transport.network.trim().to_string();
+    let websocket_path = inbound.transport.path.clone();
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let server = server.clone();
+                    let network = network.clone();
+                    let websocket_path = websocket_path.clone();
                     let worker = thread::spawn(move || {
-                        let _ = server.handle_tcp_client(stream);
+                        let result = if network == "ws" {
+                            server.handle_websocket_client(stream, websocket_path.as_deref())
+                        } else {
+                            server.handle_tcp_client(stream)
+                        };
+                        let _ = result;
                     });
                     workers_for_thread
                         .lock()

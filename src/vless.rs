@@ -2,15 +2,17 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
 use crate::socks5::SocksTarget;
-use crate::stream::relay_tcp_streams_limited;
+use crate::stream::{copy_count_best_effort_limited, relay_tcp_streams_limited};
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
+use crate::websocket::accept_websocket;
 use crate::{RouteDecision, RouteMatcher};
 
 const VERSION: u8 = 0x00;
@@ -110,6 +112,31 @@ impl VlessServer {
         self.relay(client, remote, request, bandwidth)
     }
 
+    pub fn handle_websocket_client(&self, client: TcpStream, path: Option<&str>) -> io::Result<()> {
+        let (mut reader, mut writer) = accept_websocket(client, path)?;
+        let request = self.read_request(&mut reader)?;
+        let user = self.request_user(&request);
+        let _session = self.acquire_user_session(user)?;
+        let bandwidth = self.bandwidth.limiter_for(user);
+        let remote = match self.router.decide(&request.target.host) {
+            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
+            RouteDecision::Block => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target blocked by route",
+                ));
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
+        writer.write_all(&[VERSION, 0x00])?;
+        self.relay_websocket(reader, writer, remote, request, bandwidth)
+    }
+
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
         self.traffic
             .lock()
@@ -194,6 +221,44 @@ impl VlessServer {
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
         let (upload, download) = relay_tcp_streams_limited(client, remote, bandwidth)?;
+        self.traffic
+            .lock()
+            .expect("traffic registry lock poisoned")
+            .add(
+                self.config.node_tag.clone(),
+                request.user_uuid,
+                upload,
+                download,
+            );
+        Ok(())
+    }
+
+    fn relay_websocket<R, W>(
+        &self,
+        mut reader: R,
+        mut writer: W,
+        remote: TcpStream,
+        request: VlessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()>
+    where
+        R: Read + Send + 'static,
+        W: Write,
+    {
+        let mut remote_write = remote.try_clone()?;
+        let mut remote_read = remote;
+        let upload_limiter = bandwidth.clone();
+        let upload_thread = thread::spawn(move || {
+            copy_count_best_effort_limited(
+                &mut reader,
+                &mut remote_write,
+                upload_limiter.as_deref(),
+            )
+        });
+        let download = copy_count_best_effort_limited(&mut remote_read, &mut writer, None);
+        let upload = upload_thread
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "upload relay thread panicked"))?;
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
@@ -346,6 +411,56 @@ mod tests {
         input
     }
 
+    fn websocket_request(path: &str) -> Vec<u8> {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn masked_frame(payload: &[u8]) -> Vec<u8> {
+        let mask = [1u8, 2, 3, 4];
+        let mut frame = vec![0x82, 0x80 | payload.len() as u8];
+        frame.extend_from_slice(&mask);
+        for (index, byte) in payload.iter().enumerate() {
+            frame.push(*byte ^ mask[index % 4]);
+        }
+        frame
+    }
+
+    fn read_websocket_response(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut byte = [0u8; 1];
+        while !bytes.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).expect("response byte");
+            bytes.push(byte[0]);
+        }
+        String::from_utf8(bytes).expect("response utf8")
+    }
+
+    fn read_binary_frame(stream: &mut TcpStream) -> Vec<u8> {
+        let mut header = [0u8; 2];
+        stream.read_exact(&mut header).expect("frame header");
+        assert_eq!(header[0] & 0x0f, 0x02);
+        assert_eq!(header[1] & 0x80, 0);
+        let len = match header[1] & 0x7f {
+            126 => {
+                let mut extended = [0u8; 2];
+                stream.read_exact(&mut extended).expect("frame len");
+                u16::from_be_bytes(extended) as usize
+            }
+            127 => {
+                let mut extended = [0u8; 8];
+                stream.read_exact(&mut extended).expect("frame len");
+                u64::from_be_bytes(extended) as usize
+            }
+            len => len as usize,
+        };
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).expect("frame payload");
+        payload
+    }
+
     #[test]
     fn parses_vless_tcp_request() {
         let server = server();
@@ -412,6 +527,56 @@ mod tests {
         let mut echoed = [0u8; 4];
         client.read_exact(&mut echoed).expect("client read payload");
         assert_eq!(&echoed, b"ping");
+        drop(client);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|vless|1");
+        assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn proxies_websocket_and_records_user_traffic() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vless bind");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vless accept");
+            server_clone.handle_websocket_client(stream, Some("/vless"))
+        });
+
+        let mut client = TcpStream::connect(vless_addr).expect("client connect");
+        client
+            .write_all(&websocket_request("/vless"))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+
+        client
+            .write_all(&masked_frame(&vless_request(echo_addr)))
+            .expect("vless request frame");
+        assert_eq!(read_binary_frame(&mut client), [0x00, 0x00]);
+
+        client.write_all(&masked_frame(b"ping")).expect("payload");
+        assert_eq!(read_binary_frame(&mut client), b"ping");
         drop(client);
 
         server_thread

@@ -170,18 +170,18 @@ impl InboundConfig {
         }
         if self.protocol == Protocol::Vless {
             let network = self.transport.network.trim();
-            if network != "tcp" || self.tls.is_some() {
+            if !matches!(network, "tcp" | "ws") || self.tls.is_some() {
                 return Err(ValidationError::new(format!(
-                    "{} vless currently supports only plain tcp without tls/reality",
+                    "{} vless currently supports only plain tcp/ws without tls/reality",
                     self.tag
                 )));
             }
         }
         if self.protocol == Protocol::Trojan {
             let network = self.transport.network.trim();
-            if network != "tcp" || self.tls.is_some() {
+            if !matches!(network, "tcp" | "ws") || self.tls.is_some() {
                 return Err(ValidationError::new(format!(
-                    "{} trojan currently supports only plain tcp without tls",
+                    "{} trojan currently supports only plain tcp/ws without tls",
                     self.tag
                 )));
             }
