@@ -32,6 +32,7 @@ Implemented in this first skeleton:
 - HTTP proxy inbound with Basic authentication.
 - HTTP CONNECT tunneling and plain HTTP request forwarding.
 - Basic route matching with block decisions for implemented proxy inbounds.
+- Per-user device_limit enforcement for SOCKS5 and HTTP proxy connections.
 - Concurrent per-listener connection worker threads with stop-time joining.
 - Local JSON-line TCP control socket for process status, traffic drain, and stop commands.
 - CLI with `version`, `health`, `check-config`, and `run-config`.

@@ -7,6 +7,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 
+use crate::limits::{UserSessionGuard, UserSessionTracker};
 use crate::stream::{copy_count_best_effort, relay_tcp_streams};
 use crate::traffic::{TrafficDelta, TrafficRegistry};
 use crate::user::CoreUser;
@@ -27,6 +28,7 @@ pub struct HttpProxyServer {
     users: Arc<HashMap<String, CoreUser>>,
     router: RouteMatcher,
     traffic: Arc<Mutex<TrafficRegistry>>,
+    sessions: UserSessionTracker,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +68,7 @@ impl HttpProxyServer {
             config,
             users: Arc::new(users),
             traffic,
+            sessions: UserSessionTracker::default(),
         }
     }
 
@@ -88,6 +91,7 @@ impl HttpProxyServer {
             }
             Err(error) => return Err(error),
         };
+        let _session = self.acquire_user_session(&request, &mut client)?;
         if request.method.eq_ignore_ascii_case("CONNECT") {
             self.handle_connect(client, request)
         } else {
@@ -224,6 +228,27 @@ impl HttpProxyServer {
                 io::ErrorKind::Unsupported,
                 format!("outbound route {tag} is not implemented"),
             )),
+        }
+    }
+
+    fn acquire_user_session(
+        &self,
+        request: &HttpProxyRequest,
+        client: &mut TcpStream,
+    ) -> io::Result<Option<UserSessionGuard>> {
+        let user = request
+            .user_uuid
+            .as_deref()
+            .and_then(|uuid| self.users.get(uuid));
+        match self.sessions.try_acquire(user) {
+            Ok(guard) => Ok(guard),
+            Err(error) => {
+                write_too_many_requests_response(client)?;
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    error.to_string(),
+                ))
+            }
         }
     }
 }
@@ -366,10 +391,15 @@ fn write_forbidden_response(writer: &mut impl Write) -> io::Result<()> {
     writer.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
 }
 
+fn write_too_many_requests_response(writer: &mut impl Write) -> io::Result<()> {
+    writer.write_all(b"HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n")
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
@@ -396,6 +426,18 @@ mod tests {
             node_tag: "panel|http|1".to_string(),
             listen: "127.0.0.1:0".parse().expect("listen addr"),
             users: vec![user()],
+            routes: Vec::new(),
+            connect_timeout: Duration::from_secs(3),
+        })
+    }
+
+    fn limited_server() -> HttpProxyServer {
+        let mut user = user();
+        user.device_limit = 1;
+        HttpProxyServer::new(HttpProxyServerConfig {
+            node_tag: "panel|http|1".to_string(),
+            listen: "127.0.0.1:0".parse().expect("listen addr"),
+            users: vec![user],
             routes: Vec::new(),
             connect_timeout: Duration::from_secs(3),
         })
@@ -565,5 +607,73 @@ mod tests {
 
         server_thread.join().expect("server thread");
         assert!(String::from_utf8_lossy(&response).contains("403 Forbidden"));
+    }
+
+    #[test]
+    fn writes_429_when_user_device_limit_is_reached() {
+        let target = TcpListener::bind("127.0.0.1:0").expect("target bind");
+        let target_addr = target.local_addr().expect("target addr");
+        let (release_tx, release_rx) = mpsc::channel();
+        let target_thread = thread::spawn(move || {
+            let (stream, _) = target.accept().expect("target accept");
+            release_rx.recv().expect("release target");
+            let _ = stream.shutdown(Shutdown::Both);
+        });
+
+        let server = limited_server();
+        let listener = server.bind().expect("proxy bind");
+        let proxy_addr = listener.local_addr().expect("proxy addr");
+
+        let first_listener = listener.try_clone().expect("first listener");
+        let first_server = server.clone();
+        let first_thread = thread::spawn(move || first_server.serve_tcp_once(&first_listener));
+        let mut first_client = TcpStream::connect(proxy_addr).expect("first client");
+        let first_request = format!(
+            "CONNECT {} HTTP/1.1\r\nHost: {}\r\n{}\r\n",
+            target_addr,
+            target_addr,
+            basic_auth_header()
+        );
+        first_client
+            .write_all(first_request.as_bytes())
+            .expect("first request");
+        let mut first_response = [0u8; 39];
+        first_client
+            .read_exact(&mut first_response)
+            .expect("first response");
+        assert!(String::from_utf8_lossy(&first_response).contains("200 Connection established"));
+
+        let second_listener = listener.try_clone().expect("second listener");
+        let second_server = server.clone();
+        let second_thread = thread::spawn(move || second_server.serve_tcp_once(&second_listener));
+        let mut second_client = TcpStream::connect(proxy_addr).expect("second client");
+        let second_request = format!(
+            "CONNECT {} HTTP/1.1\r\nHost: {}\r\n{}\r\n",
+            target_addr,
+            target_addr,
+            basic_auth_header()
+        );
+        second_client
+            .write_all(second_request.as_bytes())
+            .expect("second request");
+        let mut second_response = Vec::new();
+        second_client
+            .read_to_end(&mut second_response)
+            .expect("second response");
+
+        let second_error = second_thread
+            .join()
+            .expect("second server thread")
+            .expect_err("device limit should reject second connection");
+        assert_eq!(second_error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(String::from_utf8_lossy(&second_response).contains("429 Too Many Requests"));
+
+        drop(first_client);
+        release_tx.send(()).expect("release target");
+        first_thread
+            .join()
+            .expect("first server thread")
+            .expect("first connection should close cleanly");
+        target_thread.join().expect("target thread");
     }
 }

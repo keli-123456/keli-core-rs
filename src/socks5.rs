@@ -4,6 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream,
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::limits::{UserSessionGuard, UserSessionTracker};
 use crate::stream::relay_tcp_streams;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
@@ -15,6 +16,7 @@ const AUTH_PASSWORD: u8 = 0x02;
 const AUTH_NO_MATCHING_METHOD: u8 = 0xff;
 const CMD_CONNECT: u8 = 0x01;
 const STATUS_SUCCESS: u8 = 0x00;
+const STATUS_CONNECTION_NOT_ALLOWED: u8 = 0x02;
 const STATUS_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const STATUS_ADDRESS_NOT_SUPPORTED: u8 = 0x08;
 const ATYP_IPV4: u8 = 0x01;
@@ -42,6 +44,7 @@ pub struct Socks5Server {
     users: Arc<HashMap<String, CoreUser>>,
     router: RouteMatcher,
     traffic: Arc<Mutex<TrafficRegistry>>,
+    sessions: UserSessionTracker,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +71,7 @@ impl Socks5Server {
             config,
             users: Arc::new(users),
             traffic,
+            sessions: UserSessionTracker::default(),
         }
     }
 
@@ -88,6 +92,7 @@ impl Socks5Server {
                 return Err(error);
             }
         };
+        let _session = self.acquire_user_session(&request, &mut client)?;
         let remote = match self.router.decide(&request.target.host) {
             RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
             RouteDecision::Block => {
@@ -264,6 +269,27 @@ impl Socks5Server {
         }
         Ok(())
     }
+
+    fn acquire_user_session(
+        &self,
+        request: &SocksRequest,
+        client: &mut TcpStream,
+    ) -> io::Result<Option<UserSessionGuard>> {
+        let user = request
+            .user_uuid
+            .as_deref()
+            .and_then(|uuid| self.users.get(uuid));
+        match self.sessions.try_acquire(user) {
+            Ok(guard) => Ok(guard),
+            Err(error) => {
+                write_socks5_response(client, STATUS_CONNECTION_NOT_ALLOWED)?;
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    error.to_string(),
+                ))
+            }
+        }
+    }
 }
 
 fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStream> {
@@ -313,7 +339,8 @@ fn write_socks5_response<W: Write>(writer: &mut W, status: u8) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
@@ -372,6 +399,40 @@ mod tests {
         })
     }
 
+    fn limited_server() -> Socks5Server {
+        let mut user = user();
+        user.device_limit = 1;
+        Socks5Server::new(Socks5ServerConfig {
+            node_tag: "panel|socks|1".to_string(),
+            listen: "127.0.0.1:0".parse().expect("listen addr"),
+            users: vec![user],
+            routes: Vec::new(),
+            connect_timeout: Duration::from_secs(3),
+        })
+    }
+
+    fn write_authenticated_ipv4_connect(client: &mut TcpStream, target: std::net::SocketAddr) {
+        client
+            .write_all(&[
+                0x05, 0x01, 0x02, 0x01, 0x06, b'u', b's', b'e', b'r', b'-', b'a', 0x06, b'u', b's',
+                b'e', b'r', b'-', b'a', 0x05, 0x01, 0x00, 0x01,
+            ])
+            .expect("client greeting");
+        client
+            .write_all(
+                &target
+                    .ip()
+                    .to_string()
+                    .parse::<std::net::Ipv4Addr>()
+                    .expect("ipv4")
+                    .octets(),
+            )
+            .expect("client target ip");
+        client
+            .write_all(&target.port().to_be_bytes())
+            .expect("client target port");
+    }
+
     #[test]
     fn parses_authenticated_domain_connect() {
         let server = server();
@@ -426,25 +487,7 @@ mod tests {
         let server_thread = thread::spawn(move || server_clone.serve_tcp_once(&listener));
 
         let mut client = TcpStream::connect(socks_addr).expect("client connect");
-        client
-            .write_all(&[
-                0x05, 0x01, 0x02, 0x01, 0x06, b'u', b's', b'e', b'r', b'-', b'a', 0x06, b'u', b's',
-                b'e', b'r', b'-', b'a', 0x05, 0x01, 0x00, 0x01,
-            ])
-            .expect("client greeting");
-        client
-            .write_all(
-                &echo_addr
-                    .ip()
-                    .to_string()
-                    .parse::<std::net::Ipv4Addr>()
-                    .expect("ipv4")
-                    .octets(),
-            )
-            .expect("client target ip");
-        client
-            .write_all(&echo_addr.port().to_be_bytes())
-            .expect("client target port");
+        write_authenticated_ipv4_connect(&mut client, echo_addr);
 
         let mut response = [0u8; 14];
         client.read_exact(&mut response).expect("client response");
@@ -470,5 +513,57 @@ mod tests {
         assert_eq!(records[0].user_uuid, "user-a");
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn rejects_connection_when_user_device_limit_is_reached() {
+        let target = TcpListener::bind("127.0.0.1:0").expect("target bind");
+        let target_addr = target.local_addr().expect("target addr");
+        let (release_tx, release_rx) = mpsc::channel();
+        let target_thread = thread::spawn(move || {
+            let (stream, _) = target.accept().expect("target accept");
+            release_rx.recv().expect("release target");
+            let _ = stream.shutdown(Shutdown::Both);
+        });
+
+        let server = limited_server();
+        let listener = server.bind().expect("socks bind");
+        let socks_addr = listener.local_addr().expect("socks addr");
+
+        let first_listener = listener.try_clone().expect("first listener");
+        let first_server = server.clone();
+        let first_thread = thread::spawn(move || first_server.serve_tcp_once(&first_listener));
+        let mut first_client = TcpStream::connect(socks_addr).expect("first client");
+        write_authenticated_ipv4_connect(&mut first_client, target_addr);
+        let mut first_response = [0u8; 14];
+        first_client
+            .read_exact(&mut first_response)
+            .expect("first response");
+        assert_eq!(&first_response[4..6], &[0x05, 0x00]);
+
+        let second_listener = listener.try_clone().expect("second listener");
+        let second_server = server.clone();
+        let second_thread = thread::spawn(move || second_server.serve_tcp_once(&second_listener));
+        let mut second_client = TcpStream::connect(socks_addr).expect("second client");
+        write_authenticated_ipv4_connect(&mut second_client, target_addr);
+        let mut second_response = [0u8; 14];
+        second_client
+            .read_exact(&mut second_response)
+            .expect("second response");
+
+        let second_error = second_thread
+            .join()
+            .expect("second server thread")
+            .expect_err("device limit should reject second connection");
+        assert_eq!(second_error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(&second_response[4..6], &[0x05, 0x02]);
+
+        drop(first_client);
+        release_tx.send(()).expect("release target");
+        first_thread
+            .join()
+            .expect("first server thread")
+            .expect("first connection should close cleanly");
+        target_thread.join().expect("target thread");
     }
 }
