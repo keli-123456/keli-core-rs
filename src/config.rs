@@ -60,6 +60,12 @@ pub struct TransportConfig {
     pub host: Option<String>,
     pub service_name: Option<String>,
     pub proxy_protocol: bool,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub up_mbps: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub down_mbps: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ignore_client_bandwidth: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,6 +284,14 @@ impl InboundConfig {
                     self.tag
                 )));
             }
+            if self.transport.ignore_client_bandwidth
+                && (self.transport.up_mbps > 0 || self.transport.down_mbps > 0)
+            {
+                return Err(ValidationError::new(format!(
+                    "{} hysteria2 ignore_client_bandwidth conflicts with up_mbps/down_mbps",
+                    self.tag
+                )));
+            }
         }
 
         Ok(())
@@ -351,8 +365,19 @@ impl Default for TransportConfig {
             host: None,
             service_name: None,
             proxy_protocol: false,
+            up_mbps: 0,
+            down_mbps: 0,
+            ignore_client_bandwidth: false,
         }
     }
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Default for SniffingConfig {
