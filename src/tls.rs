@@ -246,7 +246,7 @@ fn write_all_wait(writer: &mut TcpStream, mut input: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn load_certs(path: impl AsRef<Path>) -> io::Result<Vec<CertificateDer<'static>>> {
+pub(crate) fn load_certs(path: impl AsRef<Path>) -> io::Result<Vec<CertificateDer<'static>>> {
     let bytes = fs::read(path.as_ref())?;
     let mut reader = BufReader::new(bytes.as_slice());
     let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
@@ -259,7 +259,7 @@ fn load_certs(path: impl AsRef<Path>) -> io::Result<Vec<CertificateDer<'static>>
     Ok(certs)
 }
 
-fn load_private_key(path: impl AsRef<Path>) -> io::Result<PrivateKeyDer<'static>> {
+pub(crate) fn load_private_key(path: impl AsRef<Path>) -> io::Result<PrivateKeyDer<'static>> {
     let bytes = fs::read(path.as_ref())?;
     let mut reader = BufReader::new(bytes.as_slice());
     rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| {

@@ -247,6 +247,22 @@ impl InboundConfig {
                 )));
             }
         }
+        if self.protocol == Protocol::Tuic {
+            let network = self.transport.network.trim();
+            if network != "tuic" {
+                return Err(ValidationError::new(format!(
+                    "{} tuic currently requires tuic transport",
+                    self.tag
+                )));
+            }
+            validate_quic_tls_config("tuic", &self.tag, self.tls.as_ref())?;
+            if self.users.is_empty() {
+                return Err(ValidationError::new(format!(
+                    "{} tuic requires at least one user",
+                    self.tag
+                )));
+            }
+        }
 
         Ok(())
     }
@@ -281,6 +297,31 @@ fn validate_tls_config(
     {
         return Err(ValidationError::new(format!(
             "{tag} {protocol} tls requires cert_file and key_file"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_quic_tls_config(
+    protocol: &str,
+    tag: &str,
+    tls: Option<&TlsConfig>,
+) -> Result<(), ValidationError> {
+    let Some(tls) = tls else {
+        return Err(ValidationError::new(format!(
+            "{tag} {protocol} requires tls certificate files"
+        )));
+    };
+    if tls.reality.is_some() {
+        return Err(ValidationError::new(format!(
+            "{tag} {protocol} reality is not implemented in keli-core-rs yet"
+        )));
+    }
+    if tls.cert_file.as_deref().unwrap_or("").trim().is_empty()
+        || tls.key_file.as_deref().unwrap_or("").trim().is_empty()
+    {
+        return Err(ValidationError::new(format!(
+            "{tag} {protocol} requires cert_file and key_file"
         )));
     }
     Ok(())
