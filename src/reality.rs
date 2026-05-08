@@ -58,6 +58,7 @@ pub enum RealityGatewayResult {
 pub struct RealityAuthenticatedStream {
     pub auth: RealityClientAuth,
     pub stream: PrefixedTcpStream,
+    pub dest: TcpStream,
 }
 
 #[derive(Debug)]
@@ -116,15 +117,18 @@ pub fn handle_reality_preface(
     config: &RealityGatewayConfig,
 ) -> io::Result<RealityGatewayResult> {
     let first_record = read_first_tls_record(&mut client)?;
+    let mut dest = connect_dest(&config.dest, config.connect_timeout)?;
+    dest.write_all(&first_record)?;
     match authenticate_reality_client_hello(&first_record, &config.auth) {
         Ok(auth) => Ok(RealityGatewayResult::Authenticated(
             RealityAuthenticatedStream {
                 auth,
                 stream: PrefixedTcpStream::new(client, first_record),
+                dest,
             },
         )),
         Err(reason) => {
-            let (upload, download) = fallback_to_dest(client, first_record, &config.dest, config)?;
+            let (upload, download) = fallback_to_dest(client, first_record, dest)?;
             Ok(RealityGatewayResult::Fallback {
                 reason,
                 upload,
@@ -299,11 +303,8 @@ fn read_first_tls_record(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
 fn fallback_to_dest(
     client: TcpStream,
     first_record: Vec<u8>,
-    dest: &str,
-    config: &RealityGatewayConfig,
+    remote: TcpStream,
 ) -> io::Result<(u64, u64)> {
-    let mut remote = connect_dest(dest, config.connect_timeout)?;
-    remote.write_all(&first_record)?;
     let initial_upload = first_record.len() as u64;
     let (upload, download) = relay_tcp_streams_limited(client, remote, None)?;
     Ok((initial_upload.saturating_add(upload), download))
@@ -665,6 +666,22 @@ mod tests {
 
     #[test]
     fn gateway_returns_authenticated_prefixed_stream() {
+        let target = TcpListener::bind("127.0.0.1:0").expect("bind target");
+        let target_addr = target.local_addr().expect("target addr");
+        let (target_tx, target_rx) = mpsc::channel();
+        let target_thread = thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("accept target");
+            let mut header = [0u8; 5];
+            stream.read_exact(&mut header).expect("read target header");
+            let body_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+            let mut captured = header.to_vec();
+            captured.resize(5 + body_len, 0);
+            stream
+                .read_exact(&mut captured[5..])
+                .expect("read target body");
+            target_tx.send(captured).expect("send target capture");
+        });
+
         let server_secret = StaticSecret::from([7u8; 32]);
         let client_secret = StaticSecret::from([9u8; 32]);
         let short_id = [0x6b, 0xa8, 0x51, 0x79, 0xe3, 0x0d, 0x4f, 0xc2];
@@ -681,7 +698,7 @@ mod tests {
         let addr = listener.local_addr().expect("reality addr");
         let server_thread = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept reality");
-            let config = gateway_config(server_secret, short_id, "127.0.0.1:9".to_string());
+            let config = gateway_config(server_secret, short_id, target_addr.to_string());
             let result = handle_reality_preface(stream, &config).expect("reality preface");
             let RealityGatewayResult::Authenticated(mut authenticated) = result else {
                 panic!("expected authenticated reality stream");
@@ -709,6 +726,8 @@ mod tests {
         client.shutdown(Shutdown::Write).expect("shutdown client");
 
         server_thread.join().expect("server thread");
+        target_thread.join().expect("target thread");
+        assert_eq!(target_rx.recv().expect("target capture"), record);
     }
 
     #[test]
