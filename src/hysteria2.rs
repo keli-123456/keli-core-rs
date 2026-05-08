@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
 use quinn::crypto::rustls::QuicServerConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{lookup_host, UdpSocket};
 
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
@@ -20,6 +22,8 @@ use crate::user::CoreUser;
 const TCP_REQUEST_ID: u64 = 0x401;
 const RESPONSE_OK: u8 = 0x00;
 const RESPONSE_ERROR: u8 = 0x01;
+const UDP_DATAGRAM_BUFFER_SIZE: usize = 1024 * 1024;
+const UDP_PACKET_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Hysteria2ServerConfig {
@@ -88,9 +92,14 @@ impl Hysteria2Server {
             self.config.alpn.clone()
         };
         server_crypto.alpn_protocols = alpn.iter().map(|value| value.as_bytes().to_vec()).collect();
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             QuicServerConfig::try_from(server_crypto).map_err(io_other)?,
         ));
+        let mut transport = quinn::TransportConfig::default();
+        transport
+            .datagram_receive_buffer_size(Some(UDP_DATAGRAM_BUFFER_SIZE))
+            .datagram_send_buffer_size(UDP_DATAGRAM_BUFFER_SIZE);
+        server_config.transport_config(Arc::new(transport));
         quinn::Endpoint::server(server_config, self.config.listen)
     }
 
@@ -128,6 +137,16 @@ impl Hysteria2Server {
         let user = self.authenticate_http3(&connection).await?;
         let _session = self.acquire_user_session(&user)?;
         let bandwidth = self.bandwidth.limiter_for(Some(&user));
+        let udp_sessions = Arc::new(Mutex::new(HashMap::new()));
+        let udp_server = self.clone();
+        let udp_connection = connection.clone();
+        let udp_user_uuid = user.uuid.clone();
+        let udp_bandwidth = bandwidth.clone();
+        tokio::spawn(async move {
+            let _ = udp_server
+                .handle_udp_datagrams(udp_connection, udp_user_uuid, udp_bandwidth, udp_sessions)
+                .await;
+        });
 
         loop {
             match connection.accept_bi().await {
@@ -181,7 +200,8 @@ impl Hysteria2Server {
 
             let response = http::Response::builder()
                 .status(http::StatusCode::from_u16(233).map_err(io_other)?)
-                .header("Hysteria-UDP", "false")
+                .header("Hysteria-UDP", "true")
+                .header("Hysteria-TCP", "true")
                 .header("Hysteria-CC-RX", "auto")
                 .body(())
                 .map_err(io_other)?;
@@ -253,10 +273,207 @@ impl Hysteria2Server {
         Ok(())
     }
 
+    async fn handle_udp_datagrams(
+        &self,
+        connection: quinn::Connection,
+        user_uuid: String,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+        sessions: Arc<Mutex<HashMap<u32, Arc<UdpRelaySession>>>>,
+    ) -> io::Result<()> {
+        loop {
+            let datagram = match connection.read_datagram().await {
+                Ok(datagram) => datagram,
+                Err(quinn::ConnectionError::ApplicationClosed { .. })
+                | Err(quinn::ConnectionError::LocallyClosed)
+                | Err(quinn::ConnectionError::ConnectionClosed(_)) => return Ok(()),
+                Err(error) => return Err(io_other(error)),
+            };
+            let Ok(message) = parse_udp_datagram(&datagram) else {
+                continue;
+            };
+            if !message.is_single_fragment() {
+                continue;
+            }
+            let _ = self
+                .handle_udp_message(
+                    &connection,
+                    &user_uuid,
+                    bandwidth.clone(),
+                    &sessions,
+                    message,
+                )
+                .await;
+        }
+    }
+
+    async fn handle_udp_message(
+        &self,
+        connection: &quinn::Connection,
+        user_uuid: &str,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+        sessions: &Arc<Mutex<HashMap<u32, Arc<UdpRelaySession>>>>,
+        message: UdpDatagram,
+    ) -> io::Result<()> {
+        match self.router.decide(&message.target.host) {
+            RouteDecision::Direct => {}
+            RouteDecision::Block | RouteDecision::UnsupportedOutbound(_) => return Ok(()),
+        }
+
+        let target_addr = resolve_udp_target(&message.target, self.config.connect_timeout).await?;
+        let session = self
+            .get_udp_session(
+                connection,
+                user_uuid,
+                sessions,
+                message.session_id,
+                target_addr,
+            )
+            .await?;
+        if let Some(limiter) = bandwidth.as_deref() {
+            limiter.wait_for(message.data.len());
+        }
+        session.socket.send_to(&message.data, target_addr).await?;
+        self.traffic
+            .lock()
+            .expect("traffic registry lock poisoned")
+            .add(
+                self.config.node_tag.clone(),
+                user_uuid.to_string(),
+                message.data.len() as u64,
+                0,
+            );
+        Ok(())
+    }
+
+    async fn get_udp_session(
+        &self,
+        connection: &quinn::Connection,
+        user_uuid: &str,
+        sessions: &Arc<Mutex<HashMap<u32, Arc<UdpRelaySession>>>>,
+        session_id: u32,
+        target_addr: SocketAddr,
+    ) -> io::Result<Arc<UdpRelaySession>> {
+        if let Some(session) = sessions
+            .lock()
+            .expect("hysteria2 udp session lock poisoned")
+            .get(&session_id)
+            .cloned()
+        {
+            return Ok(session);
+        }
+
+        let socket = Arc::new(bind_udp_socket(target_addr.ip()).await?);
+        let session = Arc::new(UdpRelaySession {
+            socket,
+            next_packet_id: AtomicU16::new(0),
+        });
+        {
+            let mut sessions = sessions
+                .lock()
+                .expect("hysteria2 udp session lock poisoned");
+            if let Some(existing) = sessions.get(&session_id) {
+                return Ok(existing.clone());
+            }
+            sessions.insert(session_id, session.clone());
+        }
+
+        let receiver = session.clone();
+        let connection = connection.clone();
+        let node_tag = self.config.node_tag.clone();
+        let user_uuid = user_uuid.to_string();
+        let traffic = self.traffic.clone();
+        tokio::spawn(async move {
+            let _ = receive_udp_replies(
+                session_id, receiver, connection, node_tag, user_uuid, traffic,
+            )
+            .await;
+        });
+        Ok(session)
+    }
+
     fn acquire_user_session(&self, user: &CoreUser) -> io::Result<Option<UserSessionGuard>> {
         self.sessions
             .try_acquire(Some(user))
             .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))
+    }
+}
+
+#[derive(Debug)]
+struct UdpRelaySession {
+    socket: Arc<UdpSocket>,
+    next_packet_id: AtomicU16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UdpDatagram {
+    session_id: u32,
+    packet_id: u16,
+    fragment_id: u8,
+    fragment_count: u8,
+    target: SocksTarget,
+    data: Vec<u8>,
+}
+
+impl UdpDatagram {
+    fn is_single_fragment(&self) -> bool {
+        self.fragment_id == 0 && self.fragment_count == 1
+    }
+}
+
+async fn bind_udp_socket(target_ip: IpAddr) -> io::Result<UdpSocket> {
+    let bind_addr = match target_ip {
+        IpAddr::V4(_) => "0.0.0.0:0",
+        IpAddr::V6(_) => "[::]:0",
+    };
+    UdpSocket::bind(bind_addr).await
+}
+
+async fn resolve_udp_target(target: &SocksTarget, timeout: Duration) -> io::Result<SocketAddr> {
+    match tokio::time::timeout(timeout, lookup_host((target.host.as_str(), target.port))).await {
+        Ok(Ok(mut addresses)) => addresses.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "hysteria2 udp target has no address",
+            )
+        }),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "hysteria2 udp target lookup timed out",
+        )),
+    }
+}
+
+async fn receive_udp_replies(
+    session_id: u32,
+    session: Arc<UdpRelaySession>,
+    connection: quinn::Connection,
+    node_tag: String,
+    user_uuid: String,
+    traffic: Arc<Mutex<TrafficRegistry>>,
+) -> io::Result<()> {
+    let mut buffer = vec![0u8; UDP_PACKET_BUFFER_SIZE];
+    loop {
+        let (read, peer) = session.socket.recv_from(&mut buffer).await?;
+        let packet_id = session.next_packet_id.fetch_add(1, Ordering::Relaxed);
+        let address = format_socket_addr(&peer);
+        let datagram = encode_udp_datagram(session_id, packet_id, 0, 1, &address, &buffer[..read])?;
+        let Some(max_size) = connection.max_datagram_size() else {
+            return Ok(());
+        };
+        if datagram.len() > max_size {
+            continue;
+        }
+        connection
+            .send_datagram_wait(Bytes::from(datagram))
+            .await
+            .map_err(io_other)?;
+        traffic.lock().expect("traffic registry lock poisoned").add(
+            node_tag.clone(),
+            user_uuid.clone(),
+            0,
+            read as u64,
+        );
     }
 }
 
@@ -347,6 +564,95 @@ fn parse_port(value: &str) -> io::Result<u16> {
     })
 }
 
+fn parse_udp_datagram(input: &[u8]) -> io::Result<UdpDatagram> {
+    if input.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hysteria2 udp datagram is too short",
+        ));
+    }
+    let session_id = u32::from_be_bytes(input[0..4].try_into().expect("fixed slice"));
+    let packet_id = u16::from_be_bytes(input[4..6].try_into().expect("fixed slice"));
+    let fragment_id = input[6];
+    let fragment_count = input[7];
+    let mut offset = 8usize;
+
+    let address_len = read_varint_from(input, &mut offset)?;
+    if address_len == 0 || address_len > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid hysteria2 udp address length",
+        ));
+    }
+    let address_len = address_len as usize;
+    if input.len().saturating_sub(offset) < address_len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated hysteria2 udp address",
+        ));
+    }
+    let address = String::from_utf8(input[offset..offset + address_len].to_vec())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid hysteria2 udp address"))?;
+    offset += address_len;
+
+    let data_len = read_varint_from(input, &mut offset)?;
+    if data_len > UDP_PACKET_BUFFER_SIZE as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid hysteria2 udp data length",
+        ));
+    }
+    let data_len = data_len as usize;
+    if input.len().saturating_sub(offset) != data_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hysteria2 udp data length mismatch",
+        ));
+    }
+
+    Ok(UdpDatagram {
+        session_id,
+        packet_id,
+        fragment_id,
+        fragment_count,
+        target: parse_target_address(&address)?,
+        data: input[offset..offset + data_len].to_vec(),
+    })
+}
+
+fn encode_udp_datagram(
+    session_id: u32,
+    packet_id: u16,
+    fragment_id: u8,
+    fragment_count: u8,
+    address: &str,
+    data: &[u8],
+) -> io::Result<Vec<u8>> {
+    if address.is_empty() || address.len() > 4096 || data.len() > UDP_PACKET_BUFFER_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid hysteria2 udp datagram field length",
+        ));
+    }
+    let mut output = Vec::with_capacity(8 + address.len() + data.len() + 8);
+    output.extend_from_slice(&session_id.to_be_bytes());
+    output.extend_from_slice(&packet_id.to_be_bytes());
+    output.push(fragment_id);
+    output.push(fragment_count);
+    output.extend_from_slice(&encode_varint(address.len() as u64)?);
+    output.extend_from_slice(address.as_bytes());
+    output.extend_from_slice(&encode_varint(data.len() as u64)?);
+    output.extend_from_slice(data);
+    Ok(output)
+}
+
+fn format_socket_addr(addr: &SocketAddr) -> String {
+    match addr.ip() {
+        IpAddr::V4(ip) => format!("{ip}:{}", addr.port()),
+        IpAddr::V6(ip) => format!("[{ip}]:{}", addr.port()),
+    }
+}
+
 async fn write_tcp_response(
     send: &mut quinn::SendStream,
     status: u8,
@@ -409,6 +715,37 @@ async fn read_varint(stream: &mut quinn::RecvStream) -> io::Result<u64> {
     if len > 1 {
         read_exact(stream, &mut bytes[1..len]).await?;
     }
+    Ok(match len {
+        1 => bytes[0] as u64,
+        2 => u16::from_be_bytes([bytes[0], bytes[1]]) as u64,
+        4 => u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64,
+        8 => u64::from_be_bytes(bytes),
+        _ => unreachable!("QUIC varint lengths are fixed"),
+    })
+}
+
+fn read_varint_from(input: &[u8], offset: &mut usize) -> io::Result<u64> {
+    if *offset >= input.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "missing QUIC varint",
+        ));
+    }
+    let first = input[*offset];
+    let tag = first >> 6;
+    let len = 1usize << tag;
+    if input.len().saturating_sub(*offset) < len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated QUIC varint",
+        ));
+    }
+    let mut bytes = [0u8; 8];
+    bytes[0] = first & 0b0011_1111;
+    if len > 1 {
+        bytes[1..len].copy_from_slice(&input[*offset + 1..*offset + len]);
+    }
+    *offset += len;
     Ok(match len {
         1 => bytes[0] as u64,
         2 => u16::from_be_bytes([bytes[0], bytes[1]]) as u64,
@@ -511,8 +848,13 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
         crypto.alpn_protocols = vec![b"h3".to_vec()];
-        let client_config =
+        let mut client_config =
             quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto).unwrap()));
+        let mut transport = quinn::TransportConfig::default();
+        transport
+            .datagram_receive_buffer_size(Some(UDP_DATAGRAM_BUFFER_SIZE))
+            .datagram_send_buffer_size(UDP_DATAGRAM_BUFFER_SIZE);
+        client_config.transport_config(Arc::new(transport));
         let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         endpoint.set_default_client_config(client_config);
         endpoint
@@ -551,17 +893,36 @@ mod tests {
         stream.finish().await.expect("finish auth request");
         let response = stream.recv_response().await.expect("auth response");
         assert_eq!(response.status().as_u16(), 233);
+        assert_eq!(
+            response
+                .headers()
+                .get("Hysteria-UDP")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
         drop(send_request);
         driver.abort();
     }
 
     fn tcp_request(addr: SocketAddr) -> Vec<u8> {
-        let address = format!("{}:{}", addr.ip(), addr.port());
+        let address = format_socket_addr(&addr);
         let mut request = encode_varint(TCP_REQUEST_ID).expect("request id");
         request.extend_from_slice(&encode_varint(address.len() as u64).expect("addr len"));
         request.extend_from_slice(address.as_bytes());
         request.extend_from_slice(&encode_varint(0).expect("padding len"));
         request
+    }
+
+    fn udp_request(session_id: u32, packet_id: u16, addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        encode_udp_datagram(
+            session_id,
+            packet_id,
+            0,
+            1,
+            &format_socket_addr(&addr),
+            payload,
+        )
+        .expect("udp datagram")
     }
 
     #[test]
@@ -586,6 +947,25 @@ mod tests {
     fn encodes_quic_varints() {
         assert_eq!(encode_varint(0x3f).unwrap(), vec![0x3f]);
         assert_eq!(encode_varint(0x401).unwrap(), vec![0x44, 0x01]);
+    }
+
+    #[test]
+    fn parses_hysteria2_udp_datagrams() {
+        let encoded = encode_udp_datagram(7, 11, 0, 1, "[::1]:53", b"dns").unwrap();
+        let parsed = parse_udp_datagram(&encoded).unwrap();
+
+        assert_eq!(parsed.session_id, 7);
+        assert_eq!(parsed.packet_id, 11);
+        assert_eq!(parsed.fragment_id, 0);
+        assert_eq!(parsed.fragment_count, 1);
+        assert_eq!(
+            parsed.target,
+            SocksTarget {
+                host: "::1".to_string(),
+                port: 53
+            }
+        );
+        assert_eq!(parsed.data, b"dns");
     }
 
     #[test]
@@ -636,6 +1016,73 @@ mod tests {
             let mut echoed = [0u8; 4];
             recv.read_exact(&mut echoed).await.expect("echoed payload");
             assert_eq!(&echoed, b"ping");
+            connection.close(0u32.into(), b"done");
+            echo_task.await.expect("echo task");
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let records = server.drain_traffic(1);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].node_tag, "panel|hysteria|1");
+            assert_eq!(records[0].user_uuid, "hy2-password");
+            assert_eq!(records[0].upload, 4);
+            assert_eq!(records[0].download, 4);
+
+            stop.store(true, Ordering::SeqCst);
+            server_task.await.expect("server task");
+        });
+    }
+
+    #[test]
+    fn proxies_hysteria2_udp_and_records_user_traffic() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let cert = test_cert("udp");
+            let echo = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("echo bind");
+            let echo_addr = echo.local_addr().expect("echo addr");
+            let echo_task = tokio::spawn(async move {
+                let mut buffer = [0u8; 16];
+                let (read, peer) = echo.recv_from(&mut buffer).await.expect("echo recv");
+                echo.send_to(&buffer[..read], peer)
+                    .await
+                    .expect("echo send");
+            });
+
+            let server = server(&cert, "127.0.0.1:0".parse().unwrap());
+            let endpoint = server.bind().expect("hy2 bind");
+            let server_addr = endpoint.local_addr().expect("server addr");
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_task = tokio::spawn(server.clone().run(endpoint, stop.clone()));
+
+            let client_endpoint = client_endpoint(cert.cert_der.clone());
+            let connection = client_endpoint
+                .connect(server_addr, "localhost")
+                .expect("connect")
+                .await
+                .expect("connection");
+            authenticate(&connection).await;
+
+            connection
+                .send_datagram_wait(Bytes::from(udp_request(9, 1, echo_addr, b"pong")))
+                .await
+                .expect("send udp datagram");
+            let response = tokio::time::timeout(Duration::from_secs(3), connection.read_datagram())
+                .await
+                .expect("udp response timeout")
+                .expect("udp response");
+            let response = parse_udp_datagram(&response).expect("response datagram");
+
+            assert_eq!(response.session_id, 9);
+            assert_eq!(response.fragment_id, 0);
+            assert_eq!(response.fragment_count, 1);
+            assert_eq!(response.data, b"pong");
+            assert_eq!(response.target.host, "127.0.0.1");
+            assert_eq!(response.target.port, echo_addr.port());
+
             connection.close(0u32.into(), b"done");
             echo_task.await.expect("echo task");
 
