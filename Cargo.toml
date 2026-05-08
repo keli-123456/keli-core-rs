@@ -15,11 +15,14 @@ name = "keli-core-rs"
 path = "src/main.rs"
 
 [dependencies]
+aes = "0.8"
 aes-gcm = "0.10"
 base64 = "0.22"
 chacha20poly1305 = "0.10"
+crc32fast = "1"
 getrandom = "0.2"
 hkdf = "0.12"
+hmac = "0.12"
 md-5 = "0.10"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
@@ -27,6 +30,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 sha2 = "0.10"
+sha3 = "0.10"
 
 [dev-dependencies]
 rcgen = "0.13"

@@ -19,6 +19,7 @@ use crate::tls::TlsAcceptor;
 use crate::traffic::{TrafficDelta, TrafficRegistry};
 use crate::trojan::{TrojanServer, TrojanServerConfig};
 use crate::vless::{VlessServer, VlessServerConfig};
+use crate::vmess::{VmessServer, VmessServerConfig};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerStatus {
@@ -101,6 +102,13 @@ impl CoreService {
                     sessions.clone(),
                     bandwidth.clone(),
                 )?,
+                Protocol::Vmess => start_vmess_listener(
+                    &inbound,
+                    config.routes.clone(),
+                    traffic.clone(),
+                    sessions.clone(),
+                    bandwidth.clone(),
+                )?,
                 Protocol::Trojan => start_trojan_listener(
                     &inbound,
                     config.routes.clone(),
@@ -168,6 +176,94 @@ impl Drop for CoreService {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn start_vmess_listener(
+    inbound: &InboundConfig,
+    routes: Vec<crate::RouteRule>,
+    traffic: Arc<Mutex<TrafficRegistry>>,
+    sessions: UserSessionTracker,
+    bandwidth: UserBandwidthLimiters,
+) -> Result<ListenerHandle, CoreServiceError> {
+    let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
+        CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        }
+    })?;
+    let server = VmessServer::with_shared_limits(
+        VmessServerConfig {
+            node_tag: inbound.tag.clone(),
+            listen,
+            users: inbound.users.clone(),
+            routes,
+            connect_timeout: Duration::from_secs(10),
+        },
+        traffic,
+        sessions,
+        bandwidth,
+    );
+    let listener = server.bind().map_err(|source| CoreServiceError::Bind {
+        tag: inbound.tag.clone(),
+        source,
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = stop.clone();
+    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers_for_thread = workers.clone();
+    let network = inbound.transport.network.trim().to_string();
+    let websocket_path = inbound.transport.path.clone();
+    let join = thread::spawn(move || {
+        while !stop_for_thread.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let server = server.clone();
+                    let network = network.clone();
+                    let websocket_path = websocket_path.clone();
+                    let worker = thread::spawn(move || {
+                        let result = if network == "ws" {
+                            server.handle_websocket_client(stream, websocket_path.as_deref())
+                        } else {
+                            server.handle_tcp_client(stream)
+                        };
+                        let _ = result;
+                    });
+                    workers_for_thread
+                        .lock()
+                        .expect("worker list lock poisoned")
+                        .push(worker);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok(ListenerHandle {
+        status: ListenerStatus {
+            tag: inbound.tag.clone(),
+            protocol: Protocol::Vmess,
+            local_addr,
+        },
+        stop,
+        workers,
+        join: Some(join),
+    })
 }
 
 fn start_anytls_listener(
@@ -849,11 +945,26 @@ mod tests {
     #[test]
     fn rejects_unimplemented_core_protocols() {
         let mut config = config(free_port());
-        config.inbounds[0].protocol = Protocol::Vmess;
+        config.inbounds[0].protocol = Protocol::Hysteria2;
 
-        let error = CoreService::start(config).expect_err("vmess should not start yet");
+        let error = CoreService::start(config).expect_err("hysteria2 should not start yet");
 
         assert!(error.to_string().contains("not implemented"));
+    }
+
+    #[test]
+    fn starts_vmess_listener_from_core_config() {
+        let mut config = config(free_port());
+        config.inbounds[0].tag = "panel|vmess|1".to_string();
+        config.inbounds[0].protocol = Protocol::Vmess;
+        config.inbounds[0].users[0].uuid = "11111111-1111-1111-1111-111111111111".to_string();
+
+        let mut service = CoreService::start(config).expect("service start");
+        let listeners = service.listeners();
+
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].protocol, Protocol::Vmess);
+        service.stop();
     }
 
     #[test]

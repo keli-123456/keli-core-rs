@@ -17,6 +17,7 @@ pub mod traffic;
 pub mod trojan;
 pub mod user;
 pub mod vless;
+pub mod vmess;
 pub mod websocket;
 
 pub use anytls::{AnyTlsServer, AnyTlsServerConfig};
@@ -45,5 +46,6 @@ pub use traffic::{TrafficDelta, TrafficKey, TrafficRegistry};
 pub use trojan::{trojan_password_hash, TrojanServer, TrojanServerConfig};
 pub use user::CoreUser;
 pub use vless::{VlessServer, VlessServerConfig};
+pub use vmess::{VmessServer, VmessServerConfig};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -234,7 +234,7 @@ mod tests {
         let mut controller = CoreController::new();
 
         let response = controller.handle(CoreCommand::ApplyConfig {
-            config: config(Protocol::Vmess),
+            config: config(Protocol::Hysteria2),
         });
 
         match response {

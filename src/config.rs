@@ -178,6 +178,27 @@ impl InboundConfig {
             }
             validate_tls_config("vless", &self.tag, network, self.tls.as_ref())?;
         }
+        if self.protocol == Protocol::Vmess {
+            let network = self.transport.network.trim();
+            if !matches!(network, "tcp" | "ws") {
+                return Err(ValidationError::new(format!(
+                    "{} vmess currently supports only tcp/ws transport",
+                    self.tag
+                )));
+            }
+            if self.tls.is_some() {
+                return Err(ValidationError::new(format!(
+                    "{} vmess tls is not implemented in keli-core-rs yet",
+                    self.tag
+                )));
+            }
+            if self.users.is_empty() {
+                return Err(ValidationError::new(format!(
+                    "{} vmess requires at least one user",
+                    self.tag
+                )));
+            }
+        }
         if self.protocol == Protocol::Trojan {
             let network = self.transport.network.trim();
             if !matches!(network, "tcp" | "ws") {
