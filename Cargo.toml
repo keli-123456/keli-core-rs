@@ -1,0 +1,19 @@
+[package]
+name = "keli-core-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MPL-2.0"
+description = "Experimental Rust data-plane core for Keli."
+
+[lib]
+name = "keli_core_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "keli-core-rs"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
