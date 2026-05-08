@@ -4,6 +4,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::Protocol;
+use crate::shadowsocks::is_supported_shadowsocks_cipher;
 use crate::user::CoreUser;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +24,8 @@ pub struct InboundConfig {
     pub listen: String,
     pub port: u16,
     pub users: Vec<CoreUser>,
+    #[serde(default)]
+    pub cipher: Option<String>,
     pub transport: TransportConfig,
     pub tls: Option<TlsConfig>,
     pub sniffing: SniffingConfig,
@@ -183,6 +186,34 @@ impl InboundConfig {
                 )));
             }
         }
+        if self.protocol == Protocol::Shadowsocks {
+            let network = self.transport.network.trim();
+            if network != "tcp" || self.tls.is_some() {
+                return Err(ValidationError::new(format!(
+                    "{} shadowsocks currently supports only plain tcp",
+                    self.tag
+                )));
+            }
+            if self.users.is_empty() {
+                return Err(ValidationError::new(format!(
+                    "{} shadowsocks requires at least one user",
+                    self.tag
+                )));
+            }
+            if self.cipher.as_deref().unwrap_or("").trim().is_empty() {
+                return Err(ValidationError::new(format!(
+                    "{} shadowsocks cipher is required",
+                    self.tag
+                )));
+            }
+            if !is_supported_shadowsocks_cipher(self.cipher.as_deref().unwrap_or("")) {
+                return Err(ValidationError::new(format!(
+                    "{} shadowsocks cipher {} is not supported",
+                    self.tag,
+                    self.cipher.as_deref().unwrap_or("")
+                )));
+            }
+        }
 
         Ok(())
     }
@@ -250,6 +281,7 @@ mod tests {
                 listen: "0.0.0.0".to_string(),
                 port: 443,
                 users: vec![user()],
+                cipher: None,
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),
@@ -275,6 +307,7 @@ mod tests {
             listen: "0.0.0.0".to_string(),
             port: 443,
             users: vec![user()],
+            cipher: None,
             transport: TransportConfig::default(),
             tls: None,
             sniffing: SniffingConfig::default(),
@@ -291,6 +324,7 @@ mod tests {
             listen: "0.0.0.0".to_string(),
             port: 443,
             users: vec![user()],
+            cipher: None,
             transport: TransportConfig::default(),
             tls: Some(TlsConfig {
                 server_name: "example.com".to_string(),
@@ -318,6 +352,7 @@ mod tests {
             listen: "0.0.0.0".to_string(),
             port: 443,
             users: vec![user()],
+            cipher: None,
             transport: TransportConfig::default(),
             tls: Some(TlsConfig {
                 server_name: "example.com".to_string(),
@@ -335,5 +370,26 @@ mod tests {
             .expect_err("trojan tls should not be accepted yet");
 
         assert!(error.to_string().contains("plain tcp"));
+    }
+
+    #[test]
+    fn rejects_shadowsocks_without_cipher() {
+        let inbound = InboundConfig {
+            tag: "panel|shadowsocks|1".to_string(),
+            protocol: Protocol::Shadowsocks,
+            listen: "0.0.0.0".to_string(),
+            port: 8388,
+            users: vec![user()],
+            cipher: None,
+            transport: TransportConfig::default(),
+            tls: None,
+            sniffing: SniffingConfig::default(),
+        };
+
+        let error = inbound
+            .validate()
+            .expect_err("shadowsocks cipher should be required");
+
+        assert!(error.to_string().contains("cipher is required"));
     }
 }

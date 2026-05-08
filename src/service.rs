@@ -12,6 +12,7 @@ use crate::config::{CoreConfig, InboundConfig, ValidationError};
 use crate::http_proxy::{HttpProxyServer, HttpProxyServerConfig};
 use crate::limits::{UserBandwidthLimiters, UserSessionTracker};
 use crate::protocol::Protocol;
+use crate::shadowsocks::{ShadowsocksServer, ShadowsocksServerConfig};
 use crate::socks5::{Socks5Server, Socks5ServerConfig};
 use crate::traffic::{TrafficDelta, TrafficRegistry};
 use crate::trojan::{TrojanServer, TrojanServerConfig};
@@ -105,6 +106,13 @@ impl CoreService {
                     sessions.clone(),
                     bandwidth.clone(),
                 )?,
+                Protocol::Shadowsocks => start_shadowsocks_listener(
+                    &inbound,
+                    config.routes.clone(),
+                    traffic.clone(),
+                    sessions.clone(),
+                    bandwidth.clone(),
+                )?,
                 _ => {
                     return Err(CoreServiceError::UnsupportedProtocol {
                         tag: inbound.tag,
@@ -151,6 +159,86 @@ impl Drop for CoreService {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn start_shadowsocks_listener(
+    inbound: &InboundConfig,
+    routes: Vec<crate::RouteRule>,
+    traffic: Arc<Mutex<TrafficRegistry>>,
+    sessions: UserSessionTracker,
+    bandwidth: UserBandwidthLimiters,
+) -> Result<ListenerHandle, CoreServiceError> {
+    let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
+        CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        }
+    })?;
+    let server = ShadowsocksServer::with_shared_limits(
+        ShadowsocksServerConfig {
+            node_tag: inbound.tag.clone(),
+            listen,
+            method: inbound.cipher.clone().unwrap_or_default(),
+            users: inbound.users.clone(),
+            routes,
+            connect_timeout: Duration::from_secs(10),
+        },
+        traffic,
+        sessions,
+        bandwidth,
+    );
+    let listener = server.bind().map_err(|source| CoreServiceError::Bind {
+        tag: inbound.tag.clone(),
+        source,
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = stop.clone();
+    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers_for_thread = workers.clone();
+    let join = thread::spawn(move || {
+        while !stop_for_thread.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let server = server.clone();
+                    let worker = thread::spawn(move || {
+                        let _ = server.handle_tcp_client(stream);
+                    });
+                    workers_for_thread
+                        .lock()
+                        .expect("worker list lock poisoned")
+                        .push(worker);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok(ListenerHandle {
+        status: ListenerStatus {
+            tag: inbound.tag.clone(),
+            protocol: Protocol::Shadowsocks,
+            local_addr,
+        },
+        stop,
+        workers,
+        join: Some(join),
+    })
 }
 
 fn start_trojan_listener(
@@ -538,6 +626,7 @@ mod tests {
                 listen: "127.0.0.1".to_string(),
                 port,
                 users: vec![user()],
+                cipher: None,
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),
@@ -647,6 +736,21 @@ mod tests {
 
         assert_eq!(listeners.len(), 1);
         assert_eq!(listeners[0].protocol, Protocol::Trojan);
+        service.stop();
+    }
+
+    #[test]
+    fn starts_shadowsocks_listener_from_core_config() {
+        let mut config = config(free_port());
+        config.inbounds[0].tag = "panel|shadowsocks|1".to_string();
+        config.inbounds[0].protocol = Protocol::Shadowsocks;
+        config.inbounds[0].cipher = Some("aes-128-gcm".to_string());
+
+        let mut service = CoreService::start(config).expect("service start");
+        let listeners = service.listeners();
+
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].protocol, Protocol::Shadowsocks);
         service.stop();
     }
 

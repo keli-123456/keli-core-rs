@@ -197,6 +197,7 @@ mod tests {
                     speed_limit: 0,
                     device_limit: 0,
                 }],
+                cipher: None,
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),

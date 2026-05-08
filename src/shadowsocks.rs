@@ -1,0 +1,668 @@
+use std::io::{self, Read, Write};
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce as AesNonce};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
+use hkdf::Hkdf;
+use md5::{Digest as Md5Digest, Md5};
+use sha1::Sha1;
+
+use crate::limits::{
+    BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
+};
+use crate::socks5::SocksTarget;
+use crate::stream::copy_count_best_effort_limited;
+use crate::traffic::TrafficRegistry;
+use crate::user::CoreUser;
+use crate::{RouteDecision, RouteMatcher};
+
+const ATYP_IPV4: u8 = 0x01;
+const ATYP_DOMAIN: u8 = 0x03;
+const ATYP_IPV6: u8 = 0x04;
+const TAG_LEN: usize = 16;
+const NONCE_LEN: usize = 12;
+const MAX_CHUNK_LEN: usize = 0x3fff;
+const HKDF_INFO: &[u8] = b"ss-subkey";
+
+#[derive(Clone, Debug)]
+pub struct ShadowsocksServerConfig {
+    pub node_tag: String,
+    pub listen: SocketAddr,
+    pub method: String,
+    pub users: Vec<CoreUser>,
+    pub routes: Vec<crate::RouteRule>,
+    pub connect_timeout: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShadowsocksServer {
+    config: ShadowsocksServerConfig,
+    router: RouteMatcher,
+    traffic: Arc<Mutex<TrafficRegistry>>,
+    sessions: UserSessionTracker,
+    bandwidth: UserBandwidthLimiters,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShadowsocksMethod {
+    Aes128Gcm,
+    Aes256Gcm,
+    ChaCha20IetfPoly1305,
+}
+
+enum ShadowsocksAead {
+    Aes128(Aes128Gcm),
+    Aes256(Aes256Gcm),
+    ChaCha20(ChaCha20Poly1305),
+}
+
+struct ShadowsocksCipher {
+    aead: ShadowsocksAead,
+    nonce: u64,
+}
+
+struct ShadowsocksRequest {
+    user: CoreUser,
+    target: SocksTarget,
+    initial_payload: Vec<u8>,
+    client_reader: ShadowsocksReader<TcpStream>,
+}
+
+struct ShadowsocksReader<R> {
+    reader: R,
+    cipher: ShadowsocksCipher,
+    buffer: Vec<u8>,
+}
+
+struct ShadowsocksWriter<W> {
+    writer: W,
+    cipher: ShadowsocksCipher,
+}
+
+impl ShadowsocksServer {
+    pub fn new(config: ShadowsocksServerConfig) -> Self {
+        Self::with_traffic(config, Arc::new(Mutex::new(TrafficRegistry::default())))
+    }
+
+    pub fn with_traffic(
+        config: ShadowsocksServerConfig,
+        traffic: Arc<Mutex<TrafficRegistry>>,
+    ) -> Self {
+        Self::with_shared_limits(
+            config,
+            traffic,
+            UserSessionTracker::default(),
+            UserBandwidthLimiters::default(),
+        )
+    }
+
+    pub fn with_shared_limits(
+        config: ShadowsocksServerConfig,
+        traffic: Arc<Mutex<TrafficRegistry>>,
+        sessions: UserSessionTracker,
+        bandwidth: UserBandwidthLimiters,
+    ) -> Self {
+        Self {
+            router: RouteMatcher::new(config.routes.clone()),
+            config,
+            traffic,
+            sessions,
+            bandwidth,
+        }
+    }
+
+    pub fn bind(&self) -> io::Result<TcpListener> {
+        TcpListener::bind(self.config.listen)
+    }
+
+    pub fn handle_tcp_client(&self, client: TcpStream) -> io::Result<()> {
+        let method = ShadowsocksMethod::parse(&self.config.method)?;
+        let request = self.read_request(client, method)?;
+        let _session = self.acquire_user_session(&request.user)?;
+        let bandwidth = self.bandwidth.limiter_for(Some(&request.user));
+        let remote = match self.router.decide(&request.target.host) {
+            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
+            RouteDecision::Block => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target blocked by route",
+                ));
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
+        self.relay(method, request, remote, bandwidth)
+    }
+
+    pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
+        self.traffic
+            .lock()
+            .expect("traffic registry lock poisoned")
+            .drain_minimum(minimum_bytes)
+    }
+
+    fn read_request(
+        &self,
+        mut client: TcpStream,
+        method: ShadowsocksMethod,
+    ) -> io::Result<ShadowsocksRequest> {
+        let mut salt = vec![0u8; method.salt_len()];
+        client.read_exact(&mut salt)?;
+        let mut encrypted_len = vec![0u8; 2 + TAG_LEN];
+        client.read_exact(&mut encrypted_len)?;
+
+        for user in self.config.users.iter().filter(|user| !user.is_empty()) {
+            let mut cipher = ShadowsocksCipher::new(method, user.credential(), &salt)?;
+            let mut len_bytes = encrypted_len.clone();
+            if cipher.decrypt(&mut len_bytes).is_err() || len_bytes.len() != 2 {
+                continue;
+            }
+
+            let payload_len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+            if payload_len == 0 || payload_len > MAX_CHUNK_LEN {
+                continue;
+            }
+
+            let mut encrypted_payload = vec![0u8; payload_len + TAG_LEN];
+            client.read_exact(&mut encrypted_payload)?;
+            cipher.decrypt(&mut encrypted_payload)?;
+            let (target, initial_payload) = parse_request_payload(encrypted_payload)?;
+            return Ok(ShadowsocksRequest {
+                user: user.clone(),
+                target,
+                initial_payload,
+                client_reader: ShadowsocksReader::with_cipher(client, cipher),
+            });
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unknown shadowsocks user",
+        ))
+    }
+
+    fn relay(
+        &self,
+        method: ShadowsocksMethod,
+        request: ShadowsocksRequest,
+        mut remote: TcpStream,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()> {
+        let user_uuid = request.user.uuid.clone();
+        let password = request.user.credential().to_string();
+        let response_stream = request.client_reader.reader.try_clone()?;
+        let mut upload = 0u64;
+        if !request.initial_payload.is_empty() {
+            if let Some(limiter) = bandwidth.as_deref() {
+                limiter.wait_for(request.initial_payload.len());
+            }
+            remote.write_all(&request.initial_payload)?;
+            upload = request.initial_payload.len() as u64;
+        }
+
+        let mut encrypted_client = request.client_reader;
+        let mut remote_write = remote.try_clone()?;
+        let upload_limiter = bandwidth.clone();
+        let upload_thread = thread::spawn(move || {
+            let copied = copy_count_best_effort_limited(
+                &mut encrypted_client,
+                &mut remote_write,
+                upload_limiter.as_deref(),
+            );
+            let _ = remote_write.shutdown(Shutdown::Write);
+            copied
+        });
+
+        let mut remote_read = remote;
+        let mut encrypted_writer =
+            ShadowsocksWriter::new_response(response_stream, method, &password)?;
+        let download =
+            copy_count_best_effort_limited(&mut remote_read, &mut encrypted_writer, None);
+        let _ = encrypted_writer.shutdown();
+        upload =
+            upload.saturating_add(upload_thread.join().map_err(|_| {
+                io::Error::new(io::ErrorKind::Other, "upload relay thread panicked")
+            })?);
+
+        self.traffic
+            .lock()
+            .expect("traffic registry lock poisoned")
+            .add(self.config.node_tag.clone(), user_uuid, upload, download);
+        Ok(())
+    }
+
+    fn acquire_user_session(&self, user: &CoreUser) -> io::Result<Option<UserSessionGuard>> {
+        match self.sessions.try_acquire(Some(user)) {
+            Ok(guard) => Ok(guard),
+            Err(error) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                error.to_string(),
+            )),
+        }
+    }
+}
+
+impl ShadowsocksMethod {
+    fn parse(method: &str) -> io::Result<Self> {
+        match normalize_method(method).as_str() {
+            "aes-128-gcm" => Ok(Self::Aes128Gcm),
+            "aes-256-gcm" => Ok(Self::Aes256Gcm),
+            "chacha20-ietf-poly1305" => Ok(Self::ChaCha20IetfPoly1305),
+            value => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("shadowsocks cipher {value} is not supported"),
+            )),
+        }
+    }
+
+    fn key_len(&self) -> usize {
+        match self {
+            Self::Aes128Gcm => 16,
+            Self::Aes256Gcm | Self::ChaCha20IetfPoly1305 => 32,
+        }
+    }
+
+    fn salt_len(&self) -> usize {
+        self.key_len()
+    }
+}
+
+impl ShadowsocksCipher {
+    fn new(method: ShadowsocksMethod, password: &str, salt: &[u8]) -> io::Result<Self> {
+        let master_key = evp_bytes_to_key(password.as_bytes(), method.key_len());
+        let mut subkey = vec![0u8; method.key_len()];
+        Hkdf::<Sha1>::new(Some(salt), &master_key)
+            .expand(HKDF_INFO, &mut subkey)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "derive shadowsocks key"))?;
+
+        let aead = match method {
+            ShadowsocksMethod::Aes128Gcm => ShadowsocksAead::Aes128(
+                Aes128Gcm::new_from_slice(&subkey)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid key"))?,
+            ),
+            ShadowsocksMethod::Aes256Gcm => ShadowsocksAead::Aes256(
+                Aes256Gcm::new_from_slice(&subkey)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid key"))?,
+            ),
+            ShadowsocksMethod::ChaCha20IetfPoly1305 => ShadowsocksAead::ChaCha20(
+                ChaCha20Poly1305::new_from_slice(&subkey)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid key"))?,
+            ),
+        };
+
+        Ok(Self { aead, nonce: 0 })
+    }
+
+    fn encrypt(&mut self, bytes: &mut Vec<u8>) -> io::Result<()> {
+        let nonce = nonce_bytes(self.nonce);
+        match &self.aead {
+            ShadowsocksAead::Aes128(cipher) => cipher
+                .encrypt_in_place(AesNonce::from_slice(&nonce), b"", bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "encrypt chunk"))?,
+            ShadowsocksAead::Aes256(cipher) => cipher
+                .encrypt_in_place(AesNonce::from_slice(&nonce), b"", bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "encrypt chunk"))?,
+            ShadowsocksAead::ChaCha20(cipher) => cipher
+                .encrypt_in_place(ChaChaNonce::from_slice(&nonce), b"", bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "encrypt chunk"))?,
+        }
+        self.nonce = self.nonce.wrapping_add(1);
+        Ok(())
+    }
+
+    fn decrypt(&mut self, bytes: &mut Vec<u8>) -> io::Result<()> {
+        let nonce = nonce_bytes(self.nonce);
+        match &self.aead {
+            ShadowsocksAead::Aes128(cipher) => cipher
+                .decrypt_in_place(AesNonce::from_slice(&nonce), b"", bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decrypt chunk"))?,
+            ShadowsocksAead::Aes256(cipher) => cipher
+                .decrypt_in_place(AesNonce::from_slice(&nonce), b"", bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decrypt chunk"))?,
+            ShadowsocksAead::ChaCha20(cipher) => cipher
+                .decrypt_in_place(ChaChaNonce::from_slice(&nonce), b"", bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decrypt chunk"))?,
+        }
+        self.nonce = self.nonce.wrapping_add(1);
+        Ok(())
+    }
+}
+
+impl<R: Read> ShadowsocksReader<R> {
+    #[cfg(test)]
+    fn new(mut reader: R, method: ShadowsocksMethod, password: &str) -> io::Result<Self> {
+        let mut salt = vec![0u8; method.salt_len()];
+        reader.read_exact(&mut salt)?;
+        let cipher = ShadowsocksCipher::new(method, password, &salt)?;
+        Ok(Self::with_cipher(reader, cipher))
+    }
+
+    fn with_cipher(reader: R, cipher: ShadowsocksCipher) -> Self {
+        Self {
+            reader,
+            cipher,
+            buffer: Vec::new(),
+        }
+    }
+
+    fn read_chunk(&mut self) -> io::Result<Vec<u8>> {
+        let mut encrypted_len = vec![0u8; 2 + TAG_LEN];
+        self.reader.read_exact(&mut encrypted_len)?;
+        self.cipher.decrypt(&mut encrypted_len)?;
+        if encrypted_len.len() != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid shadowsocks chunk length",
+            ));
+        }
+        let len = u16::from_be_bytes([encrypted_len[0], encrypted_len[1]]) as usize;
+        if len == 0 || len > MAX_CHUNK_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid shadowsocks chunk size",
+            ));
+        }
+        let mut payload = vec![0u8; len + TAG_LEN];
+        self.reader.read_exact(&mut payload)?;
+        self.cipher.decrypt(&mut payload)?;
+        Ok(payload)
+    }
+}
+
+impl<R: Read> Read for ShadowsocksReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.buffer.is_empty() {
+            self.buffer = self.read_chunk()?;
+        }
+        let len = output.len().min(self.buffer.len());
+        output[..len].copy_from_slice(&self.buffer[..len]);
+        self.buffer.drain(..len);
+        Ok(len)
+    }
+}
+
+impl<W: Write> ShadowsocksWriter<W> {
+    fn new_response(mut writer: W, method: ShadowsocksMethod, password: &str) -> io::Result<Self> {
+        let mut salt = vec![0u8; method.salt_len()];
+        fill_random(&mut salt)?;
+        writer.write_all(&salt)?;
+        let cipher = ShadowsocksCipher::new(method, password, &salt)?;
+        Ok(Self { writer, cipher })
+    }
+
+    fn write_chunk(&mut self, payload: &[u8]) -> io::Result<()> {
+        let mut encrypted_len = (payload.len() as u16).to_be_bytes().to_vec();
+        self.cipher.encrypt(&mut encrypted_len)?;
+        self.writer.write_all(&encrypted_len)?;
+
+        let mut encrypted_payload = payload.to_vec();
+        self.cipher.encrypt(&mut encrypted_payload)?;
+        self.writer.write_all(&encrypted_payload)
+    }
+
+    fn shutdown(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+impl<W: Write> Write for ShadowsocksWriter<W> {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if input.is_empty() {
+            return Ok(0);
+        }
+        let len = input.len().min(MAX_CHUNK_LEN);
+        self.write_chunk(&input[..len])?;
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+pub fn is_supported_shadowsocks_cipher(method: &str) -> bool {
+    ShadowsocksMethod::parse(method).is_ok()
+}
+
+fn parse_request_payload(payload: Vec<u8>) -> io::Result<(SocksTarget, Vec<u8>)> {
+    let mut cursor = std::io::Cursor::new(payload);
+    let host = match read_u8(&mut cursor)? {
+        ATYP_IPV4 => {
+            let mut bytes = [0u8; 4];
+            cursor.read_exact(&mut bytes)?;
+            Ipv4Addr::from(bytes).to_string()
+        }
+        ATYP_DOMAIN => {
+            let len = read_u8(&mut cursor)?;
+            read_string(&mut cursor, usize::from(len))?
+        }
+        ATYP_IPV6 => {
+            let mut bytes = [0u8; 16];
+            cursor.read_exact(&mut bytes)?;
+            Ipv6Addr::from(bytes).to_string()
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported shadowsocks address type",
+            ));
+        }
+    };
+
+    let mut port = [0u8; 2];
+    cursor.read_exact(&mut port)?;
+    let position = cursor.position() as usize;
+    let payload = cursor.into_inner();
+    Ok((
+        SocksTarget {
+            host,
+            port: u16::from_be_bytes(port),
+        },
+        payload[position..].to_vec(),
+    ))
+}
+
+fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStream> {
+    let addrs = (target.host.as_str(), target.port).to_socket_addrs()?;
+    let mut last_error = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "target did not resolve to any socket address",
+        )
+    }))
+}
+
+fn evp_bytes_to_key(password: &[u8], key_len: usize) -> Vec<u8> {
+    let mut key = Vec::with_capacity(key_len);
+    let mut previous = Vec::new();
+    while key.len() < key_len {
+        let mut hasher = Md5::new();
+        hasher.update(&previous);
+        hasher.update(password);
+        previous = hasher.finalize().to_vec();
+        key.extend_from_slice(&previous);
+    }
+    key.truncate(key_len);
+    key
+}
+
+fn normalize_method(method: &str) -> String {
+    method.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+fn nonce_bytes(nonce: u64) -> [u8; NONCE_LEN] {
+    let mut bytes = [0u8; NONCE_LEN];
+    bytes[..8].copy_from_slice(&nonce.to_le_bytes());
+    bytes
+}
+
+fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
+    getrandom::getrandom(bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("generate shadowsocks salt: {error}"),
+        )
+    })
+}
+
+fn read_u8<R: Read>(reader: &mut R) -> io::Result<u8> {
+    let mut byte = [0u8; 1];
+    reader.read_exact(&mut byte)?;
+    Ok(byte[0])
+}
+
+fn read_string<R: Read>(reader: &mut R, len: usize) -> io::Result<String> {
+    let mut bytes = vec![0u8; len];
+    reader.read_exact(&mut bytes)?;
+    String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
+
+    use crate::shadowsocks::{
+        is_supported_shadowsocks_cipher, parse_request_payload, ShadowsocksMethod,
+        ShadowsocksReader, ShadowsocksServer, ShadowsocksServerConfig, ShadowsocksWriter,
+        ATYP_IPV4,
+    };
+    use crate::user::CoreUser;
+
+    fn user() -> CoreUser {
+        CoreUser {
+            id: 1,
+            uuid: "ss-password".to_string(),
+            password: None,
+            email: None,
+            speed_limit: 0,
+            device_limit: 0,
+        }
+    }
+
+    fn server() -> ShadowsocksServer {
+        ShadowsocksServer::new(ShadowsocksServerConfig {
+            node_tag: "panel|shadowsocks|1".to_string(),
+            listen: "127.0.0.1:0".parse().expect("listen addr"),
+            method: "aes-128-gcm".to_string(),
+            users: vec![user()],
+            routes: Vec::new(),
+            connect_timeout: Duration::from_secs(3),
+        })
+    }
+
+    fn shadowsocks_request(target: std::net::SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let mut request = Vec::new();
+        request.push(ATYP_IPV4);
+        request.extend_from_slice(
+            &target
+                .ip()
+                .to_string()
+                .parse::<std::net::Ipv4Addr>()
+                .expect("ipv4")
+                .octets(),
+        );
+        request.extend_from_slice(&target.port().to_be_bytes());
+        request.extend_from_slice(payload);
+        request
+    }
+
+    #[test]
+    fn parses_supported_methods() {
+        assert!(is_supported_shadowsocks_cipher("aes-128-gcm"));
+        assert!(is_supported_shadowsocks_cipher("aes_256_gcm"));
+        assert!(is_supported_shadowsocks_cipher("chacha20-ietf-poly1305"));
+        assert!(!is_supported_shadowsocks_cipher("rc4-md5"));
+    }
+
+    #[test]
+    fn parses_request_payload_with_initial_data() {
+        let target = "127.0.0.1:443"
+            .parse::<std::net::SocketAddr>()
+            .expect("target");
+
+        let (parsed, payload) =
+            parse_request_payload(shadowsocks_request(target, b"hello")).expect("payload");
+
+        assert_eq!(parsed.host, "127.0.0.1");
+        assert_eq!(parsed.port, 443);
+        assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn proxies_tcp_and_records_user_traffic() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("ss bind");
+        let ss_addr = listener.local_addr().expect("ss addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("ss accept");
+            server_clone.handle_tcp_client(stream)
+        });
+
+        let mut client = TcpStream::connect(ss_addr).expect("client connect");
+        let method = ShadowsocksMethod::parse("aes-128-gcm").expect("method");
+        let mut writer = ShadowsocksWriter::new_response(
+            client.try_clone().expect("client clone"),
+            method,
+            "ss-password",
+        )
+        .expect("client writer");
+        writer
+            .write_all(&shadowsocks_request(echo_addr, b"ping"))
+            .expect("client request");
+        writer.flush().expect("client flush");
+
+        let mut reader = ShadowsocksReader::new(&mut client, method, "ss-password")
+            .expect("client response reader");
+        let mut echoed = [0u8; 4];
+        reader.read_exact(&mut echoed).expect("client read payload");
+        assert_eq!(&echoed, b"ping");
+        drop(reader);
+        drop(writer);
+        drop(client);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|shadowsocks|1");
+        assert_eq!(records[0].user_uuid, "ss-password");
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+}

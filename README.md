@@ -34,6 +34,7 @@ Implemented in this first skeleton:
 - Basic route matching with block decisions for implemented proxy inbounds.
 - Per-user device_limit enforcement for SOCKS5 and HTTP proxy connections.
 - Per-user speed_limit enforcement for SOCKS5 and HTTP proxy traffic.
+- Shadowsocks AEAD TCP inbound for aes-128-gcm, aes-256-gcm, and chacha20-ietf-poly1305.
 - VLESS TCP inbound for non-TLS, non-transport TCP CONNECT.
 - Trojan TCP inbound for non-TLS TCP CONNECT.
 - Concurrent per-listener connection worker threads with stop-time joining.
@@ -43,7 +44,7 @@ Implemented in this first skeleton:
 Not implemented yet:
 
 - SOCKS5 UDP associate.
-- Encrypted protocol data paths, built-in TLS, and VLESS/Trojan advanced transports.
+- VMess/Hysteria2/TUIC/AnyTLS data paths, built-in TLS, and advanced transports.
 - Advanced DNS/routing execution and custom outbounds.
 - Realtime integration.
 - Hot user patching.

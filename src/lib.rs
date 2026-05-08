@@ -8,6 +8,7 @@ pub mod protocol;
 pub mod routing;
 pub mod runtime;
 pub mod service;
+pub mod shadowsocks;
 pub mod socks5;
 pub mod stream;
 pub mod traffic;
@@ -31,6 +32,9 @@ pub use protocol::{Protocol, ProtocolPlacement};
 pub use routing::{RouteDecision, RouteMatcher};
 pub use runtime::{CorePlan, CoreStatus, ReloadDecision, RuntimeState};
 pub use service::{CoreService, CoreServiceError, ListenerStatus};
+pub use shadowsocks::{
+    is_supported_shadowsocks_cipher, ShadowsocksServer, ShadowsocksServerConfig,
+};
 pub use socks5::{Socks5Server, Socks5ServerConfig, SocksTarget};
 pub use traffic::{TrafficDelta, TrafficKey, TrafficRegistry};
 pub use trojan::{trojan_password_hash, TrojanServer, TrojanServerConfig};
