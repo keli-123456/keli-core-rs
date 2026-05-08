@@ -1249,6 +1249,65 @@ mod tests {
         assert_eq!(payload, [request.response_header, 0, 0, 0]);
     }
 
+    fn websocket_request(path: &str) -> Vec<u8> {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn masked_frame(payload: &[u8]) -> Vec<u8> {
+        let mask = [1u8, 2, 3, 4];
+        let mut frame = vec![0x82];
+        if payload.len() < 126 {
+            frame.push(0x80 | payload.len() as u8);
+        } else if payload.len() <= u16::MAX as usize {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            frame.push(0x80 | 127);
+            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        frame.extend_from_slice(&mask);
+        for (index, byte) in payload.iter().enumerate() {
+            frame.push(*byte ^ mask[index % 4]);
+        }
+        frame
+    }
+
+    fn read_websocket_response<R: Read>(stream: &mut R) -> String {
+        let mut bytes = Vec::new();
+        let mut byte = [0u8; 1];
+        while !bytes.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).expect("response byte");
+            bytes.push(byte[0]);
+        }
+        String::from_utf8(bytes).expect("response utf8")
+    }
+
+    fn read_binary_frame<R: Read>(stream: &mut R) -> Vec<u8> {
+        let mut header = [0u8; 2];
+        stream.read_exact(&mut header).expect("frame header");
+        assert_eq!(header[0] & 0x0f, 0x02);
+        assert_eq!(header[1] & 0x80, 0);
+        let len = match header[1] & 0x7f {
+            126 => {
+                let mut extended = [0u8; 2];
+                stream.read_exact(&mut extended).expect("frame len");
+                u16::from_be_bytes(extended) as usize
+            }
+            127 => {
+                let mut extended = [0u8; 8];
+                stream.read_exact(&mut extended).expect("frame len");
+                u64::from_be_bytes(extended) as usize
+            }
+            len => len as usize,
+        };
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).expect("frame payload");
+        payload
+    }
+
     #[test]
     fn parses_vmess_aead_request_header() {
         let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
@@ -1327,6 +1386,72 @@ mod tests {
         body.read_exact(&mut echoed).expect("client read payload");
         assert_eq!(&echoed, b"ping");
         drop(body);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|vmess|1");
+        assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn proxies_websocket_and_records_user_traffic() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vmess bind");
+        let vmess_addr = listener.local_addr().expect("vmess addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vmess accept");
+            server_clone.handle_websocket_client(stream, Some("/vmess"))
+        });
+
+        let (request_bytes, request) = vmess_request(echo_addr, b"ping");
+        let mut client = TcpStream::connect(vmess_addr).expect("client connect");
+        client
+            .write_all(&websocket_request("/vmess"))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame(&request_bytes))
+            .expect("vmess frame");
+
+        let mut response_header = read_binary_frame(&mut client);
+        response_header.extend_from_slice(&read_binary_frame(&mut client));
+        decode_response_header(&mut std::io::Cursor::new(response_header), &request);
+
+        let mut body_frame = read_binary_frame(&mut client);
+        body_frame.extend_from_slice(&read_binary_frame(&mut client));
+        body_frame.extend_from_slice(&read_binary_frame(&mut client));
+        let mut body = VmessBodyReader::new(
+            std::io::Cursor::new(body_frame),
+            request.response_body_key,
+            request.response_body_iv,
+            request.options,
+            request.security,
+        )
+        .expect("response body");
+        let mut echoed = [0u8; 4];
+        body.read_exact(&mut echoed).expect("client read payload");
+        assert_eq!(&echoed, b"ping");
+        drop(body);
+        drop(client);
 
         server_thread
             .join()
