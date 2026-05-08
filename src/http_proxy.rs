@@ -208,12 +208,15 @@ impl HttpProxyServer {
         client_ip: Option<std::net::IpAddr>,
     ) -> io::Result<()> {
         let target = parse_authority(&request.target, 443)?;
-        if let Err(error) = self.ensure_route_allowed(&target) {
-            write_forbidden_response(&mut client)?;
-            return Err(error);
-        }
+        let routed_target = match self.route_target(&target, "tcp") {
+            Ok(target) => target,
+            Err(error) => {
+                write_forbidden_response(&mut client)?;
+                return Err(error);
+            }
+        };
         client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
-        let remote = connect_target(&target, self.config.connect_timeout)?;
+        let remote = connect_target(&routed_target, self.config.connect_timeout)?;
         let (upload, download) = relay_tcp_streams_limited(client, remote, bandwidth)?;
         self.record_traffic(request.user_uuid, upload, download, client_ip);
         Ok(())
@@ -227,11 +230,14 @@ impl HttpProxyServer {
         client_ip: Option<std::net::IpAddr>,
     ) -> io::Result<()> {
         let target = parse_plain_http_target(&request)?;
-        if let Err(error) = self.ensure_route_allowed(&target) {
-            write_forbidden_response(client)?;
-            return Err(error);
-        }
-        let mut remote = connect_target(&target, self.config.connect_timeout)?;
+        let routed_target = match self.route_target(&target, "tcp,http") {
+            Ok(target) => target,
+            Err(error) => {
+                write_forbidden_response(client)?;
+                return Err(error);
+            }
+        };
+        let mut remote = connect_target(&routed_target, self.config.connect_timeout)?;
         let outbound = render_plain_http_request(&request, &target)?;
         if let Some(limiter) = bandwidth.as_deref() {
             limiter.wait_for(outbound.len());
@@ -241,6 +247,29 @@ impl HttpProxyServer {
         let download = copy_count_best_effort_limited(&mut remote, client, bandwidth.as_deref());
         self.record_traffic(request.user_uuid, upload, download, client_ip);
         Ok(())
+    }
+
+    fn route_target(&self, target: &HttpTarget, protocol_labels: &str) -> io::Result<HttpTarget> {
+        let decision = self
+            .router
+            .decide_target(&target.host, target.port, protocol_labels);
+        match &decision {
+            RouteDecision::Direct | RouteDecision::Outbound(_) => {
+                let routed = decision.apply_to_target(&target.host, target.port);
+                Ok(HttpTarget {
+                    host: routed.host,
+                    port: routed.port,
+                })
+            }
+            RouteDecision::Block => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "target blocked by route",
+            )),
+            RouteDecision::UnsupportedOutbound(tag) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("outbound route {tag} is not implemented"),
+            )),
+        }
     }
 
     fn record_traffic(
@@ -261,20 +290,6 @@ impl HttpProxyServer {
                     download,
                     client_ip,
                 );
-        }
-    }
-
-    fn ensure_route_allowed(&self, target: &HttpTarget) -> io::Result<()> {
-        match self.router.decide_target(&target.host, target.port, "tcp") {
-            RouteDecision::Direct => Ok(()),
-            RouteDecision::Block => Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "target blocked by route",
-            )),
-            RouteDecision::UnsupportedOutbound(tag) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("outbound route {tag} is not implemented"),
-            )),
         }
     }
 
@@ -338,19 +353,40 @@ fn parse_authority(value: &str, default_port: u16) -> io::Result<HttpTarget> {
         ));
     }
     if let Some((host, port)) = value.rsplit_once(':') {
-        if let Ok(port) = port.parse::<u16>() {
+        if !host.contains(']') {
+            let port = port.parse::<u16>().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid http authority port")
+            })?;
+            let host = host.trim_matches(['[', ']']);
+            if host.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "empty http authority host",
+                ));
+            }
             return Ok(HttpTarget {
-                host: host.trim_matches(['[', ']']).to_string(),
+                host: host.to_string(),
                 port,
             });
         }
+    }
+    if let Some(end) = value.strip_prefix('[').and_then(|rest| rest.find(']')) {
+        let host = &value[1..=end];
+        let rest = &value[end + 2..];
+        let port = rest
+            .strip_prefix(':')
+            .and_then(|port| port.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return Ok(HttpTarget {
+            host: host.to_string(),
+            port,
+        });
     }
     Ok(HttpTarget {
         host: value.trim_matches(['[', ']']).to_string(),
         port: default_port,
     })
 }
-
 fn parse_plain_http_target(request: &HttpProxyRequest) -> io::Result<HttpTarget> {
     if let Some(rest) = request.target.strip_prefix("http://") {
         let authority = rest.split('/').next().unwrap_or(rest);
@@ -638,6 +674,7 @@ mod tests {
             routes: vec![RouteRule {
                 targets: vec!["blocked.example.com".to_string()],
                 action: RouteAction::Block,
+                outbound: None,
             }],
             connect_timeout: Duration::from_secs(3),
         });
@@ -669,6 +706,7 @@ mod tests {
             routes: vec![RouteRule {
                 targets: vec!["port:6881-6889".to_string()],
                 action: RouteAction::Block,
+                outbound: None,
             }],
             connect_timeout: Duration::from_secs(3),
         });
@@ -700,6 +738,7 @@ mod tests {
             routes: vec![RouteRule {
                 targets: vec!["blocked.example.com".to_string()],
                 action: RouteAction::Block,
+                outbound: None,
             }],
             connect_timeout: Duration::from_secs(3),
         });

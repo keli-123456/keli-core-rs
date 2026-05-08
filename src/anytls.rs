@@ -17,7 +17,7 @@ use crate::limits::{
 use crate::socks5::SocksTarget;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
-use crate::{RouteDecision, RouteMatcher};
+use crate::{route_protocol_labels, RouteDecision, RouteMatcher};
 
 const CMD_WASTE: u8 = 0;
 const CMD_SYN: u8 = 1;
@@ -361,8 +361,16 @@ impl AnyTlsServer {
         target: SocksTarget,
         initial_payload: &[u8],
     ) -> io::Result<()> {
-        let remote = match self.router.decide_target(&target.host, target.port, "tcp") {
-            RouteDecision::Direct => connect_target(&target, self.config.connect_timeout)?,
+        let decision = self.router.decide_target(&target.host, target.port, "tcp");
+        let remote = match &decision {
+            RouteDecision::Direct | RouteDecision::Outbound(_) => {
+                let routed = decision.apply_to_target(&target.host, target.port);
+                let target = SocksTarget {
+                    host: routed.host,
+                    port: routed.port,
+                };
+                connect_target(&target, self.config.connect_timeout)?
+            }
             RouteDecision::Block => {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -443,8 +451,18 @@ impl AnyTlsServer {
         target: &SocksTarget,
         payload: &[u8],
     ) -> io::Result<(u64, u64)> {
-        match self.router.decide_target(&target.host, target.port, "udp") {
-            RouteDecision::Direct => {}
+        let protocol_labels = route_protocol_labels("udp", payload);
+        let decision = self
+            .router
+            .decide_target(&target.host, target.port, &protocol_labels);
+        let target = match &decision {
+            RouteDecision::Direct | RouteDecision::Outbound(_) => {
+                let routed = decision.apply_to_target(&target.host, target.port);
+                SocksTarget {
+                    host: routed.host,
+                    port: routed.port,
+                }
+            }
             RouteDecision::Block => return Ok((0, 0)),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(
@@ -452,13 +470,13 @@ impl AnyTlsServer {
                     format!("outbound route {tag} is not implemented"),
                 ));
             }
-        }
+        };
 
         if let Some(limiter) = session.bandwidth.as_deref() {
             limiter.wait_for(payload.len());
         }
 
-        let remote_addr = resolve_udp_target(target)?;
+        let remote_addr = resolve_udp_target(&target)?;
         let socket = udp.state.socket_for(remote_addr)?;
         socket.send_to(payload, remote_addr)?;
         let mut response = vec![0u8; MAX_UDP_PACKET_SIZE];

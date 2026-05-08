@@ -23,7 +23,7 @@ use crate::socks5::SocksTarget;
 use crate::stream::copy_count_best_effort_limited;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
-use crate::{RouteDecision, RouteMatcher};
+use crate::{route_protocol_labels, RouteDecision, RouteMatcher};
 
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
@@ -156,27 +156,36 @@ impl ShadowsocksServer {
         request.client_ip = client_ip;
         let _session = self.acquire_user_session(&request.user, client_ip)?;
         let bandwidth = self.bandwidth.limiter_for(Some(&request.user));
-        let remote =
-            match self
-                .router
-                .decide_target(&request.target.host, request.target.port, "tcp")
-            {
-                RouteDecision::Direct => {
-                    connect_target(&request.target, self.config.connect_timeout)?
-                }
-                RouteDecision::Block => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "target blocked by route",
-                    ));
-                }
-                RouteDecision::UnsupportedOutbound(tag) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("outbound route {tag} is not implemented"),
-                    ));
-                }
-            };
+        let protocol_labels = route_protocol_labels("tcp", &request.initial_payload);
+        let remote = match self.router.decide_target(
+            &request.target.host,
+            request.target.port,
+            &protocol_labels,
+        ) {
+            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
+            RouteDecision::Outbound(outbound) => {
+                let target = SocksTarget {
+                    host: outbound
+                        .address
+                        .clone()
+                        .unwrap_or_else(|| request.target.host.clone()),
+                    port: outbound.port.unwrap_or(request.target.port),
+                };
+                connect_target(&target, self.config.connect_timeout)?
+            }
+            RouteDecision::Block => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target blocked by route",
+                ));
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
         self.relay(method, request, remote, bandwidth)
     }
 
@@ -311,11 +320,18 @@ impl ShadowsocksServer {
         remotes: &mut HashMap<SocketAddr, UdpClientContext>,
         client_sessions: &mut HashMap<SocketAddr, UdpClientSession>,
     ) -> io::Result<()> {
-        match self
-            .router
-            .decide_target(&request.target.host, request.target.port, "udp")
-        {
-            RouteDecision::Direct => {}
+        let protocol_labels = route_protocol_labels("udp", &request.payload);
+        let decision =
+            self.router
+                .decide_target(&request.target.host, request.target.port, &protocol_labels);
+        let target = match &decision {
+            RouteDecision::Direct | RouteDecision::Outbound(_) => {
+                let routed = decision.apply_to_target(&request.target.host, request.target.port);
+                SocksTarget {
+                    host: routed.host,
+                    port: routed.port,
+                }
+            }
             RouteDecision::Block => return Ok(()),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(
@@ -323,7 +339,7 @@ impl ShadowsocksServer {
                     format!("outbound route {tag} is not implemented"),
                 ));
             }
-        }
+        };
         if let Err(error) =
             self.acquire_udp_client_session(client_addr, &request.user, client_sessions)
         {
@@ -335,7 +351,7 @@ impl ShadowsocksServer {
         if let Some(limiter) = self.bandwidth.limiter_for(Some(&request.user)).as_deref() {
             limiter.wait_for(request.payload.len());
         }
-        let remote_addr = resolve_udp_target(&request.target)?;
+        let remote_addr = resolve_udp_target(&target)?;
         udp.send_to(&request.payload, remote_addr)?;
         remotes.insert(
             remote_addr,

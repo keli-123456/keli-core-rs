@@ -50,6 +50,8 @@ pub struct OutboundConfig {
 pub struct RouteRule {
     pub targets: Vec<String>,
     pub action: RouteAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound: Option<OutboundConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,9 +164,16 @@ impl CoreConfig {
     }
 
     fn validate_outbounds(&self) -> Result<(), ValidationError> {
+        let mut tags = HashSet::new();
         for outbound in &self.outbounds {
             if outbound.tag.trim().is_empty() {
                 return Err(ValidationError::new("outbound tag is required"));
+            }
+            if !tags.insert(outbound.tag.as_str()) {
+                return Err(ValidationError::new(format!(
+                    "duplicate outbound tag: {}",
+                    outbound.tag
+                )));
             }
             if outbound.protocol.trim() != "freedom" {
                 return Err(ValidationError::new(format!(
@@ -172,36 +181,73 @@ impl CoreConfig {
                     outbound.tag, outbound.protocol
                 )));
             }
-            if outbound.tag != "direct" {
-                return Err(ValidationError::new(format!(
-                    "outbound {} is not implemented in keli-core-rs yet",
-                    outbound.tag
-                )));
-            }
-            if outbound.address.is_some() || outbound.port.is_some() {
-                return Err(ValidationError::new(format!(
-                    "outbound {} address/port routing is not implemented in keli-core-rs yet",
-                    outbound.tag
-                )));
-            }
+            validate_outbound_endpoint(outbound)?;
         }
         Ok(())
     }
 
     fn validate_routes(&self) -> Result<(), ValidationError> {
+        let outbound_tags = self
+            .outbounds
+            .iter()
+            .map(|outbound| outbound.tag.as_str())
+            .collect::<HashSet<_>>();
         for route in &self.routes {
             validate_route_targets(route)?;
             match &route.action {
                 Direct | Block => {}
                 Outbound(tag) => {
-                    return Err(ValidationError::new(format!(
-                        "route outbound {tag} is not implemented in keli-core-rs yet"
-                    )));
+                    if let Some(outbound) = &route.outbound {
+                        if outbound.tag != *tag {
+                            return Err(ValidationError::new(format!(
+                                "route outbound {tag} does not match embedded outbound {}",
+                                outbound.tag
+                            )));
+                        }
+                        validate_outbound_endpoint(outbound)?;
+                    } else if !outbound_tags.contains(tag.as_str()) {
+                        return Err(ValidationError::new(format!(
+                            "route outbound {tag} is not configured"
+                        )));
+                    }
                 }
             }
         }
         Ok(())
     }
+
+    pub fn resolved_routes(&self) -> Vec<RouteRule> {
+        self.routes
+            .iter()
+            .map(|route| {
+                let mut route = route.clone();
+                if route.outbound.is_none() {
+                    if let Outbound(tag) = &route.action {
+                        route.outbound = self
+                            .outbounds
+                            .iter()
+                            .find(|outbound| outbound.tag == *tag)
+                            .cloned();
+                    }
+                }
+                route
+            })
+            .collect()
+    }
+}
+
+fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), ValidationError> {
+    if outbound
+        .address
+        .as_deref()
+        .is_some_and(|address| address.trim().is_empty())
+    {
+        return Err(ValidationError::new(format!(
+            "outbound {} address must not be empty",
+            outbound.tag
+        )));
+    }
+    Ok(())
 }
 
 fn validate_route_targets(route: &RouteRule) -> Result<(), ValidationError> {
@@ -259,6 +305,42 @@ fn validate_route_targets(route: &RouteRule) -> Result<(), ValidationError> {
             }
             continue;
         }
+        if let Some(rule) = normalized.strip_prefix("geoip:") {
+            if rule.trim().is_empty() {
+                return Err(ValidationError::new(format!(
+                    "route target {target} is not supported in keli-core-rs yet"
+                )));
+            }
+            continue;
+        }
+        if let Some(rule) = normalized.strip_prefix("geosite:") {
+            if rule.trim().is_empty() {
+                return Err(ValidationError::new(format!(
+                    "route target {target} is not supported in keli-core-rs yet"
+                )));
+            }
+            continue;
+        }
+        if let Some(rule) = normalized.strip_prefix("regexp:") {
+            if regex::Regex::new(rule).is_err() {
+                return Err(ValidationError::new(format!(
+                    "route target {target} has invalid regexp"
+                )));
+            }
+            continue;
+        }
+        if let Some(rule) = normalized.strip_prefix("protocol:") {
+            if rule
+                .split(',')
+                .map(str::trim)
+                .all(|protocol| protocol.is_empty())
+            {
+                return Err(ValidationError::new(format!(
+                    "route target {target} is not supported in keli-core-rs yet"
+                )));
+            }
+            continue;
+        }
         if normalized.starts_with("geoip:")
             || normalized.starts_with("geosite:")
             || normalized.starts_with("regexp:")
@@ -274,6 +356,9 @@ fn validate_route_targets(route: &RouteRule) -> Result<(), ValidationError> {
 
 fn is_supported_ip_route_rule(rule: &str) -> bool {
     let rule = rule.trim().trim_matches(['[', ']']);
+    if let Some(rule) = rule.strip_prefix("geoip:") {
+        return !rule.trim().is_empty();
+    }
     if rule.parse::<IpAddr>().is_ok() {
         return true;
     }
@@ -923,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_custom_outbounds_until_data_path_exists() {
+    fn accepts_custom_freedom_outbounds_for_route_selection() {
         let mut config = CoreConfig {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
@@ -950,29 +1035,34 @@ mod tests {
                 OutboundConfig {
                     tag: "warp".to_string(),
                     protocol: "freedom".to_string(),
-                    address: None,
-                    port: None,
+                    address: Some("127.0.0.1".to_string()),
+                    port: Some(40000),
                 },
             ],
             routes: Vec::new(),
             stats: StatsConfig::default(),
         };
 
-        let error = config
-            .validate()
-            .expect_err("custom outbound should be rejected before runtime");
-        assert!(error.to_string().contains("outbound warp"));
-
-        config.outbounds.pop();
         config.routes = vec![crate::config::RouteRule {
             targets: vec!["*.example.test".to_string()],
             action: crate::config::RouteAction::Outbound("warp".to_string()),
+            outbound: None,
         }];
 
+        assert!(config.validate().is_ok());
+        let resolved_routes = config.resolved_routes();
+        let outbound = resolved_routes[0]
+            .outbound
+            .as_ref()
+            .expect("route outbound should be embedded");
+        assert_eq!(outbound.address.as_deref(), Some("127.0.0.1"));
+        assert_eq!(outbound.port, Some(40000));
+
+        config.routes[0].action = crate::config::RouteAction::Outbound("missing".to_string());
         let error = config
             .validate()
-            .expect_err("custom outbound routes should be rejected before runtime");
-        assert!(error.to_string().contains("route outbound warp"));
+            .expect_err("unknown outbound routes should be rejected before runtime");
+        assert!(error.to_string().contains("route outbound missing"));
     }
 
     #[test]
@@ -1009,29 +1099,33 @@ mod tests {
                     "network:udp".to_string(),
                 ],
                 action: crate::config::RouteAction::Block,
+                outbound: None,
             }],
             stats: StatsConfig::default(),
         };
 
         config.validate().expect("supported route targets");
 
-        config.routes[0].targets = vec!["geosite:private".to_string()];
-        let error = config
-            .validate()
-            .expect_err("geosite route target should fail");
-        assert!(error.to_string().contains("geosite:private"));
-
-        config.routes[0].targets = vec!["ip:geoip:private".to_string()];
-        let error = config
-            .validate()
-            .expect_err("geoip route target should fail");
-        assert!(error.to_string().contains("ip:geoip:private"));
+        config.routes[0].targets = vec![
+            "geosite:private".to_string(),
+            "geoip:private".to_string(),
+            "ip:geoip:private".to_string(),
+            "regexp:^api\\.".to_string(),
+            "protocol:tcp,udp".to_string(),
+        ];
+        config.validate().expect("advanced route targets");
 
         config.routes[0].targets = vec!["keyword:".to_string()];
         let error = config
             .validate()
             .expect_err("empty keyword route target should fail");
         assert!(error.to_string().contains("keyword:"));
+
+        config.routes[0].targets = vec!["regexp:*bad".to_string()];
+        let error = config
+            .validate()
+            .expect_err("invalid regexp route target should fail");
+        assert!(error.to_string().contains("invalid regexp"));
     }
 
     #[test]

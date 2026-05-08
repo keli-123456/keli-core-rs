@@ -14,7 +14,7 @@ use tokio::net::{lookup_host, UdpSocket};
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
-use crate::routing::{RouteDecision, RouteMatcher};
+use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 use crate::salamander::SalamanderUdpSocket;
 use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
@@ -293,8 +293,15 @@ impl Hysteria2Server {
         }
 
         let target = read_tcp_target(&mut recv).await?;
-        match self.router.decide_target(&target.host, target.port, "tcp") {
-            RouteDecision::Direct => {}
+        let decision = self.router.decide_target(&target.host, target.port, "tcp");
+        let target = match &decision {
+            RouteDecision::Direct | RouteDecision::Outbound(_) => {
+                let routed = decision.apply_to_target(&target.host, target.port);
+                SocksTarget {
+                    host: routed.host,
+                    port: routed.port,
+                }
+            }
             RouteDecision::Block => {
                 write_tcp_response(&mut send, RESPONSE_ERROR, "target blocked").await?;
                 let _ = send.finish();
@@ -309,7 +316,7 @@ impl Hysteria2Server {
                     format!("outbound route {tag} is not implemented"),
                 ));
             }
-        }
+        };
 
         let remote = match tokio::time::timeout(
             self.config.connect_timeout,
@@ -393,11 +400,18 @@ impl Hysteria2Server {
         client_ip: IpAddr,
         message: UdpDatagram,
     ) -> io::Result<()> {
-        match self
-            .router
-            .decide_target(&message.target.host, message.target.port, "udp")
-        {
-            RouteDecision::Direct => {}
+        let protocol_labels = route_protocol_labels("udp", &message.data);
+        let decision =
+            self.router
+                .decide_target(&message.target.host, message.target.port, &protocol_labels);
+        let target = match &decision {
+            RouteDecision::Direct | RouteDecision::Outbound(_) => {
+                let routed = decision.apply_to_target(&message.target.host, message.target.port);
+                SocksTarget {
+                    host: routed.host,
+                    port: routed.port,
+                }
+            }
             RouteDecision::Block => return Ok(()),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(
@@ -405,9 +419,9 @@ impl Hysteria2Server {
                     format!("outbound route {tag} is not implemented"),
                 ));
             }
-        }
+        };
 
-        let target_addr = resolve_udp_target(&message.target, self.config.connect_timeout).await?;
+        let target_addr = resolve_udp_target(&target, self.config.connect_timeout).await?;
         let session = self
             .get_udp_session(
                 connection,

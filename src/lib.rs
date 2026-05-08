@@ -42,7 +42,7 @@ pub use limits::{
     UserSessionTracker,
 };
 pub use protocol::{Protocol, ProtocolPlacement};
-pub use routing::{RouteDecision, RouteMatcher};
+pub use routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 pub use runtime::{CorePlan, CoreStatus, ReloadDecision, RuntimeState};
 pub use service::{CoreService, CoreServiceError, ListenerStatus};
 pub use shadowsocks::{

@@ -13,7 +13,7 @@ use tokio::net::{lookup_host, UdpSocket};
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
-use crate::routing::{RouteDecision, RouteMatcher};
+use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
 use crate::traffic::TrafficRegistry;
@@ -258,8 +258,15 @@ impl TuicServer {
             ));
         }
         let target = read_address(&mut recv).await?;
-        match self.router.decide_target(&target.host, target.port, "tcp") {
-            RouteDecision::Direct => {}
+        let decision = self.router.decide_target(&target.host, target.port, "tcp");
+        let target = match &decision {
+            RouteDecision::Direct | RouteDecision::Outbound(_) => {
+                let routed = decision.apply_to_target(&target.host, target.port);
+                SocksTarget {
+                    host: routed.host,
+                    port: routed.port,
+                }
+            }
             RouteDecision::Block => return Ok(()),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(
@@ -267,7 +274,7 @@ impl TuicServer {
                     format!("outbound route {tag} is not implemented"),
                 ));
             }
-        }
+        };
 
         let remote = tokio::time::timeout(
             self.config.connect_timeout,
@@ -412,8 +419,18 @@ impl TuicServer {
         let Some(target) = packet.target else {
             return Ok(());
         };
-        match self.router.decide_target(&target.host, target.port, "udp") {
-            RouteDecision::Direct => {}
+        let protocol_labels = route_protocol_labels("udp", &packet.payload);
+        let decision = self
+            .router
+            .decide_target(&target.host, target.port, &protocol_labels);
+        let target = match &decision {
+            RouteDecision::Direct | RouteDecision::Outbound(_) => {
+                let routed = decision.apply_to_target(&target.host, target.port);
+                SocksTarget {
+                    host: routed.host,
+                    port: routed.port,
+                }
+            }
             RouteDecision::Block => return Ok(()),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(
@@ -421,7 +438,7 @@ impl TuicServer {
                     format!("outbound route {tag} is not implemented"),
                 ));
             }
-        }
+        };
 
         let target_addr = resolve_udp_target(&target, self.config.connect_timeout).await?;
         let session = self

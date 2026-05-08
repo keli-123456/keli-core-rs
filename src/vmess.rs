@@ -29,7 +29,7 @@ use crate::tls::TlsConnection;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 use crate::websocket::{accept_websocket, accept_websocket_tls};
-use crate::{RouteDecision, RouteMatcher};
+use crate::{route_protocol_labels, RouteDecision, RouteMatcher};
 
 const VERSION: u8 = 0x01;
 const COMMAND_TCP: u8 = 0x01;
@@ -355,11 +355,18 @@ impl VmessServer {
     }
 
     fn connect_for_request(&self, request: &VmessRequest) -> io::Result<TcpStream> {
-        match self
+        let decision = self
             .router
-            .decide_target(&request.target.host, request.target.port, "tcp")
-        {
-            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout),
+            .decide_target(&request.target.host, request.target.port, "tcp");
+        match &decision {
+            RouteDecision::Direct | RouteDecision::Outbound(_) => {
+                let routed = decision.apply_to_target(&request.target.host, request.target.port);
+                let target = SocksTarget {
+                    host: routed.host,
+                    port: routed.port,
+                };
+                connect_target(&target, self.config.connect_timeout)
+            }
             RouteDecision::Block => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "target blocked by route",
@@ -663,8 +670,18 @@ impl VmessServer {
         payload: &[u8],
         bandwidth: Option<&BandwidthLimiter>,
     ) -> io::Result<(u64, Option<Vec<u8>>)> {
-        match self.router.decide_target(&target.host, target.port, "udp") {
-            RouteDecision::Direct => {}
+        let protocol_labels = route_protocol_labels("udp", payload);
+        let decision = self
+            .router
+            .decide_target(&target.host, target.port, &protocol_labels);
+        let target = match &decision {
+            RouteDecision::Direct | RouteDecision::Outbound(_) => {
+                let routed = decision.apply_to_target(&target.host, target.port);
+                SocksTarget {
+                    host: routed.host,
+                    port: routed.port,
+                }
+            }
             RouteDecision::Block => return Ok((0, None)),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(
@@ -672,13 +689,13 @@ impl VmessServer {
                     format!("outbound route {tag} is not implemented"),
                 ));
             }
-        }
+        };
 
         if let Some(limiter) = bandwidth {
             limiter.wait_for(payload.len());
         }
 
-        let remote_addr = resolve_udp_target(target)?;
+        let remote_addr = resolve_udp_target(&target)?;
         let udp = state.socket_for(remote_addr)?;
         udp.send_to(payload, remote_addr)?;
         let mut response = vec![0u8; 65_535];

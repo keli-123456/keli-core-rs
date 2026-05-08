@@ -18,7 +18,7 @@ use crate::tls::{relay_tls_stream, TlsConnection};
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 use crate::websocket::{accept_websocket, accept_websocket_tls, relay_websocket_tls_stream};
-use crate::{RouteDecision, RouteMatcher};
+use crate::{route_protocol_labels, RouteDecision, RouteMatcher};
 
 const COMMAND_TCP: u8 = 0x01;
 const COMMAND_UDP_ASSOCIATE: u8 = 0x03;
@@ -127,6 +127,16 @@ impl TrojanServer {
                 RouteDecision::Direct => {
                     connect_target(&request.target, self.config.connect_timeout)?
                 }
+                RouteDecision::Outbound(outbound) => {
+                    let target = SocksTarget {
+                        host: outbound
+                            .address
+                            .clone()
+                            .unwrap_or_else(|| request.target.host.clone()),
+                        port: outbound.port.unwrap_or(request.target.port),
+                    };
+                    connect_target(&target, self.config.connect_timeout)?
+                }
                 RouteDecision::Block => {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -183,6 +193,16 @@ impl TrojanServer {
                 RouteDecision::Direct => {
                     connect_target(&request.target, self.config.connect_timeout)?
                 }
+                RouteDecision::Outbound(outbound) => {
+                    let target = SocksTarget {
+                        host: outbound
+                            .address
+                            .clone()
+                            .unwrap_or_else(|| request.target.host.clone()),
+                        port: outbound.port.unwrap_or(request.target.port),
+                    };
+                    connect_target(&target, self.config.connect_timeout)?
+                }
                 RouteDecision::Block => {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -216,6 +236,16 @@ impl TrojanServer {
             {
                 RouteDecision::Direct => {
                     connect_target(&request.target, self.config.connect_timeout)?
+                }
+                RouteDecision::Outbound(outbound) => {
+                    let target = SocksTarget {
+                        host: outbound
+                            .address
+                            .clone()
+                            .unwrap_or_else(|| request.target.host.clone()),
+                        port: outbound.port.unwrap_or(request.target.port),
+                    };
+                    connect_target(&target, self.config.connect_timeout)?
                 }
                 RouteDecision::Block => {
                     return Err(io::Error::new(
@@ -255,6 +285,16 @@ impl TrojanServer {
             {
                 RouteDecision::Direct => {
                     connect_target(&request.target, self.config.connect_timeout)?
+                }
+                RouteDecision::Outbound(outbound) => {
+                    let target = SocksTarget {
+                        host: outbound
+                            .address
+                            .clone()
+                            .unwrap_or_else(|| request.target.host.clone()),
+                        port: outbound.port.unwrap_or(request.target.port),
+                    };
+                    connect_target(&target, self.config.connect_timeout)?
                 }
                 RouteDecision::Block => {
                     return Err(io::Error::new(
@@ -509,8 +549,18 @@ impl TrojanServer {
     where
         W: Write,
     {
-        match self.router.decide_target(&target.host, target.port, "udp") {
-            RouteDecision::Direct => {}
+        let protocol_labels = route_protocol_labels("udp", payload);
+        let decision = self
+            .router
+            .decide_target(&target.host, target.port, &protocol_labels);
+        let target = match &decision {
+            RouteDecision::Direct | RouteDecision::Outbound(_) => {
+                let routed = decision.apply_to_target(&target.host, target.port);
+                SocksTarget {
+                    host: routed.host,
+                    port: routed.port,
+                }
+            }
             RouteDecision::Block => return Ok((0, 0)),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(
@@ -518,13 +568,13 @@ impl TrojanServer {
                     format!("outbound route {tag} is not implemented"),
                 ));
             }
-        }
+        };
 
         if let Some(limiter) = bandwidth {
             limiter.wait_for(payload.len());
         }
 
-        let remote_addr = resolve_udp_target(target)?;
+        let remote_addr = resolve_udp_target(&target)?;
         let udp = state.socket_for(remote_addr)?;
         udp.send_to(payload, remote_addr)?;
         let mut response = vec![0u8; MAX_UDP_PACKET_SIZE];

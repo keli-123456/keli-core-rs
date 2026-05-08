@@ -93,68 +93,69 @@ impl CoreService {
         let sessions = UserSessionTracker::default();
         let bandwidth = UserBandwidthLimiters::default();
         let mut listeners = Vec::new();
+        let routes = config.resolved_routes();
 
         for inbound in config.inbounds {
             let handle = match inbound.protocol {
                 Protocol::Socks => start_socks_listener(
                     &inbound,
-                    config.routes.clone(),
+                    routes.clone(),
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
                 )?,
                 Protocol::Http => start_http_listener(
                     &inbound,
-                    config.routes.clone(),
+                    routes.clone(),
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
                 )?,
                 Protocol::Vless => start_vless_listener(
                     &inbound,
-                    config.routes.clone(),
+                    routes.clone(),
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
                 )?,
                 Protocol::Vmess => start_vmess_listener(
                     &inbound,
-                    config.routes.clone(),
+                    routes.clone(),
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
                 )?,
                 Protocol::Trojan => start_trojan_listener(
                     &inbound,
-                    config.routes.clone(),
+                    routes.clone(),
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
                 )?,
                 Protocol::Shadowsocks => start_shadowsocks_listener(
                     &inbound,
-                    config.routes.clone(),
+                    routes.clone(),
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
                 )?,
                 Protocol::AnyTls => start_anytls_listener(
                     &inbound,
-                    config.routes.clone(),
+                    routes.clone(),
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
                 )?,
                 Protocol::Tuic => start_tuic_listener(
                     &inbound,
-                    config.routes.clone(),
+                    routes.clone(),
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
                 )?,
                 Protocol::Hysteria2 => start_hysteria2_listener(
                     &inbound,
-                    config.routes.clone(),
+                    routes.clone(),
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
