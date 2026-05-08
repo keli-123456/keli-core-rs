@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -54,7 +54,7 @@ pub struct AnyTlsServerConfig {
 #[derive(Clone, Debug)]
 pub struct AnyTlsServer {
     config: AnyTlsServerConfig,
-    users: Arc<HashMap<[u8; 32], CoreUser>>,
+    users: Arc<RwLock<HashMap<[u8; 32], CoreUser>>>,
     router: RouteMatcher,
     traffic: Arc<Mutex<TrafficRegistry>>,
     sessions: UserSessionTracker,
@@ -121,17 +121,11 @@ impl AnyTlsServer {
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
-        let users = config
-            .users
-            .iter()
-            .filter(|user| !user.is_empty())
-            .map(|user| (sha256(user.credential()), user.clone()))
-            .collect::<HashMap<_, _>>();
-
+        let users = anytls_user_map(&config.users);
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,
-            users: Arc::new(users),
+            users: Arc::new(RwLock::new(users)),
             traffic,
             sessions,
             bandwidth,
@@ -190,12 +184,25 @@ impl AnyTlsServer {
             .drain_minimum(minimum_bytes)
     }
 
+    pub fn replace_users(&self, users: Vec<CoreUser>) {
+        let mut current = self.users.write().expect("anytls users lock poisoned");
+        *current = anytls_user_map(&users);
+    }
+
+    fn user_for_password_hash(&self, password_hash: &[u8; 32]) -> Option<CoreUser> {
+        self.users
+            .read()
+            .expect("anytls users lock poisoned")
+            .get(password_hash)
+            .cloned()
+    }
+
     fn read_auth(&self, client: &mut TcpStream) -> io::Result<CoreUser> {
         let mut auth = [0u8; 34];
         client.read_exact(&mut auth)?;
         let mut password_hash = [0u8; 32];
         password_hash.copy_from_slice(&auth[..32]);
-        let Some(user) = self.users.get(&password_hash) else {
+        let Some(user) = self.user_for_password_hash(&password_hash) else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "unknown anytls user",
@@ -205,7 +212,7 @@ impl AnyTlsServer {
         if padding_len > 0 {
             discard(client, padding_len)?;
         }
-        Ok(user.clone())
+        Ok(user)
     }
 
     fn read_frames(&self, client: &mut TcpStream, session: &mut AnyTlsSession) -> io::Result<()> {
@@ -933,6 +940,14 @@ fn sha256(password: &str) -> [u8; 32] {
     output
 }
 
+fn anytls_user_map(users: &[CoreUser]) -> HashMap<[u8; 32], CoreUser> {
+    users
+        .iter()
+        .filter(|user| !user.is_empty())
+        .map(|user| (sha256(user.credential()), user.clone()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -952,6 +967,17 @@ mod tests {
             id: 1,
             uuid: "anytls-password".to_string(),
             password: None,
+            email: None,
+            speed_limit: 0,
+            device_limit: 0,
+        }
+    }
+
+    fn user_b() -> CoreUser {
+        CoreUser {
+            id: 2,
+            uuid: "anytls-user-b".to_string(),
+            password: Some("secret-b".to_string()),
             email: None,
             speed_limit: 0,
             device_limit: 0,
@@ -978,6 +1004,21 @@ mod tests {
             connect_timeout: Duration::from_secs(3),
             padding_scheme: vec!["stop=8".to_string(), "0=30-30".to_string()],
         })
+    }
+
+    #[test]
+    fn replaces_users_without_rebuilding_anytls_server() {
+        let server = server();
+
+        server.replace_users(vec![user_b()]);
+
+        assert!(server
+            .user_for_password_hash(&sha256("anytls-password"))
+            .is_none());
+        let user = server
+            .user_for_password_hash(&sha256("secret-b"))
+            .expect("new user should authenticate");
+        assert_eq!(user.uuid, "anytls-user-b");
     }
 
     fn write_auth(client: &mut TcpStream, password: &str) {

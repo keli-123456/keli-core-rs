@@ -19,7 +19,7 @@ use crate::salamander::SalamanderUdpSocket;
 use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
 use crate::traffic::TrafficRegistry;
-use crate::user::CoreUser;
+use crate::user::{CoreUser, UserStore};
 use crate::{connect_tcp_outbound_tokio, send_udp_outbound_tokio};
 
 const TCP_REQUEST_ID: u64 = 0x401;
@@ -55,7 +55,7 @@ pub struct Hysteria2ObfsConfig {
 #[derive(Clone, Debug)]
 pub struct Hysteria2Server {
     config: Hysteria2ServerConfig,
-    users: Arc<HashMap<String, CoreUser>>,
+    users: UserStore,
     router: RouteMatcher,
     traffic: Arc<Mutex<TrafficRegistry>>,
     sessions: UserSessionTracker,
@@ -78,16 +78,12 @@ impl Hysteria2Server {
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
-        let users = config
-            .users
-            .iter()
-            .filter(|user| !user.is_empty())
-            .map(|user| (user.credential().to_string(), user.clone()))
-            .collect();
+        let users =
+            UserStore::from_keyed_users(&config.users, |user| user.credential().to_string());
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,
-            users: Arc::new(users),
+            users,
             traffic,
             sessions,
             bandwidth,
@@ -169,6 +165,15 @@ impl Hysteria2Server {
             .drain_minimum(minimum_bytes)
     }
 
+    pub fn replace_users(&self, users: Vec<CoreUser>) {
+        self.users
+            .replace_keyed_users(users, |user| user.credential().to_string());
+    }
+
+    fn user_for_auth(&self, auth: &str) -> Option<CoreUser> {
+        self.users.get(auth)
+    }
+
     async fn handle_incoming(&self, incoming: quinn::Incoming) -> io::Result<()> {
         let connection = incoming.await.map_err(io_other)?;
         let client_ip = connection.remote_address().ip();
@@ -242,7 +247,7 @@ impl Hysteria2Server {
                 .get("hysteria-auth")
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default();
-            let Some(user) = self.users.get(auth).cloned() else {
+            let Some(user) = self.user_for_auth(auth) else {
                 send_h3_status(&mut stream, 404).await?;
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -1132,6 +1137,17 @@ mod tests {
         }
     }
 
+    fn user_b() -> CoreUser {
+        CoreUser {
+            id: 2,
+            uuid: "hy2-user-b".to_string(),
+            password: Some("secret-b".to_string()),
+            email: None,
+            speed_limit: 0,
+            device_limit: 0,
+        }
+    }
+
     fn client_endpoint(cert_der: CertificateDer<'static>) -> quinn::Endpoint {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert_der).expect("root cert");
@@ -1182,6 +1198,20 @@ mod tests {
         server.config.down_mbps = down_mbps;
         server.config.ignore_client_bandwidth = ignore_client_bandwidth;
         server
+    }
+
+    #[test]
+    fn replaces_users_without_rebuilding_hysteria2_server() {
+        let cert = test_cert("replace-users");
+        let server = server(&cert, "127.0.0.1:0".parse().expect("addr"));
+
+        server.replace_users(vec![user_b()]);
+
+        assert!(server.user_for_auth("hy2-password").is_none());
+        let user = server
+            .user_for_auth("secret-b")
+            .expect("new user should authenticate");
+        assert_eq!(user.uuid, "hy2-user-b");
     }
 
     async fn authenticate(connection: &quinn::Connection) {

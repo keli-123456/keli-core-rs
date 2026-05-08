@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -51,7 +51,7 @@ pub struct TuicServerConfig {
 #[derive(Clone, Debug)]
 pub struct TuicServer {
     config: TuicServerConfig,
-    users: Arc<HashMap<[u8; 16], CoreUser>>,
+    users: Arc<RwLock<HashMap<[u8; 16], CoreUser>>>,
     router: RouteMatcher,
     traffic: Arc<Mutex<TrafficRegistry>>,
     sessions: UserSessionTracker,
@@ -74,19 +74,11 @@ impl TuicServer {
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
-        let users = config
-            .users
-            .iter()
-            .filter_map(|user| {
-                parse_uuid_bytes(&user.uuid)
-                    .ok()
-                    .map(|uuid| (uuid, user.clone()))
-            })
-            .collect();
+        let users = tuic_user_map(&config.users);
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,
-            users: Arc::new(users),
+            users: Arc::new(RwLock::new(users)),
             traffic,
             sessions,
             bandwidth,
@@ -145,6 +137,19 @@ impl TuicServer {
             .lock()
             .expect("traffic registry lock poisoned")
             .drain_minimum(minimum_bytes)
+    }
+
+    pub fn replace_users(&self, users: Vec<CoreUser>) {
+        let mut current = self.users.write().expect("tuic users lock poisoned");
+        *current = tuic_user_map(&users);
+    }
+
+    fn user_for_uuid(&self, uuid: &[u8; 16]) -> Option<CoreUser> {
+        self.users
+            .read()
+            .expect("tuic users lock poisoned")
+            .get(uuid)
+            .cloned()
     }
 
     async fn handle_incoming(&self, incoming: quinn::Incoming) -> io::Result<()> {
@@ -228,7 +233,7 @@ impl TuicServer {
         read_exact(stream, &mut uuid).await?;
         read_exact(stream, &mut token).await?;
 
-        let Some(user) = self.users.get(&uuid) else {
+        let Some(user) = self.user_for_uuid(&uuid) else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "unknown tuic user",
@@ -240,7 +245,7 @@ impl TuicServer {
                 "invalid tuic token",
             ));
         }
-        Ok(user.clone())
+        Ok(user)
     }
 
     async fn handle_connect_stream(
@@ -1115,6 +1120,17 @@ fn parse_uuid_bytes(value: &str) -> io::Result<[u8; 16]> {
     Ok(output)
 }
 
+fn tuic_user_map(users: &[CoreUser]) -> HashMap<[u8; 16], CoreUser> {
+    users
+        .iter()
+        .filter_map(|user| {
+            parse_uuid_bytes(&user.uuid)
+                .ok()
+                .map(|uuid| (uuid, user.clone()))
+        })
+        .collect()
+}
+
 fn io_other(error: impl std::fmt::Debug) -> io::Error {
     io::Error::new(io::ErrorKind::Other, format!("{error:?}"))
 }
@@ -1206,6 +1222,17 @@ mod tests {
         }
     }
 
+    fn user_b() -> CoreUser {
+        CoreUser {
+            id: 2,
+            uuid: "22222222-2222-2222-2222-222222222222".to_string(),
+            password: Some("secret-b".to_string()),
+            email: None,
+            speed_limit: 0,
+            device_limit: 0,
+        }
+    }
+
     fn client_endpoint(cert_der: CertificateDer<'static>) -> quinn::Endpoint {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert_der).expect("root cert");
@@ -1258,6 +1285,24 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported tuic congestion_control"));
+    }
+
+    #[test]
+    fn replaces_users_without_rebuilding_tuic_server() {
+        let cert = test_cert("replace-users");
+        let server = tuic_server(&cert, "127.0.0.1:0".parse().expect("addr"));
+        let old_uuid = parse_uuid_bytes(&user().uuid).expect("old uuid");
+        let new_user = user_b();
+        let new_uuid = parse_uuid_bytes(&new_user.uuid).expect("new uuid");
+
+        server.replace_users(vec![new_user]);
+
+        assert!(server.user_for_uuid(&old_uuid).is_none());
+        let user = server
+            .user_for_uuid(&new_uuid)
+            .expect("new user should authenticate");
+        assert_eq!(user.uuid, "22222222-2222-2222-2222-222222222222");
+        assert_eq!(user.credential(), "secret-b");
     }
 
     fn auth_command(connection: &quinn::Connection) -> Vec<u8> {
