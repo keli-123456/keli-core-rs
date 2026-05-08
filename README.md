@@ -29,11 +29,12 @@ Implemented in this first skeleton:
 - Transport-neutral control commands for apply config, drain traffic, status, and stop.
 - SOCKS5 TCP CONNECT inbound with username/password authentication.
 - Per-user SOCKS5 TCP upload/download accounting.
+- HTTP proxy inbound with Basic authentication.
+- HTTP CONNECT tunneling and plain HTTP request forwarding.
 - Tiny CLI with `version` and `health`.
 
 Not implemented yet:
 
-- HTTP proxy data path.
 - SOCKS5 UDP associate.
 - Encrypted protocol data paths.
 - DNS/routing execution.

@@ -60,6 +60,15 @@ SOCKS5 TCP CONNECT
   + per-user traffic counters
   + runtime config wiring
   - kelinode-rs drain/report integration
+
+HTTP proxy
+  + Basic authentication
+  + CONNECT tunneling
+  + plain HTTP request forwarding
+  + per-user traffic counters
+  + runtime config wiring
+  - keep-alive reuse
+  - kelinode-rs drain/report integration
 ```
 
 Once that path is real, the same runtime/control boundary can be expanded protocol by protocol.

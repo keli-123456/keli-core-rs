@@ -1,9 +1,11 @@
 pub mod config;
 pub mod control;
+pub mod http_proxy;
 pub mod protocol;
 pub mod runtime;
 pub mod service;
 pub mod socks5;
+pub mod stream;
 pub mod traffic;
 pub mod user;
 
@@ -12,6 +14,7 @@ pub use config::{
     TlsConfig, TransportConfig, ValidationError,
 };
 pub use control::{CoreCommand, CoreController, CoreResponse};
+pub use http_proxy::{HttpProxyServer, HttpProxyServerConfig};
 pub use protocol::{Protocol, ProtocolPlacement};
 pub use runtime::{CorePlan, CoreStatus, ReloadDecision, RuntimeState};
 pub use service::{CoreService, CoreServiceError, ListenerStatus};

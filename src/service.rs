@@ -7,6 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::config::{CoreConfig, InboundConfig, ValidationError};
+use crate::http_proxy::{HttpProxyServer, HttpProxyServerConfig};
 use crate::protocol::Protocol;
 use crate::socks5::{Socks5Server, Socks5ServerConfig};
 use crate::traffic::{TrafficDelta, TrafficRegistry};
@@ -69,6 +70,7 @@ impl CoreService {
         for inbound in config.inbounds {
             let handle = match inbound.protocol {
                 Protocol::Socks => start_socks_listener(&inbound, traffic.clone())?,
+                Protocol::Http => start_http_listener(&inbound, traffic.clone())?,
                 _ => {
                     return Err(CoreServiceError::UnsupportedProtocol {
                         tag: inbound.tag,
@@ -172,6 +174,69 @@ fn start_socks_listener(
         status: ListenerStatus {
             tag: inbound.tag.clone(),
             protocol: Protocol::Socks,
+            local_addr,
+        },
+        stop,
+        join: Some(join),
+    })
+}
+
+fn start_http_listener(
+    inbound: &InboundConfig,
+    traffic: Arc<Mutex<TrafficRegistry>>,
+) -> Result<ListenerHandle, CoreServiceError> {
+    let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
+        CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        }
+    })?;
+    let server = HttpProxyServer::with_traffic(
+        HttpProxyServerConfig {
+            node_tag: inbound.tag.clone(),
+            listen,
+            users: inbound.users.clone(),
+            connect_timeout: Duration::from_secs(10),
+        },
+        traffic,
+    );
+    let listener = server.bind().map_err(|source| CoreServiceError::Bind {
+        tag: inbound.tag.clone(),
+        source,
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = stop.clone();
+    let join = thread::spawn(move || {
+        while !stop_for_thread.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = server.handle_tcp_client(stream);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok(ListenerHandle {
+        status: ListenerStatus {
+            tag: inbound.tag.clone(),
+            protocol: Protocol::Http,
             local_addr,
         },
         stop,
@@ -317,5 +382,19 @@ mod tests {
         let error = CoreService::start(config).expect_err("vless should not start yet");
 
         assert!(error.to_string().contains("not implemented"));
+    }
+
+    #[test]
+    fn starts_http_listener_from_core_config() {
+        let mut config = config(free_port());
+        config.inbounds[0].tag = "panel|http|1".to_string();
+        config.inbounds[0].protocol = Protocol::Http;
+
+        let mut service = CoreService::start(config).expect("service start");
+        let listeners = service.listeners();
+
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].protocol, Protocol::Http);
+        service.stop();
     }
 }

@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
+use crate::stream::relay_tcp_streams;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 
@@ -237,21 +237,7 @@ impl Socks5Server {
     }
 
     fn relay(&self, client: TcpStream, remote: TcpStream, request: SocksRequest) -> io::Result<()> {
-        let mut client_read = client.try_clone()?;
-        let mut client_write = client;
-        let mut remote_read = remote.try_clone()?;
-        let mut remote_write = remote;
-
-        let upload_thread = thread::spawn(move || {
-            let bytes = copy_count_best_effort(&mut client_read, &mut remote_write);
-            let _ = remote_write.shutdown(Shutdown::Write);
-            bytes
-        });
-        let download = copy_count_best_effort(&mut remote_read, &mut client_write);
-        let _ = client_write.shutdown(Shutdown::Write);
-        let upload = upload_thread
-            .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "upload relay thread panicked"))?;
+        let (upload, download) = relay_tcp_streams(client, remote)?;
         if let Some(user_uuid) = request.user_uuid {
             self.traffic
                 .lock()
@@ -260,27 +246,6 @@ impl Socks5Server {
         }
         Ok(())
     }
-}
-
-fn copy_count_best_effort<R, W>(reader: &mut R, writer: &mut W) -> u64
-where
-    R: Read,
-    W: Write,
-{
-    let mut total = 0u64;
-    let mut buffer = [0u8; 16 * 1024];
-    loop {
-        let read = match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(_) => break,
-        };
-        if writer.write_all(&buffer[..read]).is_err() {
-            break;
-        }
-        total = total.saturating_add(read as u64);
-    }
-    total
 }
 
 fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStream> {
