@@ -4,7 +4,7 @@ use std::io::{self, Cursor, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,7 +26,7 @@ use crate::socks5::SocksTarget;
 use crate::stream::copy_count_best_effort_limited;
 use crate::tls::TlsConnection;
 use crate::traffic::TrafficRegistry;
-use crate::user::CoreUser;
+use crate::user::{CoreUser, UserStore};
 use crate::websocket::{accept_websocket, accept_websocket_tls};
 use crate::{
     connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
@@ -74,8 +74,8 @@ pub struct VmessServerConfig {
 #[derive(Clone, Debug)]
 pub struct VmessServer {
     config: VmessServerConfig,
-    users: Arc<HashMap<String, CoreUser>>,
-    auth_users: Arc<Vec<VmessAuthUser>>,
+    users: UserStore,
+    auth_users: Arc<RwLock<Vec<VmessAuthUser>>>,
     replay: Arc<Mutex<HashMap<[u8; 16], Instant>>>,
     router: RouteMatcher,
     traffic: Arc<Mutex<TrafficRegistry>>,
@@ -145,28 +145,16 @@ impl VmessServer {
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
-        let mut users = HashMap::new();
-        let mut auth_users = Vec::new();
-        for user in config.users.iter().filter(|user| !user.is_empty()) {
-            let Ok(uuid_bytes) = parse_uuid_bytes(&user.uuid) else {
-                continue;
-            };
-            let user_key = format_uuid_compact(&uuid_bytes);
-            let cmd_key = vmess_cmd_key(&uuid_bytes);
-            let auth_id_key = kdf16(&cmd_key, &[AUTH_ID_KEY]);
-            users.insert(user_key.clone(), user.clone());
-            auth_users.push(VmessAuthUser {
-                user_key,
-                cmd_key,
-                auth_id_key,
-            });
-        }
+        let users = valid_vmess_users(&config.users);
+        let auth_users = vmess_auth_users(&users);
 
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,
-            users: Arc::new(users),
-            auth_users: Arc::new(auth_users),
+            users: UserStore::from_keyed_users(&users, |user| {
+                vmess_user_key(user).expect("valid vmess user")
+            }),
+            auth_users: Arc::new(RwLock::new(auth_users)),
             replay: Arc::new(Mutex::new(HashMap::new())),
             traffic,
             sessions,
@@ -183,8 +171,8 @@ impl VmessServer {
         let mut request = self.read_request(&mut client)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user, client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user);
+        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.command == VmessCommand::Udp {
             write_response_header(&mut client, &request)?;
             return self.relay_udp_split(client.try_clone()?, client, request, bandwidth);
@@ -221,8 +209,8 @@ impl VmessServer {
         let mut request = self.read_request(&mut reader)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user, client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user);
+        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.command == VmessCommand::Udp {
             write_response_header(&mut writer, &request)?;
             return self.relay_udp_split(reader, writer, request, bandwidth);
@@ -237,8 +225,8 @@ impl VmessServer {
         let mut request = self.read_request(&mut client)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user, client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user);
+        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.command == VmessCommand::Udp {
             write_response_header(&mut client, &request)?;
             return self.relay_udp_single(client, request, bandwidth);
@@ -259,8 +247,8 @@ impl VmessServer {
         let mut request = self.read_request(&mut websocket)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user, client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user);
+        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.command == VmessCommand::Udp {
             write_response_header(&mut websocket, &request)?;
             return self.relay_udp_single(websocket, request, bandwidth);
@@ -276,6 +264,18 @@ impl VmessServer {
             .lock()
             .expect("traffic registry lock poisoned")
             .drain_minimum(minimum_bytes)
+    }
+
+    pub fn replace_users(&self, users: Vec<CoreUser>) {
+        let users = valid_vmess_users(&users);
+        self.users.replace_keyed_users(users.clone(), |user| {
+            vmess_user_key(user).expect("valid vmess user")
+        });
+        let mut auth_users = self
+            .auth_users
+            .write()
+            .expect("vmess auth users lock poisoned");
+        *auth_users = vmess_auth_users(&users);
     }
 
     fn read_request<R: Read>(&self, stream: &mut R) -> io::Result<VmessRequest> {
@@ -328,18 +328,29 @@ impl VmessServer {
         })
     }
 
-    fn match_auth_id(&self, auth_id: [u8; 16]) -> io::Result<&VmessAuthUser> {
-        for user in self.auth_users.iter() {
-            if !decode_auth_id(&user.auth_id_key, &auth_id)? {
-                continue;
+    fn match_auth_id(&self, auth_id: [u8; 16]) -> io::Result<VmessAuthUser> {
+        let matched = {
+            let auth_users = self
+                .auth_users
+                .read()
+                .expect("vmess auth users lock poisoned");
+            let mut matched = None;
+            for user in auth_users.iter() {
+                if decode_auth_id(&user.auth_id_key, &auth_id)? {
+                    matched = Some(user.clone());
+                    break;
+                }
             }
-            self.record_auth_id(auth_id)?;
-            return Ok(user);
-        }
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "invalid vmess auth id",
-        ))
+            matched
+        };
+        let Some(user) = matched else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "invalid vmess auth id",
+            ));
+        };
+        self.record_auth_id(auth_id)?;
+        Ok(user)
     }
 
     fn record_auth_id(&self, auth_id: [u8; 16]) -> io::Result<()> {
@@ -742,7 +753,7 @@ impl VmessServer {
             );
     }
 
-    fn request_user(&self, request: &VmessRequest) -> Option<&CoreUser> {
+    fn request_user(&self, request: &VmessRequest) -> Option<CoreUser> {
         self.users.get(&request.user_key)
     }
 
@@ -783,6 +794,37 @@ impl VmessUdpRelayState {
         }
         Ok(slot.as_ref().expect("udp socket initialized"))
     }
+}
+
+fn valid_vmess_users(users: &[CoreUser]) -> Vec<CoreUser> {
+    users
+        .iter()
+        .filter(|user| !user.is_empty() && vmess_user_key(user).is_some())
+        .cloned()
+        .collect()
+}
+
+fn vmess_auth_users(users: &[CoreUser]) -> Vec<VmessAuthUser> {
+    users
+        .iter()
+        .filter_map(|user| {
+            let uuid_bytes = parse_uuid_bytes(&user.uuid).ok()?;
+            let user_key = format_uuid_compact(&uuid_bytes);
+            let cmd_key = vmess_cmd_key(&uuid_bytes);
+            let auth_id_key = kdf16(&cmd_key, &[AUTH_ID_KEY]);
+            Some(VmessAuthUser {
+                user_key,
+                cmd_key,
+                auth_id_key,
+            })
+        })
+        .collect()
+}
+
+fn vmess_user_key(user: &CoreUser) -> Option<String> {
+    parse_uuid_bytes(&user.uuid)
+        .ok()
+        .map(|uuid| format_uuid_compact(&uuid))
 }
 
 #[derive(Debug)]
@@ -1878,6 +1920,17 @@ mod tests {
         }
     }
 
+    fn user_b() -> CoreUser {
+        CoreUser {
+            id: 2,
+            uuid: "22222222-2222-2222-2222-222222222222".to_string(),
+            password: None,
+            email: None,
+            speed_limit: 0,
+            device_limit: 0,
+        }
+    }
+
     fn server() -> VmessServer {
         VmessServer::new(VmessServerConfig {
             node_tag: "panel|vmess|1".to_string(),
@@ -1910,7 +1963,17 @@ mod tests {
         options: u8,
         command: u8,
     ) -> (Vec<u8>, VmessRequest) {
-        let uuid = parse_uuid_bytes(&user().uuid).expect("uuid");
+        vmess_request_for_user_with_command(&user(), target, payload, options, command)
+    }
+
+    fn vmess_request_for_user_with_command(
+        user: &CoreUser,
+        target: std::net::SocketAddr,
+        payload: &[u8],
+        options: u8,
+        command: u8,
+    ) -> (Vec<u8>, VmessRequest) {
+        let uuid = parse_uuid_bytes(&user.uuid).expect("uuid");
         let cmd_key = vmess_cmd_key(&uuid);
         let request_body_key = [0x22u8; 16];
         let request_body_iv = [0x33u8; 16];
@@ -1960,8 +2023,8 @@ mod tests {
             } else {
                 VmessCommand::Tcp
             },
-            user_key: "11111111111111111111111111111111".to_string(),
-            user_uuid: user().uuid,
+            user_key: super::format_uuid_compact(&uuid),
+            user_uuid: user.uuid.clone(),
             target: SocksTarget {
                 host: target.ip().to_string(),
                 port: target.port(),
@@ -2201,6 +2264,36 @@ mod tests {
             .expect_err("replay should fail");
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn replaces_users_without_rebuilding_vmess_server() {
+        let target: std::net::SocketAddr = "127.0.0.1:443".parse().expect("addr");
+        let server = server();
+
+        server.replace_users(vec![user_b()]);
+
+        let (old_input, _) = vmess_request(target, b"ping");
+        let mut old_stream = std::io::Cursor::new(old_input);
+        let error = server
+            .read_request(&mut old_stream)
+            .expect_err("old user should fail after replacement");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let next_user = user_b();
+        let (new_input, _) = vmess_request_for_user_with_command(
+            &next_user,
+            target,
+            b"ping",
+            OPTION_CHUNK_STREAM | OPTION_CHUNK_MASKING | OPTION_GLOBAL_PADDING,
+            COMMAND_TCP,
+        );
+        let mut new_stream = std::io::Cursor::new(new_input);
+        let request = server
+            .read_request(&mut new_stream)
+            .expect("new user should authenticate");
+        assert_eq!(request.user_uuid, next_user.uuid);
+        assert_eq!(request.user_key, "22222222222222222222222222222222");
     }
 
     #[test]
