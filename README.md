@@ -27,13 +27,15 @@ Implemented in this first skeleton:
 - Runtime planning with deterministic config fingerprints.
 - Apply/noop reload decisions.
 - Transport-neutral control commands for apply config, drain traffic, status, and stop.
+- SOCKS5 TCP CONNECT inbound with username/password authentication.
+- Per-user SOCKS5 TCP upload/download accounting.
 - Tiny CLI with `version` and `health`.
 
 Not implemented yet:
 
-- Real socket listeners.
-- Real protocol handshakes.
-- Encryption/decryption data paths.
+- HTTP proxy data path.
+- SOCKS5 UDP associate.
+- Encrypted protocol data paths.
 - DNS/routing execution.
 - Realtime integration.
 - Hot user patching.
@@ -90,7 +92,7 @@ Sidecar protocols are rejected by `keli-core-rs` config validation. They should 
 
 ## Build
 
-This machine does not currently have Rust installed. On a Linux build machine:
+Run:
 
 ```bash
 cargo fmt --check

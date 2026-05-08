@@ -52,8 +52,14 @@ mod tests {
 
     #[test]
     fn separates_external_sidecar_protocols() {
-        assert_eq!(Protocol::Naive.placement(), ProtocolPlacement::ExternalSidecar);
-        assert_eq!(Protocol::Mieru.placement(), ProtocolPlacement::ExternalSidecar);
+        assert_eq!(
+            Protocol::Naive.placement(),
+            ProtocolPlacement::ExternalSidecar
+        );
+        assert_eq!(
+            Protocol::Mieru.placement(),
+            ProtocolPlacement::ExternalSidecar
+        );
         assert!(Protocol::Vless.can_enter_core_plan());
     }
 }

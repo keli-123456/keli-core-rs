@@ -51,4 +51,15 @@ SOCKS or HTTP inbound
   + kelinode-rs drain/report integration
 ```
 
+Current status:
+
+```text
+SOCKS5 TCP CONNECT
+  + real listener
+  + username/password authentication
+  + per-user traffic counters
+  + runtime config wiring
+  - kelinode-rs drain/report integration
+```
+
 Once that path is real, the same runtime/control boundary can be expanded protocol by protocol.

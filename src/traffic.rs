@@ -22,7 +22,13 @@ pub struct TrafficRegistry {
 }
 
 impl TrafficRegistry {
-    pub fn add(&mut self, node_tag: impl Into<String>, user_uuid: impl Into<String>, upload: u64, download: u64) {
+    pub fn add(
+        &mut self,
+        node_tag: impl Into<String>,
+        user_uuid: impl Into<String>,
+        upload: u64,
+        download: u64,
+    ) {
         let node_tag = node_tag.into();
         let user_uuid = user_uuid.into();
         let key = TrafficKey {
@@ -40,7 +46,11 @@ impl TrafficRegistry {
     }
 
     pub fn drain_all(&mut self) -> Vec<TrafficDelta> {
-        let mut records = self.counters.drain().map(|(_, value)| value).collect::<Vec<_>>();
+        let mut records = self
+            .counters
+            .drain()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
         records.sort_by(|left, right| {
             left.node_tag
                 .cmp(&right.node_tag)

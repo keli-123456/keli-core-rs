@@ -125,7 +125,10 @@ impl CoreConfig {
         for inbound in &self.inbounds {
             inbound.validate()?;
             if !tags.insert(inbound.tag.as_str()) {
-                return Err(ValidationError::new(format!("duplicate inbound tag: {}", inbound.tag)));
+                return Err(ValidationError::new(format!(
+                    "duplicate inbound tag: {}",
+                    inbound.tag
+                )));
             }
         }
 
@@ -139,10 +142,16 @@ impl InboundConfig {
             return Err(ValidationError::new("inbound tag is required"));
         }
         if self.listen.trim().is_empty() {
-            return Err(ValidationError::new(format!("{} listen address is required", self.tag)));
+            return Err(ValidationError::new(format!(
+                "{} listen address is required",
+                self.tag
+            )));
         }
         if self.port == 0 {
-            return Err(ValidationError::new(format!("{} port is required", self.tag)));
+            return Err(ValidationError::new(format!(
+                "{} port is required",
+                self.tag
+            )));
         }
         if !self.protocol.can_enter_core_plan() {
             return Err(ValidationError::new(format!(
@@ -151,7 +160,10 @@ impl InboundConfig {
             )));
         }
         if self.users.iter().any(CoreUser::is_empty) {
-            return Err(ValidationError::new(format!("{} contains an empty user uuid", self.tag)));
+            return Err(ValidationError::new(format!(
+                "{} contains an empty user uuid",
+                self.tag
+            )));
         }
 
         Ok(())

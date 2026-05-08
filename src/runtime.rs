@@ -69,7 +69,13 @@ impl RuntimeState {
         self.status = CoreStatus::Stopped;
     }
 
-    pub fn record_traffic(&mut self, node_tag: impl Into<String>, user_uuid: impl Into<String>, upload: u64, download: u64) {
+    pub fn record_traffic(
+        &mut self,
+        node_tag: impl Into<String>,
+        user_uuid: impl Into<String>,
+        upload: u64,
+        download: u64,
+    ) {
         self.traffic.add(node_tag, user_uuid, upload, download);
     }
 
