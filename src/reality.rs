@@ -8,7 +8,8 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use hkdf::Hkdf;
-use sha2::Sha256;
+use hmac::{Hmac, Mac};
+use sha2::{Sha256, Sha512};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::stream::relay_tcp_streams_limited;
@@ -74,6 +75,12 @@ pub struct RealityDestHandshake {
     pub raw_records: Vec<u8>,
     pub records: Vec<RealityTlsRecord>,
     pub server_hello: RealityServerHello,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RealityCertificateSignature {
+    pub ed25519_public_key: Vec<u8>,
+    pub signature: [u8; 64],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -404,6 +411,26 @@ pub fn parse_reality_dest_handshake(
 ) -> Result<RealityDestHandshake, RealityAuthError> {
     parse_reality_dest_handshake_records(input.to_vec())?
         .ok_or_else(|| invalid("reality dest did not return server hello"))
+}
+
+pub fn sign_reality_certificate_public_key(
+    auth_key: &[u8; 32],
+    ed25519_public_key: &[u8],
+) -> RealityCertificateSignature {
+    let signature = reality_certificate_signature(auth_key, ed25519_public_key);
+    RealityCertificateSignature {
+        ed25519_public_key: ed25519_public_key.to_vec(),
+        signature,
+    }
+}
+
+pub fn verify_reality_certificate_public_key(
+    auth_key: &[u8; 32],
+    ed25519_public_key: &[u8],
+    signature: &[u8],
+) -> bool {
+    let expected = reality_certificate_signature(auth_key, ed25519_public_key);
+    constant_time_eq(signature, &expected)
 }
 
 impl PrefixedTcpStream {
@@ -751,6 +778,23 @@ fn reality_error_to_io(error: RealityAuthError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
+fn reality_certificate_signature(auth_key: &[u8; 32], ed25519_public_key: &[u8]) -> [u8; 64] {
+    let mut hmac =
+        <Hmac<Sha512> as Mac>::new_from_slice(auth_key).expect("HMAC accepts keys of any length");
+    hmac.update(ed25519_public_key);
+    hmac.finalize().into_bytes().into()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |diff, (left, right)| diff | (left ^ right))
+        == 0
+}
+
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     let value = value.trim();
     if value.len() % 2 != 0 {
@@ -882,7 +926,8 @@ mod tests {
     use crate::reality::{
         authenticate_reality_client_hello, decode_reality_private_key, decode_short_id,
         handle_reality_preface, parse_reality_dest_handshake, parse_reality_server_hello,
-        parse_tls_records, validate_reality_server_hello, RealityAuthConfig, RealityAuthError,
+        parse_tls_records, sign_reality_certificate_public_key, validate_reality_server_hello,
+        verify_reality_certificate_public_key, RealityAuthConfig, RealityAuthError,
         RealityGatewayConfig, RealityGatewayResult,
     };
 
@@ -1106,6 +1151,32 @@ mod tests {
             handshake.server_hello.key_share.expect("key share").key,
             server_key.to_vec()
         );
+    }
+
+    #[test]
+    fn signs_and_verifies_reality_certificate_public_key() {
+        let auth_key = [0x42u8; 32];
+        let public_key = [0x7au8; 32];
+
+        let signature = sign_reality_certificate_public_key(&auth_key, &public_key);
+
+        assert_eq!(signature.ed25519_public_key, public_key.to_vec());
+        assert_eq!(signature.signature.len(), 64);
+        assert!(verify_reality_certificate_public_key(
+            &auth_key,
+            &public_key,
+            &signature.signature
+        ));
+        assert!(!verify_reality_certificate_public_key(
+            &[0x24; 32],
+            &public_key,
+            &signature.signature
+        ));
+        assert!(!verify_reality_certificate_public_key(
+            &auth_key,
+            &[0x7b; 32],
+            &signature.signature
+        ));
     }
 
     #[test]
