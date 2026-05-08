@@ -29,8 +29,8 @@ pub mod websocket;
 
 pub use anytls::{AnyTlsServer, AnyTlsServerConfig};
 pub use config::{
-    CoreConfig, InboundConfig, OutboundConfig, RouteAction, RouteRule, SniffingConfig, StatsConfig,
-    TlsConfig, TransportConfig, ValidationError,
+    CoreConfig, InboundConfig, OutboundConfig, RealityConfig, RouteAction, RouteRule,
+    SniffingConfig, StatsConfig, TlsConfig, TransportConfig, ValidationError,
 };
 pub use config_io::load_core_config_json;
 pub use control::{CoreCommand, CoreController, CoreResponse};

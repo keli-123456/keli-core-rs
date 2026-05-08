@@ -38,6 +38,7 @@ pub struct ListenerStatus {
 pub enum CoreServiceError {
     InvalidConfig(ValidationError),
     Bind { tag: String, source: io::Error },
+    UnsupportedFeature { tag: String, message: String },
     UnsupportedProtocol { tag: String, protocol: Protocol },
 }
 
@@ -49,6 +50,9 @@ impl fmt::Display for CoreServiceError {
             }
             CoreServiceError::Bind { tag, source } => {
                 write!(formatter, "failed to bind inbound {tag}: {source}")
+            }
+            CoreServiceError::UnsupportedFeature { tag, message } => {
+                write!(formatter, "inbound {tag} unsupported feature: {message}")
             }
             CoreServiceError::UnsupportedProtocol { tag, protocol } => {
                 write!(
@@ -880,6 +884,17 @@ fn start_vless_listener(
             });
         return start_grpc_transport_listener(inbound, Protocol::Vless, handler);
     }
+    if inbound
+        .tls
+        .as_ref()
+        .and_then(|tls| tls.reality.as_ref())
+        .is_some()
+    {
+        return Err(CoreServiceError::UnsupportedFeature {
+            tag: inbound.tag.clone(),
+            message: "vless reality handshake runtime is not wired yet".to_string(),
+        });
+    }
     let listener = server.bind().map_err(|source| CoreServiceError::Bind {
         tag: inbound.tag.clone(),
         source,
@@ -1188,7 +1203,8 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::config::{
-        CoreConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig, TransportConfig,
+        CoreConfig, InboundConfig, OutboundConfig, RealityConfig, SniffingConfig, StatsConfig,
+        TlsConfig, TransportConfig,
     };
     use crate::grpc::{decode_hunk_message, encode_grpc_hunk, take_grpc_message};
     use crate::protocol::Protocol;
@@ -1232,6 +1248,47 @@ mod tests {
                 flow: String::new(),
                 transport: TransportConfig::default(),
                 tls: None,
+                sniffing: SniffingConfig::default(),
+            }],
+            outbounds: vec![OutboundConfig {
+                tag: "direct".to_string(),
+                protocol: "freedom".to_string(),
+                address: None,
+                port: None,
+            }],
+            routes: Vec::new(),
+            stats: StatsConfig::default(),
+        }
+    }
+
+    fn vless_reality_config(port: u16) -> CoreConfig {
+        CoreConfig {
+            instance_id: "node-a".to_string(),
+            log_level: "info".to_string(),
+            inbounds: vec![InboundConfig {
+                tag: "panel|vless|reality|1".to_string(),
+                protocol: Protocol::Vless,
+                listen: "127.0.0.1".to_string(),
+                port,
+                users: vec![user()],
+                cipher: None,
+                flow: "xtls-rprx-vision".to_string(),
+                transport: TransportConfig::default(),
+                tls: Some(TlsConfig {
+                    server_name: "www.example.com".to_string(),
+                    cert_file: None,
+                    key_file: None,
+                    alpn: Vec::new(),
+                    reject_unknown_sni: false,
+                    reality: Some(RealityConfig {
+                        dest: "www.example.com:443".to_string(),
+                        server_port: None,
+                        private_key: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".to_string(),
+                        short_id: "6ba85179e30d4fc2".to_string(),
+                        xver: 0,
+                        mldsa65_seed: None,
+                    }),
+                }),
                 sniffing: SniffingConfig::default(),
             }],
             outbounds: vec![OutboundConfig {
@@ -1476,6 +1533,15 @@ mod tests {
         assert_eq!(listeners.len(), 1);
         assert_eq!(listeners[0].protocol, Protocol::Vless);
         service.stop();
+    }
+
+    #[test]
+    fn reports_vless_reality_runtime_as_not_wired_yet() {
+        let config = vless_reality_config(free_port());
+
+        let error = CoreService::start(config).expect_err("vless reality runtime should fail");
+
+        assert!(error.to_string().contains("reality handshake runtime"));
     }
 
     #[test]

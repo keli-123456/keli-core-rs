@@ -4,6 +4,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::Protocol;
+use crate::reality::{decode_reality_private_key, decode_short_id};
 use crate::shadowsocks::is_supported_shadowsocks_cipher;
 use crate::user::CoreUser;
 
@@ -354,9 +355,8 @@ fn validate_tls_config(
         )));
     }
     if tls.reality.is_some() {
-        return Err(ValidationError::new(format!(
-            "{tag} {protocol} reality is not implemented in keli-core-rs yet"
-        )));
+        validate_reality_tls_config(protocol, tag, network, tls)?;
+        return Ok(());
     }
     if tls.cert_file.as_deref().unwrap_or("").trim().is_empty()
         || tls.key_file.as_deref().unwrap_or("").trim().is_empty()
@@ -371,6 +371,67 @@ fn validate_tls_config(
         )));
     }
     Ok(())
+}
+
+fn validate_reality_tls_config(
+    protocol: &str,
+    tag: &str,
+    network: &str,
+    tls: &TlsConfig,
+) -> Result<(), ValidationError> {
+    let reality = tls.reality.as_ref().expect("reality config exists");
+    if protocol != "vless" {
+        return Err(ValidationError::new(format!(
+            "{tag} {protocol} reality currently supports only vless"
+        )));
+    }
+    if network != "tcp" {
+        return Err(ValidationError::new(format!(
+            "{tag} vless reality currently requires tcp transport"
+        )));
+    }
+    if tls.server_name.trim().is_empty() {
+        return Err(ValidationError::new(format!(
+            "{tag} vless reality requires server_name"
+        )));
+    }
+    if reality.dest.trim().is_empty() {
+        return Err(ValidationError::new(format!(
+            "{tag} vless reality requires dest"
+        )));
+    }
+    if !dest_has_explicit_port(&reality.dest) && reality.server_port.unwrap_or_default() == 0 {
+        return Err(ValidationError::new(format!(
+            "{tag} vless reality requires server_port when dest has no port"
+        )));
+    }
+    decode_reality_private_key(&reality.private_key).map_err(|error| {
+        ValidationError::new(format!(
+            "{tag} vless reality private_key is invalid: {error}"
+        ))
+    })?;
+    decode_short_id(&reality.short_id).map_err(|error| {
+        ValidationError::new(format!("{tag} vless reality short_id is invalid: {error}"))
+    })?;
+    if reality.xver > 2 {
+        return Err(ValidationError::new(format!(
+            "{tag} vless reality xver must be 0, 1 or 2"
+        )));
+    }
+    Ok(())
+}
+
+fn dest_has_explicit_port(dest: &str) -> bool {
+    let dest = dest.trim();
+    if let Some(rest) = dest.strip_prefix('[') {
+        return rest
+            .split_once("]:")
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .is_some();
+    }
+    dest.rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .is_some()
 }
 
 fn validate_quic_tls_config(
@@ -471,8 +532,8 @@ mod tests {
     use crate::user::CoreUser;
 
     use super::{
-        CoreConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig, TlsConfig,
-        TransportConfig,
+        CoreConfig, InboundConfig, OutboundConfig, RealityConfig, SniffingConfig, StatsConfig,
+        TlsConfig, TransportConfig,
     };
 
     fn user() -> CoreUser {
@@ -652,6 +713,113 @@ mod tests {
         inbound.transport.network = "ws".to_string();
         let error = inbound.validate().expect_err("vless vision ws should fail");
         assert!(error.to_string().contains("requires tcp transport"));
+    }
+
+    #[test]
+    fn validates_vless_reality_without_certificate_files() {
+        let inbound = InboundConfig {
+            tag: "panel|vless|reality|1".to_string(),
+            protocol: Protocol::Vless,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![user()],
+            cipher: None,
+            flow: "xtls-rprx-vision".to_string(),
+            transport: TransportConfig::default(),
+            tls: Some(TlsConfig {
+                server_name: "www.example.com".to_string(),
+                cert_file: None,
+                key_file: None,
+                alpn: Vec::new(),
+                reject_unknown_sni: false,
+                reality: Some(RealityConfig {
+                    dest: "www.example.com:443".to_string(),
+                    server_port: None,
+                    private_key: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".to_string(),
+                    short_id: "6ba85179e30d4fc2".to_string(),
+                    xver: 0,
+                    mldsa65_seed: None,
+                }),
+            }),
+            sniffing: SniffingConfig::default(),
+        };
+
+        inbound.validate().expect("vless reality config");
+    }
+
+    #[test]
+    fn rejects_vless_reality_on_non_tcp_transport() {
+        let inbound = InboundConfig {
+            tag: "panel|vless|reality|1".to_string(),
+            protocol: Protocol::Vless,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![user()],
+            cipher: None,
+            flow: String::new(),
+            transport: TransportConfig {
+                network: "ws".to_string(),
+                ..TransportConfig::default()
+            },
+            tls: Some(TlsConfig {
+                server_name: "www.example.com".to_string(),
+                cert_file: None,
+                key_file: None,
+                alpn: Vec::new(),
+                reject_unknown_sni: false,
+                reality: Some(RealityConfig {
+                    dest: "www.example.com:443".to_string(),
+                    server_port: None,
+                    private_key: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".to_string(),
+                    short_id: "6ba85179e30d4fc2".to_string(),
+                    xver: 0,
+                    mldsa65_seed: None,
+                }),
+            }),
+            sniffing: SniffingConfig::default(),
+        };
+
+        let error = inbound
+            .validate()
+            .expect_err("vless reality ws should fail");
+
+        assert!(error.to_string().contains("requires tcp transport"));
+    }
+
+    #[test]
+    fn rejects_invalid_vless_reality_keys() {
+        let inbound = InboundConfig {
+            tag: "panel|vless|reality|1".to_string(),
+            protocol: Protocol::Vless,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![user()],
+            cipher: None,
+            flow: String::new(),
+            transport: TransportConfig::default(),
+            tls: Some(TlsConfig {
+                server_name: "www.example.com".to_string(),
+                cert_file: None,
+                key_file: None,
+                alpn: Vec::new(),
+                reject_unknown_sni: false,
+                reality: Some(RealityConfig {
+                    dest: "www.example.com:443".to_string(),
+                    server_port: None,
+                    private_key: "not-a-key".to_string(),
+                    short_id: "6ba85179e30d4fc2".to_string(),
+                    xver: 0,
+                    mldsa65_seed: None,
+                }),
+            }),
+            sniffing: SniffingConfig::default(),
+        };
+
+        let error = inbound
+            .validate()
+            .expect_err("vless reality key should fail");
+
+        assert!(error.to_string().contains("private_key is invalid"));
     }
 
     #[test]
