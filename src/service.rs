@@ -29,6 +29,7 @@ use crate::tls::TlsAcceptor;
 use crate::traffic::{TrafficDelta, TrafficRegistry};
 use crate::trojan::{TrojanServer, TrojanServerConfig};
 use crate::tuic::{TuicServer, TuicServerConfig};
+use crate::user::CoreUser;
 use crate::vless::{VlessServer, VlessServerConfig};
 use crate::vmess::{VmessServer, VmessServerConfig};
 
@@ -73,6 +74,7 @@ impl std::error::Error for CoreServiceError {}
 
 #[derive(Debug)]
 pub struct CoreService {
+    config: CoreConfig,
     listeners: Vec<ListenerHandle>,
     traffic: Arc<Mutex<TrafficRegistry>>,
 }
@@ -80,15 +82,46 @@ pub struct CoreService {
 #[derive(Debug)]
 struct ListenerHandle {
     status: ListenerStatus,
+    runtime: ListenerRuntime,
     stop: Arc<AtomicBool>,
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
     join: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Debug)]
+enum ListenerRuntime {
+    Socks(Socks5Server),
+    Http(HttpProxyServer),
+    Vless(VlessServer),
+    Vmess(VmessServer),
+    Trojan(TrojanServer),
+    Shadowsocks(ShadowsocksServer),
+    AnyTls(AnyTlsServer),
+    Tuic(TuicServer),
+    Hysteria2(Hysteria2Server),
+}
+
+impl ListenerRuntime {
+    fn replace_users(&self, users: Vec<CoreUser>) {
+        match self {
+            ListenerRuntime::Socks(server) => server.replace_users(users),
+            ListenerRuntime::Http(server) => server.replace_users(users),
+            ListenerRuntime::Vless(server) => server.replace_users(users),
+            ListenerRuntime::Vmess(server) => server.replace_users(users),
+            ListenerRuntime::Trojan(server) => server.replace_users(users),
+            ListenerRuntime::Shadowsocks(server) => server.replace_users(users),
+            ListenerRuntime::AnyTls(server) => server.replace_users(users),
+            ListenerRuntime::Tuic(server) => server.replace_users(users),
+            ListenerRuntime::Hysteria2(server) => server.replace_users(users),
+        }
+    }
 }
 
 impl CoreService {
     pub fn start(config: CoreConfig) -> Result<Self, CoreServiceError> {
         config.validate().map_err(CoreServiceError::InvalidConfig)?;
         crate::dns::configure(config.dns.clone());
+        let active_config = config.clone();
 
         let traffic = Arc::new(Mutex::new(TrafficRegistry::default()));
         let sessions = UserSessionTracker::default();
@@ -171,7 +204,11 @@ impl CoreService {
             listeners.push(handle);
         }
 
-        Ok(Self { listeners, traffic })
+        Ok(Self {
+            config: active_config,
+            listeners,
+            traffic,
+        })
     }
 
     pub fn listeners(&self) -> Vec<ListenerStatus> {
@@ -186,6 +223,23 @@ impl CoreService {
             .lock()
             .expect("traffic registry lock poisoned")
             .drain_minimum(minimum_bytes)
+    }
+
+    pub fn can_update_users(&self, config: &CoreConfig) -> bool {
+        config_without_users(&self.config) == config_without_users(config)
+    }
+
+    pub fn update_users(&mut self, config: CoreConfig) {
+        for inbound in &config.inbounds {
+            if let Some(handle) = self
+                .listeners
+                .iter()
+                .find(|handle| handle.status.tag == inbound.tag)
+            {
+                handle.runtime.replace_users(inbound.users.clone());
+            }
+        }
+        self.config = config;
     }
 
     pub fn stop(&mut self) {
@@ -209,10 +263,19 @@ impl Drop for CoreService {
     }
 }
 
+fn config_without_users(config: &CoreConfig) -> CoreConfig {
+    let mut config = config.clone();
+    for inbound in &mut config.inbounds {
+        inbound.users.clear();
+    }
+    config
+}
+
 fn start_grpc_transport_listener(
     inbound: &InboundConfig,
     protocol: Protocol,
     handler: GrpcStreamHandler,
+    listener_runtime: ListenerRuntime,
 ) -> Result<ListenerHandle, CoreServiceError> {
     let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
         CoreServiceError::Bind {
@@ -282,6 +345,7 @@ fn start_grpc_transport_listener(
             protocol,
             local_addr,
         },
+        runtime: listener_runtime,
         stop,
         workers,
         join: Some(join),
@@ -314,12 +378,17 @@ fn start_vmess_listener(
         bandwidth,
     );
     if inbound.transport.network.trim() == "grpc" {
-        let server = server.clone();
+        let grpc_server = server.clone();
         let handler: GrpcStreamHandler =
             Arc::new(move |reader: GrpcHunkReader, writer: GrpcHunkWriter| {
-                let _ = server.handle_split_client(reader, writer);
+                let _ = grpc_server.handle_split_client(reader, writer);
             });
-        return start_grpc_transport_listener(inbound, Protocol::Vmess, handler);
+        return start_grpc_transport_listener(
+            inbound,
+            Protocol::Vmess,
+            handler,
+            ListenerRuntime::Vmess(server),
+        );
     }
     let listener = server.bind().map_err(|source| CoreServiceError::Bind {
         tag: inbound.tag.clone(),
@@ -345,6 +414,7 @@ fn start_vmess_listener(
     let websocket_path = inbound.transport.path.clone();
     let httpupgrade_host = inbound.transport.host.clone();
     let tls_acceptor = tls_acceptor_for(inbound)?;
+    let runtime_server = server.clone();
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -404,6 +474,7 @@ fn start_vmess_listener(
             protocol: Protocol::Vmess,
             local_addr,
         },
+        runtime: ListenerRuntime::Vmess(runtime_server),
         stop,
         workers,
         join: Some(join),
@@ -472,6 +543,7 @@ fn start_hysteria2_listener(
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
     let workers = Arc::new(Mutex::new(Vec::new()));
+    let runtime_server = server.clone();
     let join = thread::spawn(move || {
         runtime.block_on(server.run(endpoint, stop_for_thread));
     });
@@ -482,6 +554,7 @@ fn start_hysteria2_listener(
             protocol: Protocol::Hysteria2,
             local_addr,
         },
+        runtime: ListenerRuntime::Hysteria2(runtime_server),
         stop,
         workers,
         join: Some(join),
@@ -559,6 +632,7 @@ fn start_tuic_listener(
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
     let workers = Arc::new(Mutex::new(Vec::new()));
+    let runtime_server = server.clone();
     let join = thread::spawn(move || {
         runtime.block_on(server.run(endpoint, stop_for_thread));
     });
@@ -569,6 +643,7 @@ fn start_tuic_listener(
             protocol: Protocol::Tuic,
             local_addr,
         },
+        runtime: ListenerRuntime::Tuic(runtime_server),
         stop,
         workers,
         join: Some(join),
@@ -621,6 +696,7 @@ fn start_anytls_listener(
     let stop_for_thread = stop.clone();
     let workers = Arc::new(Mutex::new(Vec::new()));
     let workers_for_thread = workers.clone();
+    let runtime_server = server.clone();
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -648,6 +724,7 @@ fn start_anytls_listener(
             protocol: Protocol::AnyTls,
             local_addr,
         },
+        runtime: ListenerRuntime::AnyTls(runtime_server),
         stop,
         workers,
         join: Some(join),
@@ -728,6 +805,7 @@ fn start_shadowsocks_listener(
             .push(udp_worker);
     }
     let workers_for_thread = workers.clone();
+    let runtime_server = server.clone();
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -755,6 +833,7 @@ fn start_shadowsocks_listener(
             protocol: Protocol::Shadowsocks,
             local_addr,
         },
+        runtime: ListenerRuntime::Shadowsocks(runtime_server),
         stop,
         workers,
         join: Some(join),
@@ -795,12 +874,17 @@ fn start_trojan_listener(
         bandwidth,
     );
     if inbound.transport.network.trim() == "grpc" {
-        let server = server.clone();
+        let grpc_server = server.clone();
         let handler: GrpcStreamHandler =
             Arc::new(move |reader: GrpcHunkReader, writer: GrpcHunkWriter| {
-                let _ = server.handle_split_client(reader, writer);
+                let _ = grpc_server.handle_split_client(reader, writer);
             });
-        return start_grpc_transport_listener(inbound, Protocol::Trojan, handler);
+        return start_grpc_transport_listener(
+            inbound,
+            Protocol::Trojan,
+            handler,
+            ListenerRuntime::Trojan(server),
+        );
     }
     let listener = server.bind().map_err(|source| CoreServiceError::Bind {
         tag: inbound.tag.clone(),
@@ -827,6 +911,7 @@ fn start_trojan_listener(
     let websocket_path = inbound.transport.path.clone();
     let httpupgrade_host = inbound.transport.host.clone();
     let tls_acceptor = tls_acceptor_for(inbound)?;
+    let runtime_server = server.clone();
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -886,6 +971,7 @@ fn start_trojan_listener(
             protocol: Protocol::Trojan,
             local_addr,
         },
+        runtime: ListenerRuntime::Trojan(runtime_server),
         stop,
         workers,
         join: Some(join),
@@ -919,12 +1005,17 @@ fn start_vless_listener(
         bandwidth,
     );
     if inbound.transport.network.trim() == "grpc" {
-        let server = server.clone();
+        let grpc_server = server.clone();
         let handler: GrpcStreamHandler =
             Arc::new(move |reader: GrpcHunkReader, writer: GrpcHunkWriter| {
-                let _ = server.handle_split_client(reader, writer);
+                let _ = grpc_server.handle_split_client(reader, writer);
             });
-        return start_grpc_transport_listener(inbound, Protocol::Vless, handler);
+        return start_grpc_transport_listener(
+            inbound,
+            Protocol::Vless,
+            handler,
+            ListenerRuntime::Vless(server),
+        );
     }
     if inbound
         .tls
@@ -959,6 +1050,7 @@ fn start_vless_listener(
     let websocket_path = inbound.transport.path.clone();
     let httpupgrade_host = inbound.transport.host.clone();
     let tls_acceptor = tls_acceptor_for(inbound)?;
+    let runtime_server = server.clone();
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -1018,6 +1110,7 @@ fn start_vless_listener(
             protocol: Protocol::Vless,
             local_addr,
         },
+        runtime: ListenerRuntime::Vless(runtime_server),
         stop,
         workers,
         join: Some(join),
@@ -1070,6 +1163,7 @@ fn start_socks_listener(
     let stop_for_thread = stop.clone();
     let workers = Arc::new(Mutex::new(Vec::new()));
     let workers_for_thread = workers.clone();
+    let runtime_server = server.clone();
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -1097,6 +1191,7 @@ fn start_socks_listener(
             protocol: Protocol::Socks,
             local_addr,
         },
+        runtime: ListenerRuntime::Socks(runtime_server),
         stop,
         workers,
         join: Some(join),
@@ -1149,6 +1244,7 @@ fn start_http_listener(
     let stop_for_thread = stop.clone();
     let workers = Arc::new(Mutex::new(Vec::new()));
     let workers_for_thread = workers.clone();
+    let runtime_server = server.clone();
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -1176,6 +1272,7 @@ fn start_http_listener(
             protocol: Protocol::Http,
             local_addr,
         },
+        runtime: ListenerRuntime::Http(runtime_server),
         stop,
         workers,
         join: Some(join),
@@ -1209,6 +1306,7 @@ fn start_vless_reality_listener(
     let stop_for_thread = stop.clone();
     let workers = Arc::new(Mutex::new(Vec::new()));
     let workers_for_thread = workers.clone();
+    let runtime_server = server.clone();
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -1248,6 +1346,7 @@ fn start_vless_reality_listener(
             protocol: Protocol::Vless,
             local_addr,
         },
+        runtime: ListenerRuntime::Vless(runtime_server),
         stop,
         workers,
         join: Some(join),

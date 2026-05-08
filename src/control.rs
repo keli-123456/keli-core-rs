@@ -91,6 +91,18 @@ impl CoreController {
         }
 
         if let Some(service) = &mut self.service {
+            if service.can_update_users(&config) {
+                service.update_users(config);
+                let decision = self.runtime.apply_update(plan);
+                return CoreResponse::Applied {
+                    decision: decision_name(decision).to_string(),
+                    status: self.runtime.status().clone(),
+                    listeners: self.listeners(),
+                };
+            }
+        }
+
+        if let Some(service) = &mut self.service {
             service.stop();
         }
         self.service = None;
@@ -133,6 +145,7 @@ fn decision_name(decision: ReloadDecision) -> &'static str {
     match decision {
         ReloadDecision::Noop => "noop",
         ReloadDecision::Reloaded => "reloaded",
+        ReloadDecision::Updated => "updated",
     }
 }
 
@@ -226,6 +239,48 @@ mod tests {
                 assert_eq!(decision, "noop");
                 assert_eq!(status, CoreStatus::Running);
                 assert_eq!(listeners.len(), 1);
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
+        assert!(matches!(
+            controller.handle(CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+    }
+
+    #[test]
+    fn apply_config_hot_updates_users_without_rebinding_listener() {
+        let config = config(Protocol::Socks);
+        let mut updated = config.clone();
+        updated.inbounds[0].users[0].uuid = "user-b".to_string();
+        updated.inbounds[0].users[0].password = Some("secret-b".to_string());
+        let mut controller = CoreController::new();
+
+        let first = controller.handle(CoreCommand::ApplyConfig {
+            config: config.clone(),
+        });
+        let first_addr = match first {
+            CoreResponse::Applied {
+                decision,
+                listeners,
+                ..
+            } => {
+                assert_eq!(decision, "reloaded");
+                listeners[0].local_addr
+            }
+            response => panic!("unexpected response: {response:?}"),
+        };
+        let second = controller.handle(CoreCommand::ApplyConfig { config: updated });
+
+        match second {
+            CoreResponse::Applied {
+                decision,
+                status,
+                listeners,
+            } => {
+                assert_eq!(decision, "updated");
+                assert_eq!(status, CoreStatus::Running);
+                assert_eq!(listeners[0].local_addr, first_addr);
             }
             response => panic!("unexpected response: {response:?}"),
         }

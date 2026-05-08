@@ -22,6 +22,7 @@ pub struct CorePlan {
 pub enum ReloadDecision {
     Noop,
     Reloaded,
+    Updated,
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +63,13 @@ impl RuntimeState {
         self.active_fingerprint = Some(plan.fingerprint);
         self.status = CoreStatus::Running;
         ReloadDecision::Reloaded
+    }
+
+    pub fn apply_update(&mut self, plan: CorePlan) -> ReloadDecision {
+        self.status = CoreStatus::Reloading;
+        self.active_fingerprint = Some(plan.fingerprint);
+        self.status = CoreStatus::Running;
+        ReloadDecision::Updated
     }
 
     pub fn needs_reload(&self, plan: &CorePlan) -> bool {
