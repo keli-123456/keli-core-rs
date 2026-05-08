@@ -1176,10 +1176,15 @@ fn resolve_listen_addr(listen: &str, port: u16) -> io::Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use rustls::pki_types::{CertificateDer, ServerName};
+    use rustls::{ClientConfig, RootCertStore};
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::config::{
         CoreConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig, TransportConfig,
@@ -1188,6 +1193,10 @@ mod tests {
     use crate::protocol::Protocol;
     use crate::service::CoreService;
     use crate::user::CoreUser;
+
+    trait AsyncIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+    impl<T> AsyncIo for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 
     fn user() -> CoreUser {
         CoreUser {
@@ -1262,7 +1271,11 @@ mod tests {
         request
     }
 
-    fn run_grpc_vless_client(proxy_addr: std::net::SocketAddr, echo_addr: std::net::SocketAddr) {
+    fn run_grpc_vless_client(
+        proxy_addr: std::net::SocketAddr,
+        echo_addr: std::net::SocketAddr,
+        cert_der: Option<CertificateDer<'static>>,
+    ) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1271,6 +1284,24 @@ mod tests {
             let stream = tokio::net::TcpStream::connect(proxy_addr)
                 .await
                 .expect("grpc connect");
+            let stream: Box<dyn AsyncIo> = if let Some(cert_der) = cert_der {
+                let mut roots = RootCertStore::empty();
+                roots.add(cert_der).expect("root cert");
+                let config = ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+                let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+                let server_name = ServerName::try_from("localhost")
+                    .expect("server name")
+                    .to_owned();
+                let tls = connector
+                    .connect(server_name, stream)
+                    .await
+                    .expect("tls connect");
+                Box::new(tls)
+            } else {
+                Box::new(stream)
+            };
             let (mut client, connection) =
                 h2::client::handshake(stream).await.expect("h2 handshake");
             tokio::spawn(async move {
@@ -1313,6 +1344,38 @@ mod tests {
             assert_eq!(&plain[..2], &[0x00, 0x00]);
             assert_eq!(&plain[2..6], b"ping");
         });
+    }
+
+    struct TestCert {
+        cert_path: PathBuf,
+        key_path: PathBuf,
+        cert_der: CertificateDer<'static>,
+    }
+
+    impl Drop for TestCert {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.cert_path);
+            let _ = fs::remove_file(&self.key_path);
+        }
+    }
+
+    fn test_cert(label: &str) -> TestCert {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("self signed cert");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join(format!("keli-core-rs-grpc-{label}-{nanos}.crt"));
+        let key_path = dir.join(format!("keli-core-rs-grpc-{label}-{nanos}.key"));
+        fs::write(&cert_path, cert.cert.pem()).expect("write cert");
+        fs::write(&key_path, cert.key_pair.serialize_pem()).expect("write key");
+        TestCert {
+            cert_path,
+            key_path,
+            cert_der: cert.cert.der().clone(),
+        }
     }
 
     #[test]
@@ -1451,7 +1514,53 @@ mod tests {
         let mut service = CoreService::start(config).expect("service start");
         let grpc_addr = service.listeners()[0].local_addr;
 
-        run_grpc_vless_client(grpc_addr, echo_addr);
+        run_grpc_vless_client(grpc_addr, echo_addr, None);
+        echo_thread.join().expect("echo thread");
+
+        for _ in 0..50 {
+            let records = service.drain_traffic(1);
+            if !records.is_empty() {
+                assert_eq!(records[0].upload, 4);
+                assert_eq!(records[0].download, 4);
+                service.stop();
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        service.stop();
+        panic!("traffic was not recorded");
+    }
+
+    #[test]
+    fn proxies_vless_grpc_tls_and_records_traffic() {
+        let cert = test_cert("vless");
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+        });
+
+        let mut config = config(free_port());
+        config.inbounds[0].tag = "panel|vless|1".to_string();
+        config.inbounds[0].protocol = Protocol::Vless;
+        config.inbounds[0].users[0].uuid = "11111111-1111-1111-1111-111111111111".to_string();
+        config.inbounds[0].transport.network = "grpc".to_string();
+        config.inbounds[0].transport.service_name = Some("GunService".to_string());
+        config.inbounds[0].tls = Some(crate::config::TlsConfig {
+            server_name: "localhost".to_string(),
+            cert_file: Some(cert.cert_path.to_string_lossy().to_string()),
+            key_file: Some(cert.key_path.to_string_lossy().to_string()),
+            alpn: Vec::new(),
+            reject_unknown_sni: true,
+            reality: None,
+        });
+        let mut service = CoreService::start(config).expect("service start");
+        let grpc_addr = service.listeners()[0].local_addr;
+
+        run_grpc_vless_client(grpc_addr, echo_addr, Some(cert.cert_der.clone()));
         echo_thread.join().expect("echo thread");
 
         for _ in 0..50 {
