@@ -38,6 +38,7 @@ const ACK_SERVER_TO_CLIENT: u8 = 9;
 const STATUS_OK: u8 = 0;
 const SOCKS_VERSION: u8 = 5;
 const SOCKS_CMD_CONNECT: u8 = 1;
+const SOCKS_CONNECT_SUCCESS: [u8; 10] = [SOCKS_VERSION, 0, 0, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
 const ATYP_IPV4: u8 = 1;
 const ATYP_DOMAIN: u8 = 3;
 const ATYP_IPV6: u8 = 4;
@@ -213,6 +214,7 @@ impl MieruServer {
 
         let mut writer = MieruWriter::server(client, &user, reader.session_id())?;
         writer.write_open_response()?;
+        writer.write_all(&SOCKS_CONNECT_SUCCESS)?;
         let mut upload = 0u64;
         if !initial_payload.is_empty() {
             if let Some(limiter) = bandwidth.as_deref() {
@@ -1009,7 +1011,7 @@ mod tests {
         apply_nonce_user_hint, derive_mieru_key, encode_segment_body, parse_socks_request,
         rounded_unix_time, MieruMetadata, MieruReader, MieruServer, MieruServerConfig, MieruWriter,
         SocksParseResult, DATA_CLIENT_TO_SERVER, DATA_SERVER_TO_CLIENT, OPEN_SESSION_REQUEST,
-        OPEN_SESSION_RESPONSE, STATUS_OK,
+        OPEN_SESSION_RESPONSE, SOCKS_CONNECT_SUCCESS, STATUS_OK,
     };
     use crate::user::CoreUser;
 
@@ -1139,6 +1141,7 @@ mod tests {
         let mut reader = MieruReader::accept(client, &[user()]).expect("client reader");
         let open_response = reader.take_initial_segment().expect("open");
         assert_eq!(open_response.metadata.protocol_type, OPEN_SESSION_RESPONSE);
+        assert_socks_connect_success(&mut reader);
 
         writer
             .write_client_segment(DATA_CLIENT_TO_SERVER, b"ping")
@@ -1258,6 +1261,7 @@ mod tests {
                 .protocol_type,
             OPEN_SESSION_RESPONSE
         );
+        assert_socks_connect_success(&mut reader);
         writer
             .write_client_segment(DATA_CLIENT_TO_SERVER, b"ping")
             .expect("data");
@@ -1336,6 +1340,7 @@ mod tests {
                 .protocol_type,
             OPEN_SESSION_RESPONSE
         );
+        assert_socks_connect_success(&mut reader);
         writer
             .write_client_segment(DATA_CLIENT_TO_SERVER, b"ping")
             .expect("data");
@@ -1449,6 +1454,12 @@ mod tests {
         }
         String::from_utf8(request)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8"))
+    }
+
+    fn assert_socks_connect_success(reader: &mut MieruReader) {
+        let mut reply = [0u8; 10];
+        reader.read_exact(&mut reply).expect("socks success reply");
+        assert_eq!(reply, SOCKS_CONNECT_SUCCESS);
     }
 
     #[test]
