@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -12,7 +11,7 @@ use crate::limits::{
 };
 use crate::stream::{copy_count_best_effort_limited, relay_tcp_streams_limited};
 use crate::traffic::{TrafficDelta, TrafficRegistry};
-use crate::user::CoreUser;
+use crate::user::{CoreUser, UserStore};
 use crate::{connect_tcp_outbound, RouteDecision, RouteMatcher, SocksTarget};
 
 #[derive(Clone, Debug)]
@@ -27,7 +26,7 @@ pub struct HttpProxyServerConfig {
 #[derive(Clone, Debug)]
 pub struct HttpProxyServer {
     config: HttpProxyServerConfig,
-    users: Arc<HashMap<String, CoreUser>>,
+    users: UserStore,
     router: RouteMatcher,
     traffic: Arc<Mutex<TrafficRegistry>>,
     sessions: UserSessionTracker,
@@ -73,17 +72,11 @@ impl HttpProxyServer {
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
-        let users = config
-            .users
-            .iter()
-            .filter(|user| !user.is_empty())
-            .map(|user| (user.uuid.clone(), user.clone()))
-            .collect::<HashMap<_, _>>();
-
+        let users = UserStore::from_uuid_users(&config.users);
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,
-            users: Arc::new(users),
+            users,
             traffic,
             sessions,
             bandwidth,
@@ -111,8 +104,8 @@ impl HttpProxyServer {
         };
         let user = self.request_user(&request);
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
-        let _session = self.acquire_user_session(user, &mut client)?;
-        let bandwidth = self.bandwidth.limiter_for(user);
+        let _session = self.acquire_user_session(user.as_ref(), &mut client)?;
+        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.method.eq_ignore_ascii_case("CONNECT") {
             self.handle_connect(client, request, bandwidth, client_ip)
         } else {
@@ -125,6 +118,10 @@ impl HttpProxyServer {
             .lock()
             .expect("traffic registry lock poisoned")
             .drain_minimum(minimum_bytes)
+    }
+
+    pub fn replace_users(&self, users: Vec<CoreUser>) {
+        self.users.replace_uuid_users(users);
     }
 
     fn read_request<R: BufRead>(&self, reader: &mut R) -> io::Result<HttpProxyRequest> {
@@ -315,7 +312,7 @@ impl HttpProxyServer {
         }
     }
 
-    fn request_user(&self, request: &HttpProxyRequest) -> Option<&CoreUser> {
+    fn request_user(&self, request: &HttpProxyRequest) -> Option<CoreUser> {
         request
             .user_uuid
             .as_deref()
@@ -499,6 +496,17 @@ mod tests {
         }
     }
 
+    fn user_b() -> CoreUser {
+        CoreUser {
+            id: 2,
+            uuid: "user-b".to_string(),
+            password: Some("secret-b".to_string()),
+            email: None,
+            speed_limit: 0,
+            device_limit: 0,
+        }
+    }
+
     fn server() -> HttpProxyServer {
         HttpProxyServer::new(HttpProxyServerConfig {
             node_tag: "panel|http|1".to_string(),
@@ -521,10 +529,17 @@ mod tests {
         })
     }
 
+    fn basic_auth_value(username: &str, password: &str) -> String {
+        format!(
+            "Basic {}",
+            STANDARD.encode(format!("{username}:{password}"))
+        )
+    }
+
     fn basic_auth_header() -> String {
         format!(
-            "Proxy-Authorization: Basic {}\r\n",
-            STANDARD.encode("user-a:user-a")
+            "Proxy-Authorization: {}\r\n",
+            basic_auth_value("user-a", "user-a")
         )
     }
 
@@ -633,6 +648,31 @@ mod tests {
             .expect_err("auth should fail");
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn replaces_users_without_rebuilding_http_server() {
+        let server = server();
+
+        server.replace_users(vec![user_b()]);
+
+        let old_headers = vec![(
+            "Proxy-Authorization".to_string(),
+            basic_auth_value("user-a", "user-a"),
+        )];
+        let error = server
+            .authenticate(&old_headers)
+            .expect_err("old user should fail after replacement");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let new_headers = vec![(
+            "Proxy-Authorization".to_string(),
+            basic_auth_value("user-b", "secret-b"),
+        )];
+        let user_uuid = server
+            .authenticate(&new_headers)
+            .expect("new user should authenticate");
+        assert_eq!(user_uuid.as_deref(), Some("user-b"));
     }
 
     #[test]

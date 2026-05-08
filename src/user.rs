@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,22 +27,80 @@ impl CoreUser {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct UserStore {
+    users: Arc<RwLock<HashMap<String, CoreUser>>>,
+}
+
+impl UserStore {
+    pub fn from_uuid_users(users: &[CoreUser]) -> Self {
+        Self {
+            users: Arc::new(RwLock::new(uuid_user_map(users))),
+        }
+    }
+
+    pub fn replace_uuid_users(&self, users: Vec<CoreUser>) {
+        let mut current = self.users.write().expect("user store lock poisoned");
+        *current = uuid_user_map(&users);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.users
+            .read()
+            .expect("user store lock poisoned")
+            .is_empty()
+    }
+
+    pub fn get(&self, uuid: &str) -> Option<CoreUser> {
+        self.users
+            .read()
+            .expect("user store lock poisoned")
+            .get(uuid)
+            .cloned()
+    }
+}
+
+fn uuid_user_map(users: &[CoreUser]) -> HashMap<String, CoreUser> {
+    users
+        .iter()
+        .filter(|user| !user.is_empty())
+        .map(|user| (user.uuid.clone(), user.clone()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::CoreUser;
+    use super::{CoreUser, UserStore};
 
-    #[test]
-    fn keeps_go_compatible_traffic_key() {
-        let user = CoreUser {
+    fn user(uuid: &str) -> CoreUser {
+        CoreUser {
             id: 7,
-            uuid: "user-a".to_string(),
+            uuid: uuid.to_string(),
             password: None,
             email: None,
             speed_limit: 0,
             device_limit: 0,
-        };
+        }
+    }
+
+    #[test]
+    fn keeps_go_compatible_traffic_key() {
+        let user = user("user-a");
 
         assert_eq!(user.traffic_key("panel|vless|1"), "panel|vless|1|user-a");
         assert_eq!(user.credential(), "user-a");
+    }
+
+    #[test]
+    fn user_store_replaces_uuid_users() {
+        let store = UserStore::from_uuid_users(&[user("user-a")]);
+
+        assert!(store.get("user-a").is_some());
+        assert!(store.get("user-b").is_none());
+
+        store.replace_uuid_users(vec![user("user-b")]);
+
+        assert!(store.get("user-a").is_none());
+        assert!(store.get("user-b").is_some());
     }
 }

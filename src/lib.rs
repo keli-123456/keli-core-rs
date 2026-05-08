@@ -59,7 +59,7 @@ pub use tls::{relay_tls_stream, TlsAcceptor, TlsConnection};
 pub use traffic::{TrafficDelta, TrafficKey, TrafficRegistry};
 pub use trojan::{trojan_password_hash, TrojanServer, TrojanServerConfig};
 pub use tuic::{TuicServer, TuicServerConfig};
-pub use user::CoreUser;
+pub use user::{CoreUser, UserStore};
 pub use vless::{VlessServer, VlessServerConfig};
 pub use vmess::{VmessServer, VmessServerConfig};
 

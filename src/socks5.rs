@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
@@ -11,7 +10,7 @@ use crate::limits::{
 };
 use crate::stream::relay_tcp_streams_limited;
 use crate::traffic::TrafficRegistry;
-use crate::user::CoreUser;
+use crate::user::{CoreUser, UserStore};
 use crate::{
     connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
 };
@@ -48,7 +47,7 @@ pub struct SocksTarget {
 #[derive(Clone, Debug)]
 pub struct Socks5Server {
     config: Socks5ServerConfig,
-    users: Arc<HashMap<String, CoreUser>>,
+    users: UserStore,
     router: RouteMatcher,
     traffic: Arc<Mutex<TrafficRegistry>>,
     sessions: UserSessionTracker,
@@ -89,17 +88,11 @@ impl Socks5Server {
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
-        let users = config
-            .users
-            .iter()
-            .filter(|user| !user.is_empty())
-            .map(|user| (user.uuid.clone(), user.clone()))
-            .collect::<HashMap<_, _>>();
-
+        let users = UserStore::from_uuid_users(&config.users);
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,
-            users: Arc::new(users),
+            users,
             traffic,
             sessions,
             bandwidth,
@@ -126,8 +119,8 @@ impl Socks5Server {
         };
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user, &mut client)?;
-        let bandwidth = self.bandwidth.limiter_for(user);
+        let _session = self.acquire_user_session(user.as_ref(), &mut client)?;
+        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.command == SocksCommand::UdpAssociate {
             return self.handle_udp_associate(client, request, bandwidth);
         }
@@ -162,6 +155,10 @@ impl Socks5Server {
             .lock()
             .expect("traffic registry lock poisoned")
             .drain_minimum(minimum_bytes)
+    }
+
+    pub fn replace_users(&self, users: Vec<CoreUser>) {
+        self.users.replace_uuid_users(users);
     }
 
     fn read_request<T>(&self, stream: &mut T) -> io::Result<SocksRequest>
@@ -442,7 +439,7 @@ impl Socks5Server {
         Ok(())
     }
 
-    fn request_user(&self, request: &SocksRequest) -> Option<&CoreUser> {
+    fn request_user(&self, request: &SocksRequest) -> Option<CoreUser> {
         request
             .user_uuid
             .as_deref()
@@ -686,6 +683,17 @@ mod tests {
         }
     }
 
+    fn user_b() -> CoreUser {
+        CoreUser {
+            id: 2,
+            uuid: "user-b".to_string(),
+            password: Some("secret-b".to_string()),
+            email: None,
+            speed_limit: 0,
+            device_limit: 0,
+        }
+    }
+
     fn server() -> Socks5Server {
         Socks5Server::new(Socks5ServerConfig {
             node_tag: "panel|socks|1".to_string(),
@@ -736,6 +744,22 @@ mod tests {
         client
             .write_all(&target.port().to_be_bytes())
             .expect("client target port");
+    }
+
+    fn authenticated_domain_connect(
+        username: &str,
+        password: &str,
+        host: &str,
+        port: u16,
+    ) -> Vec<u8> {
+        let mut input = vec![0x05, 0x01, 0x02, 0x01, username.len() as u8];
+        input.extend_from_slice(username.as_bytes());
+        input.push(password.len() as u8);
+        input.extend_from_slice(password.as_bytes());
+        input.extend_from_slice(&[0x05, 0x01, 0x00, 0x03, host.len() as u8]);
+        input.extend_from_slice(host.as_bytes());
+        input.extend_from_slice(&port.to_be_bytes());
+        input
     }
 
     fn udp_packet(target: SocketAddr, payload: &[u8]) -> Vec<u8> {
@@ -801,6 +825,37 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(stream.output, vec![0x05, 0x02, 0x01, 0xff]);
+    }
+
+    #[test]
+    fn replaces_users_without_rebuilding_socks_server() {
+        let server = server();
+
+        server.replace_users(vec![user_b()]);
+
+        let mut old_stream = MemoryStream::new(authenticated_domain_connect(
+            "user-a",
+            "user-a",
+            "example.com",
+            443,
+        ));
+        let error = server
+            .read_request(&mut old_stream)
+            .expect_err("old user should fail after replacement");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(old_stream.output, vec![0x05, 0x02, 0x01, 0xff]);
+
+        let mut new_stream = MemoryStream::new(authenticated_domain_connect(
+            "user-b",
+            "secret-b",
+            "example.com",
+            443,
+        ));
+        let request = server
+            .read_request(&mut new_stream)
+            .expect("new user should authenticate");
+        assert_eq!(request.user_uuid.as_deref(), Some("user-b"));
+        assert_eq!(new_stream.output, vec![0x05, 0x02, 0x01, 0x00]);
     }
 
     #[test]
