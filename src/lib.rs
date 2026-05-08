@@ -12,6 +12,7 @@ pub mod service;
 pub mod shadowsocks;
 pub mod socks5;
 pub mod stream;
+pub mod tls;
 pub mod traffic;
 pub mod trojan;
 pub mod user;
@@ -39,6 +40,7 @@ pub use shadowsocks::{
     is_supported_shadowsocks_cipher, ShadowsocksServer, ShadowsocksServerConfig,
 };
 pub use socks5::{Socks5Server, Socks5ServerConfig, SocksTarget};
+pub use tls::{relay_tls_stream, TlsAcceptor, TlsConnection};
 pub use traffic::{TrafficDelta, TrafficKey, TrafficRegistry};
 pub use trojan::{trojan_password_hash, TrojanServer, TrojanServerConfig};
 pub use user::CoreUser;

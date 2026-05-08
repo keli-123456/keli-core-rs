@@ -10,6 +10,7 @@ use crate::limits::{
 };
 use crate::socks5::SocksTarget;
 use crate::stream::{copy_count_best_effort_limited, relay_tcp_streams_limited};
+use crate::tls::{relay_tls_stream, TlsConnection};
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 use crate::websocket::accept_websocket;
@@ -135,6 +136,30 @@ impl VlessServer {
         };
         writer.write_all(&[VERSION, 0x00])?;
         self.relay_websocket(reader, writer, remote, request, bandwidth)
+    }
+
+    pub fn handle_tls_client(&self, mut client: TlsConnection) -> io::Result<()> {
+        let request = self.read_request(&mut client)?;
+        let user = self.request_user(&request);
+        let _session = self.acquire_user_session(user)?;
+        let bandwidth = self.bandwidth.limiter_for(user);
+        let remote = match self.router.decide(&request.target.host) {
+            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
+            RouteDecision::Block => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target blocked by route",
+                ));
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
+        client.write_all(&[VERSION, 0x00])?;
+        self.relay_tls(client, remote, request, bandwidth)
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
@@ -271,6 +296,26 @@ impl VlessServer {
         Ok(())
     }
 
+    fn relay_tls(
+        &self,
+        client: TlsConnection,
+        remote: TcpStream,
+        request: VlessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()> {
+        let (upload, download) = relay_tls_stream(client, remote, bandwidth)?;
+        self.traffic
+            .lock()
+            .expect("traffic registry lock poisoned")
+            .add(
+                self.config.node_tag.clone(),
+                request.user_uuid,
+                upload,
+                download,
+            );
+        Ok(())
+    }
+
     fn request_user(&self, request: &VlessRequest) -> Option<&CoreUser> {
         self.users.get(&request.user_key)
     }
@@ -346,11 +391,18 @@ fn hex_digit(value: u8) -> char {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::{Cursor, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use rustls::pki_types::{CertificateDer, ServerName};
+    use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+
+    use crate::tls::TlsAcceptor;
     use crate::user::CoreUser;
     use crate::vless::{VlessServer, VlessServerConfig};
 
@@ -409,6 +461,55 @@ mod tests {
                 .octets(),
         );
         input
+    }
+
+    struct TestCert {
+        cert_path: PathBuf,
+        key_path: PathBuf,
+        cert_der: CertificateDer<'static>,
+    }
+
+    impl Drop for TestCert {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.cert_path);
+            let _ = fs::remove_file(&self.key_path);
+        }
+    }
+
+    fn test_cert(label: &str) -> TestCert {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("self signed cert");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join(format!("keli-core-rs-{label}-{nanos}.crt"));
+        let key_path = dir.join(format!("keli-core-rs-{label}-{nanos}.key"));
+        fs::write(&cert_path, cert.cert.pem()).expect("write cert");
+        fs::write(&key_path, cert.key_pair.serialize_pem()).expect("write key");
+        TestCert {
+            cert_path,
+            key_path,
+            cert_der: cert.cert.der().clone(),
+        }
+    }
+
+    fn tls_client(
+        addr: std::net::SocketAddr,
+        cert_der: CertificateDer<'static>,
+    ) -> StreamOwned<ClientConnection, TcpStream> {
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).expect("root cert");
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name = ServerName::try_from("localhost")
+            .expect("server name")
+            .to_owned();
+        let connection = ClientConnection::new(Arc::new(config), server_name).expect("client tls");
+        let socket = TcpStream::connect(addr).expect("client connect");
+        StreamOwned::new(connection, socket)
     }
 
     fn websocket_request(path: &str) -> Vec<u8> {
@@ -516,6 +617,58 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(vless_addr).expect("client connect");
+        client
+            .write_all(&vless_request(echo_addr))
+            .expect("client request");
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).expect("client response");
+        assert_eq!(response, [0x00, 0x00]);
+
+        client.write_all(b"ping").expect("client write payload");
+        let mut echoed = [0u8; 4];
+        client.read_exact(&mut echoed).expect("client read payload");
+        assert_eq!(&echoed, b"ping");
+        drop(client);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|vless|1");
+        assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn proxies_tls_and_records_user_traffic() {
+        let cert = test_cert("vless");
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vless bind");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vless accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            server_clone.handle_tls_client(client)
+        });
+
+        let mut client = tls_client(vless_addr, cert.cert_der.clone());
         client
             .write_all(&vless_request(echo_addr))
             .expect("client request");

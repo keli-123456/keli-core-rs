@@ -170,21 +170,23 @@ impl InboundConfig {
         }
         if self.protocol == Protocol::Vless {
             let network = self.transport.network.trim();
-            if !matches!(network, "tcp" | "ws") || self.tls.is_some() {
+            if !matches!(network, "tcp" | "ws") {
                 return Err(ValidationError::new(format!(
-                    "{} vless currently supports only plain tcp/ws without tls/reality",
+                    "{} vless currently supports only tcp/ws transport",
                     self.tag
                 )));
             }
+            validate_tls_config("vless", &self.tag, network, self.tls.as_ref())?;
         }
         if self.protocol == Protocol::Trojan {
             let network = self.transport.network.trim();
-            if !matches!(network, "tcp" | "ws") || self.tls.is_some() {
+            if !matches!(network, "tcp" | "ws") {
                 return Err(ValidationError::new(format!(
-                    "{} trojan currently supports only plain tcp/ws without tls",
+                    "{} trojan currently supports only tcp/ws transport",
                     self.tag
                 )));
             }
+            validate_tls_config("trojan", &self.tag, network, self.tls.as_ref())?;
         }
         if self.protocol == Protocol::Shadowsocks {
             let network = self.transport.network.trim();
@@ -232,6 +234,40 @@ impl InboundConfig {
 
         Ok(())
     }
+}
+
+fn validate_tls_config(
+    protocol: &str,
+    tag: &str,
+    network: &str,
+    tls: Option<&TlsConfig>,
+) -> Result<(), ValidationError> {
+    let Some(tls) = tls else {
+        return Ok(());
+    };
+    if network != "tcp" {
+        return Err(ValidationError::new(format!(
+            "{tag} {protocol} tls currently supports only tcp transport"
+        )));
+    }
+    if tls.reality.is_some() {
+        return Err(ValidationError::new(format!(
+            "{tag} {protocol} reality is not implemented in keli-core-rs yet"
+        )));
+    }
+    if tls.reject_unknown_sni {
+        return Err(ValidationError::new(format!(
+            "{tag} {protocol} reject_unknown_sni is not implemented in keli-core-rs yet"
+        )));
+    }
+    if tls.cert_file.as_deref().unwrap_or("").trim().is_empty()
+        || tls.key_file.as_deref().unwrap_or("").trim().is_empty()
+    {
+        return Err(ValidationError::new(format!(
+            "{tag} {protocol} tls requires cert_file and key_file"
+        )));
+    }
+    Ok(())
 }
 
 impl Default for TransportConfig {
@@ -332,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_vless_tls_until_data_path_supports_it() {
+    fn rejects_vless_tls_without_certificate_files() {
         let inbound = InboundConfig {
             tag: "panel|vless|1".to_string(),
             protocol: Protocol::Vless,
@@ -354,13 +390,13 @@ mod tests {
 
         let error = inbound
             .validate()
-            .expect_err("vless tls should not be accepted yet");
+            .expect_err("vless tls without certificate files should fail");
 
-        assert!(error.to_string().contains("plain tcp"));
+        assert!(error.to_string().contains("cert_file and key_file"));
     }
 
     #[test]
-    fn rejects_trojan_tls_until_data_path_supports_it() {
+    fn rejects_trojan_tls_without_certificate_files() {
         let inbound = InboundConfig {
             tag: "panel|trojan|1".to_string(),
             protocol: Protocol::Trojan,
@@ -382,9 +418,9 @@ mod tests {
 
         let error = inbound
             .validate()
-            .expect_err("trojan tls should not be accepted yet");
+            .expect_err("trojan tls without certificate files should fail");
 
-        assert!(error.to_string().contains("plain tcp"));
+        assert!(error.to_string().contains("cert_file and key_file"));
     }
 
     #[test]

@@ -15,6 +15,7 @@ use crate::limits::{UserBandwidthLimiters, UserSessionTracker};
 use crate::protocol::Protocol;
 use crate::shadowsocks::{ShadowsocksServer, ShadowsocksServerConfig};
 use crate::socks5::{Socks5Server, Socks5ServerConfig};
+use crate::tls::TlsAcceptor;
 use crate::traffic::{TrafficDelta, TrafficRegistry};
 use crate::trojan::{TrojanServer, TrojanServerConfig};
 use crate::vless::{VlessServer, VlessServerConfig};
@@ -376,6 +377,7 @@ fn start_trojan_listener(
     let workers_for_thread = workers.clone();
     let network = inbound.transport.network.trim().to_string();
     let websocket_path = inbound.transport.path.clone();
+    let tls_acceptor = tls_acceptor_for(inbound)?;
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -383,8 +385,13 @@ fn start_trojan_listener(
                     let server = server.clone();
                     let network = network.clone();
                     let websocket_path = websocket_path.clone();
+                    let tls_acceptor = tls_acceptor.clone();
                     let worker = thread::spawn(move || {
-                        let result = if network == "ws" {
+                        let result = if let Some(acceptor) = tls_acceptor {
+                            acceptor
+                                .accept(stream)
+                                .and_then(|client| server.handle_tls_client(client))
+                        } else if network == "ws" {
                             server.handle_websocket_client(stream, websocket_path.as_deref())
                         } else {
                             server.handle_tcp_client(stream)
@@ -464,6 +471,7 @@ fn start_vless_listener(
     let workers_for_thread = workers.clone();
     let network = inbound.transport.network.trim().to_string();
     let websocket_path = inbound.transport.path.clone();
+    let tls_acceptor = tls_acceptor_for(inbound)?;
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -471,8 +479,13 @@ fn start_vless_listener(
                     let server = server.clone();
                     let network = network.clone();
                     let websocket_path = websocket_path.clone();
+                    let tls_acceptor = tls_acceptor.clone();
                     let worker = thread::spawn(move || {
-                        let result = if network == "ws" {
+                        let result = if let Some(acceptor) = tls_acceptor {
+                            acceptor
+                                .accept(stream)
+                                .and_then(|client| server.handle_tls_client(client))
+                        } else if network == "ws" {
                             server.handle_websocket_client(stream, websocket_path.as_deref())
                         } else {
                             server.handle_tcp_client(stream)
@@ -672,6 +685,20 @@ fn join_workers(workers: &Arc<Mutex<Vec<JoinHandle<()>>>>) {
             None => break,
         }
     }
+}
+
+fn tls_acceptor_for(inbound: &InboundConfig) -> Result<Option<TlsAcceptor>, CoreServiceError> {
+    let Some(tls) = inbound.tls.as_ref() else {
+        return Ok(None);
+    };
+    let cert_file = tls.cert_file.as_deref().unwrap_or_default();
+    let key_file = tls.key_file.as_deref().unwrap_or_default();
+    TlsAcceptor::from_files(cert_file, key_file, &tls.alpn)
+        .map(Some)
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })
 }
 
 fn resolve_listen_addr(listen: &str, port: u16) -> io::Result<SocketAddr> {
