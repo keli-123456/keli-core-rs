@@ -39,6 +39,7 @@ pub struct RealityAuthConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RealityClientAuth {
     pub server_name: String,
+    pub auth_key: [u8; 32],
     pub client_version: [u8; 3],
     pub client_time: SystemTime,
     pub short_id: [u8; 8],
@@ -193,6 +194,7 @@ pub fn authenticate_reality_client_hello(
     if auth_key.as_bytes().iter().all(|byte| *byte == 0) {
         return Err(RealityAuthError::InvalidPrivateKey);
     }
+    let auth_key_bytes = *auth_key.as_bytes();
     let mut derived = [0u8; 32];
     Hkdf::<Sha256>::new(Some(&hello.random[..20]), auth_key.as_bytes())
         .expand(b"REALITY", &mut derived)
@@ -242,6 +244,7 @@ pub fn authenticate_reality_client_hello(
 
     Ok(RealityClientAuth {
         server_name: hello.server_name,
+        auth_key: auth_key_bytes,
         client_version,
         client_time,
         short_id,
@@ -921,6 +924,12 @@ mod tests {
         let auth = authenticate_reality_client_hello(&record, &config).expect("auth");
 
         assert_eq!(auth.server_name, "www.example.test");
+        assert_eq!(
+            auth.auth_key,
+            *server_secret
+                .diffie_hellman(&PublicKey::from(&client_secret))
+                .as_bytes()
+        );
         assert_eq!(auth.client_version, [1, 8, 23]);
         assert_eq!(auth.short_id, short_id);
     }
