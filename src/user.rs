@@ -34,14 +34,28 @@ pub struct UserStore {
 
 impl UserStore {
     pub fn from_uuid_users(users: &[CoreUser]) -> Self {
+        Self::from_keyed_users(users, |user| user.uuid.clone())
+    }
+
+    pub fn from_keyed_users<F>(users: &[CoreUser], key: F) -> Self
+    where
+        F: Fn(&CoreUser) -> String,
+    {
         Self {
-            users: Arc::new(RwLock::new(uuid_user_map(users))),
+            users: Arc::new(RwLock::new(keyed_user_map(users, key))),
         }
     }
 
     pub fn replace_uuid_users(&self, users: Vec<CoreUser>) {
+        self.replace_keyed_users(users, |user| user.uuid.clone());
+    }
+
+    pub fn replace_keyed_users<F>(&self, users: Vec<CoreUser>, key: F)
+    where
+        F: Fn(&CoreUser) -> String,
+    {
         let mut current = self.users.write().expect("user store lock poisoned");
-        *current = uuid_user_map(&users);
+        *current = keyed_user_map(&users, key);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -60,11 +74,14 @@ impl UserStore {
     }
 }
 
-fn uuid_user_map(users: &[CoreUser]) -> HashMap<String, CoreUser> {
+fn keyed_user_map<F>(users: &[CoreUser], key: F) -> HashMap<String, CoreUser>
+where
+    F: Fn(&CoreUser) -> String,
+{
     users
         .iter()
         .filter(|user| !user.is_empty())
-        .map(|user| (user.uuid.clone(), user.clone()))
+        .map(|user| (key(user), user.clone()))
         .collect()
 }
 

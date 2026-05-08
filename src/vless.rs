@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
@@ -14,7 +13,7 @@ use crate::socks5::SocksTarget;
 use crate::stream::{copy_count_best_effort_limited, relay_tcp_streams_limited};
 use crate::tls::{relay_tls_stream, TlsConnection, TlsSocket};
 use crate::traffic::TrafficRegistry;
-use crate::user::CoreUser;
+use crate::user::{CoreUser, UserStore};
 use crate::vision::{VisionDecoder, VisionEncoder, VisionReader, VisionWriter};
 use crate::websocket::{accept_websocket, accept_websocket_tls, relay_websocket_tls_stream};
 use crate::{
@@ -43,7 +42,7 @@ pub struct VlessServerConfig {
 #[derive(Clone, Debug)]
 pub struct VlessServer {
     config: VlessServerConfig,
-    users: Arc<HashMap<String, CoreUser>>,
+    users: UserStore,
     router: RouteMatcher,
     traffic: Arc<Mutex<TrafficRegistry>>,
     sessions: UserSessionTracker,
@@ -93,17 +92,11 @@ impl VlessServer {
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
-        let users = config
-            .users
-            .iter()
-            .filter(|user| !user.is_empty())
-            .map(|user| (compact_uuid(&user.uuid), user.clone()))
-            .collect::<HashMap<_, _>>();
-
+        let users = UserStore::from_keyed_users(&config.users, |user| compact_uuid(&user.uuid));
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,
-            users: Arc::new(users),
+            users,
             traffic,
             sessions,
             bandwidth,
@@ -119,8 +112,8 @@ impl VlessServer {
         let mut request = self.read_request(&mut client)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user, client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user);
+        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.command == VlessCommand::Udp {
             client.write_all(&[VERSION, 0x00])?;
             return self.relay_udp_stream(client, request, bandwidth);
@@ -180,8 +173,8 @@ impl VlessServer {
         let mut request = self.read_request(&mut reader)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user, client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user);
+        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.command == VlessCommand::Udp {
             writer.write_all(&[VERSION, 0x00])?;
             return self.relay_udp_split(reader, writer, request, bandwidth);
@@ -222,8 +215,8 @@ impl VlessServer {
         let mut request = self.read_request(&mut client)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user, client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user);
+        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.command == VlessCommand::Udp {
             client.write_all(&[VERSION, 0x00])?;
             return self.relay_udp_stream(client, request, bandwidth);
@@ -266,8 +259,8 @@ impl VlessServer {
         let mut request = self.read_request(&mut websocket)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user, client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user);
+        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.command == VlessCommand::Udp {
             websocket.write_all(&[VERSION, 0x00])?;
             return self.relay_udp_stream(websocket, request, bandwidth);
@@ -305,6 +298,11 @@ impl VlessServer {
             .lock()
             .expect("traffic registry lock poisoned")
             .drain_minimum(minimum_bytes)
+    }
+
+    pub fn replace_users(&self, users: Vec<CoreUser>) {
+        self.users
+            .replace_keyed_users(users, |user| compact_uuid(&user.uuid));
     }
 
     fn read_request<T>(&self, stream: &mut T) -> io::Result<VlessRequest>
@@ -681,7 +679,7 @@ impl VlessServer {
             );
     }
 
-    fn request_user(&self, request: &VlessRequest) -> Option<&CoreUser> {
+    fn request_user(&self, request: &VlessRequest) -> Option<CoreUser> {
         self.users.get(&request.user_key)
     }
 
@@ -1103,6 +1101,17 @@ mod tests {
         }
     }
 
+    fn user_b() -> CoreUser {
+        CoreUser {
+            id: 2,
+            uuid: "22222222-2222-2222-2222-222222222222".to_string(),
+            password: None,
+            email: None,
+            speed_limit: 0,
+            device_limit: 0,
+        }
+    }
+
     fn server() -> VlessServer {
         server_with_flow("")
     }
@@ -1135,8 +1144,17 @@ mod tests {
         flow: &str,
         command: u8,
     ) -> Vec<u8> {
+        vless_request_for_user_with_flow_and_command([0x11; 16], target, flow, command)
+    }
+
+    fn vless_request_for_user_with_flow_and_command(
+        user_id: [u8; 16],
+        target: std::net::SocketAddr,
+        flow: &str,
+        command: u8,
+    ) -> Vec<u8> {
         let mut input = vec![0x00];
-        input.extend_from_slice(&[0x11; 16]);
+        input.extend_from_slice(&user_id);
         if flow.is_empty() {
             input.push(0x00);
         } else {
@@ -1352,6 +1370,28 @@ mod tests {
             .expect_err("unknown user should fail");
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn replaces_users_without_rebuilding_vless_server() {
+        let server = server();
+        let target: std::net::SocketAddr = "127.0.0.1:443".parse().expect("addr");
+
+        server.replace_users(vec![user_b()]);
+
+        let mut old_stream = MemoryStream::new(vless_request(target));
+        let error = server
+            .read_request(&mut old_stream)
+            .expect_err("old user should fail after replacement");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let mut new_stream = MemoryStream::new(vless_request_for_user_with_flow_and_command(
+            [0x22; 16], target, "", 0x01,
+        ));
+        let request = server
+            .read_request(&mut new_stream)
+            .expect("new user should authenticate");
+        assert_eq!(request.user_uuid, "22222222-2222-2222-2222-222222222222");
     }
 
     #[test]

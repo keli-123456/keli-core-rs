@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
@@ -14,7 +13,7 @@ use crate::socks5::SocksTarget;
 use crate::stream::{copy_count_best_effort_limited, relay_tcp_streams_limited};
 use crate::tls::{relay_tls_stream, TlsConnection};
 use crate::traffic::TrafficRegistry;
-use crate::user::CoreUser;
+use crate::user::{CoreUser, UserStore};
 use crate::websocket::{accept_websocket, accept_websocket_tls, relay_websocket_tls_stream};
 use crate::{
     connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
@@ -40,7 +39,7 @@ pub struct TrojanServerConfig {
 #[derive(Clone, Debug)]
 pub struct TrojanServer {
     config: TrojanServerConfig,
-    users: Arc<HashMap<String, CoreUser>>,
+    users: UserStore,
     router: RouteMatcher,
     traffic: Arc<Mutex<TrafficRegistry>>,
     sessions: UserSessionTracker,
@@ -88,17 +87,13 @@ impl TrojanServer {
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
-        let users = config
-            .users
-            .iter()
-            .filter(|user| !user.is_empty())
-            .map(|user| (trojan_password_hash(user.credential()), user.clone()))
-            .collect::<HashMap<_, _>>();
-
+        let users = UserStore::from_keyed_users(&config.users, |user| {
+            trojan_password_hash(user.credential())
+        });
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,
-            users: Arc::new(users),
+            users,
             traffic,
             sessions,
             bandwidth,
@@ -114,8 +109,8 @@ impl TrojanServer {
         let mut request = self.read_request(&mut client)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user, client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user);
+        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.command == TrojanCommand::UdpAssociate {
             return self.relay_udp_stream(client, request, bandwidth);
         }
@@ -173,8 +168,8 @@ impl TrojanServer {
         let mut request = self.read_request(&mut reader)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user, client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user);
+        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.command == TrojanCommand::UdpAssociate {
             return self.relay_udp_split(reader, writer, request, bandwidth);
         }
@@ -210,8 +205,8 @@ impl TrojanServer {
         let mut request = self.read_request(&mut client)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user, client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user);
+        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.command == TrojanCommand::UdpAssociate {
             return self.relay_udp_stream(client, request, bandwidth);
         }
@@ -252,8 +247,8 @@ impl TrojanServer {
         let mut request = self.read_request(&mut websocket)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user, client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user);
+        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.command == TrojanCommand::UdpAssociate {
             return self.relay_udp_stream(websocket, request, bandwidth);
         }
@@ -289,6 +284,11 @@ impl TrojanServer {
             .lock()
             .expect("traffic registry lock poisoned")
             .drain_minimum(minimum_bytes)
+    }
+
+    pub fn replace_users(&self, users: Vec<CoreUser>) {
+        self.users
+            .replace_keyed_users(users, |user| trojan_password_hash(user.credential()));
     }
 
     fn read_request<T>(&self, stream: &mut T) -> io::Result<TrojanRequest>
@@ -603,7 +603,7 @@ impl TrojanServer {
             );
     }
 
-    fn request_user(&self, request: &TrojanRequest) -> Option<&CoreUser> {
+    fn request_user(&self, request: &TrojanRequest) -> Option<CoreUser> {
         self.users.get(&request.password_hash)
     }
 
@@ -824,6 +824,17 @@ mod tests {
         }
     }
 
+    fn user_b() -> CoreUser {
+        CoreUser {
+            id: 2,
+            uuid: "trojan-user-b".to_string(),
+            password: Some("secret-b".to_string()),
+            email: None,
+            speed_limit: 0,
+            device_limit: 0,
+        }
+    }
+
     fn server() -> TrojanServer {
         TrojanServer::new(TrojanServerConfig {
             node_tag: "panel|trojan|1".to_string(),
@@ -843,7 +854,15 @@ mod tests {
     }
 
     fn trojan_request_with_command(target: std::net::SocketAddr, command: u8) -> Vec<u8> {
-        let mut input = trojan_password_hash("trojan-password").into_bytes();
+        trojan_request_with_password_and_command(target, "trojan-password", command)
+    }
+
+    fn trojan_request_with_password_and_command(
+        target: std::net::SocketAddr,
+        password: &str,
+        command: u8,
+    ) -> Vec<u8> {
+        let mut input = trojan_password_hash(password).into_bytes();
         input.extend_from_slice(b"\r\n");
         input.push(command);
         input.push(0x01);
@@ -1040,6 +1059,28 @@ mod tests {
             .expect_err("unknown user should fail");
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn replaces_users_without_rebuilding_trojan_server() {
+        let server = server();
+        let target: std::net::SocketAddr = "127.0.0.1:443".parse().expect("addr");
+
+        server.replace_users(vec![user_b()]);
+
+        let mut old_stream = MemoryStream::new(trojan_request(target));
+        let error = server
+            .read_request(&mut old_stream)
+            .expect_err("old user should fail after replacement");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let mut new_stream = MemoryStream::new(trojan_request_with_password_and_command(
+            target, "secret-b", 0x01,
+        ));
+        let request = server
+            .read_request(&mut new_stream)
+            .expect("new user should authenticate");
+        assert_eq!(request.user_uuid, "trojan-user-b");
     }
 
     #[test]
