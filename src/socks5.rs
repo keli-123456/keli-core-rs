@@ -4,8 +4,10 @@ use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream,
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::limits::{UserSessionGuard, UserSessionTracker};
-use crate::stream::relay_tcp_streams;
+use crate::limits::{
+    BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
+};
+use crate::stream::relay_tcp_streams_limited;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 use crate::{RouteDecision, RouteMatcher};
@@ -45,6 +47,7 @@ pub struct Socks5Server {
     router: RouteMatcher,
     traffic: Arc<Mutex<TrafficRegistry>>,
     sessions: UserSessionTracker,
+    bandwidth: UserBandwidthLimiters,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,6 +62,20 @@ impl Socks5Server {
     }
 
     pub fn with_traffic(config: Socks5ServerConfig, traffic: Arc<Mutex<TrafficRegistry>>) -> Self {
+        Self::with_shared_limits(
+            config,
+            traffic,
+            UserSessionTracker::default(),
+            UserBandwidthLimiters::default(),
+        )
+    }
+
+    pub fn with_shared_limits(
+        config: Socks5ServerConfig,
+        traffic: Arc<Mutex<TrafficRegistry>>,
+        sessions: UserSessionTracker,
+        bandwidth: UserBandwidthLimiters,
+    ) -> Self {
         let users = config
             .users
             .iter()
@@ -71,7 +88,8 @@ impl Socks5Server {
             config,
             users: Arc::new(users),
             traffic,
-            sessions: UserSessionTracker::default(),
+            sessions,
+            bandwidth,
         }
     }
 
@@ -92,7 +110,9 @@ impl Socks5Server {
                 return Err(error);
             }
         };
-        let _session = self.acquire_user_session(&request, &mut client)?;
+        let user = self.request_user(&request);
+        let _session = self.acquire_user_session(user, &mut client)?;
+        let bandwidth = self.bandwidth.limiter_for(user);
         let remote = match self.router.decide(&request.target.host) {
             RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
             RouteDecision::Block => {
@@ -110,7 +130,7 @@ impl Socks5Server {
             }
         };
         write_socks5_response(&mut client, STATUS_SUCCESS)?;
-        self.relay(client, remote, request)
+        self.relay(client, remote, request, bandwidth)
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
@@ -259,8 +279,14 @@ impl Socks5Server {
         })
     }
 
-    fn relay(&self, client: TcpStream, remote: TcpStream, request: SocksRequest) -> io::Result<()> {
-        let (upload, download) = relay_tcp_streams(client, remote)?;
+    fn relay(
+        &self,
+        client: TcpStream,
+        remote: TcpStream,
+        request: SocksRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()> {
+        let (upload, download) = relay_tcp_streams_limited(client, remote, bandwidth)?;
         if let Some(user_uuid) = request.user_uuid {
             self.traffic
                 .lock()
@@ -270,15 +296,18 @@ impl Socks5Server {
         Ok(())
     }
 
-    fn acquire_user_session(
-        &self,
-        request: &SocksRequest,
-        client: &mut TcpStream,
-    ) -> io::Result<Option<UserSessionGuard>> {
-        let user = request
+    fn request_user(&self, request: &SocksRequest) -> Option<&CoreUser> {
+        request
             .user_uuid
             .as_deref()
-            .and_then(|uuid| self.users.get(uuid));
+            .and_then(|uuid| self.users.get(uuid))
+    }
+
+    fn acquire_user_session(
+        &self,
+        user: Option<&CoreUser>,
+        client: &mut TcpStream,
+    ) -> io::Result<Option<UserSessionGuard>> {
         match self.sessions.try_acquire(user) {
             Ok(guard) => Ok(guard),
             Err(error) => {

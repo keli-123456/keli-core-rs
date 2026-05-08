@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{CoreConfig, InboundConfig, ValidationError};
 use crate::http_proxy::{HttpProxyServer, HttpProxyServerConfig};
+use crate::limits::{UserBandwidthLimiters, UserSessionTracker};
 use crate::protocol::Protocol;
 use crate::socks5::{Socks5Server, Socks5ServerConfig};
 use crate::traffic::{TrafficDelta, TrafficRegistry};
@@ -68,16 +69,26 @@ impl CoreService {
         config.validate().map_err(CoreServiceError::InvalidConfig)?;
 
         let traffic = Arc::new(Mutex::new(TrafficRegistry::default()));
+        let sessions = UserSessionTracker::default();
+        let bandwidth = UserBandwidthLimiters::default();
         let mut listeners = Vec::new();
 
         for inbound in config.inbounds {
             let handle = match inbound.protocol {
-                Protocol::Socks => {
-                    start_socks_listener(&inbound, config.routes.clone(), traffic.clone())?
-                }
-                Protocol::Http => {
-                    start_http_listener(&inbound, config.routes.clone(), traffic.clone())?
-                }
+                Protocol::Socks => start_socks_listener(
+                    &inbound,
+                    config.routes.clone(),
+                    traffic.clone(),
+                    sessions.clone(),
+                    bandwidth.clone(),
+                )?,
+                Protocol::Http => start_http_listener(
+                    &inbound,
+                    config.routes.clone(),
+                    traffic.clone(),
+                    sessions.clone(),
+                    bandwidth.clone(),
+                )?,
                 _ => {
                     return Err(CoreServiceError::UnsupportedProtocol {
                         tag: inbound.tag,
@@ -130,6 +141,8 @@ fn start_socks_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
     traffic: Arc<Mutex<TrafficRegistry>>,
+    sessions: UserSessionTracker,
+    bandwidth: UserBandwidthLimiters,
 ) -> Result<ListenerHandle, CoreServiceError> {
     let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
         CoreServiceError::Bind {
@@ -137,7 +150,7 @@ fn start_socks_listener(
             source,
         }
     })?;
-    let server = Socks5Server::with_traffic(
+    let server = Socks5Server::with_shared_limits(
         Socks5ServerConfig {
             node_tag: inbound.tag.clone(),
             listen,
@@ -146,6 +159,8 @@ fn start_socks_listener(
             connect_timeout: Duration::from_secs(10),
         },
         traffic,
+        sessions,
+        bandwidth,
     );
     let listener = server.bind().map_err(|source| CoreServiceError::Bind {
         tag: inbound.tag.clone(),
@@ -205,6 +220,8 @@ fn start_http_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
     traffic: Arc<Mutex<TrafficRegistry>>,
+    sessions: UserSessionTracker,
+    bandwidth: UserBandwidthLimiters,
 ) -> Result<ListenerHandle, CoreServiceError> {
     let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
         CoreServiceError::Bind {
@@ -212,7 +229,7 @@ fn start_http_listener(
             source,
         }
     })?;
-    let server = HttpProxyServer::with_traffic(
+    let server = HttpProxyServer::with_shared_limits(
         HttpProxyServerConfig {
             node_tag: inbound.tag.clone(),
             listen,
@@ -221,6 +238,8 @@ fn start_http_listener(
             connect_timeout: Duration::from_secs(10),
         },
         traffic,
+        sessions,
+        bandwidth,
     );
     let listener = server.bind().map_err(|source| CoreServiceError::Bind {
         tag: inbound.tag.clone(),

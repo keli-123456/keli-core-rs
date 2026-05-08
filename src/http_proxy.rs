@@ -7,8 +7,10 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 
-use crate::limits::{UserSessionGuard, UserSessionTracker};
-use crate::stream::{copy_count_best_effort, relay_tcp_streams};
+use crate::limits::{
+    BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
+};
+use crate::stream::{copy_count_best_effort_limited, relay_tcp_streams_limited};
 use crate::traffic::{TrafficDelta, TrafficRegistry};
 use crate::user::CoreUser;
 use crate::{RouteDecision, RouteMatcher};
@@ -29,6 +31,7 @@ pub struct HttpProxyServer {
     router: RouteMatcher,
     traffic: Arc<Mutex<TrafficRegistry>>,
     sessions: UserSessionTracker,
+    bandwidth: UserBandwidthLimiters,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +59,20 @@ impl HttpProxyServer {
         config: HttpProxyServerConfig,
         traffic: Arc<Mutex<TrafficRegistry>>,
     ) -> Self {
+        Self::with_shared_limits(
+            config,
+            traffic,
+            UserSessionTracker::default(),
+            UserBandwidthLimiters::default(),
+        )
+    }
+
+    pub fn with_shared_limits(
+        config: HttpProxyServerConfig,
+        traffic: Arc<Mutex<TrafficRegistry>>,
+        sessions: UserSessionTracker,
+        bandwidth: UserBandwidthLimiters,
+    ) -> Self {
         let users = config
             .users
             .iter()
@@ -68,7 +85,8 @@ impl HttpProxyServer {
             config,
             users: Arc::new(users),
             traffic,
-            sessions: UserSessionTracker::default(),
+            sessions,
+            bandwidth,
         }
     }
 
@@ -91,11 +109,13 @@ impl HttpProxyServer {
             }
             Err(error) => return Err(error),
         };
-        let _session = self.acquire_user_session(&request, &mut client)?;
+        let user = self.request_user(&request);
+        let _session = self.acquire_user_session(user, &mut client)?;
+        let bandwidth = self.bandwidth.limiter_for(user);
         if request.method.eq_ignore_ascii_case("CONNECT") {
-            self.handle_connect(client, request)
+            self.handle_connect(client, request, bandwidth)
         } else {
-            self.handle_plain_http(&mut client, request)
+            self.handle_plain_http(&mut client, request, bandwidth)
         }
     }
 
@@ -179,12 +199,17 @@ impl HttpProxyServer {
         }
     }
 
-    fn handle_connect(&self, mut client: TcpStream, request: HttpProxyRequest) -> io::Result<()> {
+    fn handle_connect(
+        &self,
+        mut client: TcpStream,
+        request: HttpProxyRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()> {
         let target = parse_authority(&request.target, 443)?;
         self.ensure_route_allowed(&target)?;
         client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
         let remote = connect_target(&target, self.config.connect_timeout)?;
-        let (upload, download) = relay_tcp_streams(client, remote)?;
+        let (upload, download) = relay_tcp_streams_limited(client, remote, bandwidth)?;
         self.record_traffic(request.user_uuid, upload, download);
         Ok(())
     }
@@ -193,6 +218,7 @@ impl HttpProxyServer {
         &self,
         client: &mut TcpStream,
         request: HttpProxyRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
         let target = parse_plain_http_target(&request)?;
         if let Err(error) = self.ensure_route_allowed(&target) {
@@ -201,9 +227,12 @@ impl HttpProxyServer {
         }
         let mut remote = connect_target(&target, self.config.connect_timeout)?;
         let outbound = render_plain_http_request(&request, &target)?;
+        if let Some(limiter) = bandwidth.as_deref() {
+            limiter.wait_for(outbound.len());
+        }
         remote.write_all(&outbound)?;
         let upload = outbound.len() as u64;
-        let download = copy_count_best_effort(&mut remote, client);
+        let download = copy_count_best_effort_limited(&mut remote, client, bandwidth.as_deref());
         self.record_traffic(request.user_uuid, upload, download);
         Ok(())
     }
@@ -233,13 +262,9 @@ impl HttpProxyServer {
 
     fn acquire_user_session(
         &self,
-        request: &HttpProxyRequest,
+        user: Option<&CoreUser>,
         client: &mut TcpStream,
     ) -> io::Result<Option<UserSessionGuard>> {
-        let user = request
-            .user_uuid
-            .as_deref()
-            .and_then(|uuid| self.users.get(uuid));
         match self.sessions.try_acquire(user) {
             Ok(guard) => Ok(guard),
             Err(error) => {
@@ -250,6 +275,13 @@ impl HttpProxyServer {
                 ))
             }
         }
+    }
+
+    fn request_user(&self, request: &HttpProxyRequest) -> Option<&CoreUser> {
+        request
+            .user_uuid
+            .as_deref()
+            .and_then(|uuid| self.users.get(uuid))
     }
 }
 
