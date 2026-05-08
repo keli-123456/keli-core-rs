@@ -9,6 +9,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
+use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
 use sha2::{Sha256, Sha512};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -84,6 +85,15 @@ pub struct RealityCertificateSignature {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RealityTemporaryCertificate {
+    pub certificate_der: Vec<u8>,
+    pub private_key_der: Vec<u8>,
+    pub subject_public_key_info_der: Vec<u8>,
+    pub ed25519_public_key: [u8; 32],
+    pub reality_signature: [u8; 64],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RealityGatewayConfig {
     pub auth: RealityAuthConfig,
     pub dest: String,
@@ -122,6 +132,7 @@ pub enum RealityAuthError {
     AuthenticationFailed,
     TimeDiffExceeded,
     ShortIdMismatch([u8; 8]),
+    CertificateGenerationFailed(String),
 }
 
 impl fmt::Display for RealityAuthError {
@@ -150,6 +161,12 @@ impl fmt::Display for RealityAuthError {
                     formatter,
                     "reality short_id mismatch: {}",
                     short_id_hex(short_id)
+                )
+            }
+            RealityAuthError::CertificateGenerationFailed(message) => {
+                write!(
+                    formatter,
+                    "reality certificate generation failed: {message}"
                 )
             }
         }
@@ -431,6 +448,33 @@ pub fn verify_reality_certificate_public_key(
 ) -> bool {
     let expected = reality_certificate_signature(auth_key, ed25519_public_key);
     constant_time_eq(signature, &expected)
+}
+
+pub fn generate_reality_temporary_certificate(
+    auth_key: &[u8; 32],
+    server_name: &str,
+) -> Result<RealityTemporaryCertificate, RealityAuthError> {
+    let server_name = server_name.trim();
+    if server_name.is_empty() {
+        return Err(RealityAuthError::CertificateGenerationFailed(
+            "server_name is required".to_string(),
+        ));
+    }
+    let key_pair = KeyPair::generate_for(&PKCS_ED25519).map_err(reality_cert_error)?;
+    let subject_public_key_info_der = key_pair.public_key_der();
+    let ed25519_public_key = extract_ed25519_public_key(&subject_public_key_info_der)?;
+    let params =
+        CertificateParams::new(vec![server_name.to_string()]).map_err(reality_cert_error)?;
+    let certificate = params.self_signed(&key_pair).map_err(reality_cert_error)?;
+    let reality_signature = reality_certificate_signature(auth_key, &ed25519_public_key);
+
+    Ok(RealityTemporaryCertificate {
+        certificate_der: certificate.der().as_ref().to_vec(),
+        private_key_der: key_pair.serialize_der(),
+        subject_public_key_info_der,
+        ed25519_public_key,
+        reality_signature,
+    })
 }
 
 impl PrefixedTcpStream {
@@ -785,6 +829,24 @@ fn reality_certificate_signature(auth_key: &[u8; 32], ed25519_public_key: &[u8])
     hmac.finalize().into_bytes().into()
 }
 
+fn extract_ed25519_public_key(input: &[u8]) -> Result<[u8; 32], RealityAuthError> {
+    const ED25519_SPKI_PREFIX: &[u8] = &[
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    if input.len() != ED25519_SPKI_PREFIX.len() + 32 || !input.starts_with(ED25519_SPKI_PREFIX) {
+        return Err(RealityAuthError::CertificateGenerationFailed(
+            "temporary certificate key is not Ed25519".to_string(),
+        ));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&input[ED25519_SPKI_PREFIX.len()..]);
+    Ok(key)
+}
+
+fn reality_cert_error(error: rcgen::Error) -> RealityAuthError {
+    RealityAuthError::CertificateGenerationFailed(error.to_string())
+}
+
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -925,8 +987,9 @@ mod tests {
 
     use crate::reality::{
         authenticate_reality_client_hello, decode_reality_private_key, decode_short_id,
-        handle_reality_preface, parse_reality_dest_handshake, parse_reality_server_hello,
-        parse_tls_records, sign_reality_certificate_public_key, validate_reality_server_hello,
+        generate_reality_temporary_certificate, handle_reality_preface,
+        parse_reality_dest_handshake, parse_reality_server_hello, parse_tls_records,
+        sign_reality_certificate_public_key, validate_reality_server_hello,
         verify_reality_certificate_public_key, RealityAuthConfig, RealityAuthError,
         RealityGatewayConfig, RealityGatewayResult,
     };
@@ -1176,6 +1239,28 @@ mod tests {
             &auth_key,
             &[0x7b; 32],
             &signature.signature
+        ));
+    }
+
+    #[test]
+    fn generates_reality_temporary_certificate_material() {
+        let auth_key = [0x42u8; 32];
+
+        let certificate = generate_reality_temporary_certificate(&auth_key, "www.example.test")
+            .expect("temporary certificate");
+
+        assert!(!certificate.certificate_der.is_empty());
+        assert!(!certificate.private_key_der.is_empty());
+        assert!(!certificate.subject_public_key_info_der.is_empty());
+        assert!(verify_reality_certificate_public_key(
+            &auth_key,
+            &certificate.ed25519_public_key,
+            &certificate.reality_signature
+        ));
+        assert!(!verify_reality_certificate_public_key(
+            &[0x24; 32],
+            &certificate.ed25519_public_key,
+            &certificate.reality_signature
         ));
     }
 
