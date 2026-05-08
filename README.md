@@ -26,6 +26,7 @@ Implemented in this first skeleton:
 - Traffic registry with minimum-threshold draining.
 - Runtime planning with deterministic config fingerprints.
 - Apply/noop reload decisions wired to real listener startup.
+- User-only config changes hot-update active listener user tables without rebinding ports.
 - Transport-neutral control commands for apply config, drain traffic, status, and stop.
 - SOCKS5 TCP CONNECT inbound with username/password authentication.
 - Per-user SOCKS5 TCP upload/download accounting.
@@ -56,7 +57,6 @@ Not implemented yet:
 - REALITY ML-DSA-65 certificate signing.
 - Advanced DNS/routing execution and custom outbounds.
 - Realtime integration.
-- Hot user patching.
 - Production packaging, release artifacts, and performance profiles.
 
 The code-level protocol and runtime parity gate is tracked in `docs/PARITY.md`.

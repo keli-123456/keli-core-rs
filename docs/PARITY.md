@@ -66,7 +66,7 @@ keliboard -> kelinode-rs -> keli-core-rs
 | Capability | Status | Notes |
 | --- | --- | --- |
 | Config schema and validation | Code path | Unsupported protocols and options should fail early. |
-| Listener apply/noop fingerprinting | Code path | Runtime planning is deterministic. |
+| Listener apply/noop/update fingerprinting | Code path | Runtime planning is deterministic; user-only changes patch active listeners without rebinding ports. |
 | Local control socket | Code path | Status, stop, and traffic drain commands exist. |
 | Per-user traffic accounting | Code path | Uses Go-compatible `<node-tag>|<user-uuid>` keys. |
 | Per-user device limit | Code path | Enforced by shared session tracker for native listeners; concurrent sessions from the same client IP count as one device. |
@@ -75,7 +75,7 @@ keliboard -> kelinode-rs -> keli-core-rs
 | Block routing | Code path | Exact/wildcard/suffix, `domain:`/`full:`/`keyword:`, `regexp:`, `geosite:`, numeric IP/CIDR, `geoip:`, port/range, `network:`, and `protocol:` matching. |
 | Custom outbound routing | Partial | Freedom outbounds render and execute, including optional `address`/`port` redirects. SOCKS5 and HTTP outbounds render and execute for TCP routes, including username/password. SOCKS5 outbounds also execute UDP routes through UDP ASSOCIATE; HTTP UDP remains rejected. |
 | DNS execution | Partial | Native core accepts DNS server config, selects servers by domain route rules, and resolves direct TCP/UDP targets through UDP or `tcp://` DNS with `UseIPv4` default. DoH/DoT and cache policy are not implemented yet. |
-| Hot user patching | Rejected | Requires runtime user table update without full core reload. |
+| Hot user patching | Code path | `ApplyConfig` returns `updated` for user-only changes and replaces protocol user tables in-place. |
 | Realtime integration | Rejected | Belongs first in `kelinode-rs` runtime control. |
 | Production packaging | Rejected | Release profile exists, but artifacts/signing/install flow are not complete. |
 

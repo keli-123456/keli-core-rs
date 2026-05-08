@@ -12,7 +12,7 @@ It should not know how to call `keliboard` directly. Panel contracts belong in `
 
 The runtime boundary turns a validated config into an active data plane.
 
-The current implementation only tracks fingerprints and reload decisions. Future stages will attach real listeners and protocol workers behind the same boundary.
+The runtime tracks config fingerprints, starts real listeners for implemented protocols, and can apply user-only updates to active listener user tables without rebinding ports.
 
 ## Control Boundary
 
@@ -23,7 +23,7 @@ The control boundary accepts transport-neutral commands:
 - Read status.
 - Stop.
 
-`ApplyConfig` now starts the real `CoreService` for implemented protocols. This lets `kelinode-rs` later use an in-process adapter, a Unix socket, or another local transport without changing the core model.
+`ApplyConfig` starts the real `CoreService` for implemented protocols. If only inbound users change, it returns `updated` and patches the existing listeners in place; otherwise it reloads the service. This lets `kelinode-rs` later use an in-process adapter, a Unix socket, or another local transport without changing the core model.
 
 The binary also exposes a minimal process boundary:
 
