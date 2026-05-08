@@ -139,6 +139,7 @@ mod tests {
                     device_limit: 0,
                 }],
                 cipher: None,
+                flow: String::new(),
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),

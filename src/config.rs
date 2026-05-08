@@ -26,6 +26,8 @@ pub struct InboundConfig {
     pub users: Vec<CoreUser>,
     #[serde(default)]
     pub cipher: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub flow: String,
     pub transport: TransportConfig,
     pub tls: Option<TlsConfig>,
     pub sniffing: SniffingConfig,
@@ -178,6 +180,7 @@ impl InboundConfig {
                 self.tag
             )));
         }
+        self.validate_flow()?;
         if self.protocol == Protocol::Vless {
             let network = self.transport.network.trim();
             if !matches!(network, "tcp" | "ws" | "httpupgrade" | "grpc") {
@@ -299,6 +302,39 @@ impl InboundConfig {
             validate_hysteria2_obfs(&self.tag, &self.transport)?;
         }
 
+        Ok(())
+    }
+
+    fn validate_flow(&self) -> Result<(), ValidationError> {
+        let flow = self.flow.trim();
+        if flow.is_empty() {
+            return Ok(());
+        }
+        if self.protocol != Protocol::Vless {
+            return Err(ValidationError::new(format!(
+                "{} flow {flow} is supported only for vless",
+                self.tag
+            )));
+        }
+        if flow != "xtls-rprx-vision" {
+            return Err(ValidationError::new(format!(
+                "{} vless flow {flow} is not supported",
+                self.tag
+            )));
+        }
+        let network = self.transport.network.trim();
+        if network != "tcp" {
+            return Err(ValidationError::new(format!(
+                "{} vless vision currently requires tcp transport",
+                self.tag
+            )));
+        }
+        if self.tls.is_none() {
+            return Err(ValidationError::new(format!(
+                "{} vless vision requires tls",
+                self.tag
+            )));
+        }
         Ok(())
     }
 }
@@ -462,6 +498,7 @@ mod tests {
                 port: 443,
                 users: vec![user()],
                 cipher: None,
+                flow: String::new(),
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),
@@ -496,6 +533,7 @@ mod tests {
                 port: 443,
                 users: vec![user()],
                 cipher: None,
+                flow: String::new(),
                 transport: TransportConfig {
                     network: network.to_string(),
                     path: Some("/edge".to_string()),
@@ -520,6 +558,7 @@ mod tests {
             port: 443,
             users: vec![user()],
             cipher: None,
+            flow: String::new(),
             transport: TransportConfig::default(),
             tls: None,
             sniffing: SniffingConfig::default(),
@@ -537,6 +576,7 @@ mod tests {
             port: 443,
             users: vec![user()],
             cipher: None,
+            flow: String::new(),
             transport: TransportConfig::default(),
             tls: Some(TlsConfig {
                 server_name: "example.com".to_string(),
@@ -565,6 +605,7 @@ mod tests {
             port: 443,
             users: vec![user()],
             cipher: None,
+            flow: String::new(),
             transport: TransportConfig::default(),
             tls: Some(TlsConfig {
                 server_name: "example.com".to_string(),
@@ -585,6 +626,35 @@ mod tests {
     }
 
     #[test]
+    fn validates_vless_vision_flow_only_for_tcp_tls() {
+        let mut inbound = InboundConfig {
+            tag: "panel|vless|1".to_string(),
+            protocol: Protocol::Vless,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![user()],
+            cipher: None,
+            flow: "xtls-rprx-vision".to_string(),
+            transport: TransportConfig::default(),
+            tls: Some(TlsConfig {
+                server_name: "example.com".to_string(),
+                cert_file: Some("/tmp/cert.pem".to_string()),
+                key_file: Some("/tmp/key.pem".to_string()),
+                alpn: Vec::new(),
+                reject_unknown_sni: false,
+                reality: None,
+            }),
+            sniffing: SniffingConfig::default(),
+        };
+
+        inbound.validate().expect("vless vision tcp tls");
+
+        inbound.transport.network = "ws".to_string();
+        let error = inbound.validate().expect_err("vless vision ws should fail");
+        assert!(error.to_string().contains("requires tcp transport"));
+    }
+
+    #[test]
     fn rejects_shadowsocks_without_cipher() {
         let inbound = InboundConfig {
             tag: "panel|shadowsocks|1".to_string(),
@@ -593,6 +663,7 @@ mod tests {
             port: 8388,
             users: vec![user()],
             cipher: None,
+            flow: String::new(),
             transport: TransportConfig::default(),
             tls: None,
             sniffing: SniffingConfig::default(),
@@ -614,6 +685,7 @@ mod tests {
             port: 8443,
             users: Vec::new(),
             cipher: None,
+            flow: String::new(),
             transport: TransportConfig::default(),
             tls: None,
             sniffing: SniffingConfig::default(),

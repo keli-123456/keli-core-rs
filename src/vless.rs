@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -13,6 +13,7 @@ use crate::stream::{copy_count_best_effort_limited, relay_tcp_streams_limited};
 use crate::tls::{relay_tls_stream, TlsConnection};
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
+use crate::vision::{VisionDecoder, VisionEncoder, VisionReader, VisionWriter};
 use crate::websocket::{accept_websocket, accept_websocket_tls, relay_websocket_tls_stream};
 use crate::{RouteDecision, RouteMatcher};
 
@@ -21,6 +22,7 @@ const COMMAND_TCP: u8 = 0x01;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x02;
 const ATYP_IPV6: u8 = 0x03;
+const FLOW_XTLS_RPRX_VISION: &str = "xtls-rprx-vision";
 
 #[derive(Clone, Debug)]
 pub struct VlessServerConfig {
@@ -28,6 +30,7 @@ pub struct VlessServerConfig {
     pub listen: SocketAddr,
     pub users: Vec<CoreUser>,
     pub routes: Vec<crate::RouteRule>,
+    pub flow: String,
     pub connect_timeout: Duration,
 }
 
@@ -45,6 +48,8 @@ pub struct VlessServer {
 struct VlessRequest {
     user_key: String,
     user_uuid: String,
+    user_id: [u8; 16],
+    flow: String,
     target: SocksTarget,
 }
 
@@ -228,11 +233,8 @@ impl VlessServer {
             ));
         };
 
-        let addon_len = read_u8(stream)?;
-        if addon_len > 0 {
-            let mut addon = vec![0u8; usize::from(addon_len)];
-            stream.read_exact(&mut addon)?;
-        }
+        let flow = self.read_addon_flow(stream)?;
+        self.validate_request_flow(&flow)?;
 
         let command = read_u8(stream)?;
         if command != COMMAND_TCP {
@@ -271,8 +273,43 @@ impl VlessServer {
         Ok(VlessRequest {
             user_key,
             user_uuid: user.uuid.clone(),
+            user_id: uuid,
+            flow,
             target: SocksTarget { host, port },
         })
+    }
+
+    fn read_addon_flow<T>(&self, stream: &mut T) -> io::Result<String>
+    where
+        T: Read,
+    {
+        let addon_len = read_u8(stream)?;
+        if addon_len == 0 {
+            return Ok(String::new());
+        }
+        let mut addon = vec![0u8; usize::from(addon_len)];
+        stream.read_exact(&mut addon)?;
+        parse_addon_flow(&addon)
+    }
+
+    fn validate_request_flow(&self, request_flow: &str) -> io::Result<()> {
+        let configured_flow = self.config.flow.trim();
+        match (configured_flow, request_flow.trim()) {
+            ("", "") => Ok(()),
+            (FLOW_XTLS_RPRX_VISION, FLOW_XTLS_RPRX_VISION) => Ok(()),
+            ("", FLOW_XTLS_RPRX_VISION) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "vless account is not allowed to use xtls-rprx-vision",
+            )),
+            (FLOW_XTLS_RPRX_VISION, "") => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "vless vision account requires xtls-rprx-vision flow",
+            )),
+            (_, flow) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported vless flow {flow}"),
+            )),
+        }
     }
 
     fn relay(
@@ -282,7 +319,11 @@ impl VlessServer {
         request: VlessRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
-        let (upload, download) = relay_tcp_streams_limited(client, remote, bandwidth)?;
+        let (upload, download) = if request.flow == FLOW_XTLS_RPRX_VISION {
+            relay_vision_tcp_streams(client, remote, request.user_id, bandwidth)?
+        } else {
+            relay_tcp_streams_limited(client, remote, bandwidth)?
+        };
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
@@ -307,20 +348,25 @@ impl VlessServer {
         R: Read + Send + 'static,
         W: Write,
     {
-        let mut remote_write = remote.try_clone()?;
-        let mut remote_read = remote;
-        let upload_limiter = bandwidth.clone();
-        let upload_thread = thread::spawn(move || {
-            copy_count_best_effort_limited(
-                &mut reader,
-                &mut remote_write,
-                upload_limiter.as_deref(),
-            )
-        });
-        let download = copy_count_best_effort_limited(&mut remote_read, &mut writer, None);
-        let upload = upload_thread
-            .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "upload relay thread panicked"))?;
+        let (upload, download) = if request.flow == FLOW_XTLS_RPRX_VISION {
+            relay_vision_split_streams(reader, writer, remote, request.user_id, bandwidth)?
+        } else {
+            let mut remote_write = remote.try_clone()?;
+            let mut remote_read = remote;
+            let upload_limiter = bandwidth.clone();
+            let upload_thread = thread::spawn(move || {
+                copy_count_best_effort_limited(
+                    &mut reader,
+                    &mut remote_write,
+                    upload_limiter.as_deref(),
+                )
+            });
+            let download = copy_count_best_effort_limited(&mut remote_read, &mut writer, None);
+            let upload = upload_thread.join().map_err(|_| {
+                io::Error::new(io::ErrorKind::Other, "upload relay thread panicked")
+            })?;
+            (upload, download)
+        };
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
@@ -340,7 +386,11 @@ impl VlessServer {
         request: VlessRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
-        let (upload, download) = relay_tls_stream(client, remote, bandwidth)?;
+        let (upload, download) = if request.flow == FLOW_XTLS_RPRX_VISION {
+            relay_tls_vision_stream(client, remote, request.user_id, bandwidth)?
+        } else {
+            relay_tls_stream(client, remote, bandwidth)?
+        };
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
@@ -408,6 +458,154 @@ fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStre
     }))
 }
 
+fn relay_vision_tcp_streams(
+    client: TcpStream,
+    remote: TcpStream,
+    user_id: [u8; 16],
+    limiter: Option<Arc<BandwidthLimiter>>,
+) -> io::Result<(u64, u64)> {
+    let client_reader = client.try_clone()?;
+    let client_writer = client;
+    relay_vision_split_streams(client_reader, client_writer, remote, user_id, limiter)
+}
+
+fn relay_vision_split_streams<R, W>(
+    reader: R,
+    writer: W,
+    remote: TcpStream,
+    user_id: [u8; 16],
+    limiter: Option<Arc<BandwidthLimiter>>,
+) -> io::Result<(u64, u64)>
+where
+    R: Read + Send + 'static,
+    W: Write,
+{
+    let mut remote_write = remote.try_clone()?;
+    let mut remote_read = remote;
+    let upload_limiter = limiter.clone();
+    let upload_thread = thread::spawn(move || {
+        let mut vision_reader = VisionReader::new(reader, user_id);
+        let bytes = copy_count_best_effort_limited(
+            &mut vision_reader,
+            &mut remote_write,
+            upload_limiter.as_deref(),
+        );
+        let _ = remote_write.shutdown(Shutdown::Write);
+        bytes
+    });
+
+    let mut vision_writer = VisionWriter::new(writer, user_id);
+    let download = copy_count_best_effort_limited(&mut remote_read, &mut vision_writer, None);
+    let upload = upload_thread
+        .join()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "upload relay thread panicked"))?;
+
+    Ok((upload, download))
+}
+
+fn relay_tls_vision_stream(
+    mut client: TlsConnection,
+    mut remote: TcpStream,
+    user_id: [u8; 16],
+    limiter: Option<Arc<BandwidthLimiter>>,
+) -> io::Result<(u64, u64)> {
+    client.set_nonblocking(true)?;
+    remote.set_nonblocking(true)?;
+
+    let mut upload = 0u64;
+    let mut download = 0u64;
+    let mut upload_done = false;
+    let mut download_done = false;
+    let mut client_buffer = [0u8; 16 * 1024];
+    let mut remote_buffer = [0u8; 16 * 1024];
+    let mut vision_decoder = VisionDecoder::new(user_id);
+    let mut vision_encoder = VisionEncoder::new(user_id);
+
+    while !upload_done || !download_done {
+        let mut progressed = false;
+
+        if !upload_done {
+            let decoded = vision_decoder.read_decoded(&mut client_buffer)?;
+            if decoded > 0 {
+                if let Some(limiter) = limiter.as_deref() {
+                    limiter.wait_for(decoded);
+                }
+                write_all_wait(&mut remote, &client_buffer[..decoded])?;
+                upload = upload.saturating_add(decoded as u64);
+                progressed = true;
+            } else {
+                match client.read(&mut client_buffer) {
+                    Ok(0) => {
+                        upload_done = true;
+                        vision_decoder.finish();
+                        let _ = remote.shutdown(Shutdown::Write);
+                        progressed = true;
+                    }
+                    Ok(read) => {
+                        vision_decoder.push(&client_buffer[..read]);
+                        progressed = true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        upload_done = true;
+                        let _ = remote.shutdown(Shutdown::Write);
+                        progressed = true;
+                    }
+                }
+            }
+        }
+
+        if !download_done {
+            match remote.read(&mut remote_buffer) {
+                Ok(0) => {
+                    download_done = true;
+                    let _ = client.close_notify_wait();
+                    progressed = true;
+                }
+                Ok(read) => {
+                    let encoded = vision_encoder.encode(&remote_buffer[..read]);
+                    client.write_plain_all_wait(&encoded)?;
+                    download = download.saturating_add(read as u64);
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    download_done = true;
+                    let _ = client.close_notify_wait();
+                    progressed = true;
+                }
+            }
+        }
+
+        if !progressed {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    let _ = client.shutdown(Shutdown::Both);
+    let _ = remote.shutdown(Shutdown::Both);
+    Ok((upload, download))
+}
+
+fn write_all_wait(writer: &mut TcpStream, mut input: &[u8]) -> io::Result<()> {
+    while !input.is_empty() {
+        match writer.write(input) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "socket write returned zero",
+                ));
+            }
+            Ok(written) => input = &input[written..],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 fn read_u8<R: Read>(reader: &mut R) -> io::Result<u8> {
     let mut byte = [0u8; 1];
     reader.read_exact(&mut byte)?;
@@ -419,6 +617,75 @@ fn read_string<R: Read>(reader: &mut R, len: usize) -> io::Result<String> {
     reader.read_exact(&mut bytes)?;
     String::from_utf8(bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8"))
+}
+
+fn parse_addon_flow(addon: &[u8]) -> io::Result<String> {
+    let mut index = 0usize;
+    let mut flow = String::new();
+    while index < addon.len() {
+        let key = read_varint(addon, &mut index)?;
+        let field = key >> 3;
+        let wire_type = key & 0x07;
+        match (field, wire_type) {
+            (1, 2) => {
+                let len = read_varint(addon, &mut index)? as usize;
+                if index + len > addon.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "vless addon flow is truncated",
+                    ));
+                }
+                flow = String::from_utf8(addon[index..index + len].to_vec()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "vless addon flow is invalid utf-8",
+                    )
+                })?;
+                index += len;
+            }
+            (_, 0) => {
+                let _ = read_varint(addon, &mut index)?;
+            }
+            (_, 2) => {
+                let len = read_varint(addon, &mut index)? as usize;
+                if index + len > addon.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "vless addon field is truncated",
+                    ));
+                }
+                index += len;
+            }
+            (_, wire_type) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported vless addon wire type {wire_type}"),
+                ));
+            }
+        }
+    }
+    Ok(flow)
+}
+
+fn read_varint(input: &[u8], index: &mut usize) -> io::Result<u64> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    while *index < input.len() {
+        let byte = input[*index];
+        *index += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+        if shift >= 64 {
+            break;
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "vless addon varint is truncated",
+    ))
 }
 
 fn compact_uuid(value: &str) -> String {
@@ -461,6 +728,7 @@ mod tests {
 
     use crate::tls::TlsAcceptor;
     use crate::user::CoreUser;
+    use crate::vision::{VisionReader, VisionWriter};
     use crate::vless::{VlessServer, VlessServerConfig};
 
     struct MemoryStream {
@@ -493,19 +761,37 @@ mod tests {
     }
 
     fn server() -> VlessServer {
+        server_with_flow("")
+    }
+
+    fn server_with_flow(flow: &str) -> VlessServer {
         VlessServer::new(VlessServerConfig {
             node_tag: "panel|vless|1".to_string(),
             listen: "127.0.0.1:0".parse().expect("listen addr"),
             users: vec![user()],
             routes: Vec::new(),
+            flow: flow.to_string(),
             connect_timeout: Duration::from_secs(3),
         })
     }
 
     fn vless_request(target: std::net::SocketAddr) -> Vec<u8> {
+        vless_request_with_flow(target, "")
+    }
+
+    fn vless_request_with_flow(target: std::net::SocketAddr, flow: &str) -> Vec<u8> {
         let mut input = vec![0x00];
         input.extend_from_slice(&[0x11; 16]);
-        input.push(0x00);
+        if flow.is_empty() {
+            input.push(0x00);
+        } else {
+            let flow = flow.as_bytes();
+            let addon_len = 2 + flow.len();
+            input.push(addon_len as u8);
+            input.push(0x0a);
+            input.push(flow.len() as u8);
+            input.extend_from_slice(flow);
+        }
         input.push(0x01);
         input.extend_from_slice(&target.port().to_be_bytes());
         input.push(0x01);
@@ -640,6 +926,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_vless_addon_flow() {
+        let flow = super::parse_addon_flow(&[
+            0x0a, 0x10, b'x', b't', b'l', b's', b'-', b'r', b'p', b'r', b'x', b'-', b'v', b'i',
+            b's', b'i', b'o', b'n',
+        ])
+        .expect("addon flow");
+
+        assert_eq!(flow, "xtls-rprx-vision");
+    }
+
+    #[test]
+    fn accepts_matching_vless_vision_flow() {
+        let server = server_with_flow("xtls-rprx-vision");
+        let target: std::net::SocketAddr = "127.0.0.1:443".parse().expect("addr");
+        let mut stream = MemoryStream::new(vless_request_with_flow(target, "xtls-rprx-vision"));
+
+        let request = server.read_request(&mut stream).expect("request");
+
+        assert_eq!(request.flow, "xtls-rprx-vision");
+        assert_eq!(request.user_id, [0x11; 16]);
+    }
+
+    #[test]
+    fn rejects_missing_vless_vision_flow() {
+        let server = server_with_flow("xtls-rprx-vision");
+        let target: std::net::SocketAddr = "127.0.0.1:443".parse().expect("addr");
+        let mut stream = MemoryStream::new(vless_request(target));
+
+        let error = server
+            .read_request(&mut stream)
+            .expect_err("missing flow should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
     fn rejects_unknown_vless_user() {
         let server = server();
         let mut input = vec![0x00];
@@ -736,6 +1058,65 @@ mod tests {
         client.write_all(b"ping").expect("client write payload");
         let mut echoed = [0u8; 4];
         client.read_exact(&mut echoed).expect("client read payload");
+        assert_eq!(&echoed, b"ping");
+        drop(client);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|vless|1");
+        assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn proxies_tls_vision_and_records_user_traffic() {
+        let cert = test_cert("vless-vision");
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+        });
+
+        let server = server_with_flow("xtls-rprx-vision");
+        let listener = server.bind().expect("vless bind");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vless accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            server_clone.handle_tls_client(client)
+        });
+
+        let mut client = tls_client(vless_addr, cert.cert_der.clone());
+        client
+            .write_all(&vless_request_with_flow(echo_addr, "xtls-rprx-vision"))
+            .expect("client request");
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).expect("client response");
+        assert_eq!(response, [0x00, 0x00]);
+
+        let mut encoded = Vec::new();
+        VisionWriter::new(&mut encoded, [0x11; 16])
+            .write_all(b"ping")
+            .expect("vision payload");
+        client.write_all(&encoded).expect("client write payload");
+
+        let mut echoed = [0u8; 4];
+        VisionReader::new(&mut client, [0x11; 16])
+            .read_exact(&mut echoed)
+            .expect("client read payload");
         assert_eq!(&echoed, b"ping");
         drop(client);
 
