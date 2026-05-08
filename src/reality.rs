@@ -14,6 +14,9 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::stream::relay_tcp_streams_limited;
 
 const TLS_RECORD_HANDSHAKE: u8 = 0x16;
+const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 0x14;
+const TLS_RECORD_ALERT: u8 = 0x15;
+const TLS_RECORD_APPLICATION_DATA: u8 = 0x17;
 const TLS_HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
 const EXT_SERVER_NAME: u16 = 0x0000;
 const EXT_KEY_SHARE: u16 = 0x0033;
@@ -261,6 +264,26 @@ impl PrefixedTcpStream {
     }
 }
 
+impl RealityAuthenticatedStream {
+    pub fn read_dest_tls_records(
+        &mut self,
+        max_records: usize,
+        timeout: Duration,
+    ) -> io::Result<Vec<u8>> {
+        if max_records == 0 {
+            return Ok(Vec::new());
+        }
+        self.dest.set_read_timeout(Some(timeout))?;
+        let result = read_tls_records(&mut self.dest, max_records);
+        let restore_result = self.dest.set_read_timeout(None);
+        match (result, restore_result) {
+            (Ok(records), Ok(())) => Ok(records),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+}
+
 impl Read for PrefixedTcpStream {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         if output.is_empty() {
@@ -284,20 +307,54 @@ impl Write for PrefixedTcpStream {
 }
 
 fn read_first_tls_record(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+    read_tls_record(stream).map(|record| record.unwrap_or_default())
+}
+
+fn read_tls_records(stream: &mut TcpStream, max_records: usize) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    for _ in 0..max_records {
+        match read_tls_record(stream) {
+            Ok(Some(record)) => output.extend_from_slice(&record),
+            Ok(None) => break,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(output)
+}
+
+fn read_tls_record(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
     let mut header = [0u8; 5];
-    stream.read_exact(&mut header)?;
-    if header[0] != TLS_RECORD_HANDSHAKE {
-        return Ok(header.to_vec());
+    match stream.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    if !matches!(
+        header[0],
+        TLS_RECORD_CHANGE_CIPHER_SPEC
+            | TLS_RECORD_ALERT
+            | TLS_RECORD_HANDSHAKE
+            | TLS_RECORD_APPLICATION_DATA
+    ) {
+        return Ok(Some(header.to_vec()));
     }
     let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
     if record_len > MAX_TLS_RECORD_LEN {
-        return Ok(header.to_vec());
+        return Ok(Some(header.to_vec()));
     }
     let mut record = Vec::with_capacity(5 + record_len);
     record.extend_from_slice(&header);
     record.resize(5 + record_len, 0);
     stream.read_exact(&mut record[5..])?;
-    Ok(record)
+    Ok(Some(record))
 }
 
 fn fallback_to_dest(
@@ -669,6 +726,12 @@ mod tests {
         let target = TcpListener::bind("127.0.0.1:0").expect("bind target");
         let target_addr = target.local_addr().expect("target addr");
         let (target_tx, target_rx) = mpsc::channel();
+        let target_records = [
+            tls_record(TLS_RECORD_HANDSHAKE, b"server-hello"),
+            tls_record(TLS_RECORD_APPLICATION_DATA, b"encrypted-extensions"),
+        ]
+        .concat();
+        let target_records_for_server = target_records.clone();
         let target_thread = thread::spawn(move || {
             let (mut stream, _) = target.accept().expect("accept target");
             let mut header = [0u8; 5];
@@ -680,6 +743,9 @@ mod tests {
                 .read_exact(&mut captured[5..])
                 .expect("read target body");
             target_tx.send(captured).expect("send target capture");
+            stream
+                .write_all(&target_records)
+                .expect("write target records");
         });
 
         let server_secret = StaticSecret::from([7u8; 32]);
@@ -718,6 +784,11 @@ mod tests {
                 .read_exact(&mut after)
                 .expect("read after bytes");
             assert_eq!(&after, b"after");
+
+            let dest_records = authenticated
+                .read_dest_tls_records(2, Duration::from_secs(3))
+                .expect("read dest records");
+            assert_eq!(dest_records, target_records_for_server);
         });
 
         let mut client = TcpStream::connect(addr).expect("connect reality");
@@ -877,6 +948,7 @@ mod tests {
     }
 
     const TLS_RECORD_HANDSHAKE: u8 = 0x16;
+    const TLS_RECORD_APPLICATION_DATA: u8 = 0x17;
     const TLS_HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
     const TLS_VERSION_1_2: u16 = 0x0303;
     const EXT_SERVER_NAME: u16 = 0x0000;
@@ -909,6 +981,15 @@ mod tests {
         output.extend_from_slice(&ext_type.to_be_bytes());
         output.extend_from_slice(&(value.len() as u16).to_be_bytes());
         output.extend_from_slice(value);
+    }
+
+    fn tls_record(record_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.push(record_type);
+        record.extend_from_slice(&TLS_VERSION_1_2.to_be_bytes());
+        record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        record.extend_from_slice(payload);
+        record
     }
 
     fn push_u24(output: &mut Vec<u8>, value: u32) {
