@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
+    UdpSocket,
+};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -10,7 +13,7 @@ use crate::limits::{
 };
 use crate::socks5::SocksTarget;
 use crate::stream::{copy_count_best_effort_limited, relay_tcp_streams_limited};
-use crate::tls::{relay_tls_stream, TlsConnection};
+use crate::tls::{relay_tls_stream, TlsConnection, TlsSocket};
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 use crate::vision::{VisionDecoder, VisionEncoder, VisionReader, VisionWriter};
@@ -19,10 +22,12 @@ use crate::{RouteDecision, RouteMatcher};
 
 const VERSION: u8 = 0x00;
 const COMMAND_TCP: u8 = 0x01;
+const COMMAND_UDP: u8 = 0x02;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x02;
 const ATYP_IPV6: u8 = 0x03;
 const FLOW_XTLS_RPRX_VISION: &str = "xtls-rprx-vision";
+const MAX_UDP_PACKET_SIZE: usize = 65_535;
 
 #[derive(Clone, Debug)]
 pub struct VlessServerConfig {
@@ -46,11 +51,25 @@ pub struct VlessServer {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VlessRequest {
+    command: VlessCommand,
     user_key: String,
     user_uuid: String,
     user_id: [u8; 16],
     flow: String,
     target: SocksTarget,
+    client_ip: Option<IpAddr>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VlessCommand {
+    Tcp,
+    Udp,
+}
+
+struct VlessUdpRelayState {
+    ipv4: Option<UdpSocket>,
+    ipv6: Option<UdpSocket>,
+    timeout: Duration,
 }
 
 impl VlessServer {
@@ -95,82 +114,134 @@ impl VlessServer {
     }
 
     pub fn handle_tcp_client(&self, mut client: TcpStream) -> io::Result<()> {
-        let request = self.read_request(&mut client)?;
+        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        let mut request = self.read_request(&mut client)?;
+        request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user)?;
+        let _session = self.acquire_user_session(user, client_ip)?;
         let bandwidth = self.bandwidth.limiter_for(user);
-        let remote = match self.router.decide(&request.target.host) {
-            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
-            RouteDecision::Block => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target blocked by route",
-                ));
-            }
-            RouteDecision::UnsupportedOutbound(tag) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("outbound route {tag} is not implemented"),
-                ));
-            }
-        };
+        if request.command == VlessCommand::Udp {
+            client.write_all(&[VERSION, 0x00])?;
+            return self.relay_udp_stream(client, request, bandwidth);
+        }
+        let remote =
+            match self
+                .router
+                .decide_target(&request.target.host, request.target.port, "tcp")
+            {
+                RouteDecision::Direct => {
+                    connect_target(&request.target, self.config.connect_timeout)?
+                }
+                RouteDecision::Block => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "target blocked by route",
+                    ));
+                }
+                RouteDecision::UnsupportedOutbound(tag) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("outbound route {tag} is not implemented"),
+                    ));
+                }
+            };
         client.write_all(&[VERSION, 0x00])?;
         self.relay(client, remote, request, bandwidth)
     }
 
     pub fn handle_websocket_client(&self, client: TcpStream, path: Option<&str>) -> io::Result<()> {
+        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let (reader, writer) = accept_websocket(client, path)?;
-        self.handle_split_client(reader, writer)
+        self.handle_split_client_with_ip(reader, writer, client_ip)
     }
 
-    pub fn handle_split_client<R, W>(&self, mut reader: R, mut writer: W) -> io::Result<()>
+    pub fn handle_split_client<R, W>(&self, reader: R, writer: W) -> io::Result<()>
     where
         R: Read + Send + 'static,
         W: Write,
     {
-        let request = self.read_request(&mut reader)?;
+        self.handle_split_client_with_ip(reader, writer, None)
+    }
+
+    fn handle_split_client_with_ip<R, W>(
+        &self,
+        mut reader: R,
+        mut writer: W,
+        client_ip: Option<IpAddr>,
+    ) -> io::Result<()>
+    where
+        R: Read + Send + 'static,
+        W: Write,
+    {
+        let mut request = self.read_request(&mut reader)?;
+        request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user)?;
+        let _session = self.acquire_user_session(user, client_ip)?;
         let bandwidth = self.bandwidth.limiter_for(user);
-        let remote = match self.router.decide(&request.target.host) {
-            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
-            RouteDecision::Block => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target blocked by route",
-                ));
-            }
-            RouteDecision::UnsupportedOutbound(tag) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("outbound route {tag} is not implemented"),
-                ));
-            }
-        };
+        if request.command == VlessCommand::Udp {
+            writer.write_all(&[VERSION, 0x00])?;
+            return self.relay_udp_split(reader, writer, request, bandwidth);
+        }
+        let remote =
+            match self
+                .router
+                .decide_target(&request.target.host, request.target.port, "tcp")
+            {
+                RouteDecision::Direct => {
+                    connect_target(&request.target, self.config.connect_timeout)?
+                }
+                RouteDecision::Block => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "target blocked by route",
+                    ));
+                }
+                RouteDecision::UnsupportedOutbound(tag) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("outbound route {tag} is not implemented"),
+                    ));
+                }
+            };
         writer.write_all(&[VERSION, 0x00])?;
         self.relay_websocket(reader, writer, remote, request, bandwidth)
     }
 
-    pub fn handle_tls_client(&self, mut client: TlsConnection) -> io::Result<()> {
-        let request = self.read_request(&mut client)?;
+    pub fn handle_tls_client<S>(&self, mut client: TlsConnection<S>) -> io::Result<()>
+    where
+        S: TlsSocket + Send + 'static,
+    {
+        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        let mut request = self.read_request(&mut client)?;
+        request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user)?;
+        let _session = self.acquire_user_session(user, client_ip)?;
         let bandwidth = self.bandwidth.limiter_for(user);
-        let remote = match self.router.decide(&request.target.host) {
-            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
-            RouteDecision::Block => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target blocked by route",
-                ));
-            }
-            RouteDecision::UnsupportedOutbound(tag) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("outbound route {tag} is not implemented"),
-                ));
-            }
-        };
+        if request.command == VlessCommand::Udp {
+            client.write_all(&[VERSION, 0x00])?;
+            return self.relay_udp_stream(client, request, bandwidth);
+        }
+        let remote =
+            match self
+                .router
+                .decide_target(&request.target.host, request.target.port, "tcp")
+            {
+                RouteDecision::Direct => {
+                    connect_target(&request.target, self.config.connect_timeout)?
+                }
+                RouteDecision::Block => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "target blocked by route",
+                    ));
+                }
+                RouteDecision::UnsupportedOutbound(tag) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("outbound route {tag} is not implemented"),
+                    ));
+                }
+            };
         client.write_all(&[VERSION, 0x00])?;
         self.relay_tls(client, remote, request, bandwidth)
     }
@@ -180,26 +251,38 @@ impl VlessServer {
         client: TlsConnection,
         path: Option<&str>,
     ) -> io::Result<()> {
+        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let mut websocket = accept_websocket_tls(client, path)?;
-        let request = self.read_request(&mut websocket)?;
+        let mut request = self.read_request(&mut websocket)?;
+        request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user)?;
+        let _session = self.acquire_user_session(user, client_ip)?;
         let bandwidth = self.bandwidth.limiter_for(user);
-        let remote = match self.router.decide(&request.target.host) {
-            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
-            RouteDecision::Block => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target blocked by route",
-                ));
-            }
-            RouteDecision::UnsupportedOutbound(tag) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("outbound route {tag} is not implemented"),
-                ));
-            }
-        };
+        if request.command == VlessCommand::Udp {
+            websocket.write_all(&[VERSION, 0x00])?;
+            return self.relay_udp_stream(websocket, request, bandwidth);
+        }
+        let remote =
+            match self
+                .router
+                .decide_target(&request.target.host, request.target.port, "tcp")
+            {
+                RouteDecision::Direct => {
+                    connect_target(&request.target, self.config.connect_timeout)?
+                }
+                RouteDecision::Block => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "target blocked by route",
+                    ));
+                }
+                RouteDecision::UnsupportedOutbound(tag) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("outbound route {tag} is not implemented"),
+                    ));
+                }
+            };
         websocket.write_all(&[VERSION, 0x00])?;
         self.relay_tls_websocket(websocket, remote, request, bandwidth)
     }
@@ -237,45 +320,33 @@ impl VlessServer {
         self.validate_request_flow(&flow)?;
 
         let command = read_u8(stream)?;
-        if command != COMMAND_TCP {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "only vless tcp command is supported",
-            ));
-        }
-
-        let mut port = [0u8; 2];
-        stream.read_exact(&mut port)?;
-        let port = u16::from_be_bytes(port);
-        let host = match read_u8(stream)? {
-            ATYP_IPV4 => {
-                let mut bytes = [0u8; 4];
-                stream.read_exact(&mut bytes)?;
-                Ipv4Addr::from(bytes).to_string()
-            }
-            ATYP_DOMAIN => {
-                let len = read_u8(stream)?;
-                read_string(stream, usize::from(len))?
-            }
-            ATYP_IPV6 => {
-                let mut bytes = [0u8; 16];
-                stream.read_exact(&mut bytes)?;
-                Ipv6Addr::from(bytes).to_string()
-            }
+        let command = match command {
+            COMMAND_TCP => VlessCommand::Tcp,
+            COMMAND_UDP => VlessCommand::Udp,
             _ => {
                 return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unsupported vless address type",
+                    io::ErrorKind::Unsupported,
+                    "only vless tcp and udp commands are supported",
                 ));
             }
         };
+        if command == VlessCommand::Udp && !flow.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "vless udp command does not support flow",
+            ));
+        }
+
+        let target = read_vless_target(stream)?;
 
         Ok(VlessRequest {
+            command,
             user_key,
             user_uuid: user.uuid.clone(),
             user_id: uuid,
             flow,
-            target: SocksTarget { host, port },
+            target,
+            client_ip: None,
         })
     }
 
@@ -327,11 +398,12 @@ impl VlessServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add(
+            .add_with_ip(
                 self.config.node_tag.clone(),
                 request.user_uuid,
                 upload,
                 download,
+                request.client_ip,
             );
         Ok(())
     }
@@ -370,22 +442,26 @@ impl VlessServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add(
+            .add_with_ip(
                 self.config.node_tag.clone(),
                 request.user_uuid,
                 upload,
                 download,
+                request.client_ip,
             );
         Ok(())
     }
 
-    fn relay_tls(
+    fn relay_tls<S>(
         &self,
-        client: TlsConnection,
+        client: TlsConnection<S>,
         remote: TcpStream,
         request: VlessRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
-    ) -> io::Result<()> {
+    ) -> io::Result<()>
+    where
+        S: TlsSocket + Send + 'static,
+    {
         let (upload, download) = if request.flow == FLOW_XTLS_RPRX_VISION {
             relay_tls_vision_stream(client, remote, request.user_id, bandwidth)?
         } else {
@@ -394,11 +470,12 @@ impl VlessServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add(
+            .add_with_ip(
                 self.config.node_tag.clone(),
                 request.user_uuid,
                 upload,
                 download,
+                request.client_ip,
             );
         Ok(())
     }
@@ -414,13 +491,158 @@ impl VlessServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add(
+            .add_with_ip(
                 self.config.node_tag.clone(),
                 request.user_uuid,
                 upload,
                 download,
+                request.client_ip,
             );
         Ok(())
+    }
+
+    fn relay_udp_stream<S>(
+        &self,
+        mut stream: S,
+        request: VlessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()>
+    where
+        S: Read + Write,
+    {
+        let mut state = VlessUdpRelayState::new(self.config.connect_timeout);
+        let mut upload = 0u64;
+        let mut download = 0u64;
+        let result = loop {
+            match read_vless_udp_payload(&mut stream) {
+                Ok(payload) => {
+                    match self.forward_udp_payload(
+                        &mut state,
+                        &mut stream,
+                        &request.target,
+                        &payload,
+                        bandwidth.as_deref(),
+                    ) {
+                        Ok((sent, received)) => {
+                            upload = upload.saturating_add(sent);
+                            download = download.saturating_add(received);
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+                Err(error) if is_stream_closed(&error) => break Ok(()),
+                Err(error) => break Err(error),
+            }
+        };
+        self.record_traffic(request.user_uuid, upload, download, request.client_ip);
+        result
+    }
+
+    fn relay_udp_split<R, W>(
+        &self,
+        mut reader: R,
+        mut writer: W,
+        request: VlessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()>
+    where
+        R: Read,
+        W: Write,
+    {
+        let mut state = VlessUdpRelayState::new(self.config.connect_timeout);
+        let mut upload = 0u64;
+        let mut download = 0u64;
+        let result = loop {
+            match read_vless_udp_payload(&mut reader) {
+                Ok(payload) => {
+                    match self.forward_udp_payload(
+                        &mut state,
+                        &mut writer,
+                        &request.target,
+                        &payload,
+                        bandwidth.as_deref(),
+                    ) {
+                        Ok((sent, received)) => {
+                            upload = upload.saturating_add(sent);
+                            download = download.saturating_add(received);
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+                Err(error) if is_stream_closed(&error) => break Ok(()),
+                Err(error) => break Err(error),
+            }
+        };
+        self.record_traffic(request.user_uuid, upload, download, request.client_ip);
+        result
+    }
+
+    fn forward_udp_payload<W>(
+        &self,
+        state: &mut VlessUdpRelayState,
+        writer: &mut W,
+        target: &SocksTarget,
+        payload: &[u8],
+        bandwidth: Option<&BandwidthLimiter>,
+    ) -> io::Result<(u64, u64)>
+    where
+        W: Write,
+    {
+        match self.router.decide_target(&target.host, target.port, "udp") {
+            RouteDecision::Direct => {}
+            RouteDecision::Block => return Ok((0, 0)),
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        }
+
+        if let Some(limiter) = bandwidth {
+            limiter.wait_for(payload.len());
+        }
+
+        let remote_addr = resolve_udp_target(target)?;
+        let udp = state.socket_for(remote_addr)?;
+        udp.send_to(payload, remote_addr)?;
+        let mut response = vec![0u8; MAX_UDP_PACKET_SIZE];
+        let download = match udp.recv_from(&mut response) {
+            Ok((read, _)) => {
+                write_vless_udp_payload(writer, &response[..read])?;
+                read as u64
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                0
+            }
+            Err(error) => return Err(error),
+        };
+
+        Ok((payload.len() as u64, download))
+    }
+
+    fn record_traffic(
+        &self,
+        user_uuid: String,
+        upload: u64,
+        download: u64,
+        client_ip: Option<IpAddr>,
+    ) {
+        self.traffic
+            .lock()
+            .expect("traffic registry lock poisoned")
+            .add_with_ip(
+                self.config.node_tag.clone(),
+                user_uuid,
+                upload,
+                download,
+                client_ip,
+            );
     }
 
     fn request_user(&self, request: &VlessRequest) -> Option<&CoreUser> {
@@ -430,8 +652,9 @@ impl VlessServer {
     fn acquire_user_session(
         &self,
         user: Option<&CoreUser>,
+        client_ip: Option<IpAddr>,
     ) -> io::Result<Option<UserSessionGuard>> {
-        match self.sessions.try_acquire(user) {
+        match self.sessions.try_acquire_for_ip(user, client_ip) {
             Ok(guard) => Ok(guard),
             Err(error) => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -439,6 +662,59 @@ impl VlessServer {
             )),
         }
     }
+}
+
+impl VlessUdpRelayState {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            ipv4: None,
+            ipv6: None,
+            timeout,
+        }
+    }
+
+    fn socket_for(&mut self, remote: SocketAddr) -> io::Result<&UdpSocket> {
+        let slot = if remote.is_ipv4() {
+            &mut self.ipv4
+        } else {
+            &mut self.ipv6
+        };
+        if slot.is_none() {
+            let socket = UdpSocket::bind(udp_bind_addr_for_remote(remote))?;
+            socket.set_read_timeout(Some(self.timeout))?;
+            *slot = Some(socket);
+        }
+        Ok(slot.as_ref().expect("udp socket initialized"))
+    }
+}
+
+fn read_vless_target<R: Read>(reader: &mut R) -> io::Result<SocksTarget> {
+    let mut port = [0u8; 2];
+    reader.read_exact(&mut port)?;
+    let port = u16::from_be_bytes(port);
+    let host = match read_u8(reader)? {
+        ATYP_IPV4 => {
+            let mut bytes = [0u8; 4];
+            reader.read_exact(&mut bytes)?;
+            Ipv4Addr::from(bytes).to_string()
+        }
+        ATYP_DOMAIN => {
+            let len = read_u8(reader)?;
+            read_string(reader, usize::from(len))?
+        }
+        ATYP_IPV6 => {
+            let mut bytes = [0u8; 16];
+            reader.read_exact(&mut bytes)?;
+            Ipv6Addr::from(bytes).to_string()
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported vless address type",
+            ));
+        }
+    };
+    Ok(SocksTarget { host, port })
 }
 
 fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStream> {
@@ -456,6 +732,55 @@ fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStre
             "target did not resolve to any socket address",
         )
     }))
+}
+
+fn resolve_udp_target(target: &SocksTarget) -> io::Result<SocketAddr> {
+    (target.host.as_str(), target.port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "udp target did not resolve to any socket address",
+            )
+        })
+}
+
+fn read_vless_udp_payload<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
+    let mut len = [0u8; 2];
+    reader.read_exact(&mut len)?;
+    let len = u16::from_be_bytes(len) as usize;
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload)?;
+    Ok(payload)
+}
+
+fn write_vless_udp_payload<W: Write>(writer: &mut W, payload: &[u8]) -> io::Result<()> {
+    if payload.len() > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "vless udp payload is too large",
+        ));
+    }
+    writer.write_all(&(payload.len() as u16).to_be_bytes())?;
+    writer.write_all(payload)
+}
+
+fn udp_bind_addr_for_remote(remote: SocketAddr) -> SocketAddr {
+    match remote {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    }
+}
+
+fn is_stream_closed(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+    )
 }
 
 fn relay_vision_tcp_streams(
@@ -503,12 +828,15 @@ where
     Ok((upload, download))
 }
 
-fn relay_tls_vision_stream(
-    mut client: TlsConnection,
+fn relay_tls_vision_stream<S>(
+    mut client: TlsConnection<S>,
     mut remote: TcpStream,
     user_id: [u8; 16],
     limiter: Option<Arc<BandwidthLimiter>>,
-) -> io::Result<(u64, u64)> {
+) -> io::Result<(u64, u64)>
+where
+    S: TlsSocket,
+{
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
 
@@ -717,7 +1045,7 @@ fn hex_digit(value: u8) -> char {
 mod tests {
     use std::fs;
     use std::io::{Cursor, Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{TcpListener, TcpStream, UdpSocket};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::thread;
@@ -779,7 +1107,19 @@ mod tests {
         vless_request_with_flow(target, "")
     }
 
+    fn vless_udp_request(target: std::net::SocketAddr) -> Vec<u8> {
+        vless_request_with_flow_and_command(target, "", 0x02)
+    }
+
     fn vless_request_with_flow(target: std::net::SocketAddr, flow: &str) -> Vec<u8> {
+        vless_request_with_flow_and_command(target, flow, 0x01)
+    }
+
+    fn vless_request_with_flow_and_command(
+        target: std::net::SocketAddr,
+        flow: &str,
+        command: u8,
+    ) -> Vec<u8> {
         let mut input = vec![0x00];
         input.extend_from_slice(&[0x11; 16]);
         if flow.is_empty() {
@@ -792,7 +1132,7 @@ mod tests {
             input.push(flow.len() as u8);
             input.extend_from_slice(flow);
         }
-        input.push(0x01);
+        input.push(command);
         input.extend_from_slice(&target.port().to_be_bytes());
         input.push(0x01);
         input.extend_from_slice(
@@ -804,6 +1144,13 @@ mod tests {
                 .octets(),
         );
         input
+    }
+
+    fn vless_udp_payload(payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(2 + payload.len());
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
     }
 
     struct TestCert {
@@ -962,6 +1309,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_vless_udp_with_vision_flow() {
+        let server = server_with_flow("xtls-rprx-vision");
+        let target: std::net::SocketAddr = "127.0.0.1:443".parse().expect("addr");
+        let mut stream = MemoryStream::new(vless_request_with_flow_and_command(
+            target,
+            "xtls-rprx-vision",
+            0x02,
+        ));
+
+        let error = server
+            .read_request(&mut stream)
+            .expect_err("vless udp with flow should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[test]
     fn rejects_unknown_vless_user() {
         let server = server();
         let mut input = vec![0x00];
@@ -1007,6 +1371,58 @@ mod tests {
         let mut echoed = [0u8; 4];
         client.read_exact(&mut echoed).expect("client read payload");
         assert_eq!(&echoed, b"ping");
+        drop(client);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|vless|1");
+        assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn proxies_udp_and_records_user_traffic() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let mut bytes = [0u8; 1024];
+            let (read, source) = echo.recv_from(&mut bytes).expect("echo read");
+            assert_eq!(&bytes[..read], b"ping");
+            echo.send_to(b"pong", source).expect("echo write");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vless bind");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vless accept");
+            server_clone.handle_tcp_client(stream)
+        });
+
+        let mut client = TcpStream::connect(vless_addr).expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("client timeout");
+        client
+            .write_all(&vless_udp_request(echo_addr))
+            .expect("client request");
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).expect("client response");
+        assert_eq!(response, [0x00, 0x00]);
+
+        client
+            .write_all(&vless_udp_payload(b"ping"))
+            .expect("client udp packet");
+        let response = super::read_vless_udp_payload(&mut client).expect("udp response");
+        assert_eq!(response, b"pong");
         drop(client);
 
         server_thread

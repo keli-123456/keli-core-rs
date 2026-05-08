@@ -59,6 +59,7 @@ struct SocksRequest {
     command: SocksCommand,
     user_uuid: Option<String>,
     target: SocksTarget,
+    client_ip: Option<IpAddr>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,35 +115,43 @@ impl Socks5Server {
     }
 
     pub fn handle_tcp_client(&self, mut client: TcpStream) -> io::Result<()> {
-        let request = match self.read_request(&mut client) {
+        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        let mut request = match self.read_request(&mut client) {
             Ok(request) => request,
             Err(error) => {
                 let _ = client.shutdown(Shutdown::Both);
                 return Err(error);
             }
         };
+        request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user, &mut client)?;
         let bandwidth = self.bandwidth.limiter_for(user);
         if request.command == SocksCommand::UdpAssociate {
             return self.handle_udp_associate(client, request, bandwidth);
         }
-        let remote = match self.router.decide(&request.target.host) {
-            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
-            RouteDecision::Block => {
-                write_socks5_response(&mut client, STATUS_COMMAND_NOT_SUPPORTED)?;
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target blocked by route",
-                ));
-            }
-            RouteDecision::UnsupportedOutbound(tag) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("outbound route {tag} is not implemented"),
-                ));
-            }
-        };
+        let remote =
+            match self
+                .router
+                .decide_target(&request.target.host, request.target.port, "tcp")
+            {
+                RouteDecision::Direct => {
+                    connect_target(&request.target, self.config.connect_timeout)?
+                }
+                RouteDecision::Block => {
+                    write_socks5_response(&mut client, STATUS_CONNECTION_NOT_ALLOWED)?;
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "target blocked by route",
+                    ));
+                }
+                RouteDecision::UnsupportedOutbound(tag) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("outbound route {tag} is not implemented"),
+                    ));
+                }
+            };
         write_socks5_response(&mut client, STATUS_SUCCESS)?;
         self.relay(client, remote, request, bandwidth)
     }
@@ -302,6 +311,7 @@ impl Socks5Server {
                 host,
                 port: u16::from_be_bytes(port),
             },
+            client_ip: None,
         })
     }
 
@@ -317,7 +327,13 @@ impl Socks5Server {
             self.traffic
                 .lock()
                 .expect("traffic registry lock poisoned")
-                .add(self.config.node_tag.clone(), user_uuid, upload, download);
+                .add_with_ip(
+                    self.config.node_tag.clone(),
+                    user_uuid,
+                    upload,
+                    download,
+                    request.client_ip,
+                );
         }
         Ok(())
     }
@@ -346,7 +362,7 @@ impl Socks5Server {
                     }
                     if Some(source) == client_udp_addr {
                         let (target, payload) = parse_udp_request(&buffer[..read])?;
-                        match self.router.decide(&target.host) {
+                        match self.router.decide_target(&target.host, target.port, "udp") {
                             RouteDecision::Direct => {
                                 if let Some(limiter) = bandwidth.as_deref() {
                                     limiter.wait_for(payload.len());
@@ -382,7 +398,13 @@ impl Socks5Server {
             self.traffic
                 .lock()
                 .expect("traffic registry lock poisoned")
-                .add(self.config.node_tag.clone(), user_uuid, upload, download);
+                .add_with_ip(
+                    self.config.node_tag.clone(),
+                    user_uuid,
+                    upload,
+                    download,
+                    request.client_ip,
+                );
         }
         Ok(())
     }
@@ -399,7 +421,8 @@ impl Socks5Server {
         user: Option<&CoreUser>,
         client: &mut TcpStream,
     ) -> io::Result<Option<UserSessionGuard>> {
-        match self.sessions.try_acquire(user) {
+        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        match self.sessions.try_acquire_for_ip(user, client_ip) {
             Ok(guard) => Ok(guard),
             Err(error) => {
                 write_socks5_response(client, STATUS_CONNECTION_NOT_ALLOWED)?;
@@ -607,6 +630,7 @@ mod tests {
 
     use crate::socks5::{Socks5Server, Socks5ServerConfig};
     use crate::user::CoreUser;
+    use crate::{RouteAction, RouteRule};
 
     struct MemoryStream {
         input: Cursor<Vec<u8>>,
@@ -814,6 +838,36 @@ mod tests {
     }
 
     #[test]
+    fn rejects_blocked_tcp_route_with_connection_not_allowed_reply() {
+        let target = "127.0.0.1:48888".parse().expect("target addr");
+        let server = Socks5Server::new(Socks5ServerConfig {
+            node_tag: "panel|socks|1".to_string(),
+            listen: "127.0.0.1:0".parse().expect("listen addr"),
+            users: vec![user()],
+            routes: vec![RouteRule {
+                targets: vec!["port:48888".to_string()],
+                action: RouteAction::Block,
+            }],
+            connect_timeout: Duration::from_secs(3),
+        });
+        let listener = server.bind().expect("socks bind");
+        let socks_addr = listener.local_addr().expect("socks addr");
+        let server_thread = thread::spawn(move || server.serve_tcp_once(&listener));
+
+        let mut client = TcpStream::connect(socks_addr).expect("client connect");
+        write_authenticated_ipv4_connect(&mut client, target);
+        let mut response = [0u8; 14];
+        client.read_exact(&mut response).expect("client response");
+
+        let error = server_thread
+            .join()
+            .expect("server thread")
+            .expect_err("blocked route should reject connection");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(&response[4..6], &[0x05, 0x02]);
+    }
+
+    #[test]
     fn proxies_udp_associate_and_records_user_traffic() {
         let echo = UdpSocket::bind("127.0.0.1:0").expect("echo bind");
         let echo_addr = echo.local_addr().expect("echo addr");
@@ -874,14 +928,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_connection_when_user_device_limit_is_reached() {
+    fn allows_same_ip_to_reuse_device_limit_slot() {
         let target = TcpListener::bind("127.0.0.1:0").expect("target bind");
         let target_addr = target.local_addr().expect("target addr");
         let (release_tx, release_rx) = mpsc::channel();
         let target_thread = thread::spawn(move || {
-            let (stream, _) = target.accept().expect("target accept");
+            let (first, _) = target.accept().expect("first target accept");
+            let (second, _) = target.accept().expect("second target accept");
             release_rx.recv().expect("release target");
-            let _ = stream.shutdown(Shutdown::Both);
+            let _ = first.shutdown(Shutdown::Both);
+            let _ = second.shutdown(Shutdown::Both);
         });
 
         let server = limited_server();
@@ -909,15 +965,11 @@ mod tests {
             .read_exact(&mut second_response)
             .expect("second response");
 
-        let second_error = second_thread
-            .join()
-            .expect("second server thread")
-            .expect_err("device limit should reject second connection");
-        assert_eq!(second_error.kind(), std::io::ErrorKind::PermissionDenied);
-        assert_eq!(&second_response[4..6], &[0x05, 0x02]);
-
+        assert_eq!(&second_response[4..6], &[0x05, 0x00]);
+        drop(second_client);
         drop(first_client);
         release_tx.send(()).expect("release target");
+        let _ = second_thread.join().expect("second server thread");
         first_thread
             .join()
             .expect("first server thread")

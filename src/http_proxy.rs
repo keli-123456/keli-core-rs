@@ -110,12 +110,13 @@ impl HttpProxyServer {
             Err(error) => return Err(error),
         };
         let user = self.request_user(&request);
+        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let _session = self.acquire_user_session(user, &mut client)?;
         let bandwidth = self.bandwidth.limiter_for(user);
         if request.method.eq_ignore_ascii_case("CONNECT") {
-            self.handle_connect(client, request, bandwidth)
+            self.handle_connect(client, request, bandwidth, client_ip)
         } else {
-            self.handle_plain_http(&mut client, request, bandwidth)
+            self.handle_plain_http(&mut client, request, bandwidth, client_ip)
         }
     }
 
@@ -204,13 +205,17 @@ impl HttpProxyServer {
         mut client: TcpStream,
         request: HttpProxyRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
+        client_ip: Option<std::net::IpAddr>,
     ) -> io::Result<()> {
         let target = parse_authority(&request.target, 443)?;
-        self.ensure_route_allowed(&target)?;
+        if let Err(error) = self.ensure_route_allowed(&target) {
+            write_forbidden_response(&mut client)?;
+            return Err(error);
+        }
         client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
         let remote = connect_target(&target, self.config.connect_timeout)?;
         let (upload, download) = relay_tcp_streams_limited(client, remote, bandwidth)?;
-        self.record_traffic(request.user_uuid, upload, download);
+        self.record_traffic(request.user_uuid, upload, download, client_ip);
         Ok(())
     }
 
@@ -219,6 +224,7 @@ impl HttpProxyServer {
         client: &mut TcpStream,
         request: HttpProxyRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
+        client_ip: Option<std::net::IpAddr>,
     ) -> io::Result<()> {
         let target = parse_plain_http_target(&request)?;
         if let Err(error) = self.ensure_route_allowed(&target) {
@@ -233,21 +239,33 @@ impl HttpProxyServer {
         remote.write_all(&outbound)?;
         let upload = outbound.len() as u64;
         let download = copy_count_best_effort_limited(&mut remote, client, bandwidth.as_deref());
-        self.record_traffic(request.user_uuid, upload, download);
+        self.record_traffic(request.user_uuid, upload, download, client_ip);
         Ok(())
     }
 
-    fn record_traffic(&self, user_uuid: Option<String>, upload: u64, download: u64) {
+    fn record_traffic(
+        &self,
+        user_uuid: Option<String>,
+        upload: u64,
+        download: u64,
+        client_ip: Option<std::net::IpAddr>,
+    ) {
         if let Some(user_uuid) = user_uuid {
             self.traffic
                 .lock()
                 .expect("traffic registry lock poisoned")
-                .add(self.config.node_tag.clone(), user_uuid, upload, download);
+                .add_with_ip(
+                    self.config.node_tag.clone(),
+                    user_uuid,
+                    upload,
+                    download,
+                    client_ip,
+                );
         }
     }
 
     fn ensure_route_allowed(&self, target: &HttpTarget) -> io::Result<()> {
-        match self.router.decide(&target.host) {
+        match self.router.decide_target(&target.host, target.port, "tcp") {
             RouteDecision::Direct => Ok(()),
             RouteDecision::Block => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -265,7 +283,8 @@ impl HttpProxyServer {
         user: Option<&CoreUser>,
         client: &mut TcpStream,
     ) -> io::Result<Option<UserSessionGuard>> {
-        match self.sessions.try_acquire(user) {
+        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        match self.sessions.try_acquire_for_ip(user, client_ip) {
             Ok(guard) => Ok(guard),
             Err(error) => {
                 write_too_many_requests_response(client)?;
@@ -642,14 +661,78 @@ mod tests {
     }
 
     #[test]
-    fn writes_429_when_user_device_limit_is_reached() {
+    fn writes_403_for_blocked_port_route() {
+        let server = HttpProxyServer::new(HttpProxyServerConfig {
+            node_tag: "panel|http|1".to_string(),
+            listen: "127.0.0.1:0".parse().expect("listen addr"),
+            users: vec![user()],
+            routes: vec![RouteRule {
+                targets: vec!["port:6881-6889".to_string()],
+                action: RouteAction::Block,
+            }],
+            connect_timeout: Duration::from_secs(3),
+        });
+        let listener = server.bind().expect("proxy bind");
+        let proxy_addr = listener.local_addr().expect("proxy addr");
+        let server_thread = thread::spawn(move || {
+            let _ = server.serve_tcp_once(&listener);
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).expect("client connect");
+        let request = format!(
+            "GET http://example.com:6883/ HTTP/1.1\r\nHost: example.com:6883\r\n{}\r\n",
+            basic_auth_header()
+        );
+        client.write_all(request.as_bytes()).expect("request");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).expect("response");
+
+        server_thread.join().expect("server thread");
+        assert!(String::from_utf8_lossy(&response).contains("403 Forbidden"));
+    }
+
+    #[test]
+    fn writes_403_for_blocked_connect_route() {
+        let server = HttpProxyServer::new(HttpProxyServerConfig {
+            node_tag: "panel|http|1".to_string(),
+            listen: "127.0.0.1:0".parse().expect("listen addr"),
+            users: vec![user()],
+            routes: vec![RouteRule {
+                targets: vec!["blocked.example.com".to_string()],
+                action: RouteAction::Block,
+            }],
+            connect_timeout: Duration::from_secs(3),
+        });
+        let listener = server.bind().expect("proxy bind");
+        let proxy_addr = listener.local_addr().expect("proxy addr");
+        let server_thread = thread::spawn(move || {
+            let _ = server.serve_tcp_once(&listener);
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).expect("client connect");
+        let request = format!(
+            "CONNECT blocked.example.com:443 HTTP/1.1\r\nHost: blocked.example.com:443\r\n{}\r\n",
+            basic_auth_header()
+        );
+        client.write_all(request.as_bytes()).expect("request");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).expect("response");
+
+        server_thread.join().expect("server thread");
+        assert!(String::from_utf8_lossy(&response).contains("403 Forbidden"));
+    }
+
+    #[test]
+    fn allows_same_ip_to_reuse_device_limit_slot() {
         let target = TcpListener::bind("127.0.0.1:0").expect("target bind");
         let target_addr = target.local_addr().expect("target addr");
         let (release_tx, release_rx) = mpsc::channel();
         let target_thread = thread::spawn(move || {
-            let (stream, _) = target.accept().expect("target accept");
+            let (first, _) = target.accept().expect("first target accept");
+            let (second, _) = target.accept().expect("second target accept");
             release_rx.recv().expect("release target");
-            let _ = stream.shutdown(Shutdown::Both);
+            let _ = first.shutdown(Shutdown::Both);
+            let _ = second.shutdown(Shutdown::Both);
         });
 
         let server = limited_server();
@@ -688,20 +771,15 @@ mod tests {
         second_client
             .write_all(second_request.as_bytes())
             .expect("second request");
-        let mut second_response = Vec::new();
+        let mut second_response = [0u8; 39];
         second_client
-            .read_to_end(&mut second_response)
+            .read_exact(&mut second_response)
             .expect("second response");
-
-        let second_error = second_thread
-            .join()
-            .expect("second server thread")
-            .expect_err("device limit should reject second connection");
-        assert_eq!(second_error.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(String::from_utf8_lossy(&second_response).contains("429 Too Many Requests"));
-
+        assert!(String::from_utf8_lossy(&second_response).contains("200 Connection established"));
+        drop(second_client);
         drop(first_client);
         release_tx.send(()).expect("release target");
+        let _ = second_thread.join().expect("second server thread");
         first_thread
             .join()
             .expect("first server thread")

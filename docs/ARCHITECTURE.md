@@ -82,8 +82,10 @@ HTTP proxy
 
 Implemented listeners accept connections concurrently and join connection workers during shutdown so traffic accounting has a clean stop boundary.
 
-The route matcher currently supports exact hosts, `*.suffix` rules, `.suffix` rules, wildcard `*`, and block decisions. Custom outbound routing is intentionally reported as unsupported until an outbound data path exists.
+The route matcher currently supports exact hosts, `*.suffix` rules, `.suffix` rules, wildcard `*`, Xray-style `domain:`, `full:`, and `keyword:` domain rules, numeric `ip:` exact/CIDR rules, `port:` exact/range rules, `network:tcp|udp` rules, and block decisions. Custom outbound routing is intentionally reported as unsupported until an outbound data path exists.
 
-VLESS REALITY is still treated as an experimental path. The core validates REALITY config, authenticates the client ClientHello, falls back invalid clients to the configured target, mirrors the first ClientHello to the target, and validates/captures the target ServerHello. It is not production-ready until the Rust side completes the REALITY TLS 1.3 server handshake and temporary certificate flow.
+VLESS REALITY is still treated as an experimental path. The core validates REALITY config, authenticates the client ClientHello, falls back invalid clients to the configured target, mirrors the first ClientHello to the target, validates/captures the target ServerHello, generates a temporary Ed25519 certificate, embeds the REALITY certificate signature, completes the rustls server handshake over the prefixed ClientHello stream, and hands the decrypted stream to VLESS/Vision. It is not production-ready until the path has real-client interop coverage against the clients Keli expects to support.
+
+The code-level parity gate is maintained in `docs/PARITY.md`. Anything not marked as a real code path there must remain rejected or sidecar-only.
 
 Once that path is real, the same runtime/control boundary can be expanded protocol by protocol.

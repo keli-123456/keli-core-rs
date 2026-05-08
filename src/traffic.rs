@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +15,8 @@ pub struct TrafficDelta {
     pub user_uuid: String,
     pub upload: u64,
     pub download: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub online_ips: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -29,6 +32,17 @@ impl TrafficRegistry {
         upload: u64,
         download: u64,
     ) {
+        self.add_with_ip(node_tag, user_uuid, upload, download, None);
+    }
+
+    pub fn add_with_ip(
+        &mut self,
+        node_tag: impl Into<String>,
+        user_uuid: impl Into<String>,
+        upload: u64,
+        download: u64,
+        client_ip: Option<IpAddr>,
+    ) {
         let node_tag = node_tag.into();
         let user_uuid = user_uuid.into();
         let key = TrafficKey {
@@ -40,9 +54,17 @@ impl TrafficRegistry {
             user_uuid,
             upload: 0,
             download: 0,
+            online_ips: Vec::new(),
         });
         entry.upload = entry.upload.saturating_add(upload);
         entry.download = entry.download.saturating_add(download);
+        if let Some(client_ip) = client_ip {
+            let client_ip = client_ip.to_string();
+            if !entry.online_ips.iter().any(|value| value == &client_ip) {
+                entry.online_ips.push(client_ip);
+                entry.online_ips.sort();
+            }
+        }
     }
 
     pub fn drain_all(&mut self) -> Vec<TrafficDelta> {
@@ -110,5 +132,29 @@ mod tests {
         assert_eq!(records[0].upload, 11);
         assert_eq!(records[0].download, 22);
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn records_online_ips_without_duplicates() {
+        let mut registry = TrafficRegistry::default();
+
+        registry.add_with_ip(
+            "node-a",
+            "user-a",
+            1,
+            1,
+            Some("198.51.100.7".parse().unwrap()),
+        );
+        registry.add_with_ip(
+            "node-a",
+            "user-a",
+            1,
+            1,
+            Some("198.51.100.7".parse().unwrap()),
+        );
+
+        let records = registry.drain_minimum(1);
+
+        assert_eq!(records[0].online_ips, vec!["198.51.100.7"]);
     }
 }

@@ -140,6 +140,7 @@ mod tests {
                 }],
                 cipher: None,
                 flow: String::new(),
+                padding_scheme: Vec::new(),
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),

@@ -43,6 +43,7 @@ pub struct TuicServerConfig {
     pub server_name: String,
     pub alpn: Vec<String>,
     pub reject_unknown_sni: bool,
+    pub congestion_control: String,
     pub connect_timeout: Duration,
 }
 
@@ -111,6 +112,7 @@ impl TuicServer {
         transport
             .datagram_receive_buffer_size(Some(UDP_DATAGRAM_BUFFER_SIZE))
             .datagram_send_buffer_size(UDP_DATAGRAM_BUFFER_SIZE);
+        apply_tuic_congestion_control(&mut transport, &self.config.congestion_control)?;
         server_config.transport_config(Arc::new(transport));
         quinn::Endpoint::server(server_config, self.config.listen)
     }
@@ -146,9 +148,10 @@ impl TuicServer {
 
     async fn handle_incoming(&self, incoming: quinn::Incoming) -> io::Result<()> {
         let connection = incoming.await.map_err(io_other)?;
+        let client_ip = connection.remote_address().ip();
         let mut auth_stream = connection.accept_uni().await.map_err(io_other)?;
         let user = self.authenticate(&connection, &mut auth_stream).await?;
-        let _session = self.acquire_user_session(&user)?;
+        let _session = self.acquire_user_session(&user, Some(client_ip))?;
         let bandwidth = self.bandwidth.limiter_for(Some(&user));
         let udp_sessions = Arc::new(Mutex::new(HashMap::new()));
 
@@ -164,6 +167,7 @@ impl TuicServer {
                     datagram_user_uuid,
                     datagram_bandwidth,
                     datagram_sessions,
+                    client_ip,
                 )
                 .await;
         });
@@ -180,6 +184,7 @@ impl TuicServer {
                     uni_user_uuid,
                     uni_bandwidth,
                     uni_sessions,
+                    client_ip,
                 )
                 .await;
         });
@@ -192,7 +197,7 @@ impl TuicServer {
                     let bandwidth = bandwidth.clone();
                     tokio::spawn(async move {
                         let _ = server
-                            .handle_connect_stream(stream, user_uuid, bandwidth)
+                            .handle_connect_stream(stream, user_uuid, bandwidth, client_ip)
                             .await;
                     });
                 }
@@ -242,6 +247,7 @@ impl TuicServer {
         (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
         user_uuid: String,
         bandwidth: Option<Arc<BandwidthLimiter>>,
+        client_ip: IpAddr,
     ) -> io::Result<()> {
         let mut header = [0u8; 2];
         read_exact(&mut recv, &mut header).await?;
@@ -252,9 +258,15 @@ impl TuicServer {
             ));
         }
         let target = read_address(&mut recv).await?;
-        match self.router.decide(&target.host) {
+        match self.router.decide_target(&target.host, target.port, "tcp") {
             RouteDecision::Direct => {}
-            RouteDecision::Block | RouteDecision::UnsupportedOutbound(_) => return Ok(()),
+            RouteDecision::Block => return Ok(()),
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
         }
 
         let remote = tokio::time::timeout(
@@ -267,7 +279,13 @@ impl TuicServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add(self.config.node_tag.clone(), user_uuid, upload, download);
+            .add_with_ip(
+                self.config.node_tag.clone(),
+                user_uuid,
+                upload,
+                download,
+                Some(client_ip),
+            );
         Ok(())
     }
 
@@ -277,6 +295,7 @@ impl TuicServer {
         user_uuid: String,
         bandwidth: Option<Arc<BandwidthLimiter>>,
         sessions: Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
+        client_ip: IpAddr,
     ) -> io::Result<()> {
         let mut fragments = UdpFragmentStore::default();
         loop {
@@ -297,6 +316,7 @@ impl TuicServer {
                 &sessions,
                 &mut fragments,
                 UdpReplyMode::Datagram,
+                client_ip,
                 command,
             )
             .await?;
@@ -309,6 +329,7 @@ impl TuicServer {
         user_uuid: String,
         bandwidth: Option<Arc<BandwidthLimiter>>,
         sessions: Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
+        client_ip: IpAddr,
     ) -> io::Result<()> {
         let mut fragments = UdpFragmentStore::default();
         loop {
@@ -333,6 +354,7 @@ impl TuicServer {
                 &sessions,
                 &mut fragments,
                 UdpReplyMode::UniStream,
+                client_ip,
                 command,
             )
             .await?;
@@ -347,13 +369,14 @@ impl TuicServer {
         sessions: &Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
         fragments: &mut UdpFragmentStore,
         reply_mode: UdpReplyMode,
+        client_ip: IpAddr,
         command: UdpCommand,
     ) -> io::Result<()> {
         match command {
             UdpCommand::Packet(packet) => match fragments.push(packet)? {
                 Some(packet) => {
                     self.handle_udp_packet(
-                        connection, user_uuid, bandwidth, sessions, reply_mode, packet,
+                        connection, user_uuid, bandwidth, sessions, reply_mode, client_ip, packet,
                     )
                     .await
                 }
@@ -380,6 +403,7 @@ impl TuicServer {
         bandwidth: Option<Arc<BandwidthLimiter>>,
         sessions: &Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
         reply_mode: UdpReplyMode,
+        client_ip: IpAddr,
         packet: UdpPacket,
     ) -> io::Result<()> {
         if !packet.is_single_fragment() {
@@ -388,9 +412,15 @@ impl TuicServer {
         let Some(target) = packet.target else {
             return Ok(());
         };
-        match self.router.decide(&target.host) {
+        match self.router.decide_target(&target.host, target.port, "udp") {
             RouteDecision::Direct => {}
-            RouteDecision::Block | RouteDecision::UnsupportedOutbound(_) => return Ok(()),
+            RouteDecision::Block => return Ok(()),
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
         }
 
         let target_addr = resolve_udp_target(&target, self.config.connect_timeout).await?;
@@ -402,6 +432,7 @@ impl TuicServer {
                 packet.assoc_id,
                 target_addr,
                 reply_mode,
+                client_ip,
             )
             .await?;
         if session.closed.load(Ordering::Relaxed) {
@@ -414,11 +445,12 @@ impl TuicServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add(
+            .add_with_ip(
                 self.config.node_tag.clone(),
                 user_uuid.to_string(),
                 packet.payload.len() as u64,
                 0,
+                Some(client_ip),
             );
         Ok(())
     }
@@ -431,6 +463,7 @@ impl TuicServer {
         assoc_id: u16,
         target_addr: SocketAddr,
         reply_mode: UdpReplyMode,
+        client_ip: IpAddr,
     ) -> io::Result<Arc<UdpRelaySession>> {
         if let Some(session) = sessions
             .lock()
@@ -466,16 +499,21 @@ impl TuicServer {
         let user_uuid = user_uuid.to_string();
         let traffic = self.traffic.clone();
         tokio::spawn(async move {
-            let _ =
-                receive_udp_replies(assoc_id, receiver, connection, node_tag, user_uuid, traffic)
-                    .await;
+            let _ = receive_udp_replies(
+                assoc_id, receiver, connection, node_tag, user_uuid, traffic, client_ip,
+            )
+            .await;
         });
         Ok(session)
     }
 
-    fn acquire_user_session(&self, user: &CoreUser) -> io::Result<Option<UserSessionGuard>> {
+    fn acquire_user_session(
+        &self,
+        user: &CoreUser,
+        client_ip: Option<IpAddr>,
+    ) -> io::Result<Option<UserSessionGuard>> {
         self.sessions
-            .try_acquire(Some(user))
+            .try_acquire_for_ip(Some(user), client_ip)
             .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))
     }
 }
@@ -618,6 +656,7 @@ async fn receive_udp_replies(
     node_tag: String,
     user_uuid: String,
     traffic: Arc<Mutex<TrafficRegistry>>,
+    client_ip: IpAddr,
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; UDP_PACKET_BUFFER_SIZE];
     loop {
@@ -652,12 +691,16 @@ async fn receive_udp_replies(
                 let _ = send.finish();
             }
         }
-        traffic.lock().expect("traffic registry lock poisoned").add(
-            node_tag.clone(),
-            user_uuid.clone(),
-            0,
-            read as u64,
-        );
+        traffic
+            .lock()
+            .expect("traffic registry lock poisoned")
+            .add_with_ip(
+                node_tag.clone(),
+                user_uuid.clone(),
+                0,
+                read as u64,
+                Some(client_ip),
+            );
     }
 }
 
@@ -1005,6 +1048,38 @@ fn io_other(error: impl std::fmt::Debug) -> io::Error {
     io::Error::new(io::ErrorKind::Other, format!("{error:?}"))
 }
 
+fn apply_tuic_congestion_control(
+    transport: &mut quinn::TransportConfig,
+    value: &str,
+) -> io::Result<()> {
+    match normalize_tuic_congestion_control(value).as_str() {
+        "" | "cubic" => {
+            transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+            Ok(())
+        }
+        "bbr" => {
+            transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+            Ok(())
+        }
+        "new_reno" | "newreno" | "reno" => {
+            transport.congestion_controller_factory(Arc::new(
+                quinn::congestion::NewRenoConfig::default(),
+            ));
+            Ok(())
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported tuic congestion_control {other}"),
+        )),
+    }
+}
+
+fn normalize_tuic_congestion_control(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1090,8 +1165,28 @@ mod tests {
             server_name: "localhost".to_string(),
             alpn: vec!["h3".to_string()],
             reject_unknown_sni: false,
+            congestion_control: String::new(),
             connect_timeout: Duration::from_secs(3),
         })
+    }
+
+    #[test]
+    fn accepts_supported_tuic_congestion_controls() {
+        for value in ["", "cubic", "bbr", "new_reno", "new-reno", "reno"] {
+            let mut transport = quinn::TransportConfig::default();
+            apply_tuic_congestion_control(&mut transport, value)
+                .unwrap_or_else(|error| panic!("{value} should be supported: {error}"));
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_tuic_congestion_control() {
+        let mut transport = quinn::TransportConfig::default();
+        let error = apply_tuic_congestion_control(&mut transport, "brutal").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error
+            .to_string()
+            .contains("unsupported tuic congestion_control"));
     }
 
     fn auth_command(connection: &quinn::Connection) -> Vec<u8> {

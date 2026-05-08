@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 
 use crate::anytls::{AnyTlsServer, AnyTlsServerConfig};
@@ -19,8 +20,8 @@ use crate::hysteria2::{Hysteria2ObfsConfig, Hysteria2Server, Hysteria2ServerConf
 use crate::limits::{UserBandwidthLimiters, UserSessionTracker};
 use crate::protocol::Protocol;
 use crate::reality::{
-    decode_reality_private_key, decode_short_id, handle_reality_preface, RealityAuthConfig,
-    RealityGatewayConfig, RealityGatewayResult,
+    decode_reality_private_key, decode_short_id, generate_reality_temporary_certificate,
+    handle_reality_preface, RealityAuthConfig, RealityGatewayConfig, RealityGatewayResult,
 };
 use crate::shadowsocks::{ShadowsocksServer, ShadowsocksServerConfig};
 use crate::socks5::{Socks5Server, Socks5ServerConfig};
@@ -334,7 +335,6 @@ fn start_vmess_listener(
             tag: inbound.tag.clone(),
             source,
         })?;
-
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
     let workers = Arc::new(Mutex::new(Vec::new()));
@@ -526,6 +526,7 @@ fn start_tuic_listener(
             server_name: tls.server_name.clone(),
             alpn: tls.alpn.clone(),
             reject_unknown_sni: tls.reject_unknown_sni,
+            congestion_control: inbound.transport.congestion_control.clone(),
             connect_timeout: Duration::from_secs(10),
         },
         traffic,
@@ -592,6 +593,7 @@ fn start_anytls_listener(
             users: inbound.users.clone(),
             routes,
             connect_timeout: Duration::from_secs(10),
+            padding_scheme: inbound.padding_scheme.clone(),
         },
         traffic,
         sessions,
@@ -613,7 +615,6 @@ fn start_anytls_listener(
             tag: inbound.tag.clone(),
             source,
         })?;
-
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
     let workers = Arc::new(Mutex::new(Vec::new()));
@@ -693,10 +694,37 @@ fn start_shadowsocks_listener(
             tag: inbound.tag.clone(),
             source,
         })?;
+    let udp = if shadowsocks_udp_enabled(&inbound.transport) {
+        let udp = server
+            .bind_udp(local_addr)
+            .map_err(|source| CoreServiceError::Bind {
+                tag: inbound.tag.clone(),
+                source,
+            })?;
+        udp.set_read_timeout(Some(Duration::from_millis(100)))
+            .map_err(|source| CoreServiceError::Bind {
+                tag: inbound.tag.clone(),
+                source,
+            })?;
+        Some(udp)
+    } else {
+        None
+    };
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
     let workers = Arc::new(Mutex::new(Vec::new()));
+    if let Some(udp) = udp {
+        let server = server.clone();
+        let stop_for_udp = stop.clone();
+        let udp_worker = thread::spawn(move || {
+            let _ = server.serve_udp(udp, stop_for_udp);
+        });
+        workers
+            .lock()
+            .expect("worker list lock poisoned")
+            .push(udp_worker);
+    }
     let workers_for_thread = workers.clone();
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
@@ -729,6 +757,14 @@ fn start_shadowsocks_listener(
         workers,
         join: Some(join),
     })
+}
+
+fn shadowsocks_udp_enabled(transport: &TransportConfig) -> bool {
+    transport
+        .network
+        .split(',')
+        .map(str::trim)
+        .any(|item| item.eq_ignore_ascii_case("udp"))
 }
 
 fn start_trojan_listener(
@@ -894,7 +930,7 @@ fn start_vless_listener(
         .and_then(|tls| tls.reality.as_ref())
         .is_some()
     {
-        return start_vless_reality_listener(inbound, listen);
+        return start_vless_reality_listener(inbound, listen, server);
     }
     let listener = server.bind().map_err(|source| CoreServiceError::Bind {
         tag: inbound.tag.clone(),
@@ -1147,6 +1183,7 @@ fn start_http_listener(
 fn start_vless_reality_listener(
     inbound: &InboundConfig,
     listen: SocketAddr,
+    server: VlessServer,
 ) -> Result<ListenerHandle, CoreServiceError> {
     let gateway = reality_gateway_config(inbound)?;
     let listener = TcpListener::bind(listen).map_err(|source| CoreServiceError::Bind {
@@ -1175,10 +1212,19 @@ fn start_vless_reality_listener(
             match listener.accept() {
                 Ok((stream, _)) => {
                     let gateway = gateway.clone();
+                    let server = server.clone();
                     let worker = thread::spawn(move || {
                         let result = handle_reality_preface(stream, &gateway);
                         if let Ok(RealityGatewayResult::Authenticated(mut authenticated)) = result {
                             let _ = authenticated.read_dest_handshake(8, Duration::from_secs(5));
+                            if let Ok(acceptor) = reality_tls_acceptor(
+                                &authenticated.auth.auth_key,
+                                &authenticated.auth.server_name,
+                            ) {
+                                if let Ok(client) = acceptor.accept_stream(authenticated.stream) {
+                                    let _ = server.handle_tls_client(client);
+                                }
+                            }
                         }
                     });
                     workers_for_thread
@@ -1204,6 +1250,16 @@ fn start_vless_reality_listener(
         workers,
         join: Some(join),
     })
+}
+
+fn reality_tls_acceptor(auth_key: &[u8; 32], server_name: &str) -> io::Result<TlsAcceptor> {
+    let certificate = generate_reality_temporary_certificate(auth_key, server_name)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    TlsAcceptor::from_der(
+        vec![CertificateDer::from(certificate.certificate_der)],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certificate.private_key_der)),
+        &[],
+    )
 }
 
 fn reality_gateway_config(
@@ -1342,6 +1398,8 @@ mod tests {
     use crate::service::CoreService;
     use crate::user::CoreUser;
 
+    use super::reality_tls_acceptor;
+
     trait AsyncIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 
     impl<T> AsyncIo for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
@@ -1377,6 +1435,7 @@ mod tests {
                 users: vec![user()],
                 cipher: None,
                 flow: String::new(),
+                padding_scheme: Vec::new(),
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),
@@ -1412,6 +1471,7 @@ mod tests {
                 users: vec![user()],
                 cipher: None,
                 flow: "xtls-rprx-vision".to_string(),
+                padding_scheme: Vec::new(),
                 transport: TransportConfig::default(),
                 tls: Some(TlsConfig {
                     server_name: "www.example.com".to_string(),
@@ -1683,6 +1743,13 @@ mod tests {
         assert_eq!(listeners.len(), 1);
         assert_eq!(listeners[0].protocol, Protocol::Vless);
         service.stop();
+    }
+
+    #[test]
+    fn builds_reality_tls_acceptor_from_authenticated_key() {
+        let acceptor = reality_tls_acceptor(&[0x42; 32], "www.example.test");
+
+        assert!(acceptor.is_ok());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Cursor as IoCursor, Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, KeyInit};
@@ -14,6 +14,7 @@ use sha2::{Sha256, Sha512};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::stream::relay_tcp_streams_limited;
+use crate::tls::TlsSocket;
 
 const TLS_RECORD_HANDSHAKE: u8 = 0x16;
 const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 0x14;
@@ -495,8 +496,26 @@ impl PrefixedTcpStream {
         self.socket.shutdown(how)
     }
 
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.peer_addr()
+    }
+
     pub fn into_inner(self) -> TcpStream {
         self.socket
+    }
+}
+
+impl TlsSocket for PrefixedTcpStream {
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        PrefixedTcpStream::peer_addr(self)
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        PrefixedTcpStream::set_nonblocking(self, nonblocking)
+    }
+
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        PrefixedTcpStream::shutdown(self, how)
     }
 }
 

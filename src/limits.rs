@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -8,7 +9,7 @@ use crate::user::CoreUser;
 
 #[derive(Clone, Debug, Default)]
 pub struct UserSessionTracker {
-    active: Arc<Mutex<HashMap<String, usize>>>,
+    active: Arc<Mutex<HashMap<String, UserSessionState>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -25,7 +26,8 @@ pub struct DeviceLimitExceeded {
 #[derive(Debug)]
 pub struct UserSessionGuard {
     user_uuid: String,
-    active: Arc<Mutex<HashMap<String, usize>>>,
+    key: UserSessionKey,
+    active: Arc<Mutex<HashMap<String, UserSessionState>>>,
 }
 
 #[derive(Debug)]
@@ -40,10 +42,30 @@ struct BandwidthState {
     last_refill: Instant,
 }
 
+#[derive(Clone, Debug, Default)]
+struct UserSessionState {
+    ips: HashMap<IpAddr, usize>,
+    anonymous: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UserSessionKey {
+    Ip(IpAddr),
+    Anonymous,
+}
+
 impl UserSessionTracker {
     pub fn try_acquire(
         &self,
         user: Option<&CoreUser>,
+    ) -> Result<Option<UserSessionGuard>, DeviceLimitExceeded> {
+        self.try_acquire_for_ip(user, None)
+    }
+
+    pub fn try_acquire_for_ip(
+        &self,
+        user: Option<&CoreUser>,
+        client_ip: Option<IpAddr>,
     ) -> Result<Option<UserSessionGuard>, DeviceLimitExceeded> {
         let Some(user) = user else {
             return Ok(None);
@@ -54,17 +76,37 @@ impl UserSessionTracker {
 
         let limit = user.device_limit as usize;
         let mut active = self.active.lock().expect("user session lock poisoned");
-        let current = active.get(&user.uuid).copied().unwrap_or(0);
-        if current >= limit {
-            return Err(DeviceLimitExceeded {
-                user_uuid: user.uuid.clone(),
-                limit: user.device_limit,
-            });
-        }
-
-        active.insert(user.uuid.clone(), current + 1);
+        let state = active.entry(user.uuid.clone()).or_default();
+        let key = if let Some(ip) = client_ip {
+            if let Some(count) = state.ips.get_mut(&ip) {
+                *count += 1;
+                return Ok(Some(UserSessionGuard {
+                    user_uuid: user.uuid.clone(),
+                    key: UserSessionKey::Ip(ip),
+                    active: Arc::clone(&self.active),
+                }));
+            }
+            if state.device_count() >= limit {
+                return Err(DeviceLimitExceeded {
+                    user_uuid: user.uuid.clone(),
+                    limit: user.device_limit,
+                });
+            }
+            state.ips.insert(ip, 1);
+            UserSessionKey::Ip(ip)
+        } else {
+            if state.device_count() >= limit {
+                return Err(DeviceLimitExceeded {
+                    user_uuid: user.uuid.clone(),
+                    limit: user.device_limit,
+                });
+            }
+            state.anonymous += 1;
+            UserSessionKey::Anonymous
+        };
         Ok(Some(UserSessionGuard {
             user_uuid: user.uuid.clone(),
+            key,
             active: Arc::clone(&self.active),
         }))
     }
@@ -74,8 +116,29 @@ impl UserSessionTracker {
             .lock()
             .expect("user session lock poisoned")
             .get(user_uuid)
-            .copied()
+            .map(UserSessionState::device_count)
             .unwrap_or(0)
+    }
+}
+
+impl UserSessionState {
+    fn device_count(&self) -> usize {
+        self.ips.len() + self.anonymous
+    }
+
+    fn release(&mut self, key: UserSessionKey) {
+        match key {
+            UserSessionKey::Ip(ip) => match self.ips.get_mut(&ip) {
+                Some(count) if *count > 1 => *count -= 1,
+                Some(_) => {
+                    self.ips.remove(&ip);
+                }
+                None => {}
+            },
+            UserSessionKey::Anonymous => {
+                self.anonymous = self.anonymous.saturating_sub(1);
+            }
+        }
     }
 }
 
@@ -176,12 +239,11 @@ impl Drop for UserSessionGuard {
         let Ok(mut active) = self.active.lock() else {
             return;
         };
-        match active.get_mut(&self.user_uuid) {
-            Some(count) if *count > 1 => *count -= 1,
-            Some(_) => {
+        if let Some(state) = active.get_mut(&self.user_uuid) {
+            state.release(self.key);
+            if state.device_count() == 0 {
                 active.remove(&self.user_uuid);
             }
-            None => {}
         }
     }
 }
@@ -247,6 +309,32 @@ mod tests {
             .try_acquire(Some(&user))
             .expect("reacquire")
             .is_some());
+    }
+
+    #[test]
+    fn counts_same_ip_as_one_device() {
+        let tracker = UserSessionTracker::default();
+        let user = user(1);
+        let ip = "198.51.100.7".parse().expect("client ip");
+        let first = tracker
+            .try_acquire_for_ip(Some(&user), Some(ip))
+            .expect("first acquire")
+            .expect("first guard");
+        let second = tracker
+            .try_acquire_for_ip(Some(&user), Some(ip))
+            .expect("same ip acquire")
+            .expect("second guard");
+
+        assert_eq!(tracker.active_count("user-a"), 1);
+        let error = tracker
+            .try_acquire_for_ip(Some(&user), Some("198.51.100.8".parse().unwrap()))
+            .expect_err("different ip should be limited");
+        assert_eq!(error.user_uuid(), "user-a");
+
+        drop(first);
+        assert_eq!(tracker.active_count("user-a"), 1);
+        drop(second);
+        assert_eq!(tracker.active_count("user-a"), 0);
     }
 
     #[test]

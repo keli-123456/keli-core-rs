@@ -1,8 +1,10 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::RouteAction::{Block, Direct, Outbound};
 use crate::protocol::Protocol;
 use crate::reality::{decode_reality_private_key, decode_short_id};
 use crate::shadowsocks::is_supported_shadowsocks_cipher;
@@ -29,6 +31,8 @@ pub struct InboundConfig {
     pub cipher: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub flow: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub padding_scheme: Vec<String>,
     pub transport: TransportConfig,
     pub tls: Option<TlsConfig>,
     pub sniffing: SniffingConfig,
@@ -73,6 +77,10 @@ pub struct TransportConfig {
     pub obfs: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub obfs_password: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub congestion_control: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub zero_rtt_handshake: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,9 +155,160 @@ impl CoreConfig {
                 )));
             }
         }
+        self.validate_outbounds()?;
+        self.validate_routes()?;
 
         Ok(())
     }
+
+    fn validate_outbounds(&self) -> Result<(), ValidationError> {
+        for outbound in &self.outbounds {
+            if outbound.tag.trim().is_empty() {
+                return Err(ValidationError::new("outbound tag is required"));
+            }
+            if outbound.protocol.trim() != "freedom" {
+                return Err(ValidationError::new(format!(
+                    "outbound {} protocol {} is not implemented in keli-core-rs yet",
+                    outbound.tag, outbound.protocol
+                )));
+            }
+            if outbound.tag != "direct" {
+                return Err(ValidationError::new(format!(
+                    "outbound {} is not implemented in keli-core-rs yet",
+                    outbound.tag
+                )));
+            }
+            if outbound.address.is_some() || outbound.port.is_some() {
+                return Err(ValidationError::new(format!(
+                    "outbound {} address/port routing is not implemented in keli-core-rs yet",
+                    outbound.tag
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_routes(&self) -> Result<(), ValidationError> {
+        for route in &self.routes {
+            validate_route_targets(route)?;
+            match &route.action {
+                Direct | Block => {}
+                Outbound(tag) => {
+                    return Err(ValidationError::new(format!(
+                        "route outbound {tag} is not implemented in keli-core-rs yet"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_route_targets(route: &RouteRule) -> Result<(), ValidationError> {
+    for target in &route.targets {
+        let target = target.trim();
+        if target.is_empty() {
+            return Err(ValidationError::new("route target must not be empty"));
+        }
+        let normalized = target.to_ascii_lowercase();
+        if let Some(rule) = normalized.strip_prefix("ip:") {
+            if !is_supported_ip_route_rule(rule) {
+                return Err(ValidationError::new(format!(
+                    "route target {target} is not supported in keli-core-rs yet"
+                )));
+            }
+            continue;
+        }
+        if let Some(rule) = normalized.strip_prefix("port:") {
+            if !is_supported_port_route_rule(rule) {
+                return Err(ValidationError::new(format!(
+                    "route target {target} is not supported in keli-core-rs yet"
+                )));
+            }
+            continue;
+        }
+        if let Some(rule) = normalized.strip_prefix("network:") {
+            if !matches!(rule.trim(), "tcp" | "udp") {
+                return Err(ValidationError::new(format!(
+                    "route target {target} is not supported in keli-core-rs yet"
+                )));
+            }
+            continue;
+        }
+        if let Some(rule) = normalized.strip_prefix("domain:") {
+            if rule.trim().trim_start_matches('.').is_empty() {
+                return Err(ValidationError::new(format!(
+                    "route target {target} is not supported in keli-core-rs yet"
+                )));
+            }
+            continue;
+        }
+        if let Some(rule) = normalized.strip_prefix("full:") {
+            if rule.trim().trim_matches(['[', ']']).is_empty() {
+                return Err(ValidationError::new(format!(
+                    "route target {target} is not supported in keli-core-rs yet"
+                )));
+            }
+            continue;
+        }
+        if let Some(rule) = normalized.strip_prefix("keyword:") {
+            if rule.trim().is_empty() {
+                return Err(ValidationError::new(format!(
+                    "route target {target} is not supported in keli-core-rs yet"
+                )));
+            }
+            continue;
+        }
+        if normalized.starts_with("geoip:")
+            || normalized.starts_with("geosite:")
+            || normalized.starts_with("regexp:")
+            || normalized.starts_with("protocol:")
+        {
+            return Err(ValidationError::new(format!(
+                "route target {target} is not supported in keli-core-rs yet"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_supported_ip_route_rule(rule: &str) -> bool {
+    let rule = rule.trim().trim_matches(['[', ']']);
+    if rule.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    let Some((ip, prefix)) = rule.split_once('/') else {
+        return false;
+    };
+    let Ok(ip) = ip.trim().parse::<IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.trim().parse::<u8>() else {
+        return false;
+    };
+    match ip {
+        IpAddr::V4(_) => prefix <= 32,
+        IpAddr::V6(_) => prefix <= 128,
+    }
+}
+
+fn is_supported_port_route_rule(rule: &str) -> bool {
+    rule.split(',').all(|item| {
+        let item = item.trim();
+        if item.is_empty() {
+            return false;
+        }
+        if let Some((start, end)) = item.split_once('-') {
+            let Ok(start) = start.trim().parse::<u16>() else {
+                return false;
+            };
+            let Ok(end) = end.trim().parse::<u16>() else {
+                return false;
+            };
+            return start <= end;
+        }
+        item.parse::<u16>().is_ok()
+    })
 }
 
 impl InboundConfig {
@@ -181,7 +340,25 @@ impl InboundConfig {
                 self.tag
             )));
         }
+        self.validate_protocol_scoped_fields()?;
         self.validate_flow()?;
+        if matches!(self.protocol, Protocol::Socks | Protocol::Http) {
+            let network = self.transport.network.trim();
+            if network != "tcp" {
+                return Err(ValidationError::new(format!(
+                    "{} {} currently supports only tcp transport",
+                    self.tag,
+                    protocol_label(&self.protocol)
+                )));
+            }
+            if self.tls.is_some() {
+                return Err(ValidationError::new(format!(
+                    "{} {} currently supports only plain tcp",
+                    self.tag,
+                    protocol_label(&self.protocol)
+                )));
+            }
+        }
         if self.protocol == Protocol::Vless {
             let network = self.transport.network.trim();
             if !matches!(network, "tcp" | "ws" | "httpupgrade" | "grpc") {
@@ -219,10 +396,10 @@ impl InboundConfig {
             validate_tls_config("trojan", &self.tag, network, self.tls.as_ref())?;
         }
         if self.protocol == Protocol::Shadowsocks {
-            let network = self.transport.network.trim();
-            if network != "tcp" || self.tls.is_some() {
+            let network = self.transport.network.trim().to_ascii_lowercase();
+            if !matches!(network.as_str(), "tcp" | "tcp,udp") || self.tls.is_some() {
                 return Err(ValidationError::new(format!(
-                    "{} shadowsocks currently supports only plain tcp",
+                    "{} shadowsocks currently supports only plain tcp or tcp,udp",
                     self.tag
                 )));
             }
@@ -276,6 +453,7 @@ impl InboundConfig {
                     self.tag
                 )));
             }
+            validate_tuic_transport_options(&self.tag, &self.transport)?;
         }
         if self.protocol == Protocol::Hysteria2 {
             let network = self.transport.network.trim();
@@ -303,6 +481,30 @@ impl InboundConfig {
             validate_hysteria2_obfs(&self.tag, &self.transport)?;
         }
 
+        Ok(())
+    }
+
+    fn validate_protocol_scoped_fields(&self) -> Result<(), ValidationError> {
+        let protocol = protocol_label(&self.protocol);
+        if self.protocol != Protocol::Shadowsocks
+            && self
+                .cipher
+                .as_deref()
+                .is_some_and(|cipher| !cipher.trim().is_empty())
+        {
+            return Err(ValidationError::new(format!(
+                "{} {protocol} does not support cipher",
+                self.tag
+            )));
+        }
+        if self.protocol != Protocol::AnyTls && !self.padding_scheme.is_empty() {
+            return Err(ValidationError::new(format!(
+                "{} {protocol} does not support padding_scheme",
+                self.tag
+            )));
+        }
+
+        validate_protocol_transport_fields(self)?;
         Ok(())
     }
 
@@ -337,6 +539,105 @@ impl InboundConfig {
             )));
         }
         Ok(())
+    }
+}
+
+fn validate_protocol_transport_fields(inbound: &InboundConfig) -> Result<(), ValidationError> {
+    let protocol = protocol_label(&inbound.protocol);
+    let transport = &inbound.transport;
+    let network = transport.network.trim();
+
+    if transport.proxy_protocol {
+        return Err(ValidationError::new(format!(
+            "{} {protocol} proxy_protocol is not implemented in keli-core-rs yet",
+            inbound.tag
+        )));
+    }
+
+    let has_bandwidth_options =
+        transport.up_mbps > 0 || transport.down_mbps > 0 || transport.ignore_client_bandwidth;
+    let has_obfs_options = transport
+        .obfs
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || transport
+            .obfs_password
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    if inbound.protocol != Protocol::Hysteria2 && (has_bandwidth_options || has_obfs_options) {
+        return Err(ValidationError::new(format!(
+            "{} {protocol} does not support hysteria2 bandwidth/obfs transport options",
+            inbound.tag
+        )));
+    }
+
+    let has_tuic_options =
+        !transport.congestion_control.trim().is_empty() || transport.zero_rtt_handshake;
+    if inbound.protocol != Protocol::Tuic && has_tuic_options {
+        return Err(ValidationError::new(format!(
+            "{} {protocol} does not support tuic transport options",
+            inbound.tag
+        )));
+    }
+
+    let supports_http_transport_fields = matches!(
+        inbound.protocol,
+        Protocol::Vless | Protocol::Vmess | Protocol::Trojan
+    ) && matches!(network, "ws" | "httpupgrade");
+    let supports_grpc_service_name = matches!(
+        inbound.protocol,
+        Protocol::Vless | Protocol::Vmess | Protocol::Trojan
+    ) && network == "grpc";
+    if transport
+        .path
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && !supports_http_transport_fields
+    {
+        return Err(ValidationError::new(format!(
+            "{} {protocol} transport path is supported only for ws/httpupgrade",
+            inbound.tag
+        )));
+    }
+    if transport
+        .host
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && !supports_http_transport_fields
+    {
+        return Err(ValidationError::new(format!(
+            "{} {protocol} transport host is supported only for ws/httpupgrade",
+            inbound.tag
+        )));
+    }
+    if transport
+        .service_name
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && !supports_grpc_service_name
+    {
+        return Err(ValidationError::new(format!(
+            "{} {protocol} transport service_name is supported only for grpc",
+            inbound.tag
+        )));
+    }
+
+    Ok(())
+}
+
+fn protocol_label(protocol: &Protocol) -> &'static str {
+    match protocol {
+        Protocol::Shadowsocks => "shadowsocks",
+        Protocol::Vmess => "vmess",
+        Protocol::Vless => "vless",
+        Protocol::Trojan => "trojan",
+        Protocol::Hysteria2 => "hysteria2",
+        Protocol::Tuic => "tuic",
+        Protocol::AnyTls => "anytls",
+        Protocol::Socks => "socks",
+        Protocol::Http => "http",
+        Protocol::Naive => "naive",
+        Protocol::Mieru => "mieru",
     }
 }
 
@@ -489,8 +790,39 @@ impl Default for TransportConfig {
             ignore_client_bandwidth: false,
             obfs: None,
             obfs_password: None,
+            congestion_control: String::new(),
+            zero_rtt_handshake: false,
         }
     }
+}
+
+fn validate_tuic_transport_options(
+    tag: &str,
+    transport: &TransportConfig,
+) -> Result<(), ValidationError> {
+    let congestion = transport.congestion_control.trim();
+    if !congestion.is_empty() && !is_supported_tuic_congestion_control(congestion) {
+        return Err(ValidationError::new(format!(
+            "{tag} tuic congestion_control {congestion} is not supported"
+        )));
+    }
+    if transport.zero_rtt_handshake {
+        return Err(ValidationError::new(format!(
+            "{tag} tuic zero_rtt_handshake is not supported yet"
+        )));
+    }
+    Ok(())
+}
+
+fn is_supported_tuic_congestion_control(value: &str) -> bool {
+    matches!(
+        value
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_")
+            .as_str(),
+        "" | "cubic" | "bbr" | "new_reno" | "newreno" | "reno"
+    )
 }
 
 fn validate_hysteria2_obfs(tag: &str, transport: &TransportConfig) -> Result<(), ValidationError> {
@@ -572,6 +904,7 @@ mod tests {
                 users: vec![user()],
                 cipher: None,
                 flow: String::new(),
+                padding_scheme: Vec::new(),
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),
@@ -590,14 +923,126 @@ mod tests {
     }
 
     #[test]
-    fn validates_httpupgrade_transport_for_vless_vmess_and_trojan() {
+    fn rejects_custom_outbounds_until_data_path_exists() {
+        let mut config = CoreConfig {
+            instance_id: "node-a".to_string(),
+            log_level: "info".to_string(),
+            inbounds: vec![InboundConfig {
+                tag: "panel|vless|1".to_string(),
+                protocol: Protocol::Vless,
+                listen: "0.0.0.0".to_string(),
+                port: 443,
+                users: vec![user()],
+                cipher: None,
+                flow: String::new(),
+                padding_scheme: Vec::new(),
+                transport: TransportConfig::default(),
+                tls: None,
+                sniffing: SniffingConfig::default(),
+            }],
+            outbounds: vec![
+                OutboundConfig {
+                    tag: "direct".to_string(),
+                    protocol: "freedom".to_string(),
+                    address: None,
+                    port: None,
+                },
+                OutboundConfig {
+                    tag: "warp".to_string(),
+                    protocol: "freedom".to_string(),
+                    address: None,
+                    port: None,
+                },
+            ],
+            routes: Vec::new(),
+            stats: StatsConfig::default(),
+        };
+
+        let error = config
+            .validate()
+            .expect_err("custom outbound should be rejected before runtime");
+        assert!(error.to_string().contains("outbound warp"));
+
+        config.outbounds.pop();
+        config.routes = vec![crate::config::RouteRule {
+            targets: vec!["*.example.test".to_string()],
+            action: crate::config::RouteAction::Outbound("warp".to_string()),
+        }];
+
+        let error = config
+            .validate()
+            .expect_err("custom outbound routes should be rejected before runtime");
+        assert!(error.to_string().contains("route outbound warp"));
+    }
+
+    #[test]
+    fn validates_supported_route_targets_and_rejects_unsupported_sources() {
+        let mut config = CoreConfig {
+            instance_id: "node-a".to_string(),
+            log_level: "info".to_string(),
+            inbounds: vec![InboundConfig {
+                tag: "panel|http|1".to_string(),
+                protocol: Protocol::Http,
+                listen: "0.0.0.0".to_string(),
+                port: 8080,
+                users: vec![user()],
+                cipher: None,
+                flow: String::new(),
+                padding_scheme: Vec::new(),
+                transport: TransportConfig::default(),
+                tls: None,
+                sniffing: SniffingConfig::default(),
+            }],
+            outbounds: vec![OutboundConfig {
+                tag: "direct".to_string(),
+                protocol: "freedom".to_string(),
+                address: None,
+                port: None,
+            }],
+            routes: vec![crate::config::RouteRule {
+                targets: vec![
+                    "domain:example.com".to_string(),
+                    "full:exact.example.com".to_string(),
+                    "keyword:tracker".to_string(),
+                    "ip:10.0.0.0/8".to_string(),
+                    "port:6881-6889,6969".to_string(),
+                    "network:udp".to_string(),
+                ],
+                action: crate::config::RouteAction::Block,
+            }],
+            stats: StatsConfig::default(),
+        };
+
+        config.validate().expect("supported route targets");
+
+        config.routes[0].targets = vec!["geosite:private".to_string()];
+        let error = config
+            .validate()
+            .expect_err("geosite route target should fail");
+        assert!(error.to_string().contains("geosite:private"));
+
+        config.routes[0].targets = vec!["ip:geoip:private".to_string()];
+        let error = config
+            .validate()
+            .expect_err("geoip route target should fail");
+        assert!(error.to_string().contains("ip:geoip:private"));
+
+        config.routes[0].targets = vec!["keyword:".to_string()];
+        let error = config
+            .validate()
+            .expect_err("empty keyword route target should fail");
+        assert!(error.to_string().contains("keyword:"));
+    }
+
+    #[test]
+    fn validates_stream_transports_for_vless_vmess_and_trojan() {
         for (protocol, network) in [
+            (Protocol::Vless, "ws"),
+            (Protocol::Vmess, "ws"),
+            (Protocol::Trojan, "ws"),
             (Protocol::Vless, "httpupgrade"),
             (Protocol::Vmess, "httpupgrade"),
             (Protocol::Trojan, "httpupgrade"),
-            (Protocol::Vless, "grpc"),
-            (Protocol::Vmess, "grpc"),
-            (Protocol::Trojan, "grpc"),
         ] {
             let inbound = InboundConfig {
                 tag: format!("panel|{network}|1"),
@@ -607,11 +1052,11 @@ mod tests {
                 users: vec![user()],
                 cipher: None,
                 flow: String::new(),
+                padding_scheme: Vec::new(),
                 transport: TransportConfig {
                     network: network.to_string(),
                     path: Some("/edge".to_string()),
                     host: Some("example.com".to_string()),
-                    service_name: Some("GunService".to_string()),
                     ..TransportConfig::default()
                 },
                 tls: None,
@@ -620,6 +1065,155 @@ mod tests {
 
             inbound.validate().expect("http transport inbound");
         }
+
+        for protocol in [Protocol::Vless, Protocol::Vmess, Protocol::Trojan] {
+            let inbound = InboundConfig {
+                tag: "panel|grpc|1".to_string(),
+                protocol,
+                listen: "0.0.0.0".to_string(),
+                port: 443,
+                users: vec![user()],
+                cipher: None,
+                flow: String::new(),
+                padding_scheme: Vec::new(),
+                transport: TransportConfig {
+                    network: "grpc".to_string(),
+                    service_name: Some("GunService".to_string()),
+                    ..TransportConfig::default()
+                },
+                tls: None,
+                sniffing: SniffingConfig::default(),
+            };
+
+            inbound.validate().expect("grpc transport inbound");
+        }
+    }
+
+    #[test]
+    fn rejects_transport_fields_that_runtime_would_ignore() {
+        let mut inbound = InboundConfig {
+            tag: "panel|vless|1".to_string(),
+            protocol: Protocol::Vless,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![user()],
+            cipher: Some("aes-128-gcm".to_string()),
+            flow: String::new(),
+            padding_scheme: Vec::new(),
+            transport: TransportConfig::default(),
+            tls: None,
+            sniffing: SniffingConfig::default(),
+        };
+
+        let error = inbound
+            .validate()
+            .expect_err("non-shadowsocks cipher should be rejected");
+        assert!(error.to_string().contains("does not support cipher"));
+
+        inbound.cipher = None;
+        inbound.padding_scheme = vec!["stop=8".to_string()];
+        let error = inbound
+            .validate()
+            .expect_err("non-anytls padding should be rejected");
+        assert!(error.to_string().contains("padding_scheme"));
+
+        inbound.padding_scheme.clear();
+        inbound.transport.proxy_protocol = true;
+        let error = inbound
+            .validate()
+            .expect_err("proxy protocol should be rejected until implemented");
+        assert!(error.to_string().contains("proxy_protocol"));
+
+        inbound.transport.proxy_protocol = false;
+        inbound.transport.up_mbps = 100;
+        let error = inbound
+            .validate()
+            .expect_err("non-hysteria2 bandwidth should be rejected");
+        assert!(error.to_string().contains("bandwidth/obfs"));
+
+        inbound.transport.up_mbps = 0;
+        inbound.transport.congestion_control = "bbr".to_string();
+        let error = inbound
+            .validate()
+            .expect_err("non-tuic congestion should be rejected");
+        assert!(error.to_string().contains("tuic transport options"));
+    }
+
+    #[test]
+    fn rejects_transport_field_on_wrong_network() {
+        let mut inbound = InboundConfig {
+            tag: "panel|vless|1".to_string(),
+            protocol: Protocol::Vless,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![user()],
+            cipher: None,
+            flow: String::new(),
+            padding_scheme: Vec::new(),
+            transport: TransportConfig {
+                network: "tcp".to_string(),
+                path: Some("/edge".to_string()),
+                ..TransportConfig::default()
+            },
+            tls: None,
+            sniffing: SniffingConfig::default(),
+        };
+
+        let error = inbound.validate().expect_err("tcp path should be rejected");
+        assert!(error.to_string().contains("transport path"));
+
+        inbound.transport.network = "ws".to_string();
+        inbound.transport.path = None;
+        inbound.transport.service_name = Some("GunService".to_string());
+        let error = inbound
+            .validate()
+            .expect_err("ws service_name should be rejected");
+        assert!(error.to_string().contains("service_name"));
+
+        inbound.transport.network = "grpc".to_string();
+        inbound.transport.service_name = None;
+        inbound.transport.host = Some("example.com".to_string());
+        let error = inbound
+            .validate()
+            .expect_err("grpc host should be rejected");
+        assert!(error.to_string().contains("transport host"));
+    }
+
+    #[test]
+    fn rejects_plain_proxy_tls_and_non_tcp_transport() {
+        let mut inbound = InboundConfig {
+            tag: "panel|socks|1".to_string(),
+            protocol: Protocol::Socks,
+            listen: "0.0.0.0".to_string(),
+            port: 1080,
+            users: vec![user()],
+            cipher: None,
+            flow: String::new(),
+            padding_scheme: Vec::new(),
+            transport: TransportConfig {
+                network: "ws".to_string(),
+                ..TransportConfig::default()
+            },
+            tls: None,
+            sniffing: SniffingConfig::default(),
+        };
+
+        let error = inbound.validate().expect_err("socks ws should be rejected");
+        assert!(error.to_string().contains("only tcp transport"));
+
+        inbound.transport.network = "tcp".to_string();
+        inbound.tls = Some(TlsConfig {
+            server_name: "example.com".to_string(),
+            cert_file: Some("/tmp/cert.pem".to_string()),
+            key_file: Some("/tmp/key.pem".to_string()),
+            alpn: Vec::new(),
+            reject_unknown_sni: false,
+            reality: None,
+        });
+        let error = inbound
+            .validate()
+            .expect_err("socks tls should be rejected");
+        assert!(error.to_string().contains("plain tcp"));
     }
 
     #[test]
@@ -632,6 +1226,7 @@ mod tests {
             users: vec![user()],
             cipher: None,
             flow: String::new(),
+            padding_scheme: Vec::new(),
             transport: TransportConfig::default(),
             tls: None,
             sniffing: SniffingConfig::default(),
@@ -650,6 +1245,7 @@ mod tests {
             users: vec![user()],
             cipher: None,
             flow: String::new(),
+            padding_scheme: Vec::new(),
             transport: TransportConfig::default(),
             tls: Some(TlsConfig {
                 server_name: "example.com".to_string(),
@@ -679,6 +1275,7 @@ mod tests {
             users: vec![user()],
             cipher: None,
             flow: String::new(),
+            padding_scheme: Vec::new(),
             transport: TransportConfig::default(),
             tls: Some(TlsConfig {
                 server_name: "example.com".to_string(),
@@ -708,6 +1305,7 @@ mod tests {
             users: vec![user()],
             cipher: None,
             flow: "xtls-rprx-vision".to_string(),
+            padding_scheme: Vec::new(),
             transport: TransportConfig::default(),
             tls: Some(TlsConfig {
                 server_name: "example.com".to_string(),
@@ -737,6 +1335,7 @@ mod tests {
             users: vec![user()],
             cipher: None,
             flow: "xtls-rprx-vision".to_string(),
+            padding_scheme: Vec::new(),
             transport: TransportConfig::default(),
             tls: Some(TlsConfig {
                 server_name: "www.example.com".to_string(),
@@ -769,6 +1368,7 @@ mod tests {
             users: vec![user()],
             cipher: None,
             flow: "xtls-rprx-vision".to_string(),
+            padding_scheme: Vec::new(),
             transport: TransportConfig::default(),
             tls: Some(TlsConfig {
                 server_name: "www.example.com".to_string(),
@@ -801,6 +1401,7 @@ mod tests {
             users: vec![user()],
             cipher: None,
             flow: String::new(),
+            padding_scheme: Vec::new(),
             transport: TransportConfig {
                 network: "ws".to_string(),
                 ..TransportConfig::default()
@@ -840,6 +1441,7 @@ mod tests {
             users: vec![user()],
             cipher: None,
             flow: String::new(),
+            padding_scheme: Vec::new(),
             transport: TransportConfig::default(),
             tls: Some(TlsConfig {
                 server_name: "www.example.com".to_string(),
@@ -876,6 +1478,7 @@ mod tests {
             users: vec![user()],
             cipher: None,
             flow: String::new(),
+            padding_scheme: Vec::new(),
             transport: TransportConfig::default(),
             tls: Some(TlsConfig {
                 server_name: "www.example.com".to_string(),
@@ -914,6 +1517,7 @@ mod tests {
             users: vec![user()],
             cipher: None,
             flow: String::new(),
+            padding_scheme: Vec::new(),
             transport: TransportConfig::default(),
             tls: None,
             sniffing: SniffingConfig::default(),
@@ -927,6 +1531,128 @@ mod tests {
     }
 
     #[test]
+    fn validates_shadowsocks_tcp_udp_transport() {
+        let inbound = InboundConfig {
+            tag: "panel|shadowsocks|1".to_string(),
+            protocol: Protocol::Shadowsocks,
+            listen: "0.0.0.0".to_string(),
+            port: 8388,
+            users: vec![user()],
+            cipher: Some("aes-128-gcm".to_string()),
+            flow: String::new(),
+            padding_scheme: Vec::new(),
+            transport: TransportConfig {
+                network: "tcp,udp".to_string(),
+                ..TransportConfig::default()
+            },
+            tls: None,
+            sniffing: SniffingConfig::default(),
+        };
+
+        inbound.validate().expect("shadowsocks tcp,udp");
+    }
+
+    #[test]
+    fn validates_tuic_supported_congestion_controls() {
+        for congestion in ["cubic", "bbr", "new-reno"] {
+            let inbound = InboundConfig {
+                tag: "panel|tuic|1".to_string(),
+                protocol: Protocol::Tuic,
+                listen: "0.0.0.0".to_string(),
+                port: 443,
+                users: vec![user()],
+                cipher: None,
+                flow: String::new(),
+                padding_scheme: Vec::new(),
+                transport: TransportConfig {
+                    network: "tuic".to_string(),
+                    congestion_control: congestion.to_string(),
+                    ..TransportConfig::default()
+                },
+                tls: Some(TlsConfig {
+                    server_name: "tuic.example.test".to_string(),
+                    cert_file: Some("/tmp/tuic.crt".to_string()),
+                    key_file: Some("/tmp/tuic.key".to_string()),
+                    alpn: vec!["h3".to_string()],
+                    reject_unknown_sni: false,
+                    reality: None,
+                }),
+                sniffing: SniffingConfig::default(),
+            };
+
+            inbound.validate().expect("tuic congestion should validate");
+        }
+    }
+
+    #[test]
+    fn rejects_tuic_unsupported_congestion_control() {
+        let inbound = InboundConfig {
+            tag: "panel|tuic|1".to_string(),
+            protocol: Protocol::Tuic,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![user()],
+            cipher: None,
+            flow: String::new(),
+            padding_scheme: Vec::new(),
+            transport: TransportConfig {
+                network: "tuic".to_string(),
+                congestion_control: "brutal".to_string(),
+                ..TransportConfig::default()
+            },
+            tls: Some(TlsConfig {
+                server_name: "tuic.example.test".to_string(),
+                cert_file: Some("/tmp/tuic.crt".to_string()),
+                key_file: Some("/tmp/tuic.key".to_string()),
+                alpn: vec!["h3".to_string()],
+                reject_unknown_sni: false,
+                reality: None,
+            }),
+            sniffing: SniffingConfig::default(),
+        };
+
+        let error = inbound
+            .validate()
+            .expect_err("unsupported tuic congestion should fail");
+
+        assert!(error.to_string().contains("congestion_control brutal"));
+    }
+
+    #[test]
+    fn rejects_tuic_zero_rtt_until_runtime_supports_it() {
+        let inbound = InboundConfig {
+            tag: "panel|tuic|1".to_string(),
+            protocol: Protocol::Tuic,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![user()],
+            cipher: None,
+            flow: String::new(),
+            padding_scheme: Vec::new(),
+            transport: TransportConfig {
+                network: "tuic".to_string(),
+                zero_rtt_handshake: true,
+                ..TransportConfig::default()
+            },
+            tls: Some(TlsConfig {
+                server_name: "tuic.example.test".to_string(),
+                cert_file: Some("/tmp/tuic.crt".to_string()),
+                key_file: Some("/tmp/tuic.key".to_string()),
+                alpn: vec!["h3".to_string()],
+                reject_unknown_sni: false,
+                reality: None,
+            }),
+            sniffing: SniffingConfig::default(),
+        };
+
+        let error = inbound
+            .validate()
+            .expect_err("tuic zero-rtt should fail until implemented");
+
+        assert!(error.to_string().contains("zero_rtt_handshake"));
+    }
+
+    #[test]
     fn rejects_anytls_without_users() {
         let inbound = InboundConfig {
             tag: "panel|anytls|1".to_string(),
@@ -936,6 +1662,7 @@ mod tests {
             users: Vec::new(),
             cipher: None,
             flow: String::new(),
+            padding_scheme: Vec::new(),
             transport: TransportConfig::default(),
             tls: None,
             sniffing: SniffingConfig::default(),

@@ -1,8 +1,13 @@
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
+    UdpSocket,
+};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce as AesNonce};
@@ -27,6 +32,7 @@ const TAG_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 const MAX_CHUNK_LEN: usize = 0x3fff;
 const HKDF_INFO: &[u8] = b"ss-subkey";
+const UDP_SESSION_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug)]
 pub struct ShadowsocksServerConfig {
@@ -70,6 +76,26 @@ struct ShadowsocksRequest {
     target: SocksTarget,
     initial_payload: Vec<u8>,
     client_reader: ShadowsocksReader<TcpStream>,
+    client_ip: Option<IpAddr>,
+}
+
+struct ShadowsocksUdpRequest {
+    user: CoreUser,
+    target: SocksTarget,
+    payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct UdpClientContext {
+    client_addr: SocketAddr,
+    user: CoreUser,
+}
+
+#[derive(Debug)]
+struct UdpClientSession {
+    user_uuid: String,
+    last_seen: Instant,
+    _guard: Option<UserSessionGuard>,
 }
 
 struct ShadowsocksReader<R> {
@@ -119,26 +145,38 @@ impl ShadowsocksServer {
         TcpListener::bind(self.config.listen)
     }
 
+    pub fn bind_udp(&self, listen: SocketAddr) -> io::Result<UdpSocket> {
+        UdpSocket::bind(listen)
+    }
+
     pub fn handle_tcp_client(&self, client: TcpStream) -> io::Result<()> {
+        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let method = ShadowsocksMethod::parse(&self.config.method)?;
-        let request = self.read_request(client, method)?;
-        let _session = self.acquire_user_session(&request.user)?;
+        let mut request = self.read_request(client, method)?;
+        request.client_ip = client_ip;
+        let _session = self.acquire_user_session(&request.user, client_ip)?;
         let bandwidth = self.bandwidth.limiter_for(Some(&request.user));
-        let remote = match self.router.decide(&request.target.host) {
-            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
-            RouteDecision::Block => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target blocked by route",
-                ));
-            }
-            RouteDecision::UnsupportedOutbound(tag) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("outbound route {tag} is not implemented"),
-                ));
-            }
-        };
+        let remote =
+            match self
+                .router
+                .decide_target(&request.target.host, request.target.port, "tcp")
+            {
+                RouteDecision::Direct => {
+                    connect_target(&request.target, self.config.connect_timeout)?
+                }
+                RouteDecision::Block => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "target blocked by route",
+                    ));
+                }
+                RouteDecision::UnsupportedOutbound(tag) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("outbound route {tag} is not implemented"),
+                    ));
+                }
+            };
         self.relay(method, request, remote, bandwidth)
     }
 
@@ -147,6 +185,50 @@ impl ShadowsocksServer {
             .lock()
             .expect("traffic registry lock poisoned")
             .drain_minimum(minimum_bytes)
+    }
+
+    pub fn serve_udp(&self, udp: UdpSocket, stop: Arc<AtomicBool>) -> io::Result<()> {
+        udp.set_read_timeout(Some(Duration::from_millis(100)))?;
+        let method = ShadowsocksMethod::parse(&self.config.method)?;
+        let mut remotes = HashMap::<SocketAddr, UdpClientContext>::new();
+        let mut client_sessions = HashMap::<SocketAddr, UdpClientSession>::new();
+        let mut buffer = vec![0u8; 65_535];
+        while !stop.load(Ordering::SeqCst) {
+            prune_udp_sessions(&mut client_sessions, &mut remotes);
+            match udp.recv_from(&mut buffer) {
+                Ok((read, source)) => {
+                    let packet = &buffer[..read];
+                    if let Ok(request) = self.read_udp_request(packet, method) {
+                        self.handle_udp_request(
+                            &udp,
+                            source,
+                            request,
+                            &mut remotes,
+                            &mut client_sessions,
+                        )?;
+                    } else if let Some(context) = remotes.get(&source) {
+                        let response = encode_udp_packet(method, context, source, packet)?;
+                        udp.send_to(&response, context.client_addr)?;
+                        if let Some(session) = client_sessions.get_mut(&context.client_addr) {
+                            session.last_seen = Instant::now();
+                        }
+                        self.record_udp_traffic(
+                            &context.user.uuid,
+                            0,
+                            packet.len() as u64,
+                            Some(context.client_addr.ip()),
+                        );
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     fn read_request(
@@ -180,6 +262,7 @@ impl ShadowsocksServer {
                 target,
                 initial_payload,
                 client_reader: ShadowsocksReader::with_cipher(client, cipher),
+                client_ip: None,
             });
         }
 
@@ -187,6 +270,113 @@ impl ShadowsocksServer {
             io::ErrorKind::PermissionDenied,
             "unknown shadowsocks user",
         ))
+    }
+
+    fn read_udp_request(
+        &self,
+        packet: &[u8],
+        method: ShadowsocksMethod,
+    ) -> io::Result<ShadowsocksUdpRequest> {
+        if packet.len() <= method.salt_len() + TAG_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "shadowsocks udp packet too short",
+            ));
+        }
+        let (salt, encrypted_payload) = packet.split_at(method.salt_len());
+        for user in self.config.users.iter().filter(|user| !user.is_empty()) {
+            let mut payload = encrypted_payload.to_vec();
+            let mut cipher = ShadowsocksCipher::new(method, user.credential(), salt)?;
+            if cipher.decrypt(&mut payload).is_err() {
+                continue;
+            }
+            let (target, payload) = parse_request_payload(payload)?;
+            return Ok(ShadowsocksUdpRequest {
+                user: user.clone(),
+                target,
+                payload,
+            });
+        }
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unknown shadowsocks udp user",
+        ))
+    }
+
+    fn handle_udp_request(
+        &self,
+        udp: &UdpSocket,
+        client_addr: SocketAddr,
+        request: ShadowsocksUdpRequest,
+        remotes: &mut HashMap<SocketAddr, UdpClientContext>,
+        client_sessions: &mut HashMap<SocketAddr, UdpClientSession>,
+    ) -> io::Result<()> {
+        match self
+            .router
+            .decide_target(&request.target.host, request.target.port, "udp")
+        {
+            RouteDecision::Direct => {}
+            RouteDecision::Block => return Ok(()),
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        }
+        if let Err(error) =
+            self.acquire_udp_client_session(client_addr, &request.user, client_sessions)
+        {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        if let Some(limiter) = self.bandwidth.limiter_for(Some(&request.user)).as_deref() {
+            limiter.wait_for(request.payload.len());
+        }
+        let remote_addr = resolve_udp_target(&request.target)?;
+        udp.send_to(&request.payload, remote_addr)?;
+        remotes.insert(
+            remote_addr,
+            UdpClientContext {
+                client_addr,
+                user: request.user.clone(),
+            },
+        );
+        self.record_udp_traffic(
+            &request.user.uuid,
+            request.payload.len() as u64,
+            0,
+            Some(client_addr.ip()),
+        );
+        Ok(())
+    }
+
+    fn acquire_udp_client_session(
+        &self,
+        client_addr: SocketAddr,
+        user: &CoreUser,
+        client_sessions: &mut HashMap<SocketAddr, UdpClientSession>,
+    ) -> io::Result<()> {
+        if let Some(session) = client_sessions.get_mut(&client_addr) {
+            if session.user_uuid == user.uuid {
+                session.last_seen = Instant::now();
+                return Ok(());
+            }
+            client_sessions.remove(&client_addr);
+        }
+
+        let guard = self.acquire_user_session(user, Some(client_addr.ip()))?;
+        client_sessions.insert(
+            client_addr,
+            UdpClientSession {
+                user_uuid: user.uuid.clone(),
+                last_seen: Instant::now(),
+                _guard: guard,
+            },
+        );
+        Ok(())
     }
 
     fn relay(
@@ -235,18 +425,66 @@ impl ShadowsocksServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add(self.config.node_tag.clone(), user_uuid, upload, download);
+            .add_with_ip(
+                self.config.node_tag.clone(),
+                user_uuid,
+                upload,
+                download,
+                request.client_ip,
+            );
         Ok(())
     }
 
-    fn acquire_user_session(&self, user: &CoreUser) -> io::Result<Option<UserSessionGuard>> {
-        match self.sessions.try_acquire(Some(user)) {
+    fn record_udp_traffic(
+        &self,
+        user_uuid: &str,
+        upload: u64,
+        download: u64,
+        client_ip: Option<IpAddr>,
+    ) {
+        if upload > 0 || download > 0 {
+            self.traffic
+                .lock()
+                .expect("traffic registry lock poisoned")
+                .add_with_ip(
+                    self.config.node_tag.clone(),
+                    user_uuid.to_string(),
+                    upload,
+                    download,
+                    client_ip,
+                );
+        }
+    }
+
+    fn acquire_user_session(
+        &self,
+        user: &CoreUser,
+        client_ip: Option<IpAddr>,
+    ) -> io::Result<Option<UserSessionGuard>> {
+        match self.sessions.try_acquire_for_ip(Some(user), client_ip) {
             Ok(guard) => Ok(guard),
             Err(error) => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 error.to_string(),
             )),
         }
+    }
+}
+
+fn prune_udp_sessions(
+    client_sessions: &mut HashMap<SocketAddr, UdpClientSession>,
+    remotes: &mut HashMap<SocketAddr, UdpClientContext>,
+) {
+    let now = Instant::now();
+    let expired = client_sessions
+        .iter()
+        .filter_map(|(client_addr, session)| {
+            (now.duration_since(session.last_seen) > UDP_SESSION_TTL).then_some(*client_addr)
+        })
+        .collect::<Vec<_>>();
+    for client_addr in expired {
+        client_sessions.remove(&client_addr);
+        remotes.retain(|_, context| context.client_addr != client_addr);
     }
 }
 
@@ -490,6 +728,53 @@ fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStre
     }))
 }
 
+fn resolve_udp_target(target: &SocksTarget) -> io::Result<SocketAddr> {
+    (target.host.as_str(), target.port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "udp target did not resolve to any socket address",
+            )
+        })
+}
+
+fn encode_udp_packet(
+    method: ShadowsocksMethod,
+    context: &UdpClientContext,
+    source: SocketAddr,
+    payload: &[u8],
+) -> io::Result<Vec<u8>> {
+    let mut salt = vec![0u8; method.salt_len()];
+    fill_random(&mut salt)?;
+    let mut cipher = ShadowsocksCipher::new(method, context.user.credential(), &salt)?;
+    let mut body = encode_target(source);
+    body.extend_from_slice(payload);
+    cipher.encrypt(&mut body)?;
+
+    let mut output = Vec::with_capacity(salt.len() + body.len());
+    output.extend_from_slice(&salt);
+    output.extend_from_slice(&body);
+    Ok(output)
+}
+
+fn encode_target(source: SocketAddr) -> Vec<u8> {
+    let mut output = Vec::new();
+    match source.ip() {
+        std::net::IpAddr::V4(ip) => {
+            output.push(ATYP_IPV4);
+            output.extend_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => {
+            output.push(ATYP_IPV6);
+            output.extend_from_slice(&ip.octets());
+        }
+    }
+    output.extend_from_slice(&source.port().to_be_bytes());
+    output
+}
+
 fn evp_bytes_to_key(password: &[u8], key_len: usize) -> Vec<u8> {
     let mut key = Vec::with_capacity(key_len);
     let mut previous = Vec::new();
@@ -538,15 +823,18 @@ fn read_string<R: Read>(reader: &mut R, len: usize) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
     use crate::shadowsocks::{
-        is_supported_shadowsocks_cipher, parse_request_payload, ShadowsocksMethod,
-        ShadowsocksReader, ShadowsocksServer, ShadowsocksServerConfig, ShadowsocksWriter,
-        ATYP_IPV4,
+        is_supported_shadowsocks_cipher, parse_request_payload, ShadowsocksCipher,
+        ShadowsocksMethod, ShadowsocksReader, ShadowsocksServer, ShadowsocksServerConfig,
+        ShadowsocksWriter, UdpClientContext, UdpClientSession, ATYP_IPV4,
     };
     use crate::user::CoreUser;
 
@@ -572,6 +860,19 @@ mod tests {
         })
     }
 
+    fn limited_server() -> ShadowsocksServer {
+        let mut limited_user = user();
+        limited_user.device_limit = 1;
+        ShadowsocksServer::new(ShadowsocksServerConfig {
+            node_tag: "panel|shadowsocks|1".to_string(),
+            listen: "127.0.0.1:0".parse().expect("listen addr"),
+            method: "aes-128-gcm".to_string(),
+            users: vec![limited_user],
+            routes: Vec::new(),
+            connect_timeout: Duration::from_secs(3),
+        })
+    }
+
     fn shadowsocks_request(target: std::net::SocketAddr, payload: &[u8]) -> Vec<u8> {
         let mut request = Vec::new();
         request.push(ATYP_IPV4);
@@ -586,6 +887,36 @@ mod tests {
         request.extend_from_slice(&target.port().to_be_bytes());
         request.extend_from_slice(payload);
         request
+    }
+
+    fn shadowsocks_udp_packet(
+        method: ShadowsocksMethod,
+        password: &str,
+        target: SocketAddr,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut salt = vec![0x11; method.salt_len()];
+        let mut cipher = ShadowsocksCipher::new(method, password, &salt).expect("udp cipher");
+        let mut body = shadowsocks_request(target, payload);
+        cipher.encrypt(&mut body).expect("udp encrypt");
+        salt.extend_from_slice(&body);
+        salt
+    }
+
+    fn read_shadowsocks_udp_packet(
+        method: ShadowsocksMethod,
+        password: &str,
+        packet: &[u8],
+    ) -> (SocketAddr, Vec<u8>) {
+        let (salt, encrypted) = packet.split_at(method.salt_len());
+        let mut body = encrypted.to_vec();
+        let mut cipher = ShadowsocksCipher::new(method, password, salt).expect("udp cipher");
+        cipher.decrypt(&mut body).expect("udp decrypt");
+        let (target, payload) = parse_request_payload(body).expect("udp payload");
+        let addr = format!("{}:{}", target.host, target.port)
+            .parse()
+            .expect("udp source addr");
+        (addr, payload)
     }
 
     #[test]
@@ -664,5 +995,111 @@ mod tests {
         assert_eq!(records[0].user_uuid, "ss-password");
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn proxies_udp_and_records_user_traffic() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let mut buffer = [0u8; 1024];
+            let (read, source) = echo.recv_from(&mut buffer).expect("echo read");
+            assert_eq!(&buffer[..read], b"ping");
+            echo.send_to(b"pong", source).expect("echo write");
+        });
+
+        let server = server();
+        let udp = server
+            .bind_udp("127.0.0.1:0".parse().expect("udp listen"))
+            .expect("ss udp bind");
+        udp.set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("udp timeout");
+        let ss_addr = udp.local_addr().expect("ss udp addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_clone = server.clone();
+        let stop_for_thread = stop.clone();
+        let server_thread = thread::spawn(move || server_clone.serve_udp(udp, stop_for_thread));
+
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client bind");
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("client timeout");
+        let method = ShadowsocksMethod::parse("aes-128-gcm").expect("method");
+        let request = shadowsocks_udp_packet(method, "ss-password", echo_addr, b"ping");
+        client.send_to(&request, ss_addr).expect("client send");
+
+        let mut response = [0u8; 1024];
+        let (read, _) = client.recv_from(&mut response).expect("client recv");
+        let (source, payload) =
+            read_shadowsocks_udp_packet(method, "ss-password", &response[..read]);
+        assert_eq!(source, echo_addr);
+        assert_eq!(payload, b"pong");
+
+        stop.store(true, Ordering::SeqCst);
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve udp");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|shadowsocks|1");
+        assert_eq!(records[0].user_uuid, "ss-password");
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn udp_device_limit_counts_same_ip_once_across_client_ports() {
+        let server = limited_server();
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("relay bind");
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("echo bind");
+        echo.set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("echo timeout");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let method = ShadowsocksMethod::parse("aes-128-gcm").expect("method");
+        let mut remotes = HashMap::<SocketAddr, UdpClientContext>::new();
+        let mut client_sessions = HashMap::<SocketAddr, UdpClientSession>::new();
+
+        let packet = shadowsocks_udp_packet(method, "ss-password", echo_addr, b"first-client");
+        let request = server
+            .read_udp_request(&packet, method)
+            .expect("first udp request");
+        server
+            .handle_udp_request(
+                &relay,
+                "127.0.0.1:30001".parse().expect("client one"),
+                request,
+                &mut remotes,
+                &mut client_sessions,
+            )
+            .expect("first udp handle");
+
+        let mut buffer = [0u8; 64];
+        let (read, _) = echo.recv_from(&mut buffer).expect("first echo read");
+        assert_eq!(&buffer[..read], b"first-client");
+        assert_eq!(server.sessions.active_count("ss-password"), 1);
+
+        let packet = shadowsocks_udp_packet(method, "ss-password", echo_addr, b"second-client");
+        let request = server
+            .read_udp_request(&packet, method)
+            .expect("second udp request");
+        server
+            .handle_udp_request(
+                &relay,
+                "127.0.0.1:30002".parse().expect("client two"),
+                request,
+                &mut remotes,
+                &mut client_sessions,
+            )
+            .expect("same-ip udp handle");
+
+        let (read, _) = echo.recv_from(&mut buffer).expect("second echo read");
+        assert_eq!(&buffer[..read], b"second-client");
+        assert_eq!(server.sessions.active_count("ss-password"), 1);
+
+        drop(client_sessions);
+        assert_eq!(server.sessions.active_count("ss-password"), 0);
     }
 }

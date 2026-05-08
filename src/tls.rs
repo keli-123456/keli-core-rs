@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, BufReader, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
@@ -18,8 +18,28 @@ pub struct TlsAcceptor {
     config: Arc<ServerConfig>,
 }
 
-pub struct TlsConnection {
-    socket: TcpStream,
+pub trait TlsSocket: Read + Write {
+    fn peer_addr(&self) -> io::Result<SocketAddr>;
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()>;
+    fn shutdown(&self, how: Shutdown) -> io::Result<()>;
+}
+
+impl TlsSocket for TcpStream {
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        TcpStream::peer_addr(self)
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        TcpStream::set_nonblocking(self, nonblocking)
+    }
+
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        TcpStream::shutdown(self, how)
+    }
+}
+
+pub struct TlsConnection<S = TcpStream> {
+    socket: S,
     connection: ServerConnection,
 }
 
@@ -47,7 +67,29 @@ impl TlsAcceptor {
         })
     }
 
+    pub fn from_der(
+        certs: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        alpn: &[String],
+    ) -> io::Result<Self> {
+        let mut config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(tls_error)?;
+        config.alpn_protocols = alpn.iter().map(|value| value.as_bytes().to_vec()).collect();
+        Ok(Self {
+            config: Arc::new(config),
+        })
+    }
+
     pub fn accept(&self, socket: TcpStream) -> io::Result<TlsConnection> {
+        self.accept_stream(socket)
+    }
+
+    pub fn accept_stream<S>(&self, socket: S) -> io::Result<TlsConnection<S>>
+    where
+        S: TlsSocket,
+    {
         let mut connection = TlsConnection {
             socket,
             connection: ServerConnection::new(self.config.clone()).map_err(tls_error)?,
@@ -62,7 +104,14 @@ impl TlsAcceptor {
     }
 }
 
-impl TlsConnection {
+impl<S> TlsConnection<S>
+where
+    S: TlsSocket,
+{
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.peer_addr()
+    }
+
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         self.socket.set_nonblocking(nonblocking)
     }
@@ -120,7 +169,10 @@ impl TlsConnection {
     }
 }
 
-impl Read for TlsConnection {
+impl<S> Read for TlsConnection<S>
+where
+    S: TlsSocket,
+{
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         if output.is_empty() {
             return Ok(0);
@@ -146,7 +198,10 @@ impl Read for TlsConnection {
     }
 }
 
-impl Write for TlsConnection {
+impl<S> Write for TlsConnection<S>
+where
+    S: TlsSocket,
+{
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
         if input.is_empty() {
             return Ok(0);
@@ -161,11 +216,14 @@ impl Write for TlsConnection {
     }
 }
 
-pub fn relay_tls_stream(
-    mut client: TlsConnection,
+pub fn relay_tls_stream<S>(
+    mut client: TlsConnection<S>,
     mut remote: TcpStream,
     limiter: Option<Arc<BandwidthLimiter>>,
-) -> io::Result<(u64, u64)> {
+) -> io::Result<(u64, u64)>
+where
+    S: TlsSocket,
+{
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
 

@@ -170,8 +170,9 @@ impl Hysteria2Server {
 
     async fn handle_incoming(&self, incoming: quinn::Incoming) -> io::Result<()> {
         let connection = incoming.await.map_err(io_other)?;
+        let client_ip = connection.remote_address().ip();
         let auth = self.authenticate_http3(&connection).await?;
-        let _session = self.acquire_user_session(&auth.user)?;
+        let _session = self.acquire_user_session(&auth.user, Some(client_ip))?;
         let bandwidth = self.connection_limiters(
             self.bandwidth.limiter_for(Some(&auth.user)),
             auth.client_rx_bps,
@@ -183,7 +184,13 @@ impl Hysteria2Server {
         let udp_bandwidth = bandwidth.clone();
         tokio::spawn(async move {
             let _ = udp_server
-                .handle_udp_datagrams(udp_connection, udp_user_uuid, udp_bandwidth, udp_sessions)
+                .handle_udp_datagrams(
+                    udp_connection,
+                    udp_user_uuid,
+                    udp_bandwidth,
+                    udp_sessions,
+                    client_ip,
+                )
                 .await;
         });
 
@@ -194,7 +201,9 @@ impl Hysteria2Server {
                     let user_uuid = auth.user.uuid.clone();
                     let bandwidth = bandwidth.clone();
                     tokio::spawn(async move {
-                        let _ = server.handle_tcp_stream(stream, user_uuid, bandwidth).await;
+                        let _ = server
+                            .handle_tcp_stream(stream, user_uuid, bandwidth, client_ip)
+                            .await;
                     });
                 }
                 Err(quinn::ConnectionError::ApplicationClosed { .. })
@@ -271,6 +280,7 @@ impl Hysteria2Server {
         (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
         user_uuid: String,
         bandwidth: DirectionalLimiters,
+        client_ip: IpAddr,
     ) -> io::Result<()> {
         let request_id = read_varint(&mut recv).await?;
         if request_id != TCP_REQUEST_ID {
@@ -283,12 +293,21 @@ impl Hysteria2Server {
         }
 
         let target = read_tcp_target(&mut recv).await?;
-        match self.router.decide(&target.host) {
+        match self.router.decide_target(&target.host, target.port, "tcp") {
             RouteDecision::Direct => {}
-            RouteDecision::Block | RouteDecision::UnsupportedOutbound(_) => {
+            RouteDecision::Block => {
                 write_tcp_response(&mut send, RESPONSE_ERROR, "target blocked").await?;
                 let _ = send.finish();
                 return Ok(());
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                write_tcp_response(&mut send, RESPONSE_ERROR, "outbound route not implemented")
+                    .await?;
+                let _ = send.finish();
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
             }
         }
 
@@ -319,7 +338,13 @@ impl Hysteria2Server {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add(self.config.node_tag.clone(), user_uuid, upload, download);
+            .add_with_ip(
+                self.config.node_tag.clone(),
+                user_uuid,
+                upload,
+                download,
+                Some(client_ip),
+            );
         Ok(())
     }
 
@@ -329,6 +354,7 @@ impl Hysteria2Server {
         user_uuid: String,
         bandwidth: DirectionalLimiters,
         sessions: Arc<Mutex<HashMap<u32, Arc<UdpRelaySession>>>>,
+        client_ip: IpAddr,
     ) -> io::Result<()> {
         let mut fragments = UdpFragmentStore::default();
         loop {
@@ -351,6 +377,7 @@ impl Hysteria2Server {
                     &user_uuid,
                     bandwidth.clone(),
                     &sessions,
+                    client_ip,
                     message,
                 )
                 .await;
@@ -363,11 +390,21 @@ impl Hysteria2Server {
         user_uuid: &str,
         bandwidth: DirectionalLimiters,
         sessions: &Arc<Mutex<HashMap<u32, Arc<UdpRelaySession>>>>,
+        client_ip: IpAddr,
         message: UdpDatagram,
     ) -> io::Result<()> {
-        match self.router.decide(&message.target.host) {
+        match self
+            .router
+            .decide_target(&message.target.host, message.target.port, "udp")
+        {
             RouteDecision::Direct => {}
-            RouteDecision::Block | RouteDecision::UnsupportedOutbound(_) => return Ok(()),
+            RouteDecision::Block => return Ok(()),
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
         }
 
         let target_addr = resolve_udp_target(&message.target, self.config.connect_timeout).await?;
@@ -379,6 +416,7 @@ impl Hysteria2Server {
                 message.session_id,
                 target_addr,
                 bandwidth.clone(),
+                client_ip,
             )
             .await?;
         bandwidth.wait_upload(message.data.len());
@@ -386,11 +424,12 @@ impl Hysteria2Server {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add(
+            .add_with_ip(
                 self.config.node_tag.clone(),
                 user_uuid.to_string(),
                 message.data.len() as u64,
                 0,
+                Some(client_ip),
             );
         Ok(())
     }
@@ -403,6 +442,7 @@ impl Hysteria2Server {
         session_id: u32,
         target_addr: SocketAddr,
         bandwidth: DirectionalLimiters,
+        client_ip: IpAddr,
     ) -> io::Result<Arc<UdpRelaySession>> {
         if let Some(session) = sessions
             .lock()
@@ -436,6 +476,7 @@ impl Hysteria2Server {
         tokio::spawn(async move {
             let _ = receive_udp_replies(
                 session_id, receiver, connection, node_tag, user_uuid, traffic, bandwidth,
+                client_ip,
             )
             .await;
         });
@@ -474,9 +515,13 @@ impl Hysteria2Server {
         DirectionalLimiters { upload, download }
     }
 
-    fn acquire_user_session(&self, user: &CoreUser) -> io::Result<Option<UserSessionGuard>> {
+    fn acquire_user_session(
+        &self,
+        user: &CoreUser,
+        client_ip: Option<IpAddr>,
+    ) -> io::Result<Option<UserSessionGuard>> {
         self.sessions
-            .try_acquire(Some(user))
+            .try_acquire_for_ip(Some(user), client_ip)
             .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))
     }
 }
@@ -619,6 +664,7 @@ async fn receive_udp_replies(
     user_uuid: String,
     traffic: Arc<Mutex<TrafficRegistry>>,
     bandwidth: DirectionalLimiters,
+    client_ip: IpAddr,
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; UDP_PACKET_BUFFER_SIZE];
     loop {
@@ -637,12 +683,16 @@ async fn receive_udp_replies(
             .send_datagram_wait(Bytes::from(datagram))
             .await
             .map_err(io_other)?;
-        traffic.lock().expect("traffic registry lock poisoned").add(
-            node_tag.clone(),
-            user_uuid.clone(),
-            0,
-            read as u64,
-        );
+        traffic
+            .lock()
+            .expect("traffic registry lock poisoned")
+            .add_with_ip(
+                node_tag.clone(),
+                user_uuid.clone(),
+                0,
+                read as u64,
+                Some(client_ip),
+            );
     }
 }
 

@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::io::{self, Cursor, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
+    UdpSocket,
+};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,6 +33,7 @@ use crate::{RouteDecision, RouteMatcher};
 
 const VERSION: u8 = 0x01;
 const COMMAND_TCP: u8 = 0x01;
+const COMMAND_UDP: u8 = 0x02;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x02;
 const ATYP_IPV6: u8 = 0x03;
@@ -94,9 +98,11 @@ enum VmessSecurity {
 
 #[derive(Clone, Debug)]
 struct VmessRequest {
+    command: VmessCommand,
     user_key: String,
     user_uuid: String,
     target: SocksTarget,
+    client_ip: Option<IpAddr>,
     request_body_key: [u8; 16],
     request_body_iv: [u8; 16],
     response_body_key: [u8; 16],
@@ -104,6 +110,18 @@ struct VmessRequest {
     response_header: u8,
     options: u8,
     security: VmessSecurity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VmessCommand {
+    Tcp,
+    Udp,
+}
+
+struct VmessUdpRelayState {
+    ipv4: Option<UdpSocket>,
+    ipv6: Option<UdpSocket>,
+    timeout: Duration,
 }
 
 impl VmessServer {
@@ -160,39 +178,70 @@ impl VmessServer {
     }
 
     pub fn handle_tcp_client(&self, mut client: TcpStream) -> io::Result<()> {
-        let request = self.read_request(&mut client)?;
+        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        let mut request = self.read_request(&mut client)?;
+        request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user)?;
+        let _session = self.acquire_user_session(user, client_ip)?;
         let bandwidth = self.bandwidth.limiter_for(user);
+        if request.command == VmessCommand::Udp {
+            write_response_header(&mut client, &request)?;
+            return self.relay_udp_split(client.try_clone()?, client, request, bandwidth);
+        }
         let remote = self.connect_for_request(&request)?;
         write_response_header(&mut client, &request)?;
         self.relay_split(client, remote, request, bandwidth)
     }
 
     pub fn handle_websocket_client(&self, client: TcpStream, path: Option<&str>) -> io::Result<()> {
+        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let (reader, writer) = accept_websocket(client, path)?;
-        self.handle_split_client(reader, writer)
+        self.handle_split_client_with_ip(reader, writer, client_ip)
     }
 
-    pub fn handle_split_client<R, W>(&self, mut reader: R, mut writer: W) -> io::Result<()>
+    pub fn handle_split_client<R, W>(&self, reader: R, writer: W) -> io::Result<()>
     where
         R: Read + Send + 'static,
         W: Write,
     {
-        let request = self.read_request(&mut reader)?;
+        self.handle_split_client_with_ip(reader, writer, None)
+    }
+
+    fn handle_split_client_with_ip<R, W>(
+        &self,
+        mut reader: R,
+        mut writer: W,
+        client_ip: Option<IpAddr>,
+    ) -> io::Result<()>
+    where
+        R: Read + Send + 'static,
+        W: Write,
+    {
+        let mut request = self.read_request(&mut reader)?;
+        request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user)?;
+        let _session = self.acquire_user_session(user, client_ip)?;
         let bandwidth = self.bandwidth.limiter_for(user);
+        if request.command == VmessCommand::Udp {
+            write_response_header(&mut writer, &request)?;
+            return self.relay_udp_split(reader, writer, request, bandwidth);
+        }
         let remote = self.connect_for_request(&request)?;
         write_response_header(&mut writer, &request)?;
         self.relay_split_io(reader, writer, remote, request, bandwidth)
     }
 
     pub fn handle_tls_client(&self, mut client: TlsConnection) -> io::Result<()> {
-        let request = self.read_request(&mut client)?;
+        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        let mut request = self.read_request(&mut client)?;
+        request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user)?;
+        let _session = self.acquire_user_session(user, client_ip)?;
         let bandwidth = self.bandwidth.limiter_for(user);
+        if request.command == VmessCommand::Udp {
+            write_response_header(&mut client, &request)?;
+            return self.relay_udp_single(client, request, bandwidth);
+        }
         let remote = self.connect_for_request(&request)?;
         write_response_header(&mut client, &request)?;
         client.set_nonblocking(true)?;
@@ -204,11 +253,17 @@ impl VmessServer {
         client: TlsConnection,
         path: Option<&str>,
     ) -> io::Result<()> {
+        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let mut websocket = accept_websocket_tls(client, path)?;
-        let request = self.read_request(&mut websocket)?;
+        let mut request = self.read_request(&mut websocket)?;
+        request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user)?;
+        let _session = self.acquire_user_session(user, client_ip)?;
         let bandwidth = self.bandwidth.limiter_for(user);
+        if request.command == VmessCommand::Udp {
+            write_response_header(&mut websocket, &request)?;
+            return self.relay_udp_single(websocket, request, bandwidth);
+        }
         let remote = self.connect_for_request(&request)?;
         write_response_header(&mut websocket, &request)?;
         websocket.set_nonblocking(true)?;
@@ -241,6 +296,12 @@ impl VmessServer {
                 "vmess global padding requires chunk masking",
             ));
         }
+        if parsed.command == VmessCommand::Udp && parsed.options & OPTION_CHUNK_STREAM == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "vmess udp command requires chunk stream option",
+            ));
+        }
         let Some(core_user) = self.users.get(&user.user_key) else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -251,9 +312,11 @@ impl VmessServer {
         let response_body_iv = first_16_sha256(&parsed.request_body_iv);
 
         Ok(VmessRequest {
+            command: parsed.command,
             user_key: user.user_key.clone(),
             user_uuid: core_user.uuid.clone(),
             target: parsed.target,
+            client_ip: None,
             request_body_key: parsed.request_body_key,
             request_body_iv: parsed.request_body_iv,
             response_body_key,
@@ -292,7 +355,10 @@ impl VmessServer {
     }
 
     fn connect_for_request(&self, request: &VmessRequest) -> io::Result<TcpStream> {
-        match self.router.decide(&request.target.host) {
+        match self
+            .router
+            .decide_target(&request.target.host, request.target.port, "tcp")
+        {
             RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout),
             RouteDecision::Block => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -368,11 +434,12 @@ impl VmessServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add(
+            .add_with_ip(
                 self.config.node_tag.clone(),
                 request.user_uuid,
                 upload,
                 download,
+                request.client_ip,
             );
         Ok(())
     }
@@ -467,13 +534,188 @@ impl VmessServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add(
+            .add_with_ip(
                 self.config.node_tag.clone(),
                 request.user_uuid,
                 upload,
                 download,
+                request.client_ip,
             );
         Ok(())
+    }
+
+    fn relay_udp_split<R, W>(
+        &self,
+        client_reader: R,
+        client_writer: W,
+        request: VmessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()>
+    where
+        R: Read,
+        W: Write,
+    {
+        let mut request_body = VmessBodyReader::new(
+            client_reader,
+            request.request_body_key,
+            request.request_body_iv,
+            request.options,
+            request.security,
+        )?;
+        let mut response_body = VmessBodyWriter::new_with_length_seed(
+            client_writer,
+            request.response_body_key,
+            request.response_body_iv,
+            request.request_body_key,
+            request.request_body_iv,
+            request.options,
+            request.security,
+        )?;
+        let mut state = VmessUdpRelayState::new(self.config.connect_timeout);
+        let mut upload = 0u64;
+        let mut download = 0u64;
+        let result = loop {
+            match request_body.read_packet() {
+                Ok(Some(payload)) => {
+                    match self.forward_udp_payload(
+                        &mut state,
+                        &request.target,
+                        &payload,
+                        bandwidth.as_deref(),
+                    ) {
+                        Ok((sent, response)) => {
+                            upload = upload.saturating_add(sent);
+                            if let Some(response) = response {
+                                response_body.write_packet(&response)?;
+                                download = download.saturating_add(response.len() as u64);
+                            }
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+                Ok(None) => break Ok(()),
+                Err(error) => break Err(error),
+            }
+        };
+        let _ = response_body.finish();
+        self.record_traffic(request.user_uuid, upload, download, request.client_ip);
+        result
+    }
+
+    fn relay_udp_single<S>(
+        &self,
+        mut client: S,
+        request: VmessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()>
+    where
+        S: Read + Write,
+    {
+        let mut request_body = VmessBodyDecoder::new(
+            request.request_body_key,
+            request.request_body_iv,
+            request.options,
+            request.security,
+        );
+        let mut response_body = VmessBodyEncoder::new_with_length_seed(
+            request.response_body_key,
+            request.response_body_iv,
+            request.request_body_key,
+            request.request_body_iv,
+            request.options,
+            request.security,
+        );
+        let mut state = VmessUdpRelayState::new(self.config.connect_timeout);
+        let mut upload = 0u64;
+        let mut download = 0u64;
+        let result = loop {
+            match request_body.read_packet(&mut client) {
+                Ok(Some(payload)) => {
+                    match self.forward_udp_payload(
+                        &mut state,
+                        &request.target,
+                        &payload,
+                        bandwidth.as_deref(),
+                    ) {
+                        Ok((sent, response)) => {
+                            upload = upload.saturating_add(sent);
+                            if let Some(response) = response {
+                                response_body.write_packet(&mut client, &response)?;
+                                download = download.saturating_add(response.len() as u64);
+                            }
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+                Ok(None) => break Ok(()),
+                Err(error) => break Err(error),
+            }
+        };
+        let _ = response_body.finish(&mut client);
+        self.record_traffic(request.user_uuid, upload, download, request.client_ip);
+        result
+    }
+
+    fn forward_udp_payload(
+        &self,
+        state: &mut VmessUdpRelayState,
+        target: &SocksTarget,
+        payload: &[u8],
+        bandwidth: Option<&BandwidthLimiter>,
+    ) -> io::Result<(u64, Option<Vec<u8>>)> {
+        match self.router.decide_target(&target.host, target.port, "udp") {
+            RouteDecision::Direct => {}
+            RouteDecision::Block => return Ok((0, None)),
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        }
+
+        if let Some(limiter) = bandwidth {
+            limiter.wait_for(payload.len());
+        }
+
+        let remote_addr = resolve_udp_target(target)?;
+        let udp = state.socket_for(remote_addr)?;
+        udp.send_to(payload, remote_addr)?;
+        let mut response = vec![0u8; 65_535];
+        match udp.recv_from(&mut response) {
+            Ok((read, _)) => {
+                response.truncate(read);
+                Ok((payload.len() as u64, Some(response)))
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok((payload.len() as u64, None))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn record_traffic(
+        &self,
+        user_uuid: String,
+        upload: u64,
+        download: u64,
+        client_ip: Option<IpAddr>,
+    ) {
+        self.traffic
+            .lock()
+            .expect("traffic registry lock poisoned")
+            .add_with_ip(
+                self.config.node_tag.clone(),
+                user_uuid,
+                upload,
+                download,
+                client_ip,
+            );
     }
 
     fn request_user(&self, request: &VmessRequest) -> Option<&CoreUser> {
@@ -483,8 +725,9 @@ impl VmessServer {
     fn acquire_user_session(
         &self,
         user: Option<&CoreUser>,
+        client_ip: Option<IpAddr>,
     ) -> io::Result<Option<UserSessionGuard>> {
-        match self.sessions.try_acquire(user) {
+        match self.sessions.try_acquire_for_ip(user, client_ip) {
             Ok(guard) => Ok(guard),
             Err(error) => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -494,8 +737,33 @@ impl VmessServer {
     }
 }
 
+impl VmessUdpRelayState {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            ipv4: None,
+            ipv6: None,
+            timeout,
+        }
+    }
+
+    fn socket_for(&mut self, remote: SocketAddr) -> io::Result<&UdpSocket> {
+        let slot = if remote.is_ipv4() {
+            &mut self.ipv4
+        } else {
+            &mut self.ipv6
+        };
+        if slot.is_none() {
+            let socket = UdpSocket::bind(udp_bind_addr_for_remote(remote))?;
+            socket.set_read_timeout(Some(self.timeout))?;
+            *slot = Some(socket);
+        }
+        Ok(slot.as_ref().expect("udp socket initialized"))
+    }
+}
+
 #[derive(Debug)]
 struct ParsedVmessHeader {
+    command: VmessCommand,
     target: SocksTarget,
     request_body_key: [u8; 16],
     request_body_iv: [u8; 16],
@@ -601,6 +869,10 @@ impl<R: Read> VmessBodyReader<R> {
             ),
         })
     }
+
+    fn read_packet(&mut self) -> io::Result<Option<Vec<u8>>> {
+        self.decoder.read_packet(&mut self.reader)
+    }
 }
 
 impl VmessBodyDecoder {
@@ -651,6 +923,23 @@ impl VmessBodyDecoder {
         output[..len].copy_from_slice(&self.buffer[..len]);
         self.buffer.drain(..len);
         Ok(len)
+    }
+
+    fn read_packet<R: Read>(&mut self, reader: &mut R) -> io::Result<Option<Vec<u8>>> {
+        if self.security == VmessSecurity::None && self.options & OPTION_CHUNK_STREAM == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "vmess udp packets require chunk stream framing",
+            ));
+        }
+        if !self.buffer.is_empty() {
+            return Ok(Some(std::mem::take(&mut self.buffer)));
+        }
+        self.read_next_chunk(reader)?;
+        if self.buffer.is_empty() && self.eof {
+            return Ok(None);
+        }
+        Ok(Some(std::mem::take(&mut self.buffer)))
     }
 
     fn read_next_chunk<R: Read>(&mut self, reader: &mut R) -> io::Result<()> {
@@ -785,6 +1074,10 @@ impl<W: Write> VmessBodyWriter<W> {
         self.encoder.finish(&mut self.writer)
     }
 
+    fn write_packet(&mut self, input: &[u8]) -> io::Result<()> {
+        self.encoder.write_packet(&mut self.writer, input)
+    }
+
     #[cfg(test)]
     fn into_inner(self) -> W {
         self.writer
@@ -829,6 +1122,16 @@ impl VmessBodyEncoder {
             input = &input[len..];
         }
         Ok(original)
+    }
+
+    fn write_packet<W: Write>(&mut self, writer: &mut W, input: &[u8]) -> io::Result<()> {
+        if self.security == VmessSecurity::None && self.options & OPTION_CHUNK_STREAM == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "vmess udp packets require chunk stream framing",
+            ));
+        }
+        self.write_chunk(writer, input)
     }
 
     fn finish<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
@@ -1164,13 +1467,16 @@ fn parse_request_header(header: &[u8]) -> io::Result<ParsedVmessHeader> {
     let options = header[34];
     let padding_len = (header[35] >> 4) as usize;
     let security = VmessSecurity::parse(header[35] & 0x0f)?;
-    let command = header[37];
-    if command != COMMAND_TCP {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "only vmess tcp command is supported",
-        ));
-    }
+    let command = match header[37] {
+        COMMAND_TCP => VmessCommand::Tcp,
+        COMMAND_UDP => VmessCommand::Udp,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "only vmess tcp and udp commands are supported",
+            ));
+        }
+    };
 
     let mut cursor = Cursor::new(&header[38..checksum_offset]);
     let target = read_vmess_target(&mut cursor)?;
@@ -1183,6 +1489,7 @@ fn parse_request_header(header: &[u8]) -> io::Result<ParsedVmessHeader> {
     }
 
     Ok(ParsedVmessHeader {
+        command,
         target,
         request_body_key,
         request_body_iv,
@@ -1286,6 +1593,25 @@ fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStre
             "target did not resolve to any socket address",
         )
     }))
+}
+
+fn resolve_udp_target(target: &SocksTarget) -> io::Result<SocketAddr> {
+    (target.host.as_str(), target.port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "udp target did not resolve to any socket address",
+            )
+        })
+}
+
+fn udp_bind_addr_for_remote(remote: SocketAddr) -> SocketAddr {
+    match remote {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    }
 }
 
 fn write_all_wait<W: Write>(writer: &mut W, mut input: &[u8]) -> io::Result<()> {
@@ -1518,7 +1844,7 @@ fn create_auth_id(cmd_key: &[u8; 16], timestamp: i64, random: [u8; 4]) -> [u8; 1
 mod tests {
     use std::fs;
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{TcpListener, TcpStream, UdpSocket};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::thread;
@@ -1529,8 +1855,8 @@ mod tests {
 
     use super::{
         create_auth_id, fnv1a, kdf, parse_uuid_bytes, vmess_cmd_key, write_response_header,
-        VmessBodyReader, VmessBodyWriter, VmessRequest, VmessSecurity, VmessServer,
-        VmessServerConfig, ATYP_IPV4, COMMAND_TCP, OPTION_AUTHENTICATED_LENGTH,
+        VmessBodyReader, VmessBodyWriter, VmessCommand, VmessRequest, VmessSecurity, VmessServer,
+        VmessServerConfig, ATYP_IPV4, COMMAND_TCP, COMMAND_UDP, OPTION_AUTHENTICATED_LENGTH,
         OPTION_CHUNK_MASKING, OPTION_CHUNK_STREAM, OPTION_GLOBAL_PADDING, SECURITY_AES128_GCM,
         VERSION,
     };
@@ -1572,6 +1898,15 @@ mod tests {
         payload: &[u8],
         options: u8,
     ) -> (Vec<u8>, VmessRequest) {
+        vmess_request_with_command(target, payload, options, COMMAND_TCP)
+    }
+
+    fn vmess_request_with_command(
+        target: std::net::SocketAddr,
+        payload: &[u8],
+        options: u8,
+        command: u8,
+    ) -> (Vec<u8>, VmessRequest) {
         let uuid = parse_uuid_bytes(&user().uuid).expect("uuid");
         let cmd_key = vmess_cmd_key(&uuid);
         let request_body_key = [0x22u8; 16];
@@ -1586,7 +1921,7 @@ mod tests {
         header.push(options);
         header.push(SECURITY_AES128_GCM);
         header.push(0);
-        header.push(COMMAND_TCP);
+        header.push(command);
         header.extend_from_slice(&target.port().to_be_bytes());
         header.push(ATYP_IPV4);
         header.extend_from_slice(
@@ -1617,12 +1952,18 @@ mod tests {
         let response_body_key = super::first_16_sha256(&request_body_key);
         let response_body_iv = super::first_16_sha256(&request_body_iv);
         let request = VmessRequest {
+            command: if command == COMMAND_UDP {
+                VmessCommand::Udp
+            } else {
+                VmessCommand::Tcp
+            },
             user_key: "11111111111111111111111111111111".to_string(),
             user_uuid: user().uuid,
             target: SocksTarget {
                 host: target.ip().to_string(),
                 port: target.port(),
             },
+            client_ip: None,
             request_body_key,
             request_body_iv,
             response_body_key,
@@ -1911,6 +2252,67 @@ mod tests {
     }
 
     #[test]
+    fn proxies_udp_and_records_user_traffic() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let mut bytes = [0u8; 1024];
+            let (read, source) = echo.recv_from(&mut bytes).expect("echo read");
+            assert_eq!(&bytes[..read], b"ping");
+            echo.send_to(b"pong", source).expect("echo write");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vmess bind");
+        let vmess_addr = listener.local_addr().expect("vmess addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vmess accept");
+            server_clone.handle_tcp_client(stream)
+        });
+
+        let (request_bytes, request) = vmess_request_with_command(
+            echo_addr,
+            b"ping",
+            OPTION_CHUNK_STREAM | OPTION_CHUNK_MASKING | OPTION_GLOBAL_PADDING,
+            COMMAND_UDP,
+        );
+        let mut client = TcpStream::connect(vmess_addr).expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("client timeout");
+        client.write_all(&request_bytes).expect("client request");
+        decode_response_header(&mut client, &request);
+        let mut body = VmessBodyReader::new(
+            client,
+            request.response_body_key,
+            request.response_body_iv,
+            request.options,
+            request.security,
+        )
+        .expect("response body");
+        let response = body
+            .read_packet()
+            .expect("udp response read")
+            .expect("udp response packet");
+        assert_eq!(response, b"pong");
+        drop(body);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|vmess|1");
+        assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
     fn proxies_tcp_with_authenticated_length() {
         let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
         let echo_addr = echo.local_addr().expect("echo addr");
@@ -2162,12 +2564,14 @@ mod tests {
     #[test]
     fn writes_vmess_response_header() {
         let request = VmessRequest {
+            command: VmessCommand::Tcp,
             user_key: "user".to_string(),
             user_uuid: "user".to_string(),
             target: SocksTarget {
                 host: "127.0.0.1".to_string(),
                 port: 80,
             },
+            client_ip: None,
             request_body_key: [0x22; 16],
             request_body_iv: [0x33; 16],
             response_body_key: super::first_16_sha256(&[0x22; 16]),
