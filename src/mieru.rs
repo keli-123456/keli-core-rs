@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
+};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,7 +19,9 @@ use crate::socks5::SocksTarget;
 use crate::stream::copy_count_best_effort_limited;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
-use crate::{connect_tcp_outbound, route_protocol_labels, RouteDecision, RouteMatcher};
+use crate::{
+    connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
+};
 
 const NONCE_LEN: usize = 24;
 const METADATA_LEN: usize = 32;
@@ -38,10 +42,13 @@ const ACK_SERVER_TO_CLIENT: u8 = 9;
 const STATUS_OK: u8 = 0;
 const SOCKS_VERSION: u8 = 5;
 const SOCKS_CMD_CONNECT: u8 = 1;
+const SOCKS_CMD_UDP_ASSOCIATE: u8 = 3;
 const SOCKS_CONNECT_SUCCESS: [u8; 10] = [SOCKS_VERSION, 0, 0, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
 const ATYP_IPV4: u8 = 1;
 const ATYP_DOMAIN: u8 = 3;
 const ATYP_IPV6: u8 = 4;
+const MIERU_UDP_MARKER_START: u8 = 0x00;
+const MIERU_UDP_MARKER_END: u8 = 0xff;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -126,10 +133,24 @@ enum SegmentAttempt {
 #[derive(Debug, PartialEq, Eq)]
 enum SocksParseResult {
     Complete {
+        command: MieruSocksCommand,
         target: SocksTarget,
         consumed: usize,
     },
     NeedMore,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MieruSocksCommand {
+    TcpConnect,
+    UdpAssociate,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MieruSocksRequest {
+    command: MieruSocksCommand,
+    target: SocksTarget,
+    consumed: usize,
 }
 
 impl MieruServer {
@@ -184,33 +205,59 @@ impl MieruServer {
             ));
         }
         let mut request_bytes = initial.payload;
-        let (target, consumed) = read_socks_request_from_mieru(&mut reader, &mut request_bytes)?;
-        let initial_payload = request_bytes.split_off(consumed);
+        let request = read_socks_request_from_mieru(&mut reader, &mut request_bytes)?;
+        let initial_payload = request_bytes.split_off(request.consumed);
         let _session = self.acquire_user_session(&user, client_ip)?;
         let bandwidth = self.bandwidth.limiter_for(Some(&user));
+
+        if request.command == MieruSocksCommand::UdpAssociate {
+            let mut writer = MieruWriter::server(client, &user, reader.session_id())?;
+            writer.write_open_response()?;
+            writer.write_all(&SOCKS_CONNECT_SUCCESS)?;
+            let (upload, download) = relay_mieru_udp_associate(
+                reader,
+                writer,
+                initial_payload,
+                &self.router,
+                self.config.connect_timeout,
+                bandwidth,
+            )?;
+            self.traffic
+                .lock()
+                .expect("traffic registry lock poisoned")
+                .add_with_ip(
+                    self.config.node_tag.clone(),
+                    user.uuid,
+                    upload,
+                    download,
+                    client_ip,
+                );
+            return Ok(());
+        }
+
         let protocol_labels = route_protocol_labels("tcp", &initial_payload);
-        let mut remote =
-            match self
-                .router
-                .decide_target(&target.host, target.port, &protocol_labels)
-            {
-                RouteDecision::Direct => connect_target(&target, self.config.connect_timeout)?,
-                RouteDecision::Outbound(outbound) => {
-                    connect_tcp_outbound(&outbound, &target, self.config.connect_timeout)?
-                }
-                RouteDecision::Block => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "target blocked by route",
-                    ));
-                }
-                RouteDecision::UnsupportedOutbound(tag) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("outbound route {tag} is not implemented"),
-                    ));
-                }
-            };
+        let mut remote = match self.router.decide_target(
+            &request.target.host,
+            request.target.port,
+            &protocol_labels,
+        ) {
+            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
+            RouteDecision::Outbound(outbound) => {
+                connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
+            }
+            RouteDecision::Block => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target blocked by route",
+                ));
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
 
         let mut writer = MieruWriter::server(client, &user, reader.session_id())?;
         writer.write_open_response()?;
@@ -851,10 +898,20 @@ fn active_user_list(users: &[CoreUser]) -> Vec<CoreUser> {
 fn read_socks_request_from_mieru<R: Read>(
     reader: &mut R,
     bytes: &mut Vec<u8>,
-) -> io::Result<(SocksTarget, usize)> {
+) -> io::Result<MieruSocksRequest> {
     loop {
         match parse_socks_request(bytes)? {
-            SocksParseResult::Complete { target, consumed } => return Ok((target, consumed)),
+            SocksParseResult::Complete {
+                command,
+                target,
+                consumed,
+            } => {
+                return Ok(MieruSocksRequest {
+                    command,
+                    target,
+                    consumed,
+                })
+            }
             SocksParseResult::NeedMore => {
                 let mut temp = [0u8; 1024];
                 let read = reader.read(&mut temp)?;
@@ -884,12 +941,16 @@ fn parse_socks_request(input: &[u8]) -> io::Result<SocksParseResult> {
             "invalid mieru socks request header",
         ));
     }
-    if header[1] != SOCKS_CMD_CONNECT {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "mieru currently supports only socks connect requests",
-        ));
-    }
+    let command = match header[1] {
+        SOCKS_CMD_CONNECT => MieruSocksCommand::TcpConnect,
+        SOCKS_CMD_UDP_ASSOCIATE => MieruSocksCommand::UdpAssociate,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "mieru currently supports only socks connect and udp associate requests",
+            ));
+        }
+    };
 
     let mut cursor = offset + 4;
     let host = match header[3] {
@@ -939,6 +1000,7 @@ fn parse_socks_request(input: &[u8]) -> io::Result<SocksParseResult> {
     let port = u16::from_be_bytes([input[cursor], input[cursor + 1]]);
     cursor += 2;
     Ok(SocksParseResult::Complete {
+        command,
         target: SocksTarget { host, port },
         consumed: cursor,
     })
@@ -968,6 +1030,253 @@ fn socks_request_offset(input: &[u8]) -> io::Result<Option<usize>> {
 
 fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStream> {
     crate::dns::connect_tcp(&target.host, target.port, timeout)
+}
+
+fn relay_mieru_udp_associate(
+    mut reader: MieruReader,
+    mut writer: MieruWriter,
+    mut pending: Vec<u8>,
+    router: &RouteMatcher,
+    timeout: Duration,
+    limiter: Option<Arc<BandwidthLimiter>>,
+) -> io::Result<(u64, u64)> {
+    let mut upload = 0u64;
+    let mut download = 0u64;
+    while let Some(packet) = read_mieru_udp_frame(&mut reader, &mut pending)? {
+        let (target, payload) = parse_socks_udp_packet(&packet)?;
+        if let Some(limiter) = limiter.as_deref() {
+            limiter.wait_for(payload.len());
+        }
+        let protocol_labels = route_protocol_labels("udp", &payload);
+        let response = match router.decide_target(&target.host, target.port, &protocol_labels) {
+            RouteDecision::Direct => send_direct_mieru_udp(&target, &payload, timeout),
+            RouteDecision::Outbound(outbound) => {
+                send_udp_outbound(&outbound, &target, &payload, timeout)
+            }
+            RouteDecision::Block => continue,
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
+        let (source, response_payload) = match response {
+            Ok(response) => response,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        upload = upload.saturating_add(payload.len() as u64);
+        download = download.saturating_add(response_payload.len() as u64);
+        let response_target = socket_addr_to_target(source);
+        let response_packet = encode_socks_udp_packet(&response_target, &response_payload)?;
+        let framed = encode_mieru_udp_frame(&response_packet)?;
+        writer.write_all(&framed)?;
+    }
+    writer.shutdown();
+    Ok((upload, download))
+}
+
+fn read_mieru_udp_frame<R: Read>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+) -> io::Result<Option<Vec<u8>>> {
+    loop {
+        if let Some(frame) = take_mieru_udp_frame(buffer)? {
+            return Ok(Some(frame));
+        }
+        let mut temp = [0u8; 4096];
+        let read = reader.read(&mut temp)?;
+        if read == 0 {
+            if buffer.is_empty() {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "mieru udp frame ended early",
+            ));
+        }
+        buffer.extend_from_slice(&temp[..read]);
+    }
+}
+
+fn take_mieru_udp_frame(buffer: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {
+    while buffer
+        .first()
+        .is_some_and(|byte| *byte != MIERU_UDP_MARKER_START)
+    {
+        buffer.remove(0);
+    }
+    if buffer.len() < 4 {
+        return Ok(None);
+    }
+    let len = u16::from_be_bytes([buffer[1], buffer[2]]) as usize;
+    let total = 1 + 2 + len + 1;
+    if buffer.len() < total {
+        return Ok(None);
+    }
+    if buffer[total - 1] != MIERU_UDP_MARKER_END {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid mieru udp frame marker",
+        ));
+    }
+    let payload = buffer[3..3 + len].to_vec();
+    buffer.drain(..total);
+    Ok(Some(payload))
+}
+
+fn encode_mieru_udp_frame(packet: &[u8]) -> io::Result<Vec<u8>> {
+    let len = u16::try_from(packet.len()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "mieru udp packet is too large")
+    })?;
+    let mut output = Vec::with_capacity(packet.len() + 4);
+    output.push(MIERU_UDP_MARKER_START);
+    output.extend_from_slice(&len.to_be_bytes());
+    output.extend_from_slice(packet);
+    output.push(MIERU_UDP_MARKER_END);
+    Ok(output)
+}
+
+fn parse_socks_udp_packet(input: &[u8]) -> io::Result<(SocksTarget, Vec<u8>)> {
+    if input.len() < 4 || input[0] != 0 || input[1] != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid socks udp packet header",
+        ));
+    }
+    if input[2] != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "fragmented socks udp packets are not supported",
+        ));
+    }
+    let mut cursor = 4;
+    let host = match input[3] {
+        ATYP_IPV4 => {
+            if input.len() < cursor + 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short socks udp ipv4 address",
+                ));
+            }
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&input[cursor..cursor + 4]);
+            cursor += 4;
+            Ipv4Addr::from(bytes).to_string()
+        }
+        ATYP_IPV6 => {
+            if input.len() < cursor + 16 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short socks udp ipv6 address",
+                ));
+            }
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&input[cursor..cursor + 16]);
+            cursor += 16;
+            Ipv6Addr::from(bytes).to_string()
+        }
+        ATYP_DOMAIN => {
+            if input.len() < cursor + 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short socks udp domain length",
+                ));
+            }
+            let len = input[cursor] as usize;
+            cursor += 1;
+            if input.len() < cursor + len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short socks udp domain",
+                ));
+            }
+            let host = String::from_utf8(input[cursor..cursor + len].to_vec()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid socks udp domain")
+            })?;
+            cursor += len;
+            host
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported socks udp address type",
+            ));
+        }
+    };
+    if input.len() < cursor + 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short socks udp port",
+        ));
+    }
+    let port = u16::from_be_bytes([input[cursor], input[cursor + 1]]);
+    cursor += 2;
+    Ok((SocksTarget { host, port }, input[cursor..].to_vec()))
+}
+
+fn encode_socks_udp_packet(target: &SocksTarget, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let mut output = vec![0, 0, 0];
+    encode_socks_target(&mut output, target)?;
+    output.extend_from_slice(payload);
+    Ok(output)
+}
+
+fn encode_socks_target(output: &mut Vec<u8>, target: &SocksTarget) -> io::Result<()> {
+    if let Ok(ipv4) = target.host.parse::<Ipv4Addr>() {
+        output.push(ATYP_IPV4);
+        output.extend_from_slice(&ipv4.octets());
+    } else if let Ok(ipv6) = target.host.parse::<Ipv6Addr>() {
+        output.push(ATYP_IPV6);
+        output.extend_from_slice(&ipv6.octets());
+    } else {
+        let host = target.host.as_bytes();
+        let len = u8::try_from(host.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socks domain is too long"))?;
+        output.push(ATYP_DOMAIN);
+        output.push(len);
+        output.extend_from_slice(host);
+    }
+    output.extend_from_slice(&target.port.to_be_bytes());
+    Ok(())
+}
+
+fn send_direct_mieru_udp(
+    target: &SocksTarget,
+    payload: &[u8],
+    timeout: Duration,
+) -> io::Result<(SocketAddr, Vec<u8>)> {
+    let remote_addr = crate::dns::resolve_socket_addr(&target.host, target.port, timeout)?;
+    let udp = UdpSocket::bind(udp_bind_addr_for_remote(remote_addr))?;
+    udp.set_read_timeout(Some(timeout))?;
+    udp.set_write_timeout(Some(timeout))?;
+    udp.send_to(payload, remote_addr)?;
+    let mut response = vec![0u8; 65_535];
+    let (read, source) = udp.recv_from(&mut response)?;
+    response.truncate(read);
+    Ok((source, response))
+}
+
+fn udp_bind_addr_for_remote(remote: SocketAddr) -> SocketAddr {
+    match remote {
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+    }
+}
+
+fn socket_addr_to_target(addr: SocketAddr) -> SocksTarget {
+    SocksTarget {
+        host: addr.ip().to_string(),
+        port: addr.port(),
+    }
 }
 
 fn relay_mieru_streams(
@@ -1001,17 +1310,19 @@ fn relay_mieru_streams(
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{TcpListener, TcpStream, UdpSocket};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
     use crate::config::{OutboundConfig, RouteAction, RouteRule};
     use crate::mieru::{
-        apply_nonce_user_hint, derive_mieru_key, encode_segment_body, parse_socks_request,
-        rounded_unix_time, MieruMetadata, MieruReader, MieruServer, MieruServerConfig, MieruWriter,
-        SocksParseResult, DATA_CLIENT_TO_SERVER, DATA_SERVER_TO_CLIENT, OPEN_SESSION_REQUEST,
-        OPEN_SESSION_RESPONSE, SOCKS_CONNECT_SUCCESS, STATUS_OK,
+        apply_nonce_user_hint, derive_mieru_key, encode_mieru_udp_frame, encode_segment_body,
+        encode_socks_udp_packet, parse_socks_request, parse_socks_udp_packet, read_mieru_udp_frame,
+        rounded_unix_time, MieruMetadata, MieruReader, MieruServer, MieruServerConfig,
+        MieruSocksCommand, MieruWriter, SocksParseResult, DATA_CLIENT_TO_SERVER,
+        DATA_SERVER_TO_CLIENT, OPEN_SESSION_REQUEST, OPEN_SESSION_RESPONSE,
+        SOCKS_CMD_UDP_ASSOCIATE, SOCKS_CONNECT_SUCCESS, STATUS_OK,
     };
     use crate::user::CoreUser;
 
@@ -1049,6 +1360,7 @@ mod tests {
         assert_eq!(
             parsed,
             SocksParseResult::Complete {
+                command: MieruSocksCommand::TcpConnect,
                 target: crate::socks5::SocksTarget {
                     host: "example.com".to_string(),
                     port: 443
@@ -1152,6 +1464,72 @@ mod tests {
 
         drop(writer);
         echo_thread.join().expect("echo thread");
+        let records = server_thread.join().expect("server thread");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn server_proxies_mieru_udp_associate() {
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("udp bind");
+        let udp_addr = udp.local_addr().expect("udp addr");
+        let udp_thread = thread::spawn(move || {
+            let mut bytes = [0u8; 16];
+            let (read, peer) = udp.recv_from(&mut bytes).expect("udp read");
+            assert_eq!(&bytes[..read], b"ping");
+            udp.send_to(b"pong", peer).expect("udp write");
+        });
+
+        let server = MieruServer::new(MieruServerConfig {
+            node_tag: "panel|mieru|1".to_string(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            users: vec![user()],
+            routes: Vec::new(),
+            connect_timeout: Duration::from_secs(5),
+        });
+        let listener = server.bind().expect("server bind");
+        let listen_addr = listener.local_addr().expect("listen addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            server.handle_tcp_client(stream).expect("handle");
+            server.drain_traffic(1)
+        });
+
+        let client = TcpStream::connect(listen_addr).expect("connect");
+        let mut writer = test_client_writer(client.try_clone().expect("clone"), &user(), 19);
+        writer
+            .write_client_segment(OPEN_SESSION_REQUEST, &socks_udp_associate_request())
+            .expect("open");
+        let mut reader = MieruReader::accept(client, &[user()]).expect("client reader");
+        let open_response = reader.take_initial_segment().expect("open");
+        assert_eq!(open_response.metadata.protocol_type, OPEN_SESSION_RESPONSE);
+        assert_socks_connect_success(&mut reader);
+
+        let udp_packet = encode_socks_udp_packet(
+            &crate::socks5::SocksTarget {
+                host: udp_addr.ip().to_string(),
+                port: udp_addr.port(),
+            },
+            b"ping",
+        )
+        .expect("encode socks udp");
+        let frame = encode_mieru_udp_frame(&udp_packet).expect("encode mieru udp");
+        writer
+            .write_client_segment(DATA_CLIENT_TO_SERVER, &frame)
+            .expect("write udp");
+
+        let response_frame =
+            read_mieru_udp_frame(&mut reader, &mut Vec::new()).expect("read frame");
+        let (response_target, response_payload) =
+            parse_socks_udp_packet(&response_frame.expect("response frame")).expect("parse udp");
+        assert_eq!(response_target.host, udp_addr.ip().to_string());
+        assert_eq!(response_target.port, udp_addr.port());
+        assert_eq!(response_payload, b"pong");
+
+        drop(writer);
+        drop(reader);
+        udp_thread.join().expect("udp thread");
         let records = server_thread.join().expect("server thread");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].upload, 4);
@@ -1411,6 +1789,10 @@ mod tests {
         request.extend_from_slice(host_bytes);
         request.extend_from_slice(&port.to_be_bytes());
         request
+    }
+
+    fn socks_udp_associate_request() -> Vec<u8> {
+        vec![0x05, SOCKS_CMD_UDP_ASSOCIATE, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
     }
 
     fn read_socks5_connect_target(stream: &mut TcpStream) -> std::io::Result<crate::SocksTarget> {
