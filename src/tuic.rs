@@ -276,6 +276,7 @@ impl TuicServer {
         bandwidth: Option<Arc<BandwidthLimiter>>,
         sessions: Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
     ) -> io::Result<()> {
+        let mut fragments = UdpFragmentStore::default();
         loop {
             let datagram = match connection.read_datagram().await {
                 Ok(datagram) => datagram,
@@ -292,6 +293,7 @@ impl TuicServer {
                 &user_uuid,
                 bandwidth.clone(),
                 &sessions,
+                &mut fragments,
                 UdpReplyMode::Datagram,
                 command,
             )
@@ -306,6 +308,7 @@ impl TuicServer {
         bandwidth: Option<Arc<BandwidthLimiter>>,
         sessions: Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
     ) -> io::Result<()> {
+        let mut fragments = UdpFragmentStore::default();
         loop {
             let mut stream = match connection.accept_uni().await {
                 Ok(stream) => stream,
@@ -326,6 +329,7 @@ impl TuicServer {
                 &user_uuid,
                 bandwidth.clone(),
                 &sessions,
+                &mut fragments,
                 UdpReplyMode::UniStream,
                 command,
             )
@@ -339,16 +343,20 @@ impl TuicServer {
         user_uuid: &str,
         bandwidth: Option<Arc<BandwidthLimiter>>,
         sessions: &Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
+        fragments: &mut UdpFragmentStore,
         reply_mode: UdpReplyMode,
         command: UdpCommand,
     ) -> io::Result<()> {
         match command {
-            UdpCommand::Packet(packet) => {
-                self.handle_udp_packet(
-                    connection, user_uuid, bandwidth, sessions, reply_mode, packet,
-                )
-                .await
-            }
+            UdpCommand::Packet(packet) => match fragments.push(packet)? {
+                Some(packet) => {
+                    self.handle_udp_packet(
+                        connection, user_uuid, bandwidth, sessions, reply_mode, packet,
+                    )
+                    .await
+                }
+                None => Ok(()),
+            },
             UdpCommand::Dissociate(assoc_id) => {
                 if let Some(session) = sessions
                     .lock()
@@ -504,6 +512,76 @@ struct UdpPacket {
 impl UdpPacket {
     fn is_single_fragment(&self) -> bool {
         self.fragment_total == 1 && self.fragment_id == 0
+    }
+}
+
+#[derive(Debug, Default)]
+struct UdpFragmentStore {
+    fragments: HashMap<(u16, u16), UdpFragmentSet>,
+}
+
+#[derive(Debug)]
+struct UdpFragmentSet {
+    target: Option<SocksTarget>,
+    parts: Vec<Option<Vec<u8>>>,
+}
+
+impl UdpFragmentStore {
+    fn push(&mut self, packet: UdpPacket) -> io::Result<Option<UdpPacket>> {
+        if packet.fragment_total == 0 || packet.fragment_id >= packet.fragment_total {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid tuic udp fragment index",
+            ));
+        }
+        if packet.is_single_fragment() {
+            return Ok(Some(packet));
+        }
+
+        let key = (packet.assoc_id, packet.packet_id);
+        let count = packet.fragment_total as usize;
+        let index = packet.fragment_id as usize;
+        let set = self.fragments.entry(key).or_insert_with(|| UdpFragmentSet {
+            target: None,
+            parts: vec![None; count],
+        });
+        if set.parts.len() != count {
+            self.fragments.remove(&key);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mismatched tuic udp fragment group",
+            ));
+        }
+        if let Some(target) = packet.target {
+            if let Some(existing) = &set.target {
+                if existing != &target {
+                    self.fragments.remove(&key);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "mismatched tuic udp fragment target",
+                    ));
+                }
+            }
+            set.target = Some(target);
+        }
+        set.parts[index] = Some(packet.payload);
+        if !set.parts.iter().all(Option::is_some) || set.target.is_none() {
+            return Ok(None);
+        }
+
+        let set = self.fragments.remove(&key).expect("fragment set exists");
+        let mut payload = Vec::new();
+        for part in set.parts {
+            payload.extend_from_slice(&part.expect("all fragments present"));
+        }
+        Ok(Some(UdpPacket {
+            assoc_id: key.0,
+            packet_id: key.1,
+            fragment_total: 1,
+            fragment_id: 0,
+            target: set.target,
+            payload,
+        }))
     }
 }
 
@@ -1067,6 +1145,41 @@ mod tests {
                 payload: b"dns".to_vec(),
             })
         );
+    }
+
+    #[test]
+    fn reassembles_tuic_udp_fragments() {
+        let target = SocksTarget {
+            host: "127.0.0.1".to_string(),
+            port: 53,
+        };
+        let first =
+            match parse_udp_command(&encode_udp_packet(7, 12, 2, 0, Some(&target), b"he").unwrap())
+                .unwrap()
+            {
+                UdpCommand::Packet(packet) => packet,
+                _ => panic!("expected packet"),
+            };
+        let second = match parse_udp_command(&encode_udp_packet(7, 12, 2, 1, None, b"llo").unwrap())
+            .unwrap()
+        {
+            UdpCommand::Packet(packet) => packet,
+            _ => panic!("expected packet"),
+        };
+        let mut fragments = UdpFragmentStore::default();
+
+        assert!(fragments.push(second).unwrap().is_none());
+        let packet = fragments
+            .push(first)
+            .unwrap()
+            .expect("complete fragmented packet");
+
+        assert_eq!(packet.assoc_id, 7);
+        assert_eq!(packet.packet_id, 12);
+        assert_eq!(packet.fragment_total, 1);
+        assert_eq!(packet.fragment_id, 0);
+        assert_eq!(packet.target, Some(target));
+        assert_eq!(packet.payload, b"hello");
     }
 
     #[test]

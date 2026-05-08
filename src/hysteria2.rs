@@ -280,6 +280,7 @@ impl Hysteria2Server {
         bandwidth: Option<Arc<BandwidthLimiter>>,
         sessions: Arc<Mutex<HashMap<u32, Arc<UdpRelaySession>>>>,
     ) -> io::Result<()> {
+        let mut fragments = UdpFragmentStore::default();
         loop {
             let datagram = match connection.read_datagram().await {
                 Ok(datagram) => datagram,
@@ -291,9 +292,9 @@ impl Hysteria2Server {
             let Ok(message) = parse_udp_datagram(&datagram) else {
                 continue;
             };
-            if !message.is_single_fragment() {
+            let Some(message) = fragments.push(message)? else {
                 continue;
-            }
+            };
             let _ = self
                 .handle_udp_message(
                     &connection,
@@ -417,6 +418,64 @@ struct UdpDatagram {
 impl UdpDatagram {
     fn is_single_fragment(&self) -> bool {
         self.fragment_id == 0 && self.fragment_count == 1
+    }
+}
+
+#[derive(Debug, Default)]
+struct UdpFragmentStore {
+    fragments: HashMap<(u32, u16), UdpFragmentSet>,
+}
+
+#[derive(Debug)]
+struct UdpFragmentSet {
+    target: SocksTarget,
+    parts: Vec<Option<Vec<u8>>>,
+}
+
+impl UdpFragmentStore {
+    fn push(&mut self, message: UdpDatagram) -> io::Result<Option<UdpDatagram>> {
+        if message.fragment_count == 0 || message.fragment_id >= message.fragment_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid hysteria2 udp fragment index",
+            ));
+        }
+        if message.is_single_fragment() {
+            return Ok(Some(message));
+        }
+
+        let key = (message.session_id, message.packet_id);
+        let count = message.fragment_count as usize;
+        let index = message.fragment_id as usize;
+        let set = self.fragments.entry(key).or_insert_with(|| UdpFragmentSet {
+            target: message.target.clone(),
+            parts: vec![None; count],
+        });
+        if set.parts.len() != count || set.target != message.target {
+            self.fragments.remove(&key);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mismatched hysteria2 udp fragment group",
+            ));
+        }
+        set.parts[index] = Some(message.data);
+        if !set.parts.iter().all(Option::is_some) {
+            return Ok(None);
+        }
+
+        let set = self.fragments.remove(&key).expect("fragment set exists");
+        let mut data = Vec::new();
+        for part in set.parts {
+            data.extend_from_slice(&part.expect("all fragments present"));
+        }
+        Ok(Some(UdpDatagram {
+            session_id: key.0,
+            packet_id: key.1,
+            fragment_id: 0,
+            fragment_count: 1,
+            target: set.target,
+            data,
+        }))
     }
 }
 
@@ -953,6 +1012,29 @@ mod tests {
             }
         );
         assert_eq!(parsed.data, b"dns");
+    }
+
+    #[test]
+    fn reassembles_hysteria2_udp_fragments() {
+        let mut fragments = UdpFragmentStore::default();
+        let first =
+            parse_udp_datagram(&encode_udp_datagram(7, 12, 0, 2, "127.0.0.1:53", b"he").unwrap())
+                .unwrap();
+        let second =
+            parse_udp_datagram(&encode_udp_datagram(7, 12, 1, 2, "127.0.0.1:53", b"llo").unwrap())
+                .unwrap();
+
+        assert!(fragments.push(first).unwrap().is_none());
+        let message = fragments
+            .push(second)
+            .unwrap()
+            .expect("complete fragmented message");
+
+        assert_eq!(message.session_id, 7);
+        assert_eq!(message.packet_id, 12);
+        assert_eq!(message.fragment_id, 0);
+        assert_eq!(message.fragment_count, 1);
+        assert_eq!(message.data, b"hello");
     }
 
     #[test]
