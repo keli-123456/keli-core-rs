@@ -36,8 +36,8 @@ The binary also exposes a minimal process boundary:
 Protocols are split by responsibility:
 
 ```text
-Core-planned:      VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC, AnyTLS, SOCKS, HTTP
-External sidecar:  Naive, Mieru
+Core-planned:      VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC, AnyTLS, Mieru TCP, SOCKS, HTTP
+External sidecar:  Naive
 ```
 
 External sidecar protocols must be handled by `keli-edge`. The Rust core should not silently accept them and produce a fake running state.

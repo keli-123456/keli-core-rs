@@ -21,7 +21,7 @@ The first goal is not to replace Xray immediately. The first goal is to define a
 Implemented in this first skeleton:
 
 - Core config model for inbound, outbound, routing, TLS, sniffing, users, and stats.
-- Protocol placement rules so external sidecar protocols such as Naive and Mieru are not faked inside the core.
+- Protocol placement rules so external sidecar protocols such as Naive are not faked inside the core.
 - Go-compatible user traffic keys using `<node-tag>|<user-uuid>`.
 - Traffic registry with minimum-threshold draining.
 - Runtime planning with deterministic config fingerprints.
@@ -87,7 +87,7 @@ The code-level protocol and runtime parity gate is tracked in `docs/PARITY.md`.
 
 `keli-edge`
 
-- Sidecar supervisor/runtime for protocols that should not be forced into Xray-style core plans, such as Mieru and Naive.
+- Sidecar supervisor/runtime for protocols that should not be forced into Xray-style core plans, such as Naive.
 
 ## Protocol Strategy
 
@@ -102,11 +102,11 @@ Early core-planned protocols:
 - Hysteria2
 - TUIC
 - AnyTLS
+- Mieru TCP
 
 External sidecar protocols:
 
 - Naive
-- Mieru
 
 Sidecar protocols are rejected by `keli-core-rs` config validation. They should be handled by `kelinode-rs` through `keli-edge`.
 
