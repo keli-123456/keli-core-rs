@@ -1,9 +1,11 @@
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use keli_core_rs::{
-    load_core_config_json, CoreCommand, CoreController, CoreResponse, RuntimeState, VERSION,
+    load_core_config_json, start_control_server, CoreCommand, CoreController, CoreResponse,
+    RuntimeState, VERSION,
 };
 
 fn main() -> ExitCode {
@@ -43,9 +45,13 @@ fn run() -> Result<(), String> {
             let path = args
                 .next()
                 .ok_or_else(|| "run-config requires a json config path".to_string())?;
+            let control_addr = parse_run_config_options(args)?;
             let config = load_core_config_json(path).map_err(|error| error.to_string())?;
-            let mut controller = CoreController::new();
-            let response = controller.handle(CoreCommand::ApplyConfig { config });
+            let controller = Arc::new(Mutex::new(CoreController::new()));
+            let response = controller
+                .lock()
+                .map_err(|_| "controller lock poisoned".to_string())?
+                .handle(CoreCommand::ApplyConfig { config });
             println!(
                 "{}",
                 serde_json::to_string(&response).map_err(|error| error.to_string())?
@@ -53,14 +59,49 @@ fn run() -> Result<(), String> {
             if matches!(response, CoreResponse::Error { .. }) {
                 return Err("failed to start core service".to_string());
             }
+            let mut control = match control_addr {
+                Some(addr) => Some(
+                    start_control_server(&addr, controller).map_err(|error| error.to_string())?,
+                ),
+                None => None,
+            };
             loop {
-                thread::park_timeout(Duration::from_secs(3600));
+                if control.as_ref().is_some_and(|handle| handle.is_stopped()) {
+                    break;
+                }
+                thread::park_timeout(Duration::from_secs(1));
+            }
+            if let Some(handle) = &mut control {
+                handle.stop();
             }
         }
         _ => {
             println!("keli-core-rs {} experimental core skeleton", VERSION);
-            println!("commands: version, health, check-config <path>, run-config <path>");
+            println!(
+                "commands: version, health, check-config <path>, run-config <path> [--control <addr>]"
+            );
         }
     }
     Ok(())
+}
+
+fn parse_run_config_options(
+    mut args: impl Iterator<Item = String>,
+) -> Result<Option<String>, String> {
+    let mut control_addr = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--control" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--control requires a listen address".to_string())?;
+                if value.trim().is_empty() {
+                    return Err("--control requires a listen address".to_string());
+                }
+                control_addr = Some(value);
+            }
+            value => return Err(format!("unknown run-config option {value}")),
+        }
+    }
+    Ok(control_addr)
 }

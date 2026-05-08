@@ -33,6 +33,7 @@ Implemented in this first skeleton:
 - HTTP CONNECT tunneling and plain HTTP request forwarding.
 - Basic route matching with block decisions for implemented proxy inbounds.
 - Concurrent per-listener connection worker threads with stop-time joining.
+- Local JSON-line TCP control socket for process status, traffic drain, and stop commands.
 - CLI with `version`, `health`, `check-config`, and `run-config`.
 
 Not implemented yet:
@@ -103,6 +104,7 @@ cargo test
 cargo run -- health
 cargo run -- check-config ./core.json
 cargo run -- run-config ./core.json
+cargo run -- run-config ./core.json --control 127.0.0.1:18080
 ```
 
 ## Compatibility Rules

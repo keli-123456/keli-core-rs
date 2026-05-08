@@ -29,6 +29,7 @@ The binary also exposes a minimal process boundary:
 
 - `check-config <path>` validates a JSON `CoreConfig` and prints its fingerprint.
 - `run-config <path>` applies a JSON `CoreConfig`, prints the apply response, and keeps the core service alive.
+- `run-config <path> --control <addr>` also opens a local JSON-line TCP control socket for `status`, `drain_traffic`, and `stop`.
 
 ## Protocol Placement
 
@@ -73,6 +74,7 @@ HTTP proxy
   + block route enforcement
   + per-user traffic counters
   + runtime config wiring
+  + process-level control socket for status and traffic drain
   - keep-alive reuse
   - kelinode-rs drain/report integration
 ```
