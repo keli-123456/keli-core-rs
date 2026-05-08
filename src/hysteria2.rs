@@ -595,28 +595,13 @@ fn parse_udp_datagram(input: &[u8]) -> io::Result<UdpDatagram> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid hysteria2 udp address"))?;
     offset += address_len;
 
-    let data_len = read_varint_from(input, &mut offset)?;
-    if data_len > UDP_PACKET_BUFFER_SIZE as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid hysteria2 udp data length",
-        ));
-    }
-    let data_len = data_len as usize;
-    if input.len().saturating_sub(offset) != data_len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "hysteria2 udp data length mismatch",
-        ));
-    }
-
     Ok(UdpDatagram {
         session_id,
         packet_id,
         fragment_id,
         fragment_count,
         target: parse_target_address(&address)?,
-        data: input[offset..offset + data_len].to_vec(),
+        data: input[offset..].to_vec(),
     })
 }
 
@@ -641,7 +626,6 @@ fn encode_udp_datagram(
     output.push(fragment_count);
     output.extend_from_slice(&encode_varint(address.len() as u64)?);
     output.extend_from_slice(address.as_bytes());
-    output.extend_from_slice(&encode_varint(data.len() as u64)?);
     output.extend_from_slice(data);
     Ok(output)
 }
@@ -951,9 +935,12 @@ mod tests {
 
     #[test]
     fn parses_hysteria2_udp_datagrams() {
-        let encoded = encode_udp_datagram(7, 11, 0, 1, "[::1]:53", b"dns").unwrap();
+        let address = "[::1]:53";
+        let encoded = encode_udp_datagram(7, 11, 0, 1, address, b"dns").unwrap();
         let parsed = parse_udp_datagram(&encoded).unwrap();
 
+        assert_eq!(encoded[8], address.len() as u8);
+        assert_eq!(&encoded[9 + address.len()..], b"dns");
         assert_eq!(parsed.session_id, 7);
         assert_eq!(parsed.packet_id, 11);
         assert_eq!(parsed.fragment_id, 0);
