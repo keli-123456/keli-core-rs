@@ -233,6 +233,34 @@ mod tests {
     use std::net::SocketAddr;
 
     #[test]
+    fn control_server_handles_apply_config_command() {
+        let controller = Arc::new(Mutex::new(CoreController::new()));
+        let mut server = start_control_server("127.0.0.1:0", controller).expect("start control");
+
+        match send(
+            server.local_addr(),
+            &CoreCommand::ApplyConfig { config: config() },
+        ) {
+            CoreResponse::Applied {
+                decision,
+                status,
+                listeners,
+            } => {
+                assert_eq!(decision, "reloaded");
+                assert_eq!(status, CoreStatus::Running);
+                assert_eq!(listeners.len(), 1);
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
+        assert!(matches!(
+            send(server.local_addr(), &CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+
+        server.stop();
+    }
+
+    #[test]
     fn control_server_handles_status_traffic_and_stop_commands() {
         let mut controller = CoreController::new();
         let apply = controller.handle(CoreCommand::ApplyConfig { config: config() });

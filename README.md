@@ -40,7 +40,7 @@ Implemented in this first skeleton:
 - Trojan TCP inbound for non-TLS TCP CONNECT and UDP ASSOCIATE.
 - AnyTLS TCP frame inbound with password authentication, TCP stream forwarding, UDP-over-TCP relay, and padding-scheme update negotiation.
 - Concurrent per-listener connection worker threads with stop-time joining.
-- Local JSON-line TCP control socket for process status, traffic drain, and stop commands.
+- Local JSON-line TCP control socket for apply config, process status, traffic drain, and stop commands.
 - CLI with `version`, `health`, `check-config`, and `run-config`.
 - SOCKS5 UDP ASSOCIATE with UDP packet framing, relay lifetime bound to the TCP control connection, and per-user traffic accounting.
 - VMess AEAD TCP/UDP inbound with TCP, TLS, WebSocket, TLS WebSocket, authenticated length, and replay protection.

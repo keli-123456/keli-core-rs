@@ -67,7 +67,7 @@ keliboard -> kelinode-rs -> keli-core-rs
 | --- | --- | --- |
 | Config schema and validation | Code path | Unsupported protocols and options should fail early. |
 | Listener apply/noop/update fingerprinting | Code path | Runtime planning is deterministic; user-only changes patch active listeners without rebinding ports. |
-| Local control socket | Code path | Status, stop, and traffic drain commands exist. |
+| Local control socket | Code path | Apply config, status, stop, and traffic drain commands exist. |
 | Per-user traffic accounting | Code path | Uses Go-compatible `<node-tag>|<user-uuid>` keys. |
 | Per-user device limit | Code path | Enforced by shared session tracker for native listeners; concurrent sessions from the same client IP count as one device. |
 | Per-user speed limit | Code path | Enforced by shared bandwidth limiter for native listeners. |
