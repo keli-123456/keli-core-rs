@@ -32,7 +32,7 @@ Implemented in this first skeleton:
 - HTTP proxy inbound with Basic authentication.
 - HTTP CONNECT tunneling and plain HTTP request forwarding.
 - Concurrent per-listener connection worker threads with stop-time joining.
-- Tiny CLI with `version` and `health`.
+- CLI with `version`, `health`, `check-config`, and `run-config`.
 
 Not implemented yet:
 
@@ -100,6 +100,8 @@ Run:
 cargo fmt --check
 cargo test
 cargo run -- health
+cargo run -- check-config ./core.json
+cargo run -- run-config ./core.json
 ```
 
 ## Compatibility Rules

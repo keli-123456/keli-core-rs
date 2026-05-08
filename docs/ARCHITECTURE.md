@@ -25,6 +25,11 @@ The control boundary accepts transport-neutral commands:
 
 `ApplyConfig` now starts the real `CoreService` for implemented protocols. This lets `kelinode-rs` later use an in-process adapter, a Unix socket, or another local transport without changing the core model.
 
+The binary also exposes a minimal process boundary:
+
+- `check-config <path>` validates a JSON `CoreConfig` and prints its fingerprint.
+- `run-config <path>` applies a JSON `CoreConfig`, prints the apply response, and keeps the core service alive.
+
 ## Protocol Placement
 
 Protocols are split by responsibility:
