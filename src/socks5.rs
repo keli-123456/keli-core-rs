@@ -13,7 +13,9 @@ use crate::limits::{
 use crate::stream::relay_tcp_streams_limited;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
-use crate::{route_protocol_labels, RouteDecision, RouteMatcher};
+use crate::{
+    connect_tcp_outbound, outbound_udp_target, route_protocol_labels, RouteDecision, RouteMatcher,
+};
 
 const SOCKS5_VERSION: u8 = 0x05;
 const AUTH_NONE: u8 = 0x00;
@@ -133,9 +135,10 @@ impl Socks5Server {
         let decision = self
             .router
             .decide_target(&request.target.host, request.target.port, "tcp");
-        let routed = match &decision {
-            RouteDecision::Direct | RouteDecision::Outbound(_) => {
-                decision.apply_to_target(&request.target.host, request.target.port)
+        let remote = match &decision {
+            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
+            RouteDecision::Outbound(outbound) => {
+                connect_tcp_outbound(outbound, &request.target, self.config.connect_timeout)?
             }
             RouteDecision::Block => {
                 write_socks5_response(&mut client, STATUS_CONNECTION_NOT_ALLOWED)?;
@@ -151,11 +154,6 @@ impl Socks5Server {
                 ));
             }
         };
-        let remote_target = SocksTarget {
-            host: routed.host,
-            port: routed.port,
-        };
-        let remote = connect_target(&remote_target, self.config.connect_timeout)?;
         write_socks5_response(&mut client, STATUS_SUCCESS)?;
         self.relay(client, remote, request, bandwidth)
     }
@@ -371,15 +369,19 @@ impl Socks5Server {
                             self.router
                                 .decide_target(&target.host, target.port, &protocol_labels);
                         match &decision {
-                            RouteDecision::Direct | RouteDecision::Outbound(_) => {
+                            RouteDecision::Direct => {
                                 if let Some(limiter) = bandwidth.as_deref() {
                                     limiter.wait_for(payload.len());
                                 }
-                                let routed = decision.apply_to_target(&target.host, target.port);
-                                let remote_target = SocksTarget {
-                                    host: routed.host,
-                                    port: routed.port,
-                                };
+                                let remote_addr = resolve_udp_target(&target)?;
+                                udp.send_to(payload, remote_addr)?;
+                                upload = upload.saturating_add(payload.len() as u64);
+                            }
+                            RouteDecision::Outbound(outbound) => {
+                                if let Some(limiter) = bandwidth.as_deref() {
+                                    limiter.wait_for(payload.len());
+                                }
+                                let remote_target = outbound_udp_target(outbound, &target)?;
                                 let remote_addr = resolve_udp_target(&remote_target)?;
                                 udp.send_to(payload, remote_addr)?;
                                 upload = upload.saturating_add(payload.len() as u64);

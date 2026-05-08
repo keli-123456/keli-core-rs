@@ -29,7 +29,9 @@ use crate::tls::TlsConnection;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 use crate::websocket::{accept_websocket, accept_websocket_tls};
-use crate::{route_protocol_labels, RouteDecision, RouteMatcher};
+use crate::{
+    connect_tcp_outbound, outbound_udp_target, route_protocol_labels, RouteDecision, RouteMatcher,
+};
 
 const VERSION: u8 = 0x01;
 const COMMAND_TCP: u8 = 0x01;
@@ -359,13 +361,9 @@ impl VmessServer {
             .router
             .decide_target(&request.target.host, request.target.port, "tcp");
         match &decision {
-            RouteDecision::Direct | RouteDecision::Outbound(_) => {
-                let routed = decision.apply_to_target(&request.target.host, request.target.port);
-                let target = SocksTarget {
-                    host: routed.host,
-                    port: routed.port,
-                };
-                connect_target(&target, self.config.connect_timeout)
+            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout),
+            RouteDecision::Outbound(outbound) => {
+                connect_tcp_outbound(outbound, &request.target, self.config.connect_timeout)
             }
             RouteDecision::Block => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -675,13 +673,8 @@ impl VmessServer {
             .router
             .decide_target(&target.host, target.port, &protocol_labels);
         let target = match &decision {
-            RouteDecision::Direct | RouteDecision::Outbound(_) => {
-                let routed = decision.apply_to_target(&target.host, target.port);
-                SocksTarget {
-                    host: routed.host,
-                    port: routed.port,
-                }
-            }
+            RouteDecision::Direct => target.clone(),
+            RouteDecision::Outbound(outbound) => outbound_udp_target(outbound, target)?,
             RouteDecision::Block => return Ok((0, None)),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(

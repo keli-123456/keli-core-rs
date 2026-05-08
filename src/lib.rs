@@ -8,6 +8,7 @@ pub mod http_proxy;
 pub mod httpupgrade;
 pub mod hysteria2;
 pub mod limits;
+pub mod outbound;
 pub mod protocol;
 pub mod reality;
 pub mod routing;
@@ -41,6 +42,7 @@ pub use limits::{
     BandwidthLimiter, DeviceLimitExceeded, UserBandwidthLimiters, UserSessionGuard,
     UserSessionTracker,
 };
+pub use outbound::{connect_tcp_outbound, connect_tcp_outbound_tokio, outbound_udp_target};
 pub use protocol::{Protocol, ProtocolPlacement};
 pub use routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 pub use runtime::{CorePlan, CoreStatus, ReloadDecision, RuntimeState};

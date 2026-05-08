@@ -23,7 +23,9 @@ use crate::socks5::SocksTarget;
 use crate::stream::copy_count_best_effort_limited;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
-use crate::{route_protocol_labels, RouteDecision, RouteMatcher};
+use crate::{
+    connect_tcp_outbound, outbound_udp_target, route_protocol_labels, RouteDecision, RouteMatcher,
+};
 
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
@@ -164,14 +166,7 @@ impl ShadowsocksServer {
         ) {
             RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
             RouteDecision::Outbound(outbound) => {
-                let target = SocksTarget {
-                    host: outbound
-                        .address
-                        .clone()
-                        .unwrap_or_else(|| request.target.host.clone()),
-                    port: outbound.port.unwrap_or(request.target.port),
-                };
-                connect_target(&target, self.config.connect_timeout)?
+                connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
             }
             RouteDecision::Block => {
                 return Err(io::Error::new(
@@ -325,13 +320,8 @@ impl ShadowsocksServer {
             self.router
                 .decide_target(&request.target.host, request.target.port, &protocol_labels);
         let target = match &decision {
-            RouteDecision::Direct | RouteDecision::Outbound(_) => {
-                let routed = decision.apply_to_target(&request.target.host, request.target.port);
-                SocksTarget {
-                    host: routed.host,
-                    port: routed.port,
-                }
-            }
+            RouteDecision::Direct => request.target.clone(),
+            RouteDecision::Outbound(outbound) => outbound_udp_target(outbound, &request.target)?,
             RouteDecision::Block => return Ok(()),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(

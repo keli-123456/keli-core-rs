@@ -84,16 +84,20 @@ pub fn route_protocol_labels(network: &str, payload: &[u8]) -> String {
 impl RouteDecision {
     pub fn apply_to_target(&self, host: &str, port: u16) -> RoutedTarget {
         match self {
-            RouteDecision::Outbound(outbound) => RoutedTarget {
-                host: outbound
-                    .address
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or(host)
-                    .to_string(),
-                port: outbound.port.unwrap_or(port),
-            },
+            RouteDecision::Outbound(outbound)
+                if outbound.protocol.trim().eq_ignore_ascii_case("freedom") =>
+            {
+                RoutedTarget {
+                    host: outbound
+                        .address
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or(host)
+                        .to_string(),
+                    port: outbound.port.unwrap_or(port),
+                }
+            }
             _ => RoutedTarget {
                 host: host.to_string(),
                 port,
@@ -617,6 +621,8 @@ mod tests {
                 protocol: "freedom".to_string(),
                 address: None,
                 port: None,
+                username: None,
+                password: None,
             }),
         }]);
 
@@ -627,6 +633,8 @@ mod tests {
                 protocol: "freedom".to_string(),
                 address: None,
                 port: None,
+                username: None,
+                password: None,
             })
         );
     }
@@ -638,6 +646,8 @@ mod tests {
             protocol: "freedom".to_string(),
             address: Some("127.0.0.1".to_string()),
             port: Some(8443),
+            username: None,
+            password: None,
         });
 
         let target = decision.apply_to_target("example.com", 443);

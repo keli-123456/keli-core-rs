@@ -18,7 +18,9 @@ use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 use crate::vision::{VisionDecoder, VisionEncoder, VisionReader, VisionWriter};
 use crate::websocket::{accept_websocket, accept_websocket_tls, relay_websocket_tls_stream};
-use crate::{route_protocol_labels, RouteDecision, RouteMatcher};
+use crate::{
+    connect_tcp_outbound, outbound_udp_target, route_protocol_labels, RouteDecision, RouteMatcher,
+};
 
 const VERSION: u8 = 0x00;
 const COMMAND_TCP: u8 = 0x01;
@@ -133,14 +135,7 @@ impl VlessServer {
                     connect_target(&request.target, self.config.connect_timeout)?
                 }
                 RouteDecision::Outbound(outbound) => {
-                    let target = SocksTarget {
-                        host: outbound
-                            .address
-                            .clone()
-                            .unwrap_or_else(|| request.target.host.clone()),
-                        port: outbound.port.unwrap_or(request.target.port),
-                    };
-                    connect_target(&target, self.config.connect_timeout)?
+                    connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
                 }
                 RouteDecision::Block => {
                     return Err(io::Error::new(
@@ -201,14 +196,7 @@ impl VlessServer {
                     connect_target(&request.target, self.config.connect_timeout)?
                 }
                 RouteDecision::Outbound(outbound) => {
-                    let target = SocksTarget {
-                        host: outbound
-                            .address
-                            .clone()
-                            .unwrap_or_else(|| request.target.host.clone()),
-                        port: outbound.port.unwrap_or(request.target.port),
-                    };
-                    connect_target(&target, self.config.connect_timeout)?
+                    connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
                 }
                 RouteDecision::Block => {
                     return Err(io::Error::new(
@@ -250,14 +238,7 @@ impl VlessServer {
                     connect_target(&request.target, self.config.connect_timeout)?
                 }
                 RouteDecision::Outbound(outbound) => {
-                    let target = SocksTarget {
-                        host: outbound
-                            .address
-                            .clone()
-                            .unwrap_or_else(|| request.target.host.clone()),
-                        port: outbound.port.unwrap_or(request.target.port),
-                    };
-                    connect_target(&target, self.config.connect_timeout)?
+                    connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
                 }
                 RouteDecision::Block => {
                     return Err(io::Error::new(
@@ -301,14 +282,7 @@ impl VlessServer {
                     connect_target(&request.target, self.config.connect_timeout)?
                 }
                 RouteDecision::Outbound(outbound) => {
-                    let target = SocksTarget {
-                        host: outbound
-                            .address
-                            .clone()
-                            .unwrap_or_else(|| request.target.host.clone()),
-                        port: outbound.port.unwrap_or(request.target.port),
-                    };
-                    connect_target(&target, self.config.connect_timeout)?
+                    connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
                 }
                 RouteDecision::Block => {
                     return Err(io::Error::new(
@@ -633,13 +607,8 @@ impl VlessServer {
             .router
             .decide_target(&target.host, target.port, &protocol_labels);
         let target = match &decision {
-            RouteDecision::Direct | RouteDecision::Outbound(_) => {
-                let routed = decision.apply_to_target(&target.host, target.port);
-                SocksTarget {
-                    host: routed.host,
-                    port: routed.port,
-                }
-            }
+            RouteDecision::Direct => target.clone(),
+            RouteDecision::Outbound(outbound) => outbound_udp_target(outbound, target)?,
             RouteDecision::Block => return Ok((0, 0)),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(

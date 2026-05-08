@@ -20,6 +20,7 @@ use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
+use crate::{connect_tcp_outbound_tokio, outbound_udp_target};
 
 const TCP_REQUEST_ID: u64 = 0x401;
 const RESPONSE_OK: u8 = 0x00;
@@ -294,12 +295,38 @@ impl Hysteria2Server {
 
         let target = read_tcp_target(&mut recv).await?;
         let decision = self.router.decide_target(&target.host, target.port, "tcp");
-        let target = match &decision {
-            RouteDecision::Direct | RouteDecision::Outbound(_) => {
-                let routed = decision.apply_to_target(&target.host, target.port);
-                SocksTarget {
-                    host: routed.host,
-                    port: routed.port,
+        let remote = match &decision {
+            RouteDecision::Direct => match tokio::time::timeout(
+                self.config.connect_timeout,
+                tokio::net::TcpStream::connect((target.host.as_str(), target.port)),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    write_tcp_response(&mut send, RESPONSE_ERROR, "connect failed").await?;
+                    let _ = send.finish();
+                    return Err(error);
+                }
+                Err(_) => {
+                    write_tcp_response(&mut send, RESPONSE_ERROR, "connect timed out").await?;
+                    let _ = send.finish();
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "target connect timed out",
+                    ));
+                }
+            },
+            RouteDecision::Outbound(outbound) => {
+                match connect_tcp_outbound_tokio(outbound, &target, self.config.connect_timeout)
+                    .await
+                {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        write_tcp_response(&mut send, RESPONSE_ERROR, "connect failed").await?;
+                        let _ = send.finish();
+                        return Err(error);
+                    }
                 }
             }
             RouteDecision::Block => {
@@ -314,28 +341,6 @@ impl Hysteria2Server {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     format!("outbound route {tag} is not implemented"),
-                ));
-            }
-        };
-
-        let remote = match tokio::time::timeout(
-            self.config.connect_timeout,
-            tokio::net::TcpStream::connect((target.host.as_str(), target.port)),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(error)) => {
-                write_tcp_response(&mut send, RESPONSE_ERROR, "connect failed").await?;
-                let _ = send.finish();
-                return Err(error);
-            }
-            Err(_) => {
-                write_tcp_response(&mut send, RESPONSE_ERROR, "connect timed out").await?;
-                let _ = send.finish();
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "target connect timed out",
                 ));
             }
         };
@@ -405,13 +410,8 @@ impl Hysteria2Server {
             self.router
                 .decide_target(&message.target.host, message.target.port, &protocol_labels);
         let target = match &decision {
-            RouteDecision::Direct | RouteDecision::Outbound(_) => {
-                let routed = decision.apply_to_target(&message.target.host, message.target.port);
-                SocksTarget {
-                    host: routed.host,
-                    port: routed.port,
-                }
-            }
+            RouteDecision::Direct => message.target.clone(),
+            RouteDecision::Outbound(outbound) => outbound_udp_target(outbound, &message.target)?,
             RouteDecision::Block => return Ok(()),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(

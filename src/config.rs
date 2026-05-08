@@ -42,8 +42,14 @@ pub struct InboundConfig {
 pub struct OutboundConfig {
     pub tag: String,
     pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,7 +181,10 @@ impl CoreConfig {
                     outbound.tag
                 )));
             }
-            if outbound.protocol.trim() != "freedom" {
+            if !matches!(
+                outbound.protocol.trim().to_ascii_lowercase().as_str(),
+                "freedom" | "socks" | "socks5" | "http"
+            ) {
                 return Err(ValidationError::new(format!(
                     "outbound {} protocol {} is not implemented in keli-core-rs yet",
                     outbound.tag, outbound.protocol
@@ -237,6 +246,7 @@ impl CoreConfig {
 }
 
 fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), ValidationError> {
+    let protocol = outbound.protocol.trim().to_ascii_lowercase();
     if outbound
         .address
         .as_deref()
@@ -246,6 +256,26 @@ fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), Validatio
             "outbound {} address must not be empty",
             outbound.tag
         )));
+    }
+    if matches!(protocol.as_str(), "socks" | "socks5" | "http") {
+        if outbound
+            .address
+            .as_deref()
+            .map(str::trim)
+            .map(str::is_empty)
+            .unwrap_or(true)
+        {
+            return Err(ValidationError::new(format!(
+                "outbound {} address is required for {}",
+                outbound.tag, outbound.protocol
+            )));
+        }
+        if outbound.port.is_none() {
+            return Err(ValidationError::new(format!(
+                "outbound {} port is required for {}",
+                outbound.tag, outbound.protocol
+            )));
+        }
     }
     Ok(())
 }
@@ -999,6 +1029,8 @@ mod tests {
                 protocol: "freedom".to_string(),
                 address: None,
                 port: None,
+                username: None,
+                password: None,
             }],
             routes: Vec::new(),
             stats: StatsConfig::default(),
@@ -1031,12 +1063,16 @@ mod tests {
                     protocol: "freedom".to_string(),
                     address: None,
                     port: None,
+                    username: None,
+                    password: None,
                 },
                 OutboundConfig {
                     tag: "warp".to_string(),
                     protocol: "freedom".to_string(),
                     address: Some("127.0.0.1".to_string()),
                     port: Some(40000),
+                    username: None,
+                    password: None,
                 },
             ],
             routes: Vec::new(),
@@ -1066,6 +1102,49 @@ mod tests {
     }
 
     #[test]
+    fn validates_tcp_proxy_outbound_endpoints() {
+        let mut config = CoreConfig {
+            instance_id: "node-a".to_string(),
+            log_level: "info".to_string(),
+            inbounds: vec![InboundConfig {
+                tag: "panel|http|1".to_string(),
+                protocol: Protocol::Http,
+                listen: "0.0.0.0".to_string(),
+                port: 8080,
+                users: vec![user()],
+                cipher: None,
+                flow: String::new(),
+                padding_scheme: Vec::new(),
+                transport: TransportConfig::default(),
+                tls: None,
+                sniffing: SniffingConfig::default(),
+            }],
+            outbounds: vec![OutboundConfig {
+                tag: "proxy".to_string(),
+                protocol: "socks".to_string(),
+                address: Some("127.0.0.1".to_string()),
+                port: Some(1080),
+                username: Some("alice".to_string()),
+                password: Some("secret".to_string()),
+            }],
+            routes: vec![crate::config::RouteRule {
+                targets: vec!["domain:example.com".to_string()],
+                action: crate::config::RouteAction::Outbound("proxy".to_string()),
+                outbound: None,
+            }],
+            stats: StatsConfig::default(),
+        };
+
+        config.validate().expect("socks outbound should validate");
+
+        config.outbounds[0].port = None;
+        let error = config
+            .validate()
+            .expect_err("proxy outbound without port should fail");
+        assert!(error.to_string().contains("port is required"));
+    }
+
+    #[test]
     fn validates_supported_route_targets_and_rejects_unsupported_sources() {
         let mut config = CoreConfig {
             instance_id: "node-a".to_string(),
@@ -1088,6 +1167,8 @@ mod tests {
                 protocol: "freedom".to_string(),
                 address: None,
                 port: None,
+                username: None,
+                password: None,
             }],
             routes: vec![crate::config::RouteRule {
                 targets: vec![

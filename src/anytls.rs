@@ -17,7 +17,9 @@ use crate::limits::{
 use crate::socks5::SocksTarget;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
-use crate::{route_protocol_labels, RouteDecision, RouteMatcher};
+use crate::{
+    connect_tcp_outbound, outbound_udp_target, route_protocol_labels, RouteDecision, RouteMatcher,
+};
 
 const CMD_WASTE: u8 = 0;
 const CMD_SYN: u8 = 1;
@@ -361,15 +363,14 @@ impl AnyTlsServer {
         target: SocksTarget,
         initial_payload: &[u8],
     ) -> io::Result<()> {
-        let decision = self.router.decide_target(&target.host, target.port, "tcp");
+        let protocol_labels = route_protocol_labels("tcp", initial_payload);
+        let decision = self
+            .router
+            .decide_target(&target.host, target.port, &protocol_labels);
         let remote = match &decision {
-            RouteDecision::Direct | RouteDecision::Outbound(_) => {
-                let routed = decision.apply_to_target(&target.host, target.port);
-                let target = SocksTarget {
-                    host: routed.host,
-                    port: routed.port,
-                };
-                connect_target(&target, self.config.connect_timeout)?
+            RouteDecision::Direct => connect_target(&target, self.config.connect_timeout)?,
+            RouteDecision::Outbound(outbound) => {
+                connect_tcp_outbound(outbound, &target, self.config.connect_timeout)?
             }
             RouteDecision::Block => {
                 return Err(io::Error::new(
@@ -456,13 +457,8 @@ impl AnyTlsServer {
             .router
             .decide_target(&target.host, target.port, &protocol_labels);
         let target = match &decision {
-            RouteDecision::Direct | RouteDecision::Outbound(_) => {
-                let routed = decision.apply_to_target(&target.host, target.port);
-                SocksTarget {
-                    host: routed.host,
-                    port: routed.port,
-                }
-            }
+            RouteDecision::Direct => target.clone(),
+            RouteDecision::Outbound(outbound) => outbound_udp_target(outbound, target)?,
             RouteDecision::Block => return Ok((0, 0)),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(

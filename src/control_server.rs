@@ -209,6 +209,8 @@ mod tests {
                 protocol: "freedom".to_string(),
                 address: None,
                 port: None,
+                username: None,
+                password: None,
             }],
             routes: Vec::new(),
             stats: StatsConfig::default(),

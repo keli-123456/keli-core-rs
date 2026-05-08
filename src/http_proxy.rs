@@ -13,7 +13,7 @@ use crate::limits::{
 use crate::stream::{copy_count_best_effort_limited, relay_tcp_streams_limited};
 use crate::traffic::{TrafficDelta, TrafficRegistry};
 use crate::user::CoreUser;
-use crate::{RouteDecision, RouteMatcher};
+use crate::{connect_tcp_outbound, RouteDecision, RouteMatcher, SocksTarget};
 
 #[derive(Clone, Debug)]
 pub struct HttpProxyServerConfig {
@@ -208,15 +208,14 @@ impl HttpProxyServer {
         client_ip: Option<std::net::IpAddr>,
     ) -> io::Result<()> {
         let target = parse_authority(&request.target, 443)?;
-        let routed_target = match self.route_target(&target, "tcp") {
-            Ok(target) => target,
+        let remote = match self.connect_route_target(&target, "tcp") {
+            Ok(remote) => remote,
             Err(error) => {
                 write_forbidden_response(&mut client)?;
                 return Err(error);
             }
         };
         client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
-        let remote = connect_target(&routed_target, self.config.connect_timeout)?;
         let (upload, download) = relay_tcp_streams_limited(client, remote, bandwidth)?;
         self.record_traffic(request.user_uuid, upload, download, client_ip);
         Ok(())
@@ -230,14 +229,13 @@ impl HttpProxyServer {
         client_ip: Option<std::net::IpAddr>,
     ) -> io::Result<()> {
         let target = parse_plain_http_target(&request)?;
-        let routed_target = match self.route_target(&target, "tcp,http") {
-            Ok(target) => target,
+        let mut remote = match self.connect_route_target(&target, "tcp,http") {
+            Ok(remote) => remote,
             Err(error) => {
                 write_forbidden_response(client)?;
                 return Err(error);
             }
         };
-        let mut remote = connect_target(&routed_target, self.config.connect_timeout)?;
         let outbound = render_plain_http_request(&request, &target)?;
         if let Some(limiter) = bandwidth.as_deref() {
             limiter.wait_for(outbound.len());
@@ -249,18 +247,24 @@ impl HttpProxyServer {
         Ok(())
     }
 
-    fn route_target(&self, target: &HttpTarget, protocol_labels: &str) -> io::Result<HttpTarget> {
+    fn connect_route_target(
+        &self,
+        target: &HttpTarget,
+        protocol_labels: &str,
+    ) -> io::Result<TcpStream> {
         let decision = self
             .router
             .decide_target(&target.host, target.port, protocol_labels);
         match &decision {
-            RouteDecision::Direct | RouteDecision::Outbound(_) => {
-                let routed = decision.apply_to_target(&target.host, target.port);
-                Ok(HttpTarget {
-                    host: routed.host,
-                    port: routed.port,
-                })
-            }
+            RouteDecision::Direct => connect_target(target, self.config.connect_timeout),
+            RouteDecision::Outbound(outbound) => connect_tcp_outbound(
+                outbound,
+                &SocksTarget {
+                    host: target.host.clone(),
+                    port: target.port,
+                },
+                self.config.connect_timeout,
+            ),
             RouteDecision::Block => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "target blocked by route",
