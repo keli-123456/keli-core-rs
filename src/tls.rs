@@ -92,7 +92,7 @@ impl TlsConnection {
         }
     }
 
-    fn write_plain_all_wait(&mut self, mut input: &[u8]) -> io::Result<()> {
+    pub(crate) fn write_plain_all_wait(&mut self, mut input: &[u8]) -> io::Result<()> {
         while !input.is_empty() {
             let written = self.connection.writer().write(input)?;
             if written == 0 {
@@ -107,7 +107,7 @@ impl TlsConnection {
         Ok(())
     }
 
-    fn close_notify_wait(&mut self) -> io::Result<()> {
+    pub(crate) fn close_notify_wait(&mut self) -> io::Result<()> {
         self.connection.send_close_notify();
         self.flush_tls_wait()
     }

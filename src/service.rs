@@ -388,9 +388,16 @@ fn start_trojan_listener(
                     let tls_acceptor = tls_acceptor.clone();
                     let worker = thread::spawn(move || {
                         let result = if let Some(acceptor) = tls_acceptor {
-                            acceptor
-                                .accept(stream)
-                                .and_then(|client| server.handle_tls_client(client))
+                            acceptor.accept(stream).and_then(|client| {
+                                if network == "ws" {
+                                    server.handle_tls_websocket_client(
+                                        client,
+                                        websocket_path.as_deref(),
+                                    )
+                                } else {
+                                    server.handle_tls_client(client)
+                                }
+                            })
                         } else if network == "ws" {
                             server.handle_websocket_client(stream, websocket_path.as_deref())
                         } else {
@@ -482,9 +489,16 @@ fn start_vless_listener(
                     let tls_acceptor = tls_acceptor.clone();
                     let worker = thread::spawn(move || {
                         let result = if let Some(acceptor) = tls_acceptor {
-                            acceptor
-                                .accept(stream)
-                                .and_then(|client| server.handle_tls_client(client))
+                            acceptor.accept(stream).and_then(|client| {
+                                if network == "ws" {
+                                    server.handle_tls_websocket_client(
+                                        client,
+                                        websocket_path.as_deref(),
+                                    )
+                                } else {
+                                    server.handle_tls_client(client)
+                                }
+                            })
                         } else if network == "ws" {
                             server.handle_websocket_client(stream, websocket_path.as_deref())
                         } else {

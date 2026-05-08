@@ -245,9 +245,9 @@ fn validate_tls_config(
     let Some(tls) = tls else {
         return Ok(());
     };
-    if network != "tcp" {
+    if !matches!(network, "tcp" | "ws") {
         return Err(ValidationError::new(format!(
-            "{tag} {protocol} tls currently supports only tcp transport"
+            "{tag} {protocol} tls currently supports only tcp/ws transport"
         )));
     }
     if tls.reality.is_some() {
