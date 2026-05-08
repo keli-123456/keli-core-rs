@@ -22,9 +22,10 @@ use crate::limits::{
 };
 use crate::socks5::SocksTarget;
 use crate::stream::copy_count_best_effort_limited;
+use crate::tls::TlsConnection;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
-use crate::websocket::accept_websocket;
+use crate::websocket::{accept_websocket, accept_websocket_tls};
 use crate::{RouteDecision, RouteMatcher};
 
 const VERSION: u8 = 0x01;
@@ -176,6 +177,33 @@ impl VmessServer {
         let remote = self.connect_for_request(&request)?;
         write_response_header(&mut writer, &request)?;
         self.relay_split_io(reader, writer, remote, request, bandwidth)
+    }
+
+    pub fn handle_tls_client(&self, mut client: TlsConnection) -> io::Result<()> {
+        let request = self.read_request(&mut client)?;
+        let user = self.request_user(&request);
+        let _session = self.acquire_user_session(user)?;
+        let bandwidth = self.bandwidth.limiter_for(user);
+        let remote = self.connect_for_request(&request)?;
+        write_response_header(&mut client, &request)?;
+        client.set_nonblocking(true)?;
+        self.relay_single_io(client, remote, request, bandwidth)
+    }
+
+    pub fn handle_tls_websocket_client(
+        &self,
+        client: TlsConnection,
+        path: Option<&str>,
+    ) -> io::Result<()> {
+        let mut websocket = accept_websocket_tls(client, path)?;
+        let request = self.read_request(&mut websocket)?;
+        let user = self.request_user(&request);
+        let _session = self.acquire_user_session(user)?;
+        let bandwidth = self.bandwidth.limiter_for(user);
+        let remote = self.connect_for_request(&request)?;
+        write_response_header(&mut websocket, &request)?;
+        websocket.set_nonblocking(true)?;
+        self.relay_single_io(websocket, remote, request, bandwidth)
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
@@ -344,6 +372,103 @@ impl VmessServer {
         Ok(())
     }
 
+    fn relay_single_io<S>(
+        &self,
+        mut client: S,
+        mut remote: TcpStream,
+        request: VmessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()>
+    where
+        S: Read + Write,
+    {
+        remote.set_nonblocking(true)?;
+        let mut request_body = VmessBodyDecoder::new(
+            request.request_body_key,
+            request.request_body_iv,
+            request.options,
+            request.security,
+        );
+        let mut response_body = VmessBodyEncoder::new(
+            request.response_body_key,
+            request.response_body_iv,
+            request.options,
+            request.security,
+        );
+        let mut upload = 0u64;
+        let mut download = 0u64;
+        let mut upload_done = false;
+        let mut download_done = false;
+        let mut client_buffer = [0u8; 16 * 1024];
+        let mut remote_buffer = [0u8; 16 * 1024];
+
+        while !upload_done || !download_done {
+            let mut progressed = false;
+
+            if !upload_done {
+                match request_body.read_plain(&mut client, &mut client_buffer) {
+                    Ok(0) => {
+                        upload_done = true;
+                        let _ = remote.shutdown(Shutdown::Write);
+                        progressed = true;
+                    }
+                    Ok(read) => {
+                        if let Some(limiter) = bandwidth.as_deref() {
+                            limiter.wait_for(read);
+                        }
+                        write_all_wait(&mut remote, &client_buffer[..read])?;
+                        upload = upload.saturating_add(read as u64);
+                        progressed = true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        upload_done = true;
+                        let _ = remote.shutdown(Shutdown::Write);
+                        progressed = true;
+                    }
+                }
+            }
+
+            if !download_done {
+                match remote.read(&mut remote_buffer) {
+                    Ok(0) => {
+                        download_done = true;
+                        let _ = response_body.finish(&mut client);
+                        progressed = true;
+                    }
+                    Ok(read) => {
+                        response_body.write_plain(&mut client, &remote_buffer[..read])?;
+                        download = download.saturating_add(read as u64);
+                        progressed = true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        download_done = true;
+                        let _ = response_body.finish(&mut client);
+                        progressed = true;
+                    }
+                }
+            }
+
+            if !progressed {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let _ = response_body.finish(&mut client);
+        let _ = remote.shutdown(Shutdown::Both);
+        self.traffic
+            .lock()
+            .expect("traffic registry lock poisoned")
+            .add(
+                self.config.node_tag.clone(),
+                request.user_uuid,
+                upload,
+                download,
+            );
+        Ok(())
+    }
+
     fn request_user(&self, request: &VmessRequest) -> Option<&CoreUser> {
         self.users.get(&request.user_key)
     }
@@ -374,17 +499,30 @@ struct ParsedVmessHeader {
 
 struct VmessBodyReader<R> {
     reader: R,
+    decoder: VmessBodyDecoder,
+}
+
+struct VmessBodyWriter<W> {
+    writer: W,
+    encoder: VmessBodyEncoder,
+}
+
+struct VmessBodyDecoder {
     security: VmessSecurity,
     key: [u8; 16],
     size: VmessSizeParser,
     nonce: ChunkNonce,
     options: u8,
     buffer: Vec<u8>,
+    size_bytes: [u8; 2],
+    size_read: usize,
+    chunk: Vec<u8>,
+    chunk_read: usize,
+    chunk_padding: usize,
     eof: bool,
 }
 
-struct VmessBodyWriter<W> {
-    writer: W,
+struct VmessBodyEncoder {
     security: VmessSecurity,
     key: [u8; 16],
     size: VmessSizeParser,
@@ -413,17 +551,49 @@ impl<R: Read> VmessBodyReader<R> {
     ) -> io::Result<Self> {
         Ok(Self {
             reader,
+            decoder: VmessBodyDecoder::new(key, iv, options, security),
+        })
+    }
+}
+
+impl VmessBodyDecoder {
+    fn new(key: [u8; 16], iv: [u8; 16], options: u8, security: VmessSecurity) -> Self {
+        Self {
             security,
             key,
             size: VmessSizeParser::new(iv, options),
             nonce: ChunkNonce { iv, count: 0 },
             options,
             buffer: Vec::new(),
+            size_bytes: [0; 2],
+            size_read: 0,
+            chunk: Vec::new(),
+            chunk_read: 0,
+            chunk_padding: 0,
             eof: false,
-        })
+        }
     }
 
-    fn read_next_chunk(&mut self) -> io::Result<()> {
+    fn read_plain<R: Read>(&mut self, reader: &mut R, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.security == VmessSecurity::None && self.options & OPTION_CHUNK_STREAM == 0 {
+            return reader.read(output);
+        }
+        while self.buffer.is_empty() && !self.eof {
+            self.read_next_chunk(reader)?;
+        }
+        if self.buffer.is_empty() {
+            return Ok(0);
+        }
+        let len = output.len().min(self.buffer.len());
+        output[..len].copy_from_slice(&self.buffer[..len]);
+        self.buffer.drain(..len);
+        Ok(len)
+    }
+
+    fn read_next_chunk<R: Read>(&mut self, reader: &mut R) -> io::Result<()> {
         if self.eof {
             return Ok(());
         }
@@ -431,33 +601,58 @@ impl<R: Read> VmessBodyReader<R> {
             return Ok(());
         }
 
-        let mut encoded_size = [0u8; 2];
-        match self.reader.read_exact(&mut encoded_size) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+        if self.chunk.is_empty() {
+            while self.size_read < self.size_bytes.len() {
+                match reader.read(&mut self.size_bytes[self.size_read..]) {
+                    Ok(0) if self.size_read == 0 => {
+                        self.eof = true;
+                        return Ok(());
+                    }
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "truncated vmess chunk size",
+                        ));
+                    }
+                    Ok(read) => self.size_read += read,
+                    Err(error) => return Err(error),
+                }
+            }
+
+            let padding = self.padding_len()?;
+            let size = self.size.decode(self.size_bytes) as usize;
+            self.size_read = 0;
+            let overhead = self.security.overhead();
+            if size == overhead + padding {
                 self.eof = true;
                 return Ok(());
             }
-            Err(error) => return Err(error),
+            if size < overhead + padding {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid vmess chunk size",
+                ));
+            }
+            self.chunk = vec![0u8; size];
+            self.chunk_read = 0;
+            self.chunk_padding = padding;
         }
 
-        let padding = self.padding_len()?;
-        let size = self.size.decode(encoded_size) as usize;
-        let overhead = self.security.overhead();
-        if size == overhead + padding {
-            self.eof = true;
-            return Ok(());
+        while self.chunk_read < self.chunk.len() {
+            match reader.read(&mut self.chunk[self.chunk_read..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated vmess chunk",
+                    ));
+                }
+                Ok(read) => self.chunk_read += read,
+                Err(error) => return Err(error),
+            }
         }
-        if size < overhead + padding {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid vmess chunk size",
-            ));
-        }
-        let mut chunk = vec![0u8; size];
-        self.reader.read_exact(&mut chunk)?;
-        let payload_len = size - padding;
-        let payload = &chunk[..payload_len];
+
+        let payload_len = self.chunk.len() - self.chunk_padding;
+        let payload = &self.chunk[..payload_len];
         self.buffer = match self.security {
             VmessSecurity::None => payload.to_vec(),
             VmessSecurity::Aes128Gcm => {
@@ -469,6 +664,9 @@ impl<R: Read> VmessBodyReader<R> {
                 chacha20_open(&self.key, &nonce, payload, &[])?
             }
         };
+        self.chunk.clear();
+        self.chunk_read = 0;
+        self.chunk_padding = 0;
         Ok(())
     }
 
@@ -482,22 +680,7 @@ impl<R: Read> VmessBodyReader<R> {
 
 impl<R: Read> Read for VmessBodyReader<R> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() {
-            return Ok(0);
-        }
-        if self.security == VmessSecurity::None && self.options & OPTION_CHUNK_STREAM == 0 {
-            return self.reader.read(output);
-        }
-        while self.buffer.is_empty() && !self.eof {
-            self.read_next_chunk()?;
-        }
-        if self.buffer.is_empty() {
-            return Ok(0);
-        }
-        let len = output.len().min(self.buffer.len());
-        output[..len].copy_from_slice(&self.buffer[..len]);
-        self.buffer.drain(..len);
-        Ok(len)
+        self.decoder.read_plain(&mut self.reader, output)
     }
 }
 
@@ -511,33 +694,61 @@ impl<W: Write> VmessBodyWriter<W> {
     ) -> io::Result<Self> {
         Ok(Self {
             writer,
-            security,
-            key,
-            size: VmessSizeParser::new(iv, options),
-            nonce: ChunkNonce { iv, count: 0 },
-            options,
-            finished: false,
+            encoder: VmessBodyEncoder::new(key, iv, options, security),
         })
     }
 
     fn finish(&mut self) -> io::Result<()> {
-        if self.finished {
-            return Ok(());
-        }
-        self.finished = true;
-        if self.security == VmessSecurity::None && self.options & OPTION_CHUNK_STREAM == 0 {
-            return self.writer.flush();
-        }
-        self.write_chunk(&[])?;
-        self.writer.flush()
+        self.encoder.finish(&mut self.writer)
     }
 
     #[cfg(test)]
     fn into_inner(self) -> W {
         self.writer
     }
+}
 
-    fn write_chunk(&mut self, input: &[u8]) -> io::Result<()> {
+impl VmessBodyEncoder {
+    fn new(key: [u8; 16], iv: [u8; 16], options: u8, security: VmessSecurity) -> Self {
+        Self {
+            security,
+            key,
+            size: VmessSizeParser::new(iv, options),
+            nonce: ChunkNonce { iv, count: 0 },
+            options,
+            finished: false,
+        }
+    }
+
+    fn write_plain<W: Write>(&mut self, writer: &mut W, mut input: &[u8]) -> io::Result<usize> {
+        if input.is_empty() {
+            return Ok(0);
+        }
+        if self.security == VmessSecurity::None && self.options & OPTION_CHUNK_STREAM == 0 {
+            return writer.write(input);
+        }
+        let original = input.len();
+        while !input.is_empty() {
+            let len = input.len().min(MAX_CHUNK_SIZE);
+            self.write_chunk(writer, &input[..len])?;
+            input = &input[len..];
+        }
+        Ok(original)
+    }
+
+    fn finish<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        if self.security == VmessSecurity::None && self.options & OPTION_CHUNK_STREAM == 0 {
+            return writer.flush();
+        }
+        self.write_chunk(writer, &[])?;
+        writer.flush()
+    }
+
+    fn write_chunk<W: Write>(&mut self, writer: &mut W, input: &[u8]) -> io::Result<()> {
         let padding = self.padding_len()?;
         let payload = match self.security {
             VmessSecurity::None => input.to_vec(),
@@ -558,13 +769,13 @@ impl<W: Write> VmessBodyWriter<W> {
             ));
         }
         let encoded = self.size.encode(total_size as u16);
-        self.writer.write_all(&encoded)?;
-        self.writer.write_all(&payload)?;
+        write_all_wait(writer, &encoded)?;
+        write_all_wait(writer, &payload)?;
         if padding > 0 {
             let mut padding_bytes = vec![0u8; padding];
             getrandom::getrandom(&mut padding_bytes)
                 .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
-            self.writer.write_all(&padding_bytes)?;
+            write_all_wait(writer, &padding_bytes)?;
         }
         Ok(())
     }
@@ -578,20 +789,8 @@ impl<W: Write> VmessBodyWriter<W> {
 }
 
 impl<W: Write> Write for VmessBodyWriter<W> {
-    fn write(&mut self, mut input: &[u8]) -> io::Result<usize> {
-        if input.is_empty() {
-            return Ok(0);
-        }
-        if self.security == VmessSecurity::None && self.options & OPTION_CHUNK_STREAM == 0 {
-            return self.writer.write(input);
-        }
-        let original = input.len();
-        while !input.is_empty() {
-            let len = input.len().min(MAX_CHUNK_SIZE);
-            self.write_chunk(&input[..len])?;
-            input = &input[len..];
-        }
-        Ok(original)
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        self.encoder.write_plain(&mut self.writer, input)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -866,6 +1065,25 @@ fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStre
     }))
 }
 
+fn write_all_wait<W: Write>(writer: &mut W, mut input: &[u8]) -> io::Result<()> {
+    while !input.is_empty() {
+        match writer.write(input) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "writer returned zero",
+                ));
+            }
+            Ok(written) => input = &input[written..],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 fn vmess_cmd_key(uuid: &[u8; 16]) -> [u8; 16] {
     let mut hasher = Md5::new();
     Md5Digest::update(&mut hasher, uuid);
@@ -1075,10 +1293,16 @@ fn create_auth_id(cmd_key: &[u8; 16], timestamp: i64, random: [u8; 4]) -> [u8; 1
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use rustls::pki_types::{CertificateDer, ServerName};
+    use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
     use super::{
         create_auth_id, fnv1a, kdf, parse_uuid_bytes, vmess_cmd_key, write_response_header,
@@ -1087,6 +1311,7 @@ mod tests {
         OPTION_GLOBAL_PADDING, SECURITY_AES128_GCM, VERSION,
     };
     use crate::socks5::SocksTarget;
+    use crate::tls::TlsAcceptor;
     use crate::user::CoreUser;
 
     fn user() -> CoreUser {
@@ -1308,6 +1533,55 @@ mod tests {
         payload
     }
 
+    struct TestCert {
+        cert_path: PathBuf,
+        key_path: PathBuf,
+        cert_der: CertificateDer<'static>,
+    }
+
+    impl Drop for TestCert {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.cert_path);
+            let _ = fs::remove_file(&self.key_path);
+        }
+    }
+
+    fn test_cert(label: &str) -> TestCert {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("self signed cert");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join(format!("keli-core-rs-vmess-{label}-{nanos}.crt"));
+        let key_path = dir.join(format!("keli-core-rs-vmess-{label}-{nanos}.key"));
+        fs::write(&cert_path, cert.cert.pem()).expect("write cert");
+        fs::write(&key_path, cert.key_pair.serialize_pem()).expect("write key");
+        TestCert {
+            cert_path,
+            key_path,
+            cert_der: cert.cert.der().clone(),
+        }
+    }
+
+    fn tls_client(
+        addr: std::net::SocketAddr,
+        cert_der: CertificateDer<'static>,
+    ) -> StreamOwned<ClientConnection, TcpStream> {
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).expect("root cert");
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name = ServerName::try_from("localhost")
+            .expect("server name")
+            .to_owned();
+        let connection = ClientConnection::new(Arc::new(config), server_name).expect("client tls");
+        let socket = TcpStream::connect(addr).expect("client connect");
+        StreamOwned::new(connection, socket)
+    }
+
     #[test]
     fn parses_vmess_aead_request_header() {
         let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
@@ -1402,6 +1676,61 @@ mod tests {
     }
 
     #[test]
+    fn proxies_tls_and_records_user_traffic() {
+        let cert = test_cert("tcp");
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vmess bind");
+        let vmess_addr = listener.local_addr().expect("vmess addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vmess accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            server_clone.handle_tls_client(client)
+        });
+
+        let (request_bytes, request) = vmess_request(echo_addr, b"ping");
+        let mut client = tls_client(vmess_addr, cert.cert_der.clone());
+        client.write_all(&request_bytes).expect("client request");
+        decode_response_header(&mut client, &request);
+        let mut body = VmessBodyReader::new(
+            client,
+            request.response_body_key,
+            request.response_body_iv,
+            request.options,
+            request.security,
+        )
+        .expect("response body");
+        let mut echoed = [0u8; 4];
+        body.read_exact(&mut echoed).expect("client read payload");
+        assert_eq!(&echoed, b"ping");
+        drop(body);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|vmess|1");
+        assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
     fn proxies_websocket_and_records_user_traffic() {
         let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
         let echo_addr = echo.local_addr().expect("echo addr");
@@ -1423,6 +1752,76 @@ mod tests {
 
         let (request_bytes, request) = vmess_request(echo_addr, b"ping");
         let mut client = TcpStream::connect(vmess_addr).expect("client connect");
+        client
+            .write_all(&websocket_request("/vmess"))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame(&request_bytes))
+            .expect("vmess frame");
+
+        let mut response_header = read_binary_frame(&mut client);
+        response_header.extend_from_slice(&read_binary_frame(&mut client));
+        decode_response_header(&mut std::io::Cursor::new(response_header), &request);
+
+        let mut body_frame = read_binary_frame(&mut client);
+        body_frame.extend_from_slice(&read_binary_frame(&mut client));
+        body_frame.extend_from_slice(&read_binary_frame(&mut client));
+        let mut body = VmessBodyReader::new(
+            std::io::Cursor::new(body_frame),
+            request.response_body_key,
+            request.response_body_iv,
+            request.options,
+            request.security,
+        )
+        .expect("response body");
+        let mut echoed = [0u8; 4];
+        body.read_exact(&mut echoed).expect("client read payload");
+        assert_eq!(&echoed, b"ping");
+        drop(body);
+        drop(client);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|vmess|1");
+        assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn proxies_tls_websocket_and_records_user_traffic() {
+        let cert = test_cert("ws");
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vmess bind");
+        let vmess_addr = listener.local_addr().expect("vmess addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vmess accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            server_clone.handle_tls_websocket_client(client, Some("/vmess"))
+        });
+
+        let (request_bytes, request) = vmess_request(echo_addr, b"ping");
+        let mut client = tls_client(vmess_addr, cert.cert_der.clone());
         client
             .write_all(&websocket_request("/vmess"))
             .expect("websocket request");

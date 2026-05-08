@@ -186,12 +186,7 @@ impl InboundConfig {
                     self.tag
                 )));
             }
-            if self.tls.is_some() {
-                return Err(ValidationError::new(format!(
-                    "{} vmess tls is not implemented in keli-core-rs yet",
-                    self.tag
-                )));
-            }
+            validate_tls_config("vmess", &self.tag, network, self.tls.as_ref())?;
             if self.users.is_empty() {
                 return Err(ValidationError::new(format!(
                     "{} vmess requires at least one user",

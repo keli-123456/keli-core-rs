@@ -226,6 +226,7 @@ fn start_vmess_listener(
     let workers_for_thread = workers.clone();
     let network = inbound.transport.network.trim().to_string();
     let websocket_path = inbound.transport.path.clone();
+    let tls_acceptor = tls_acceptor_for(inbound)?;
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -233,8 +234,20 @@ fn start_vmess_listener(
                     let server = server.clone();
                     let network = network.clone();
                     let websocket_path = websocket_path.clone();
+                    let tls_acceptor = tls_acceptor.clone();
                     let worker = thread::spawn(move || {
-                        let result = if network == "ws" {
+                        let result = if let Some(acceptor) = tls_acceptor {
+                            acceptor.accept(stream).and_then(|client| {
+                                if network == "ws" {
+                                    server.handle_tls_websocket_client(
+                                        client,
+                                        websocket_path.as_deref(),
+                                    )
+                                } else {
+                                    server.handle_tls_client(client)
+                                }
+                            })
+                        } else if network == "ws" {
                             server.handle_websocket_client(stream, websocket_path.as_deref())
                         } else {
                             server.handle_tcp_client(stream)
