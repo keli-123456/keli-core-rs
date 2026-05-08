@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use quinn::crypto::rustls::QuicServerConfig;
+use quinn::Runtime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, UdpSocket};
 
@@ -14,6 +15,7 @@ use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
 use crate::routing::{RouteDecision, RouteMatcher};
+use crate::salamander::SalamanderUdpSocket;
 use crate::socks5::SocksTarget;
 use crate::tls::{load_certs, load_private_key};
 use crate::traffic::TrafficRegistry;
@@ -38,6 +40,13 @@ pub struct Hysteria2ServerConfig {
     pub up_mbps: u32,
     pub down_mbps: u32,
     pub ignore_client_bandwidth: bool,
+    pub obfs: Option<Hysteria2ObfsConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hysteria2ObfsConfig {
+    pub kind: String,
+    pub password: String,
 }
 
 #[derive(Clone, Debug)]
@@ -103,7 +112,29 @@ impl Hysteria2Server {
             .datagram_receive_buffer_size(Some(UDP_DATAGRAM_BUFFER_SIZE))
             .datagram_send_buffer_size(UDP_DATAGRAM_BUFFER_SIZE);
         server_config.transport_config(Arc::new(transport));
-        quinn::Endpoint::server(server_config, self.config.listen)
+        let Some(obfs) = self.config.obfs.as_ref() else {
+            return quinn::Endpoint::server(server_config, self.config.listen);
+        };
+        if !obfs.kind.eq_ignore_ascii_case("salamander") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "hysteria2 only supports salamander obfs",
+            ));
+        }
+
+        let socket = std::net::UdpSocket::bind(self.config.listen)?;
+        let runtime = Arc::new(quinn::TokioRuntime);
+        let socket = runtime.wrap_udp_socket(socket)?;
+        let socket = Arc::new(SalamanderUdpSocket::new(
+            socket,
+            obfs.password.as_bytes().to_vec(),
+        )?);
+        quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        )
     }
 
     pub async fn run(self, endpoint: quinn::Endpoint, stop: Arc<AtomicBool>) {
@@ -1016,6 +1047,7 @@ mod tests {
             up_mbps: 0,
             down_mbps: 0,
             ignore_client_bandwidth: false,
+            obfs: None,
         })
     }
 

@@ -9,9 +9,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::anytls::{AnyTlsServer, AnyTlsServerConfig};
-use crate::config::{CoreConfig, InboundConfig, ValidationError};
+use crate::config::{CoreConfig, InboundConfig, TransportConfig, ValidationError};
 use crate::http_proxy::{HttpProxyServer, HttpProxyServerConfig};
-use crate::hysteria2::{Hysteria2Server, Hysteria2ServerConfig};
+use crate::hysteria2::{Hysteria2ObfsConfig, Hysteria2Server, Hysteria2ServerConfig};
 use crate::limits::{UserBandwidthLimiters, UserSessionTracker};
 use crate::protocol::Protocol;
 use crate::shadowsocks::{ShadowsocksServer, ShadowsocksServerConfig};
@@ -325,6 +325,7 @@ fn start_hysteria2_listener(
             up_mbps: inbound.transport.up_mbps,
             down_mbps: inbound.transport.down_mbps,
             ignore_client_bandwidth: inbound.transport.ignore_client_bandwidth,
+            obfs: hysteria2_obfs_config(&inbound.transport),
         },
         traffic,
         sessions,
@@ -367,6 +368,18 @@ fn start_hysteria2_listener(
         stop,
         workers,
         join: Some(join),
+    })
+}
+
+fn hysteria2_obfs_config(transport: &TransportConfig) -> Option<Hysteria2ObfsConfig> {
+    let kind = transport.obfs.as_deref().unwrap_or("").trim();
+    let password = transport.obfs_password.as_deref().unwrap_or("").trim();
+    if kind.is_empty() && password.is_empty() {
+        return None;
+    }
+    Some(Hysteria2ObfsConfig {
+        kind: kind.to_string(),
+        password: password.to_string(),
     })
 }
 

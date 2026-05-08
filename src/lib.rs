@@ -9,6 +9,7 @@ pub mod limits;
 pub mod protocol;
 pub mod routing;
 pub mod runtime;
+mod salamander;
 pub mod service;
 pub mod shadowsocks;
 pub mod socks5;

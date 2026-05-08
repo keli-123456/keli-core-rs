@@ -66,6 +66,10 @@ pub struct TransportConfig {
     pub down_mbps: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub ignore_client_bandwidth: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obfs: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obfs_password: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +296,7 @@ impl InboundConfig {
                     self.tag
                 )));
             }
+            validate_hysteria2_obfs(&self.tag, &self.transport)?;
         }
 
         Ok(())
@@ -368,8 +373,29 @@ impl Default for TransportConfig {
             up_mbps: 0,
             down_mbps: 0,
             ignore_client_bandwidth: false,
+            obfs: None,
+            obfs_password: None,
         }
     }
+}
+
+fn validate_hysteria2_obfs(tag: &str, transport: &TransportConfig) -> Result<(), ValidationError> {
+    let obfs = transport.obfs.as_deref().unwrap_or("").trim();
+    let password = transport.obfs_password.as_deref().unwrap_or("").trim();
+    if obfs.is_empty() && password.is_empty() {
+        return Ok(());
+    }
+    if !obfs.eq_ignore_ascii_case("salamander") {
+        return Err(ValidationError::new(format!(
+            "{tag} hysteria2 only supports salamander obfs"
+        )));
+    }
+    if password.len() < 4 {
+        return Err(ValidationError::new(format!(
+            "{tag} hysteria2 salamander obfs password must be at least 4 bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn is_zero_u32(value: &u32) -> bool {
