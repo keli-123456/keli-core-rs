@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{
-    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
-    UdpSocket,
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -755,32 +754,11 @@ fn read_vless_target<R: Read>(reader: &mut R) -> io::Result<SocksTarget> {
 }
 
 fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStream> {
-    let addrs = (target.host.as_str(), target.port).to_socket_addrs()?;
-    let mut last_error = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            "target did not resolve to any socket address",
-        )
-    }))
+    crate::dns::connect_tcp(&target.host, target.port, timeout)
 }
 
 fn resolve_udp_target(target: &SocksTarget) -> io::Result<SocketAddr> {
-    (target.host.as_str(), target.port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "udp target did not resolve to any socket address",
-            )
-        })
+    crate::dns::resolve_socket_addr(&target.host, target.port, Duration::from_secs(5))
 }
 
 fn read_vless_udp_payload<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {

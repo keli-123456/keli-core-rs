@@ -9,7 +9,7 @@ use bytes::Bytes;
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::Runtime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{lookup_host, UdpSocket};
+use tokio::net::UdpSocket;
 
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
@@ -296,27 +296,27 @@ impl Hysteria2Server {
         let target = read_tcp_target(&mut recv).await?;
         let decision = self.router.decide_target(&target.host, target.port, "tcp");
         let remote = match &decision {
-            RouteDecision::Direct => match tokio::time::timeout(
-                self.config.connect_timeout,
-                tokio::net::TcpStream::connect((target.host.as_str(), target.port)),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(error)) => {
-                    write_tcp_response(&mut send, RESPONSE_ERROR, "connect failed").await?;
-                    let _ = send.finish();
-                    return Err(error);
+            RouteDecision::Direct => {
+                match crate::dns::connect_tcp_tokio(
+                    &target.host,
+                    target.port,
+                    self.config.connect_timeout,
+                )
+                .await
+                {
+                    Ok(stream) => stream,
+                    Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                        write_tcp_response(&mut send, RESPONSE_ERROR, "connect timed out").await?;
+                        let _ = send.finish();
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        write_tcp_response(&mut send, RESPONSE_ERROR, "connect failed").await?;
+                        let _ = send.finish();
+                        return Err(error);
+                    }
                 }
-                Err(_) => {
-                    write_tcp_response(&mut send, RESPONSE_ERROR, "connect timed out").await?;
-                    let _ = send.finish();
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "target connect timed out",
-                    ));
-                }
-            },
+            }
             RouteDecision::Outbound(outbound) => {
                 match connect_tcp_outbound_tokio(outbound, &target, self.config.connect_timeout)
                     .await
@@ -718,19 +718,7 @@ async fn bind_udp_socket(target_ip: IpAddr) -> io::Result<UdpSocket> {
 }
 
 async fn resolve_udp_target(target: &SocksTarget, timeout: Duration) -> io::Result<SocketAddr> {
-    match tokio::time::timeout(timeout, lookup_host((target.host.as_str(), target.port))).await {
-        Ok(Ok(mut addresses)) => addresses.next().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "hysteria2 udp target has no address",
-            )
-        }),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "hysteria2 udp target lookup timed out",
-        )),
-    }
+    crate::dns::resolve_socket_addr_tokio(&target.host, target.port, timeout).await
 }
 
 async fn receive_udp_replies(

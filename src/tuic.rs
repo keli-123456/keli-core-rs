@@ -8,7 +8,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use quinn::crypto::rustls::QuicServerConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{lookup_host, UdpSocket};
+use tokio::net::UdpSocket;
 
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
@@ -261,12 +261,14 @@ impl TuicServer {
         let target = read_address(&mut recv).await?;
         let decision = self.router.decide_target(&target.host, target.port, "tcp");
         let remote = match &decision {
-            RouteDecision::Direct => tokio::time::timeout(
-                self.config.connect_timeout,
-                tokio::net::TcpStream::connect((target.host.as_str(), target.port)),
-            )
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "target connect timed out"))??,
+            RouteDecision::Direct => {
+                crate::dns::connect_tcp_tokio(
+                    &target.host,
+                    target.port,
+                    self.config.connect_timeout,
+                )
+                .await?
+            }
             RouteDecision::Outbound(outbound) => {
                 connect_tcp_outbound_tokio(outbound, &target, self.config.connect_timeout).await?
             }
@@ -715,19 +717,7 @@ async fn bind_udp_socket(target_ip: IpAddr) -> io::Result<UdpSocket> {
 }
 
 async fn resolve_udp_target(target: &SocksTarget, timeout: Duration) -> io::Result<SocketAddr> {
-    match tokio::time::timeout(timeout, lookup_host((target.host.as_str(), target.port))).await {
-        Ok(Ok(mut addresses)) => addresses.next().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "tuic udp target has no address",
-            )
-        }),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "tuic udp target lookup timed out",
-        )),
-    }
+    crate::dns::resolve_socket_addr_tokio(&target.host, target.port, timeout).await
 }
 
 async fn receive_udp_replies(

@@ -14,10 +14,27 @@ use crate::user::CoreUser;
 pub struct CoreConfig {
     pub instance_id: String,
     pub log_level: String,
+    #[serde(default)]
+    pub dns: DnsConfig,
     pub inbounds: Vec<InboundConfig>,
     pub outbounds: Vec<OutboundConfig>,
     pub routes: Vec<RouteRule>,
     pub stats: StatsConfig,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsConfig {
+    #[serde(default)]
+    pub servers: Vec<DnsServerConfig>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub query_strategy: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsServerConfig {
+    pub address: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,8 +181,23 @@ impl CoreConfig {
             }
         }
         self.validate_outbounds()?;
+        self.validate_dns()?;
         self.validate_routes()?;
 
+        Ok(())
+    }
+
+    fn validate_dns(&self) -> Result<(), ValidationError> {
+        for server in &self.dns.servers {
+            if server.address.trim().is_empty() {
+                return Err(ValidationError::new("dns server address must not be empty"));
+            }
+            validate_route_targets(&RouteRule {
+                targets: server.domains.clone(),
+                action: Direct,
+                outbound: None,
+            })?;
+        }
         Ok(())
     }
 
@@ -991,8 +1023,8 @@ mod tests {
     use crate::user::CoreUser;
 
     use super::{
-        CoreConfig, InboundConfig, OutboundConfig, RealityConfig, SniffingConfig, StatsConfig,
-        TlsConfig, TransportConfig,
+        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, RealityConfig, SniffingConfig,
+        StatsConfig, TlsConfig, TransportConfig,
     };
 
     fn user() -> CoreUser {
@@ -1011,6 +1043,7 @@ mod tests {
         let config = CoreConfig {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
+            dns: DnsConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|vless|1".to_string(),
                 protocol: Protocol::Vless,
@@ -1044,6 +1077,7 @@ mod tests {
         let mut config = CoreConfig {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
+            dns: DnsConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|vless|1".to_string(),
                 protocol: Protocol::Vless,
@@ -1106,6 +1140,7 @@ mod tests {
         let mut config = CoreConfig {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
+            dns: DnsConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|http|1".to_string(),
                 protocol: Protocol::Http,
@@ -1149,6 +1184,7 @@ mod tests {
         let mut config = CoreConfig {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
+            dns: DnsConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|http|1".to_string(),
                 protocol: Protocol::Http,

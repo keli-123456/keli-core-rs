@@ -88,6 +88,7 @@ struct ListenerHandle {
 impl CoreService {
     pub fn start(config: CoreConfig) -> Result<Self, CoreServiceError> {
         config.validate().map_err(CoreServiceError::InvalidConfig)?;
+        crate::dns::configure(config.dns.clone());
 
         let traffic = Arc::new(Mutex::new(TrafficRegistry::default()));
         let sessions = UserSessionTracker::default();
@@ -1391,8 +1392,8 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::config::{
-        CoreConfig, InboundConfig, OutboundConfig, RealityConfig, SniffingConfig, StatsConfig,
-        TlsConfig, TransportConfig,
+        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, RealityConfig, SniffingConfig,
+        StatsConfig, TlsConfig, TransportConfig,
     };
     use crate::grpc::{decode_hunk_message, encode_grpc_hunk, take_grpc_message};
     use crate::protocol::Protocol;
@@ -1428,6 +1429,7 @@ mod tests {
         CoreConfig {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
+            dns: DnsConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|socks|1".to_string(),
                 protocol: Protocol::Socks,
@@ -1466,6 +1468,7 @@ mod tests {
         CoreConfig {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
+            dns: DnsConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|vless|reality|1".to_string(),
                 protocol: Protocol::Vless,

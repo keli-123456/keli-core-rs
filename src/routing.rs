@@ -34,20 +34,8 @@ impl RouteMatcher {
     }
 
     pub fn decide_target(&self, host: &str, port: u16, protocol_labels: &str) -> RouteDecision {
-        let host = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
-        let host_ip = host.parse::<IpAddr>().ok();
-        let mut resolved_ips = None;
         for route in &self.routes {
-            if route.targets.iter().any(|target| {
-                matches_target(
-                    &host,
-                    host_ip,
-                    &mut resolved_ips,
-                    port,
-                    protocol_labels,
-                    target,
-                )
-            }) {
+            if route_targets_match(&route.targets, host, port, protocol_labels) {
                 return match &route.action {
                     RouteAction::Direct => RouteDecision::Direct,
                     RouteAction::Block => RouteDecision::Block,
@@ -61,6 +49,27 @@ impl RouteMatcher {
         }
         RouteDecision::Direct
     }
+}
+
+pub fn route_targets_match(
+    targets: &[String],
+    host: &str,
+    port: u16,
+    protocol_labels: &str,
+) -> bool {
+    let host = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    let host_ip = host.parse::<IpAddr>().ok();
+    let mut resolved_ips = None;
+    targets.iter().any(|target| {
+        matches_target(
+            &host,
+            host_ip,
+            &mut resolved_ips,
+            port,
+            protocol_labels,
+            target,
+        )
+    })
 }
 
 pub fn route_protocol_labels(network: &str, payload: &[u8]) -> String {

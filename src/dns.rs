@@ -1,0 +1,448 @@
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{OnceLock, RwLock};
+use std::time::Duration;
+
+use crate::config::{DnsConfig, DnsServerConfig};
+use crate::routing::route_targets_match;
+
+static DNS_CONFIG: OnceLock<RwLock<DnsConfig>> = OnceLock::new();
+static DNS_QUERY_ID: AtomicU16 = AtomicU16::new(1);
+
+pub fn configure(config: DnsConfig) {
+    let lock = DNS_CONFIG.get_or_init(|| RwLock::new(DnsConfig::default()));
+    *lock.write().expect("dns config lock poisoned") = config;
+}
+
+pub fn connect_tcp(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
+    let addrs = resolve_socket_addrs(host, port, timeout)?;
+    let mut last_error = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "target did not resolve to any socket address",
+        )
+    }))
+}
+
+pub async fn connect_tcp_tokio(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> io::Result<tokio::net::TcpStream> {
+    let addrs = resolve_socket_addrs_tokio(host, port, timeout).await?;
+    let mut last_error = None;
+    for addr in addrs {
+        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => {
+                last_error = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "target connect timed out",
+                ));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "target did not resolve to any socket address",
+        )
+    }))
+}
+
+pub fn resolve_socket_addr(host: &str, port: u16, timeout: Duration) -> io::Result<SocketAddr> {
+    resolve_socket_addrs(host, port, timeout)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "target did not resolve to any socket address",
+            )
+        })
+}
+
+pub async fn resolve_socket_addr_tokio(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> io::Result<SocketAddr> {
+    resolve_socket_addrs_tokio(host, port, timeout)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "target did not resolve to any socket address",
+            )
+        })
+}
+
+pub async fn resolve_socket_addrs_tokio(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> io::Result<Vec<SocketAddr>> {
+    let host = host.to_string();
+    tokio::task::spawn_blocking(move || resolve_socket_addrs(&host, port, timeout))
+        .await
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("dns resolve task failed: {error}"),
+            )
+        })?
+}
+
+pub fn resolve_socket_addrs(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> io::Result<Vec<SocketAddr>> {
+    let host = host.trim().trim_matches(['[', ']']);
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let config = current_config();
+    if config.servers.is_empty() {
+        return system_resolve(host, port);
+    }
+
+    let servers = select_servers(&config, host);
+    let query_types = query_types(&config.query_strategy);
+    let mut last_error = None;
+    for server in servers {
+        for qtype in &query_types {
+            match query_dns_server(&server, host, *qtype, timeout) {
+                Ok(ips) if !ips.is_empty() => {
+                    return Ok(ips
+                        .into_iter()
+                        .map(|ip| SocketAddr::new(ip, port))
+                        .collect());
+                }
+                Ok(_) => {}
+                Err(error) => last_error = Some(error),
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "configured dns servers returned no target address",
+        )
+    }))
+}
+
+fn current_config() -> DnsConfig {
+    DNS_CONFIG
+        .get_or_init(|| RwLock::new(DnsConfig::default()))
+        .read()
+        .expect("dns config lock poisoned")
+        .clone()
+}
+
+fn select_servers(config: &DnsConfig, host: &str) -> Vec<DnsServerConfig> {
+    let matched = config
+        .servers
+        .iter()
+        .filter(|server| {
+            !server.domains.is_empty() && route_targets_match(&server.domains, host, 0, "")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !matched.is_empty() {
+        return matched;
+    }
+    config
+        .servers
+        .iter()
+        .filter(|server| server.domains.is_empty())
+        .cloned()
+        .collect()
+}
+
+fn query_types(strategy: &str) -> Vec<u16> {
+    match strategy.trim().to_ascii_lowercase().as_str() {
+        "useipv6" | "ipv6" => vec![28],
+        "asis" | "useip" | "useipv4v6" => vec![1, 28],
+        _ => vec![1],
+    }
+}
+
+fn query_dns_server(
+    server: &DnsServerConfig,
+    host: &str,
+    qtype: u16,
+    timeout: Duration,
+) -> io::Result<Vec<IpAddr>> {
+    let server_addr = dns_server_addr(&server.address)?;
+    let bind_addr = match server_addr {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    };
+    let socket = UdpSocket::bind(bind_addr)?;
+    socket.set_read_timeout(Some(timeout))?;
+    socket.set_write_timeout(Some(timeout))?;
+
+    let query_id = DNS_QUERY_ID.fetch_add(1, Ordering::Relaxed);
+    let query = encode_query(query_id, host, qtype)?;
+    socket.send_to(&query, server_addr)?;
+
+    let mut response = [0u8; 4096];
+    let (read, _) = socket.recv_from(&mut response)?;
+    parse_response(&response[..read], query_id, qtype)
+}
+
+fn dns_server_addr(address: &str) -> io::Result<SocketAddr> {
+    let address = address.trim();
+    if address.contains("://") {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "only udp dns server addresses are supported",
+        ));
+    }
+    if let Ok(addr) = address.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    let host = address.trim_matches(['[', ']']);
+    (host, 53).to_socket_addrs()?.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "dns server did not resolve to any socket address",
+        )
+    })
+}
+
+fn system_resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    (host, port).to_socket_addrs().map(|addrs| addrs.collect())
+}
+
+fn encode_query(query_id: u16, host: &str, qtype: u16) -> io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(512);
+    output.extend_from_slice(&query_id.to_be_bytes());
+    output.extend_from_slice(&0x0100u16.to_be_bytes());
+    output.extend_from_slice(&1u16.to_be_bytes());
+    output.extend_from_slice(&0u16.to_be_bytes());
+    output.extend_from_slice(&0u16.to_be_bytes());
+    output.extend_from_slice(&0u16.to_be_bytes());
+    for label in host.trim_end_matches('.').split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dns query host label is invalid",
+            ));
+        }
+        output.push(label.len() as u8);
+        output.extend_from_slice(label.as_bytes());
+    }
+    output.push(0);
+    output.extend_from_slice(&qtype.to_be_bytes());
+    output.extend_from_slice(&1u16.to_be_bytes());
+    Ok(output)
+}
+
+fn parse_response(input: &[u8], query_id: u16, qtype: u16) -> io::Result<Vec<IpAddr>> {
+    if input.len() < 12 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "dns response is too short",
+        ));
+    }
+    if u16::from_be_bytes([input[0], input[1]]) != query_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dns response id mismatch",
+        ));
+    }
+    let flags = u16::from_be_bytes([input[2], input[3]]);
+    if flags & 0x8000 == 0 || flags & 0x000f != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dns response indicates failure",
+        ));
+    }
+    let question_count = u16::from_be_bytes([input[4], input[5]]) as usize;
+    let answer_count = u16::from_be_bytes([input[6], input[7]]) as usize;
+    let mut offset = 12;
+    for _ in 0..question_count {
+        read_name(input, &mut offset)?;
+        if input.len().saturating_sub(offset) < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated dns question",
+            ));
+        }
+        offset += 4;
+    }
+
+    let mut ips = Vec::new();
+    for _ in 0..answer_count {
+        read_name(input, &mut offset)?;
+        if input.len().saturating_sub(offset) < 10 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated dns answer",
+            ));
+        }
+        let answer_type = u16::from_be_bytes([input[offset], input[offset + 1]]);
+        let class = u16::from_be_bytes([input[offset + 2], input[offset + 3]]);
+        let data_len = u16::from_be_bytes([input[offset + 8], input[offset + 9]]) as usize;
+        offset += 10;
+        if input.len().saturating_sub(offset) < data_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated dns answer data",
+            ));
+        }
+        if class == 1 && answer_type == qtype {
+            match (answer_type, data_len) {
+                (1, 4) => {
+                    ips.push(IpAddr::V4(Ipv4Addr::new(
+                        input[offset],
+                        input[offset + 1],
+                        input[offset + 2],
+                        input[offset + 3],
+                    )));
+                }
+                (28, 16) => {
+                    let mut bytes = [0u8; 16];
+                    bytes.copy_from_slice(&input[offset..offset + 16]);
+                    ips.push(IpAddr::V6(Ipv6Addr::from(bytes)));
+                }
+                _ => {}
+            }
+        }
+        offset += data_len;
+    }
+    Ok(ips)
+}
+
+fn read_name(input: &[u8], offset: &mut usize) -> io::Result<()> {
+    let mut cursor = *offset;
+    let mut jumped = false;
+    for _ in 0..128 {
+        let Some(&len) = input.get(cursor) else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated dns name",
+            ));
+        };
+        if len & 0xc0 == 0xc0 {
+            if input.get(cursor + 1).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated dns name pointer",
+                ));
+            }
+            if !jumped {
+                *offset = cursor + 2;
+            }
+            let pointer = (((len & 0x3f) as usize) << 8) | input[cursor + 1] as usize;
+            cursor = pointer;
+            jumped = true;
+            continue;
+        }
+        if len == 0 {
+            if !jumped {
+                *offset = cursor + 1;
+            }
+            return Ok(());
+        }
+        cursor += 1 + usize::from(len);
+        if cursor > input.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated dns label",
+            ));
+        }
+        if !jumped {
+            *offset = cursor;
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "dns name compression loop",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn parses_dns_a_response() {
+        let query = encode_query(7, "example.com", 1).expect("query");
+        let mut response = Vec::new();
+        response.extend_from_slice(&7u16.to_be_bytes());
+        response.extend_from_slice(&0x8180u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+        response.extend_from_slice(&query[12..]);
+        response.extend_from_slice(&[0xc0, 0x0c]);
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&60u32.to_be_bytes());
+        response.extend_from_slice(&4u16.to_be_bytes());
+        response.extend_from_slice(&[203, 0, 113, 9]);
+
+        let ips = parse_response(&response, 7, 1).expect("response");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))]);
+    }
+
+    #[test]
+    fn resolves_with_configured_dns_server() {
+        let dns = UdpSocket::bind("127.0.0.1:0").expect("dns bind");
+        dns.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("dns timeout");
+        let dns_addr = dns.local_addr().expect("dns addr");
+        let server = thread::spawn(move || {
+            let mut packet = [0u8; 512];
+            let (read, peer) = dns.recv_from(&mut packet).expect("dns recv");
+            assert!(read > 12);
+            let query_id = u16::from_be_bytes([packet[0], packet[1]]);
+            let mut response = Vec::new();
+            response.extend_from_slice(&query_id.to_be_bytes());
+            response.extend_from_slice(&0x8180u16.to_be_bytes());
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&0u16.to_be_bytes());
+            response.extend_from_slice(&0u16.to_be_bytes());
+            response.extend_from_slice(&packet[12..read]);
+            response.extend_from_slice(&[0xc0, 0x0c]);
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&30u32.to_be_bytes());
+            response.extend_from_slice(&4u16.to_be_bytes());
+            response.extend_from_slice(&[198, 51, 100, 8]);
+            dns.send_to(&response, peer).expect("dns response");
+        });
+
+        configure(DnsConfig {
+            servers: vec![DnsServerConfig {
+                address: dns_addr.to_string(),
+                domains: vec!["domain:example.com".to_string()],
+            }],
+            query_strategy: "UseIPv4".to_string(),
+        });
+        let addrs =
+            resolve_socket_addrs("api.example.com", 443, Duration::from_secs(2)).expect("resolve");
+        assert_eq!(addrs, vec!["198.51.100.8:443".parse().unwrap()]);
+        server.join().expect("server");
+        configure(DnsConfig::default());
+    }
+}

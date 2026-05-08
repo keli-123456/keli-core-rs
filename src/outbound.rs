@@ -1,5 +1,5 @@
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -96,7 +96,7 @@ fn send_direct_udp(
     payload: &[u8],
     timeout: Duration,
 ) -> io::Result<(SocketAddr, Vec<u8>)> {
-    let remote_addr = resolve_socket_addr(target)?;
+    let remote_addr = resolve_socket_addr(target, timeout)?;
     let udp = UdpSocket::bind(udp_bind_addr_for_remote(remote_addr))?;
     udp.set_read_timeout(Some(timeout))?;
     udp.set_write_timeout(Some(timeout))?;
@@ -121,7 +121,7 @@ fn freedom_target(outbound: &OutboundConfig, target: &SocksTarget) -> SocksTarge
 }
 
 fn connect_direct(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStream> {
-    let addrs = (target.host.as_str(), target.port).to_socket_addrs()?;
+    let addrs = crate::dns::resolve_socket_addrs(&target.host, target.port, timeout)?;
     let mut last_error = None;
     for addr in addrs {
         match TcpStream::connect_timeout(&addr, timeout) {
@@ -238,7 +238,7 @@ fn send_socks5_udp(
     control.write_all(&request)?;
 
     let relay = read_socks5_reply_target(&mut control)?;
-    let relay = relay_socket_addr(outbound, relay)?;
+    let relay = relay_socket_addr(outbound, relay, timeout)?;
     let udp = UdpSocket::bind(udp_bind_addr_for_remote(relay))?;
     udp.set_read_timeout(Some(timeout))?;
     udp.set_write_timeout(Some(timeout))?;
@@ -248,7 +248,7 @@ fn send_socks5_udp(
     let mut response = vec![0u8; 65_535];
     let (read, _) = udp.recv_from(&mut response)?;
     let (source, payload) = parse_socks5_udp_packet(&response[..read])?;
-    let source = resolve_socket_addr(&source)?;
+    let source = resolve_socket_addr(&source, timeout)?;
     Ok((source, payload))
 }
 
@@ -484,7 +484,11 @@ fn read_socks5_target_body_from_read<R: Read>(reader: &mut R, atyp: u8) -> io::R
     })
 }
 
-fn relay_socket_addr(outbound: &OutboundConfig, relay: SocksTarget) -> io::Result<SocketAddr> {
+fn relay_socket_addr(
+    outbound: &OutboundConfig,
+    relay: SocksTarget,
+    timeout: Duration,
+) -> io::Result<SocketAddr> {
     let host = relay
         .host
         .parse::<IpAddr>()
@@ -492,22 +496,17 @@ fn relay_socket_addr(outbound: &OutboundConfig, relay: SocksTarget) -> io::Resul
         .filter(|ip| !ip.is_unspecified())
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| outbound.address.clone().unwrap_or(relay.host));
-    resolve_socket_addr(&SocksTarget {
-        host,
-        port: relay.port,
-    })
+    resolve_socket_addr(
+        &SocksTarget {
+            host,
+            port: relay.port,
+        },
+        timeout,
+    )
 }
 
-fn resolve_socket_addr(target: &SocksTarget) -> io::Result<SocketAddr> {
-    (target.host.as_str(), target.port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "target did not resolve to any socket address",
-            )
-        })
+fn resolve_socket_addr(target: &SocksTarget, timeout: Duration) -> io::Result<SocketAddr> {
+    crate::dns::resolve_socket_addr(&target.host, target.port, timeout)
 }
 
 fn udp_bind_addr_for_remote(remote: SocketAddr) -> SocketAddr {

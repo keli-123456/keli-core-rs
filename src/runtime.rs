@@ -115,7 +115,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use crate::config::{
-        CoreConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig, TransportConfig,
+        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig,
+        TransportConfig,
     };
     use crate::protocol::Protocol;
     use crate::runtime::{ReloadDecision, RuntimeState};
@@ -125,6 +126,7 @@ mod tests {
         CoreConfig {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
+            dns: DnsConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|socks|1".to_string(),
                 protocol: Protocol::Socks,

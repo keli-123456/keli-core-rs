@@ -164,7 +164,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::config::{
-        CoreConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig, TransportConfig,
+        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig,
+        TransportConfig,
     };
     use crate::control::{CoreCommand, CoreController, CoreResponse};
     use crate::control_server::start_control_server;
@@ -184,6 +185,7 @@ mod tests {
         CoreConfig {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
+            dns: DnsConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|socks|1".to_string(),
                 protocol: Protocol::Socks,

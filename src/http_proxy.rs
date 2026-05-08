@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -324,20 +324,7 @@ impl HttpProxyServer {
 }
 
 fn connect_target(target: &HttpTarget, timeout: Duration) -> io::Result<TcpStream> {
-    let addrs = (target.host.as_str(), target.port).to_socket_addrs()?;
-    let mut last_error = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            "target did not resolve to any socket address",
-        )
-    }))
+    crate::dns::connect_tcp(&target.host, target.port, timeout)
 }
 
 fn parse_basic_auth(value: &str) -> Option<(String, String)> {

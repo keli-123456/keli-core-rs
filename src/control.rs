@@ -141,7 +141,8 @@ mod tests {
     use std::net::TcpListener;
 
     use crate::config::{
-        CoreConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig, TransportConfig,
+        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig,
+        TransportConfig,
     };
     use crate::control::{CoreCommand, CoreController, CoreResponse};
     use crate::protocol::Protocol;
@@ -160,6 +161,7 @@ mod tests {
         CoreConfig {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
+            dns: DnsConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|proxy|1".to_string(),
                 protocol,
