@@ -1177,8 +1177,8 @@ fn start_vless_reality_listener(
                     let gateway = gateway.clone();
                     let worker = thread::spawn(move || {
                         let result = handle_reality_preface(stream, &gateway);
-                        if let Ok(RealityGatewayResult::Authenticated(_authenticated)) = result {
-                            // Full REALITY TLS handshake continuation is wired in the next stage.
+                        if let Ok(RealityGatewayResult::Authenticated(mut authenticated)) = result {
+                            let _ = authenticated.read_dest_handshake(8, Duration::from_secs(5));
                         }
                     });
                     workers_for_thread

@@ -69,6 +69,13 @@ pub struct RealityKeyShare {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RealityDestHandshake {
+    pub raw_records: Vec<u8>,
+    pub records: Vec<RealityTlsRecord>,
+    pub server_hello: RealityServerHello,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RealityGatewayConfig {
     pub auth: RealityAuthConfig,
     pub dest: String,
@@ -389,6 +396,13 @@ pub fn validate_reality_server_hello(
     Ok(hello)
 }
 
+pub fn parse_reality_dest_handshake(
+    input: &[u8],
+) -> Result<RealityDestHandshake, RealityAuthError> {
+    parse_reality_dest_handshake_records(input.to_vec())?
+        .ok_or_else(|| invalid("reality dest did not return server hello"))
+}
+
 impl PrefixedTcpStream {
     pub fn new(socket: TcpStream, prefix: Vec<u8>) -> Self {
         Self {
@@ -411,6 +425,27 @@ impl PrefixedTcpStream {
 }
 
 impl RealityAuthenticatedStream {
+    pub fn read_dest_handshake(
+        &mut self,
+        max_records: usize,
+        timeout: Duration,
+    ) -> io::Result<RealityDestHandshake> {
+        if max_records == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max_records must be greater than zero",
+            ));
+        }
+        self.dest.set_read_timeout(Some(timeout))?;
+        let result = read_reality_dest_handshake(&mut self.dest, max_records);
+        let restore_result = self.dest.set_read_timeout(None);
+        match (result, restore_result) {
+            (Ok(handshake), Ok(())) => Ok(handshake),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
     pub fn read_dest_tls_records(
         &mut self,
         max_records: usize,
@@ -474,6 +509,39 @@ fn read_tls_records(stream: &mut TcpStream, max_records: usize) -> io::Result<Ve
         }
     }
     Ok(output)
+}
+
+fn read_reality_dest_handshake(
+    stream: &mut TcpStream,
+    max_records: usize,
+) -> io::Result<RealityDestHandshake> {
+    let mut raw_records = Vec::new();
+    for _ in 0..max_records {
+        match read_tls_record(stream) {
+            Ok(Some(record)) => {
+                raw_records.extend_from_slice(&record);
+                if let Some(handshake) = parse_reality_dest_handshake_records(raw_records.clone())
+                    .map_err(reality_error_to_io)?
+                {
+                    return Ok(handshake);
+                }
+            }
+            Ok(None) => break,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "reality dest did not return server hello",
+    ))
 }
 
 fn read_tls_record(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
@@ -658,6 +726,28 @@ fn is_tls13_cipher_suite(value: u16) -> bool {
     matches!(value, 0x1301 | 0x1302 | 0x1303)
 }
 
+fn parse_reality_dest_handshake_records(
+    raw_records: Vec<u8>,
+) -> Result<Option<RealityDestHandshake>, RealityAuthError> {
+    let records = parse_tls_records(&raw_records)?;
+    let Some(record) = records
+        .iter()
+        .find(|record| record.record_type == TLS_RECORD_HANDSHAKE)
+    else {
+        return Ok(None);
+    };
+    let server_hello = validate_reality_server_hello(record)?;
+    Ok(Some(RealityDestHandshake {
+        raw_records,
+        records,
+        server_hello,
+    }))
+}
+
+fn reality_error_to_io(error: RealityAuthError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     let value = value.trim();
     if value.len() % 2 != 0 {
@@ -788,9 +878,9 @@ mod tests {
 
     use crate::reality::{
         authenticate_reality_client_hello, decode_reality_private_key, decode_short_id,
-        handle_reality_preface, parse_reality_server_hello, parse_tls_records,
-        validate_reality_server_hello, RealityAuthConfig, RealityAuthError, RealityGatewayConfig,
-        RealityGatewayResult,
+        handle_reality_preface, parse_reality_dest_handshake, parse_reality_server_hello,
+        parse_tls_records, validate_reality_server_hello, RealityAuthConfig, RealityAuthError,
+        RealityGatewayConfig, RealityGatewayResult,
     };
 
     #[test]
@@ -980,6 +1070,45 @@ mod tests {
     }
 
     #[test]
+    fn parses_dest_handshake_with_server_hello_after_compat_record() {
+        let session_id = [0x55u8; 32];
+        let server_key = [0x9au8; 32];
+        let raw_records = [
+            tls_record(TLS_RECORD_CHANGE_CIPHER_SPEC, &[1]),
+            tls_record(
+                TLS_RECORD_HANDSHAKE,
+                &server_hello_payload(
+                    &session_id,
+                    0x1301,
+                    TLS_VERSION_1_3,
+                    GROUP_X25519,
+                    &server_key,
+                ),
+            ),
+        ]
+        .concat();
+
+        let handshake = parse_reality_dest_handshake(&raw_records).expect("dest handshake");
+
+        assert_eq!(handshake.raw_records, raw_records);
+        assert_eq!(handshake.records.len(), 2);
+        assert_eq!(handshake.server_hello.session_id, session_id);
+        assert_eq!(
+            handshake.server_hello.key_share.expect("key share").key,
+            server_key.to_vec()
+        );
+    }
+
+    #[test]
+    fn rejects_dest_handshake_without_server_hello() {
+        let raw_records = tls_record(TLS_RECORD_APPLICATION_DATA, b"encrypted");
+
+        let error = parse_reality_dest_handshake(&raw_records).expect_err("missing server hello");
+
+        assert!(error.to_string().contains("server hello"));
+    }
+
+    #[test]
     fn gateway_returns_authenticated_prefixed_stream() {
         let target = TcpListener::bind("127.0.0.1:0").expect("bind target");
         let target_addr = target.local_addr().expect("target addr");
@@ -1062,6 +1191,75 @@ mod tests {
         server_thread.join().expect("server thread");
         target_thread.join().expect("target thread");
         assert_eq!(target_rx.recv().expect("target capture"), record);
+    }
+
+    #[test]
+    fn authenticated_stream_reads_dest_handshake_until_server_hello() {
+        let target = TcpListener::bind("127.0.0.1:0").expect("bind target");
+        let target_addr = target.local_addr().expect("target addr");
+        let target_records = [
+            tls_record(TLS_RECORD_CHANGE_CIPHER_SPEC, &[1]),
+            tls_record(
+                TLS_RECORD_HANDSHAKE,
+                &server_hello_payload(
+                    &[0x55; 32],
+                    0x1301,
+                    TLS_VERSION_1_3,
+                    GROUP_X25519,
+                    &[0x9a; 32],
+                ),
+            ),
+            tls_record(TLS_RECORD_APPLICATION_DATA, b"encrypted"),
+        ]
+        .concat();
+        let target_thread = thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("accept target");
+            let mut header = [0u8; 5];
+            stream.read_exact(&mut header).expect("read target header");
+            let body_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+            let mut captured = vec![0u8; body_len];
+            stream.read_exact(&mut captured).expect("read target body");
+            stream
+                .write_all(&target_records)
+                .expect("write target records");
+        });
+
+        let server_secret = StaticSecret::from([7u8; 32]);
+        let client_secret = StaticSecret::from([9u8; 32]);
+        let short_id = [0x6b, 0xa8, 0x51, 0x79, 0xe3, 0x0d, 0x4f, 0xc2];
+        let record = build_reality_client_hello(
+            &client_secret,
+            &PublicKey::from(&server_secret),
+            "www.example.test",
+            [1, 8, 23],
+            1_777_650_625,
+            short_id,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind reality");
+        let addr = listener.local_addr().expect("reality addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept reality");
+            let config = gateway_config(server_secret, short_id, target_addr.to_string());
+            let result = handle_reality_preface(stream, &config).expect("reality preface");
+            let RealityGatewayResult::Authenticated(mut authenticated) = result else {
+                panic!("expected authenticated reality stream");
+            };
+
+            let handshake = authenticated
+                .read_dest_handshake(4, Duration::from_secs(1))
+                .expect("dest handshake");
+
+            assert_eq!(handshake.records.len(), 2);
+            assert_eq!(
+                handshake.server_hello.selected_version,
+                Some(TLS_VERSION_1_3)
+            );
+        });
+
+        let mut client = TcpStream::connect(addr).expect("client connect");
+        client.write_all(&record).expect("client write");
+        server_thread.join().expect("server thread");
+        target_thread.join().expect("target thread");
     }
 
     #[test]
