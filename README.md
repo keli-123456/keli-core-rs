@@ -57,7 +57,7 @@ Not implemented yet:
 - REALITY ML-DSA-65 certificate signing.
 - Advanced DNS/routing execution and custom outbounds.
 - Realtime integration.
-- Production packaging, release artifacts, and performance profiles.
+- Broader release platform matrix and performance profiles.
 
 The code-level protocol and runtime parity gate is tracked in `docs/PARITY.md`.
 
@@ -122,6 +122,18 @@ cargo run -- check-config ./core.json
 cargo run -- run-config ./core.json
 cargo run -- run-config ./core.json --control 127.0.0.1:18080
 ```
+
+## Release Artifacts
+
+Tag pushes such as `v0.1.0` and manual release workflow runs package the Linux x86_64 binary as:
+
+```text
+keli-core-rs-<version>-linux-x86_64.tar.gz
+keli-core-rs-<version>-linux-x86_64.tar.gz.sha256
+keli-core-rs-<version>-linux-x86_64.manifest.json
+```
+
+`kelinode-rs` can run that binary directly when `kernel.type: keli-core-rs` is selected. Put `keli-core-rs` in `PATH`, or set `kernel.core_command` in the node config to the absolute installed binary path.
 
 ## Compatibility Rules
 
