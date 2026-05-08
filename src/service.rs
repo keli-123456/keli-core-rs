@@ -59,6 +59,7 @@ pub struct CoreService {
 struct ListenerHandle {
     status: ListenerStatus,
     stop: Arc<AtomicBool>,
+    workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -110,6 +111,7 @@ impl CoreService {
             if let Some(join) = handle.join.take() {
                 let _ = join.join();
             }
+            join_workers(&handle.workers);
         }
     }
 }
@@ -158,11 +160,20 @@ fn start_socks_listener(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
+    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers_for_thread = workers.clone();
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let _ = server.handle_tcp_client(stream);
+                    let server = server.clone();
+                    let worker = thread::spawn(move || {
+                        let _ = server.handle_tcp_client(stream);
+                    });
+                    workers_for_thread
+                        .lock()
+                        .expect("worker list lock poisoned")
+                        .push(worker);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -179,6 +190,7 @@ fn start_socks_listener(
             local_addr,
         },
         stop,
+        workers,
         join: Some(join),
     })
 }
@@ -221,11 +233,20 @@ fn start_http_listener(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
+    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers_for_thread = workers.clone();
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let _ = server.handle_tcp_client(stream);
+                    let server = server.clone();
+                    let worker = thread::spawn(move || {
+                        let _ = server.handle_tcp_client(stream);
+                    });
+                    workers_for_thread
+                        .lock()
+                        .expect("worker list lock poisoned")
+                        .push(worker);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -242,8 +263,21 @@ fn start_http_listener(
             local_addr,
         },
         stop,
+        workers,
         join: Some(join),
     })
+}
+
+fn join_workers(workers: &Arc<Mutex<Vec<JoinHandle<()>>>>) {
+    loop {
+        let worker = workers.lock().expect("worker list lock poisoned").pop();
+        match worker {
+            Some(worker) => {
+                let _ = worker.join();
+            }
+            None => break,
+        }
+    }
 }
 
 fn resolve_listen_addr(listen: &str, port: u16) -> io::Result<SocketAddr> {

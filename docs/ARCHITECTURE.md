@@ -71,4 +71,6 @@ HTTP proxy
   - kelinode-rs drain/report integration
 ```
 
+Implemented listeners accept connections concurrently and join connection workers during shutdown so traffic accounting has a clean stop boundary.
+
 Once that path is real, the same runtime/control boundary can be expanded protocol by protocol.

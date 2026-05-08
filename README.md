@@ -31,6 +31,7 @@ Implemented in this first skeleton:
 - Per-user SOCKS5 TCP upload/download accounting.
 - HTTP proxy inbound with Basic authentication.
 - HTTP CONNECT tunneling and plain HTTP request forwarding.
+- Concurrent per-listener connection worker threads with stop-time joining.
 - Tiny CLI with `version` and `health`.
 
 Not implemented yet:
@@ -40,7 +41,6 @@ Not implemented yet:
 - DNS/routing execution.
 - Realtime integration.
 - Hot user patching.
-- Concurrent connection worker pool.
 - Production packaging.
 
 ## Relationship To Existing Projects
