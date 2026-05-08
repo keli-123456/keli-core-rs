@@ -63,6 +63,7 @@ Current status:
 SOCKS5 TCP CONNECT
   + real listener
   + username/password authentication
+  + UDP ASSOCIATE relay
   + per-user traffic counters
   + runtime config wiring
   - kelinode-rs drain/report integration
@@ -82,5 +83,7 @@ HTTP proxy
 Implemented listeners accept connections concurrently and join connection workers during shutdown so traffic accounting has a clean stop boundary.
 
 The route matcher currently supports exact hosts, `*.suffix` rules, `.suffix` rules, wildcard `*`, and block decisions. Custom outbound routing is intentionally reported as unsupported until an outbound data path exists.
+
+VLESS REALITY is still treated as an experimental path. The core validates REALITY config, authenticates the client ClientHello, falls back invalid clients to the configured target, mirrors the first ClientHello to the target, and validates/captures the target ServerHello. It is not production-ready until the Rust side completes the REALITY TLS 1.3 server handshake and temporary certificate flow.
 
 Once that path is real, the same runtime/control boundary can be expanded protocol by protocol.

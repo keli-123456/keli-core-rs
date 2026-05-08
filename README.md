@@ -41,11 +41,20 @@ Implemented in this first skeleton:
 - Concurrent per-listener connection worker threads with stop-time joining.
 - Local JSON-line TCP control socket for process status, traffic drain, and stop commands.
 - CLI with `version`, `health`, `check-config`, and `run-config`.
+- SOCKS5 UDP ASSOCIATE with UDP packet framing, relay lifetime bound to the TCP control connection, and per-user traffic accounting.
+- VMess AEAD TCP inbound with TCP, TLS, WebSocket, TLS WebSocket, authenticated length, and replay protection.
+- VLESS Vision flow for TLS and TCP relay paths.
+- Trojan TLS, WebSocket, and TLS WebSocket data paths.
+- VLESS / VMess / Trojan gRPC transport listeners.
+- Hysteria2 QUIC TCP and UDP data paths, including salamander obfs validation.
+- TUIC QUIC TCP and UDP data paths.
+- VLESS REALITY config validation, client ClientHello authentication, fallback routing, dest ServerHello validation, and dest handshake capture.
 
 Not implemented yet:
 
-- SOCKS5 UDP associate.
-- VMess/Hysteria2/TUIC data paths, built-in TLS, AnyTLS UDP-over-TCP, and advanced transports.
+- Full VLESS REALITY TLS 1.3 server handshake and temporary certificate generation.
+- REALITY ML-DSA-65 certificate signing.
+- AnyTLS UDP-over-TCP.
 - Advanced DNS/routing execution and custom outbounds.
 - Realtime integration.
 - Hot user patching.
