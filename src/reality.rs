@@ -467,9 +467,11 @@ pub fn generate_reality_temporary_certificate(
         CertificateParams::new(vec![server_name.to_string()]).map_err(reality_cert_error)?;
     let certificate = params.self_signed(&key_pair).map_err(reality_cert_error)?;
     let reality_signature = reality_certificate_signature(auth_key, &ed25519_public_key);
+    let certificate_der =
+        replace_certificate_signature_value(certificate.der().as_ref(), &reality_signature)?;
 
     Ok(RealityTemporaryCertificate {
-        certificate_der: certificate.der().as_ref().to_vec(),
+        certificate_der,
         private_key_der: key_pair.serialize_der(),
         subject_public_key_info_der,
         ed25519_public_key,
@@ -827,6 +829,103 @@ fn reality_certificate_signature(auth_key: &[u8; 32], ed25519_public_key: &[u8])
         <Hmac<Sha512> as Mac>::new_from_slice(auth_key).expect("HMAC accepts keys of any length");
     hmac.update(ed25519_public_key);
     hmac.finalize().into_bytes().into()
+}
+
+fn replace_certificate_signature_value(
+    certificate_der: &[u8],
+    signature: &[u8; 64],
+) -> Result<Vec<u8>, RealityAuthError> {
+    let (outer_start, outer_len, outer_header_len) = der_read_tlv(certificate_der, 0, 0x30)?;
+    if outer_start != 0 || outer_start + outer_header_len + outer_len != certificate_der.len() {
+        return Err(RealityAuthError::CertificateGenerationFailed(
+            "temporary certificate DER has invalid outer sequence".to_string(),
+        ));
+    }
+    let mut offset = outer_start + outer_header_len;
+    let end = offset + outer_len;
+    let mut last = None;
+    while offset < end {
+        let (child_start, child_len, child_header_len) = der_read_tlv_any(certificate_der, offset)?;
+        let child_end = child_start + child_header_len + child_len;
+        if child_end > end {
+            return Err(RealityAuthError::CertificateGenerationFailed(
+                "temporary certificate DER child exceeds outer sequence".to_string(),
+            ));
+        }
+        last = Some((child_start, child_len, child_header_len));
+        offset = child_end;
+    }
+    let Some((signature_start, signature_len, signature_header_len)) = last else {
+        return Err(RealityAuthError::CertificateGenerationFailed(
+            "temporary certificate DER is empty".to_string(),
+        ));
+    };
+    if certificate_der[signature_start] != 0x03 || signature_len != 65 {
+        return Err(RealityAuthError::CertificateGenerationFailed(
+            "temporary certificate signatureValue is not a 64-byte BIT STRING".to_string(),
+        ));
+    }
+    let signature_content = signature_start + signature_header_len;
+    if certificate_der[signature_content] != 0 {
+        return Err(RealityAuthError::CertificateGenerationFailed(
+            "temporary certificate signatureValue has non-zero unused bits".to_string(),
+        ));
+    }
+
+    let mut output = certificate_der.to_vec();
+    output[signature_content + 1..signature_content + 65].copy_from_slice(signature);
+    Ok(output)
+}
+
+fn der_read_tlv(
+    input: &[u8],
+    offset: usize,
+    expected_tag: u8,
+) -> Result<(usize, usize, usize), RealityAuthError> {
+    let (start, len, header_len) = der_read_tlv_any(input, offset)?;
+    if input[start] != expected_tag {
+        return Err(RealityAuthError::CertificateGenerationFailed(format!(
+            "temporary certificate DER expected tag 0x{expected_tag:02x}"
+        )));
+    }
+    Ok((start, len, header_len))
+}
+
+fn der_read_tlv_any(
+    input: &[u8],
+    offset: usize,
+) -> Result<(usize, usize, usize), RealityAuthError> {
+    if offset + 2 > input.len() {
+        return Err(RealityAuthError::CertificateGenerationFailed(
+            "temporary certificate DER field is truncated".to_string(),
+        ));
+    }
+    let len_byte = input[offset + 1];
+    let (len, len_len) = if len_byte & 0x80 == 0 {
+        (usize::from(len_byte), 1)
+    } else {
+        let len_len = usize::from(len_byte & 0x7f);
+        if len_len == 0
+            || len_len > std::mem::size_of::<usize>()
+            || offset + 2 + len_len > input.len()
+        {
+            return Err(RealityAuthError::CertificateGenerationFailed(
+                "temporary certificate DER length is invalid".to_string(),
+            ));
+        }
+        let mut len = 0usize;
+        for byte in &input[offset + 2..offset + 2 + len_len] {
+            len = (len << 8) | usize::from(*byte);
+        }
+        (len, 1 + len_len)
+    };
+    let header_len = 1 + len_len;
+    if offset + header_len + len > input.len() {
+        return Err(RealityAuthError::CertificateGenerationFailed(
+            "temporary certificate DER field length exceeds input".to_string(),
+        ));
+    }
+    Ok((offset, len, header_len))
 }
 
 fn extract_ed25519_public_key(input: &[u8]) -> Result<[u8; 32], RealityAuthError> {
@@ -1252,6 +1351,10 @@ mod tests {
         assert!(!certificate.certificate_der.is_empty());
         assert!(!certificate.private_key_der.is_empty());
         assert!(!certificate.subject_public_key_info_der.is_empty());
+        assert_eq!(
+            certificate_signature_value(&certificate.certificate_der),
+            certificate.reality_signature
+        );
         assert!(verify_reality_certificate_public_key(
             &auth_key,
             &certificate.ed25519_public_key,
@@ -1656,6 +1759,28 @@ mod tests {
         record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         record.extend_from_slice(payload);
         record
+    }
+
+    fn certificate_signature_value(certificate_der: &[u8]) -> [u8; 64] {
+        let (_, outer_len, outer_header_len) =
+            super::der_read_tlv(certificate_der, 0, 0x30).expect("outer cert sequence");
+        let mut offset = outer_header_len;
+        let end = offset + outer_len;
+        let mut last = None;
+        while offset < end {
+            let (start, len, header_len) =
+                super::der_read_tlv_any(certificate_der, offset).expect("cert child");
+            last = Some((start, len, header_len));
+            offset = start + header_len + len;
+        }
+        let (start, len, header_len) = last.expect("signature child");
+        assert_eq!(certificate_der[start], 0x03);
+        assert_eq!(len, 65);
+        assert_eq!(certificate_der[start + header_len], 0);
+        let mut signature = [0u8; 64];
+        signature
+            .copy_from_slice(&certificate_der[start + header_len + 1..start + header_len + 65]);
+        signature
     }
 
     fn push_u24(output: &mut Vec<u8>, value: u32) {
