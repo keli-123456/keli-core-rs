@@ -72,8 +72,12 @@ impl CoreService {
 
         for inbound in config.inbounds {
             let handle = match inbound.protocol {
-                Protocol::Socks => start_socks_listener(&inbound, traffic.clone())?,
-                Protocol::Http => start_http_listener(&inbound, traffic.clone())?,
+                Protocol::Socks => {
+                    start_socks_listener(&inbound, config.routes.clone(), traffic.clone())?
+                }
+                Protocol::Http => {
+                    start_http_listener(&inbound, config.routes.clone(), traffic.clone())?
+                }
                 _ => {
                     return Err(CoreServiceError::UnsupportedProtocol {
                         tag: inbound.tag,
@@ -124,6 +128,7 @@ impl Drop for CoreService {
 
 fn start_socks_listener(
     inbound: &InboundConfig,
+    routes: Vec<crate::RouteRule>,
     traffic: Arc<Mutex<TrafficRegistry>>,
 ) -> Result<ListenerHandle, CoreServiceError> {
     let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
@@ -137,6 +142,7 @@ fn start_socks_listener(
             node_tag: inbound.tag.clone(),
             listen,
             users: inbound.users.clone(),
+            routes,
             connect_timeout: Duration::from_secs(10),
         },
         traffic,
@@ -197,6 +203,7 @@ fn start_socks_listener(
 
 fn start_http_listener(
     inbound: &InboundConfig,
+    routes: Vec<crate::RouteRule>,
     traffic: Arc<Mutex<TrafficRegistry>>,
 ) -> Result<ListenerHandle, CoreServiceError> {
     let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
@@ -210,6 +217,7 @@ fn start_http_listener(
             node_tag: inbound.tag.clone(),
             listen,
             users: inbound.users.clone(),
+            routes,
             connect_timeout: Duration::from_secs(10),
         },
         traffic,

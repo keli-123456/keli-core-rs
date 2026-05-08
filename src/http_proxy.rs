@@ -10,12 +10,14 @@ use base64::Engine;
 use crate::stream::{copy_count_best_effort, relay_tcp_streams};
 use crate::traffic::{TrafficDelta, TrafficRegistry};
 use crate::user::CoreUser;
+use crate::{RouteDecision, RouteMatcher};
 
 #[derive(Clone, Debug)]
 pub struct HttpProxyServerConfig {
     pub node_tag: String,
     pub listen: SocketAddr,
     pub users: Vec<CoreUser>,
+    pub routes: Vec<crate::RouteRule>,
     pub connect_timeout: Duration,
 }
 
@@ -23,6 +25,7 @@ pub struct HttpProxyServerConfig {
 pub struct HttpProxyServer {
     config: HttpProxyServerConfig,
     users: Arc<HashMap<String, CoreUser>>,
+    router: RouteMatcher,
     traffic: Arc<Mutex<TrafficRegistry>>,
 }
 
@@ -59,6 +62,7 @@ impl HttpProxyServer {
             .collect::<HashMap<_, _>>();
 
         Self {
+            router: RouteMatcher::new(config.routes.clone()),
             config,
             users: Arc::new(users),
             traffic,
@@ -173,6 +177,7 @@ impl HttpProxyServer {
 
     fn handle_connect(&self, mut client: TcpStream, request: HttpProxyRequest) -> io::Result<()> {
         let target = parse_authority(&request.target, 443)?;
+        self.ensure_route_allowed(&target)?;
         client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
         let remote = connect_target(&target, self.config.connect_timeout)?;
         let (upload, download) = relay_tcp_streams(client, remote)?;
@@ -186,6 +191,10 @@ impl HttpProxyServer {
         request: HttpProxyRequest,
     ) -> io::Result<()> {
         let target = parse_plain_http_target(&request)?;
+        if let Err(error) = self.ensure_route_allowed(&target) {
+            write_forbidden_response(client)?;
+            return Err(error);
+        }
         let mut remote = connect_target(&target, self.config.connect_timeout)?;
         let outbound = render_plain_http_request(&request, &target)?;
         remote.write_all(&outbound)?;
@@ -201,6 +210,20 @@ impl HttpProxyServer {
                 .lock()
                 .expect("traffic registry lock poisoned")
                 .add(self.config.node_tag.clone(), user_uuid, upload, download);
+        }
+    }
+
+    fn ensure_route_allowed(&self, target: &HttpTarget) -> io::Result<()> {
+        match self.router.decide(&target.host) {
+            RouteDecision::Direct => Ok(()),
+            RouteDecision::Block => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "target blocked by route",
+            )),
+            RouteDecision::UnsupportedOutbound(tag) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("outbound route {tag} is not implemented"),
+            )),
         }
     }
 }
@@ -339,6 +362,10 @@ fn write_auth_required_response(writer: &mut impl Write) -> io::Result<()> {
     )
 }
 
+fn write_forbidden_response(writer: &mut impl Write) -> io::Result<()> {
+    writer.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -349,6 +376,7 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
 
+    use crate::config::{RouteAction, RouteRule};
     use crate::http_proxy::{HttpProxyServer, HttpProxyServerConfig};
     use crate::user::CoreUser;
 
@@ -368,6 +396,7 @@ mod tests {
             node_tag: "panel|http|1".to_string(),
             listen: "127.0.0.1:0".parse().expect("listen addr"),
             users: vec![user()],
+            routes: Vec::new(),
             connect_timeout: Duration::from_secs(3),
         })
     }
@@ -505,5 +534,36 @@ mod tests {
 
         server_thread.join().expect("server thread");
         assert!(String::from_utf8_lossy(&response).contains("407 Proxy Authentication Required"));
+    }
+
+    #[test]
+    fn writes_403_for_blocked_route() {
+        let server = HttpProxyServer::new(HttpProxyServerConfig {
+            node_tag: "panel|http|1".to_string(),
+            listen: "127.0.0.1:0".parse().expect("listen addr"),
+            users: vec![user()],
+            routes: vec![RouteRule {
+                targets: vec!["blocked.example.com".to_string()],
+                action: RouteAction::Block,
+            }],
+            connect_timeout: Duration::from_secs(3),
+        });
+        let listener = server.bind().expect("proxy bind");
+        let proxy_addr = listener.local_addr().expect("proxy addr");
+        let server_thread = thread::spawn(move || {
+            let _ = server.serve_tcp_once(&listener);
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).expect("client connect");
+        let request = format!(
+            "GET http://blocked.example.com/ HTTP/1.1\r\nHost: blocked.example.com\r\n{}\r\n",
+            basic_auth_header()
+        );
+        client.write_all(request.as_bytes()).expect("request");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).expect("response");
+
+        server_thread.join().expect("server thread");
+        assert!(String::from_utf8_lossy(&response).contains("403 Forbidden"));
     }
 }

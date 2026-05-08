@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::stream::relay_tcp_streams;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
+use crate::{RouteDecision, RouteMatcher};
 
 const SOCKS5_VERSION: u8 = 0x05;
 const AUTH_NONE: u8 = 0x00;
@@ -25,6 +26,7 @@ pub struct Socks5ServerConfig {
     pub node_tag: String,
     pub listen: SocketAddr,
     pub users: Vec<CoreUser>,
+    pub routes: Vec<crate::RouteRule>,
     pub connect_timeout: Duration,
 }
 
@@ -38,6 +40,7 @@ pub struct SocksTarget {
 pub struct Socks5Server {
     config: Socks5ServerConfig,
     users: Arc<HashMap<String, CoreUser>>,
+    router: RouteMatcher,
     traffic: Arc<Mutex<TrafficRegistry>>,
 }
 
@@ -61,6 +64,7 @@ impl Socks5Server {
             .collect::<HashMap<_, _>>();
 
         Self {
+            router: RouteMatcher::new(config.routes.clone()),
             config,
             users: Arc::new(users),
             traffic,
@@ -84,7 +88,23 @@ impl Socks5Server {
                 return Err(error);
             }
         };
-        let remote = connect_target(&request.target, self.config.connect_timeout)?;
+        let remote = match self.router.decide(&request.target.host) {
+            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
+            RouteDecision::Block => {
+                write_socks5_response(&mut client, STATUS_COMMAND_NOT_SUPPORTED)?;
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target blocked by route",
+                ));
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
+        write_socks5_response(&mut client, STATUS_SUCCESS)?;
         self.relay(client, remote, request)
     }
 
@@ -124,9 +144,7 @@ impl Socks5Server {
             _ => unreachable!("selected auth method is controlled internally"),
         };
 
-        let request = self.read_connect_request(stream, user_uuid)?;
-        write_socks5_response(stream, STATUS_SUCCESS)?;
-        Ok(request)
+        self.read_connect_request(stream, user_uuid)
     }
 
     fn select_auth_method(&self, methods: &[u8]) -> u8 {
@@ -349,6 +367,7 @@ mod tests {
             node_tag: "panel|socks|1".to_string(),
             listen: "127.0.0.1:0".parse().expect("listen addr"),
             users: vec![user()],
+            routes: Vec::new(),
             connect_timeout: Duration::from_secs(3),
         })
     }
@@ -369,12 +388,7 @@ mod tests {
         assert_eq!(request.user_uuid.as_deref(), Some("user-a"));
         assert_eq!(request.target.host, "example.com");
         assert_eq!(request.target.port, 443);
-        assert_eq!(
-            stream.output,
-            vec![
-                0x05, 0x02, 0x01, 0x00, 0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-            ]
-        );
+        assert_eq!(stream.output, vec![0x05, 0x02, 0x01, 0x00]);
     }
 
     #[test]

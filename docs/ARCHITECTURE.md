@@ -70,6 +70,7 @@ HTTP proxy
   + Basic authentication
   + CONNECT tunneling
   + plain HTTP request forwarding
+  + block route enforcement
   + per-user traffic counters
   + runtime config wiring
   - keep-alive reuse
@@ -77,5 +78,7 @@ HTTP proxy
 ```
 
 Implemented listeners accept connections concurrently and join connection workers during shutdown so traffic accounting has a clean stop boundary.
+
+The route matcher currently supports exact hosts, `*.suffix` rules, `.suffix` rules, wildcard `*`, and block decisions. Custom outbound routing is intentionally reported as unsupported until an outbound data path exists.
 
 Once that path is real, the same runtime/control boundary can be expanded protocol by protocol.
