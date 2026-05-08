@@ -7,6 +7,8 @@ use std::thread;
 use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 use rustls::{ServerConfig, ServerConnection};
 
 use crate::limits::BandwidthLimiter;
@@ -27,13 +29,18 @@ impl TlsAcceptor {
         key_file: impl AsRef<Path>,
         alpn: &[String],
     ) -> io::Result<Self> {
-        let certs = load_certs(cert_file)?;
-        let key = load_private_key(key_file)?;
-        let mut config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(tls_error)?;
-        config.alpn_protocols = alpn.iter().map(|value| value.as_bytes().to_vec()).collect();
+        Self::from_files_with_sni_policy(cert_file, key_file, alpn, "", false)
+    }
+
+    pub fn from_files_with_sni_policy(
+        cert_file: impl AsRef<Path>,
+        key_file: impl AsRef<Path>,
+        alpn: &[String],
+        server_name: &str,
+        reject_unknown_sni: bool,
+    ) -> io::Result<Self> {
+        let config =
+            server_config_from_files(cert_file, key_file, alpn, server_name, reject_unknown_sni)?;
 
         Ok(Self {
             config: Arc::new(config),
@@ -270,6 +277,77 @@ pub(crate) fn load_private_key(path: impl AsRef<Path>) -> io::Result<PrivateKeyD
     })
 }
 
+pub(crate) fn server_config_from_files(
+    cert_file: impl AsRef<Path>,
+    key_file: impl AsRef<Path>,
+    alpn: &[String],
+    server_name: &str,
+    reject_unknown_sni: bool,
+) -> io::Result<ServerConfig> {
+    let certs = load_certs(cert_file)?;
+    let key = load_private_key(key_file)?;
+    let builder = ServerConfig::builder().with_no_client_auth();
+    let mut config = if reject_unknown_sni {
+        let server_name = server_name.trim();
+        if server_name.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reject_unknown_sni requires server_name",
+            ));
+        }
+        let certified_key =
+            CertifiedKey::from_der(certs, key, builder.crypto_provider()).map_err(tls_error)?;
+        builder.with_cert_resolver(Arc::new(SniCertResolver {
+            expected_name: server_name.to_ascii_lowercase(),
+            certified_key: Arc::new(certified_key),
+        }))
+    } else {
+        builder.with_single_cert(certs, key).map_err(tls_error)?
+    };
+    config.alpn_protocols = alpn.iter().map(|value| value.as_bytes().to_vec()).collect();
+    Ok(config)
+}
+
+#[derive(Debug)]
+struct SniCertResolver {
+    expected_name: String,
+    certified_key: Arc<CertifiedKey>,
+}
+
+impl ResolvesServerCert for SniCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let server_name = client_hello.server_name()?;
+        sni_matches(&self.expected_name, server_name).then(|| self.certified_key.clone())
+    }
+}
+
+fn sni_matches(expected_name: &str, server_name: &str) -> bool {
+    let server_name = server_name.trim().to_ascii_lowercase();
+    if expected_name == server_name {
+        return true;
+    }
+    let Some(suffix) = expected_name.strip_prefix("*.") else {
+        return false;
+    };
+    server_name.len() > suffix.len()
+        && server_name.ends_with(suffix)
+        && server_name.as_bytes()[server_name.len() - suffix.len() - 1] == b'.'
+}
+
 fn tls_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sni_matches;
+
+    #[test]
+    fn matches_exact_and_wildcard_sni() {
+        assert!(sni_matches("node.example.test", "node.example.test"));
+        assert!(sni_matches("node.example.test", "NODE.EXAMPLE.TEST"));
+        assert!(sni_matches("*.example.test", "node.example.test"));
+        assert!(!sni_matches("*.example.test", "example.test"));
+        assert!(!sni_matches("node.example.test", "other.example.test"));
+    }
 }

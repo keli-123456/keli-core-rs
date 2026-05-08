@@ -17,7 +17,7 @@ use crate::limits::{
 use crate::routing::{RouteDecision, RouteMatcher};
 use crate::salamander::SalamanderUdpSocket;
 use crate::socks5::SocksTarget;
-use crate::tls::{load_certs, load_private_key};
+use crate::tls::server_config_from_files;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 
@@ -35,7 +35,9 @@ pub struct Hysteria2ServerConfig {
     pub routes: Vec<crate::RouteRule>,
     pub cert_file: String,
     pub key_file: String,
+    pub server_name: String,
     pub alpn: Vec<String>,
+    pub reject_unknown_sni: bool,
     pub connect_timeout: Duration,
     pub up_mbps: u32,
     pub down_mbps: u32,
@@ -92,18 +94,18 @@ impl Hysteria2Server {
     }
 
     pub fn bind(&self) -> io::Result<quinn::Endpoint> {
-        let certs = load_certs(&self.config.cert_file)?;
-        let key = load_private_key(&self.config.key_file)?;
-        let mut server_crypto = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(io_other)?;
         let alpn = if self.config.alpn.is_empty() {
             vec!["h3".to_string()]
         } else {
             self.config.alpn.clone()
         };
-        server_crypto.alpn_protocols = alpn.iter().map(|value| value.as_bytes().to_vec()).collect();
+        let server_crypto = server_config_from_files(
+            &self.config.cert_file,
+            &self.config.key_file,
+            &alpn,
+            &self.config.server_name,
+            self.config.reject_unknown_sni,
+        )?;
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             QuicServerConfig::try_from(server_crypto).map_err(io_other)?,
         ));
@@ -1042,7 +1044,9 @@ mod tests {
             routes: Vec::new(),
             cert_file: cert.cert_path.to_string_lossy().to_string(),
             key_file: cert.key_path.to_string_lossy().to_string(),
+            server_name: "localhost".to_string(),
             alpn: vec!["h3".to_string()],
+            reject_unknown_sni: false,
             connect_timeout: Duration::from_secs(3),
             up_mbps: 0,
             down_mbps: 0,

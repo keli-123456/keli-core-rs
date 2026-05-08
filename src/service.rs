@@ -320,7 +320,9 @@ fn start_hysteria2_listener(
             routes,
             cert_file: tls.cert_file.clone().unwrap_or_default(),
             key_file: tls.key_file.clone().unwrap_or_default(),
+            server_name: tls.server_name.clone(),
             alpn: tls.alpn.clone(),
+            reject_unknown_sni: tls.reject_unknown_sni,
             connect_timeout: Duration::from_secs(10),
             up_mbps: inbound.transport.up_mbps,
             down_mbps: inbound.transport.down_mbps,
@@ -408,7 +410,9 @@ fn start_tuic_listener(
             routes,
             cert_file: tls.cert_file.clone().unwrap_or_default(),
             key_file: tls.key_file.clone().unwrap_or_default(),
+            server_name: tls.server_name.clone(),
             alpn: tls.alpn.clone(),
+            reject_unknown_sni: tls.reject_unknown_sni,
             connect_timeout: Duration::from_secs(10),
         },
         traffic,
@@ -992,12 +996,18 @@ fn tls_acceptor_for(inbound: &InboundConfig) -> Result<Option<TlsAcceptor>, Core
     };
     let cert_file = tls.cert_file.as_deref().unwrap_or_default();
     let key_file = tls.key_file.as_deref().unwrap_or_default();
-    TlsAcceptor::from_files(cert_file, key_file, &tls.alpn)
-        .map(Some)
-        .map_err(|source| CoreServiceError::Bind {
-            tag: inbound.tag.clone(),
-            source,
-        })
+    TlsAcceptor::from_files_with_sni_policy(
+        cert_file,
+        key_file,
+        &tls.alpn,
+        &tls.server_name,
+        tls.reject_unknown_sni,
+    )
+    .map(Some)
+    .map_err(|source| CoreServiceError::Bind {
+        tag: inbound.tag.clone(),
+        source,
+    })
 }
 
 fn resolve_listen_addr(listen: &str, port: u16) -> io::Result<SocketAddr> {

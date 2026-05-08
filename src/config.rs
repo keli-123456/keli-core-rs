@@ -322,16 +322,16 @@ fn validate_tls_config(
             "{tag} {protocol} reality is not implemented in keli-core-rs yet"
         )));
     }
-    if tls.reject_unknown_sni {
-        return Err(ValidationError::new(format!(
-            "{tag} {protocol} reject_unknown_sni is not implemented in keli-core-rs yet"
-        )));
-    }
     if tls.cert_file.as_deref().unwrap_or("").trim().is_empty()
         || tls.key_file.as_deref().unwrap_or("").trim().is_empty()
     {
         return Err(ValidationError::new(format!(
             "{tag} {protocol} tls requires cert_file and key_file"
+        )));
+    }
+    if tls.reject_unknown_sni && tls.server_name.trim().is_empty() {
+        return Err(ValidationError::new(format!(
+            "{tag} {protocol} reject_unknown_sni requires server_name"
         )));
     }
     Ok(())
@@ -357,6 +357,11 @@ fn validate_quic_tls_config(
     {
         return Err(ValidationError::new(format!(
             "{tag} {protocol} requires cert_file and key_file"
+        )));
+    }
+    if tls.reject_unknown_sni && tls.server_name.trim().is_empty() {
+        return Err(ValidationError::new(format!(
+            "{tag} {protocol} reject_unknown_sni requires server_name"
         )));
     }
     Ok(())
