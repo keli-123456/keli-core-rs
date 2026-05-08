@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::anytls::{AnyTlsServer, AnyTlsServerConfig};
 use crate::config::{CoreConfig, InboundConfig, TransportConfig, ValidationError};
 use crate::http_proxy::{HttpProxyServer, HttpProxyServerConfig};
+use crate::httpupgrade::{accept_httpupgrade, accept_httpupgrade_tls};
 use crate::hysteria2::{Hysteria2ObfsConfig, Hysteria2Server, Hysteria2ServerConfig};
 use crate::limits::{UserBandwidthLimiters, UserSessionTracker};
 use crate::protocol::Protocol;
@@ -242,6 +243,7 @@ fn start_vmess_listener(
     let workers_for_thread = workers.clone();
     let network = inbound.transport.network.trim().to_string();
     let websocket_path = inbound.transport.path.clone();
+    let httpupgrade_host = inbound.transport.host.clone();
     let tls_acceptor = tls_acceptor_for(inbound)?;
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
@@ -250,21 +252,34 @@ fn start_vmess_listener(
                     let server = server.clone();
                     let network = network.clone();
                     let websocket_path = websocket_path.clone();
+                    let httpupgrade_host = httpupgrade_host.clone();
                     let tls_acceptor = tls_acceptor.clone();
                     let worker = thread::spawn(move || {
                         let result = if let Some(acceptor) = tls_acceptor {
-                            acceptor.accept(stream).and_then(|client| {
-                                if network == "ws" {
-                                    server.handle_tls_websocket_client(
+                            acceptor
+                                .accept(stream)
+                                .and_then(|client| match network.as_str() {
+                                    "ws" => server.handle_tls_websocket_client(
                                         client,
                                         websocket_path.as_deref(),
+                                    ),
+                                    "httpupgrade" => accept_httpupgrade_tls(
+                                        client,
+                                        websocket_path.as_deref(),
+                                        httpupgrade_host.as_deref(),
                                     )
-                                } else {
-                                    server.handle_tls_client(client)
-                                }
-                            })
+                                    .and_then(|client| server.handle_tls_client(client)),
+                                    _ => server.handle_tls_client(client),
+                                })
                         } else if network == "ws" {
                             server.handle_websocket_client(stream, websocket_path.as_deref())
+                        } else if network == "httpupgrade" {
+                            accept_httpupgrade(
+                                stream,
+                                websocket_path.as_deref(),
+                                httpupgrade_host.as_deref(),
+                            )
+                            .and_then(|stream| server.handle_tcp_client(stream))
                         } else {
                             server.handle_tcp_client(stream)
                         };
@@ -666,6 +681,7 @@ fn start_trojan_listener(
     let workers_for_thread = workers.clone();
     let network = inbound.transport.network.trim().to_string();
     let websocket_path = inbound.transport.path.clone();
+    let httpupgrade_host = inbound.transport.host.clone();
     let tls_acceptor = tls_acceptor_for(inbound)?;
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
@@ -674,21 +690,34 @@ fn start_trojan_listener(
                     let server = server.clone();
                     let network = network.clone();
                     let websocket_path = websocket_path.clone();
+                    let httpupgrade_host = httpupgrade_host.clone();
                     let tls_acceptor = tls_acceptor.clone();
                     let worker = thread::spawn(move || {
                         let result = if let Some(acceptor) = tls_acceptor {
-                            acceptor.accept(stream).and_then(|client| {
-                                if network == "ws" {
-                                    server.handle_tls_websocket_client(
+                            acceptor
+                                .accept(stream)
+                                .and_then(|client| match network.as_str() {
+                                    "ws" => server.handle_tls_websocket_client(
                                         client,
                                         websocket_path.as_deref(),
+                                    ),
+                                    "httpupgrade" => accept_httpupgrade_tls(
+                                        client,
+                                        websocket_path.as_deref(),
+                                        httpupgrade_host.as_deref(),
                                     )
-                                } else {
-                                    server.handle_tls_client(client)
-                                }
-                            })
+                                    .and_then(|client| server.handle_tls_client(client)),
+                                    _ => server.handle_tls_client(client),
+                                })
                         } else if network == "ws" {
                             server.handle_websocket_client(stream, websocket_path.as_deref())
+                        } else if network == "httpupgrade" {
+                            accept_httpupgrade(
+                                stream,
+                                websocket_path.as_deref(),
+                                httpupgrade_host.as_deref(),
+                            )
+                            .and_then(|stream| server.handle_tcp_client(stream))
                         } else {
                             server.handle_tcp_client(stream)
                         };
@@ -767,6 +796,7 @@ fn start_vless_listener(
     let workers_for_thread = workers.clone();
     let network = inbound.transport.network.trim().to_string();
     let websocket_path = inbound.transport.path.clone();
+    let httpupgrade_host = inbound.transport.host.clone();
     let tls_acceptor = tls_acceptor_for(inbound)?;
     let join = thread::spawn(move || {
         while !stop_for_thread.load(Ordering::SeqCst) {
@@ -775,21 +805,34 @@ fn start_vless_listener(
                     let server = server.clone();
                     let network = network.clone();
                     let websocket_path = websocket_path.clone();
+                    let httpupgrade_host = httpupgrade_host.clone();
                     let tls_acceptor = tls_acceptor.clone();
                     let worker = thread::spawn(move || {
                         let result = if let Some(acceptor) = tls_acceptor {
-                            acceptor.accept(stream).and_then(|client| {
-                                if network == "ws" {
-                                    server.handle_tls_websocket_client(
+                            acceptor
+                                .accept(stream)
+                                .and_then(|client| match network.as_str() {
+                                    "ws" => server.handle_tls_websocket_client(
                                         client,
                                         websocket_path.as_deref(),
+                                    ),
+                                    "httpupgrade" => accept_httpupgrade_tls(
+                                        client,
+                                        websocket_path.as_deref(),
+                                        httpupgrade_host.as_deref(),
                                     )
-                                } else {
-                                    server.handle_tls_client(client)
-                                }
-                            })
+                                    .and_then(|client| server.handle_tls_client(client)),
+                                    _ => server.handle_tls_client(client),
+                                })
                         } else if network == "ws" {
                             server.handle_websocket_client(stream, websocket_path.as_deref())
+                        } else if network == "httpupgrade" {
+                            accept_httpupgrade(
+                                stream,
+                                websocket_path.as_deref(),
+                                httpupgrade_host.as_deref(),
+                            )
+                            .and_then(|stream| server.handle_tcp_client(stream))
                         } else {
                             server.handle_tcp_client(stream)
                         };
@@ -1172,6 +1215,24 @@ mod tests {
         config.inbounds[0].tag = "panel|vless|1".to_string();
         config.inbounds[0].protocol = Protocol::Vless;
         config.inbounds[0].users[0].uuid = "11111111-1111-1111-1111-111111111111".to_string();
+
+        let mut service = CoreService::start(config).expect("service start");
+        let listeners = service.listeners();
+
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].protocol, Protocol::Vless);
+        service.stop();
+    }
+
+    #[test]
+    fn starts_vless_httpupgrade_listener_from_core_config() {
+        let mut config = config(free_port());
+        config.inbounds[0].tag = "panel|vless|1".to_string();
+        config.inbounds[0].protocol = Protocol::Vless;
+        config.inbounds[0].users[0].uuid = "11111111-1111-1111-1111-111111111111".to_string();
+        config.inbounds[0].transport.network = "httpupgrade".to_string();
+        config.inbounds[0].transport.path = Some("/edge".to_string());
+        config.inbounds[0].transport.host = Some("example.test".to_string());
 
         let mut service = CoreService::start(config).expect("service start");
         let listeners = service.listeners();

@@ -4,6 +4,7 @@ pub mod config_io;
 pub mod control;
 pub mod control_server;
 pub mod http_proxy;
+pub mod httpupgrade;
 pub mod hysteria2;
 pub mod limits;
 pub mod protocol;

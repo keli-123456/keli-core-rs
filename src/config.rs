@@ -180,9 +180,9 @@ impl InboundConfig {
         }
         if self.protocol == Protocol::Vless {
             let network = self.transport.network.trim();
-            if !matches!(network, "tcp" | "ws") {
+            if !matches!(network, "tcp" | "ws" | "httpupgrade") {
                 return Err(ValidationError::new(format!(
-                    "{} vless currently supports only tcp/ws transport",
+                    "{} vless currently supports only tcp/ws/httpupgrade transport",
                     self.tag
                 )));
             }
@@ -190,9 +190,9 @@ impl InboundConfig {
         }
         if self.protocol == Protocol::Vmess {
             let network = self.transport.network.trim();
-            if !matches!(network, "tcp" | "ws") {
+            if !matches!(network, "tcp" | "ws" | "httpupgrade") {
                 return Err(ValidationError::new(format!(
-                    "{} vmess currently supports only tcp/ws transport",
+                    "{} vmess currently supports only tcp/ws/httpupgrade transport",
                     self.tag
                 )));
             }
@@ -206,9 +206,9 @@ impl InboundConfig {
         }
         if self.protocol == Protocol::Trojan {
             let network = self.transport.network.trim();
-            if !matches!(network, "tcp" | "ws") {
+            if !matches!(network, "tcp" | "ws" | "httpupgrade") {
                 return Err(ValidationError::new(format!(
-                    "{} trojan currently supports only tcp/ws transport",
+                    "{} trojan currently supports only tcp/ws/httpupgrade transport",
                     self.tag
                 )));
             }
@@ -312,9 +312,9 @@ fn validate_tls_config(
     let Some(tls) = tls else {
         return Ok(());
     };
-    if !matches!(network, "tcp" | "ws") {
+    if !matches!(network, "tcp" | "ws" | "httpupgrade") {
         return Err(ValidationError::new(format!(
-            "{tag} {protocol} tls currently supports only tcp/ws transport"
+            "{tag} {protocol} tls currently supports only tcp/ws/httpupgrade transport"
         )));
     }
     if tls.reality.is_some() {
@@ -477,6 +477,30 @@ mod tests {
         };
 
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validates_httpupgrade_transport_for_vless_vmess_and_trojan() {
+        for protocol in [Protocol::Vless, Protocol::Vmess, Protocol::Trojan] {
+            let inbound = InboundConfig {
+                tag: "panel|httpupgrade|1".to_string(),
+                protocol,
+                listen: "0.0.0.0".to_string(),
+                port: 443,
+                users: vec![user()],
+                cipher: None,
+                transport: TransportConfig {
+                    network: "httpupgrade".to_string(),
+                    path: Some("/edge".to_string()),
+                    host: Some("example.com".to_string()),
+                    ..TransportConfig::default()
+                },
+                tls: None,
+                sniffing: SniffingConfig::default(),
+            };
+
+            inbound.validate().expect("httpupgrade inbound");
+        }
     }
 
     #[test]
