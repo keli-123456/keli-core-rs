@@ -41,6 +41,13 @@ pub struct RealityClientAuth {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RealityTlsRecord {
+    pub record_type: u8,
+    pub version: u16,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RealityGatewayConfig {
     pub auth: RealityAuthConfig,
     pub dest: String,
@@ -243,6 +250,29 @@ pub fn decode_short_id(value: &str) -> Result<[u8; 8], RealityAuthError> {
     Ok(short_id)
 }
 
+pub fn parse_tls_records(input: &[u8]) -> Result<Vec<RealityTlsRecord>, RealityAuthError> {
+    let mut records = Vec::new();
+    let mut cursor = Cursor::new(input);
+    while cursor.remaining() > 0 {
+        if cursor.remaining() < 5 {
+            return Err(invalid("tls record header is truncated"));
+        }
+        let record_type = cursor.read_u8()?;
+        let version = cursor.read_u16()?;
+        let len = cursor.read_u16()? as usize;
+        if len > MAX_TLS_RECORD_LEN {
+            return Err(invalid("tls record is too large"));
+        }
+        let payload = cursor.read_slice(len)?.to_vec();
+        records.push(RealityTlsRecord {
+            record_type,
+            version,
+            payload,
+        });
+    }
+    Ok(records)
+}
+
 impl PrefixedTcpStream {
     pub fn new(socket: TcpStream, prefix: Vec<u8>) -> Self {
         Self {
@@ -337,13 +367,7 @@ fn read_tls_record(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(error),
     }
-    if !matches!(
-        header[0],
-        TLS_RECORD_CHANGE_CIPHER_SPEC
-            | TLS_RECORD_ALERT
-            | TLS_RECORD_HANDSHAKE
-            | TLS_RECORD_APPLICATION_DATA
-    ) {
+    if !is_tls_record_type(header[0]) {
         return Ok(Some(header.to_vec()));
     }
     let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
@@ -355,6 +379,16 @@ fn read_tls_record(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
     record.resize(5 + record_len, 0);
     stream.read_exact(&mut record[5..])?;
     Ok(Some(record))
+}
+
+fn is_tls_record_type(value: u8) -> bool {
+    matches!(
+        value,
+        TLS_RECORD_CHANGE_CIPHER_SPEC
+            | TLS_RECORD_ALERT
+            | TLS_RECORD_HANDSHAKE
+            | TLS_RECORD_APPLICATION_DATA
+    )
 }
 
 fn fallback_to_dest(
@@ -615,8 +649,8 @@ mod tests {
 
     use crate::reality::{
         authenticate_reality_client_hello, decode_reality_private_key, decode_short_id,
-        handle_reality_preface, RealityAuthConfig, RealityAuthError, RealityGatewayConfig,
-        RealityGatewayResult,
+        handle_reality_preface, parse_tls_records, RealityAuthConfig, RealityAuthError,
+        RealityGatewayConfig, RealityGatewayResult,
     };
 
     #[test]
@@ -722,6 +756,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_tls_records_for_reality_dest_preface() {
+        let bytes = [
+            tls_record(TLS_RECORD_HANDSHAKE, b"server-hello"),
+            tls_record(TLS_RECORD_CHANGE_CIPHER_SPEC, &[1]),
+            tls_record(TLS_RECORD_APPLICATION_DATA, b"encrypted"),
+        ]
+        .concat();
+
+        let records = parse_tls_records(&bytes).expect("records");
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].record_type, TLS_RECORD_HANDSHAKE);
+        assert_eq!(records[0].payload, b"server-hello");
+        assert_eq!(records[1].record_type, TLS_RECORD_CHANGE_CIPHER_SPEC);
+        assert_eq!(records[1].payload, [1]);
+        assert_eq!(records[2].record_type, TLS_RECORD_APPLICATION_DATA);
+        assert_eq!(records[2].payload, b"encrypted");
+    }
+
+    #[test]
     fn gateway_returns_authenticated_prefixed_stream() {
         let target = TcpListener::bind("127.0.0.1:0").expect("bind target");
         let target_addr = target.local_addr().expect("target addr");
@@ -789,6 +843,11 @@ mod tests {
                 .read_dest_tls_records(2, Duration::from_secs(3))
                 .expect("read dest records");
             assert_eq!(dest_records, target_records_for_server);
+            let parsed = parse_tls_records(&dest_records).expect("parse dest records");
+            assert_eq!(parsed[0].record_type, TLS_RECORD_HANDSHAKE);
+            assert_eq!(parsed[0].payload, b"server-hello");
+            assert_eq!(parsed[1].record_type, TLS_RECORD_APPLICATION_DATA);
+            assert_eq!(parsed[1].payload, b"encrypted-extensions");
         });
 
         let mut client = TcpStream::connect(addr).expect("connect reality");
@@ -948,6 +1007,7 @@ mod tests {
     }
 
     const TLS_RECORD_HANDSHAKE: u8 = 0x16;
+    const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 0x14;
     const TLS_RECORD_APPLICATION_DATA: u8 = 0x17;
     const TLS_HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
     const TLS_VERSION_1_2: u16 = 0x0303;
