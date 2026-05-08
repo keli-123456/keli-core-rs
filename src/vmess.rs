@@ -50,6 +50,7 @@ const RESPONSE_HEADER_LENGTH_KEY: &[u8] = b"AEAD Resp Header Len Key";
 const RESPONSE_HEADER_LENGTH_IV: &[u8] = b"AEAD Resp Header Len IV";
 const RESPONSE_HEADER_PAYLOAD_KEY: &[u8] = b"AEAD Resp Header Key";
 const RESPONSE_HEADER_PAYLOAD_IV: &[u8] = b"AEAD Resp Header IV";
+const AUTHENTICATED_LENGTH_KEY: &[u8] = b"auth_len";
 const CMD_KEY_SALT: &[u8] = b"c48619fe-8f02-49e0-b9e9-edf763e17e21";
 const MAX_HEADER_LEN: usize = 4096;
 const MAX_CHUNK_SIZE: usize = 16 * 1024;
@@ -219,12 +220,6 @@ impl VmessServer {
         let user = self.match_auth_id(auth_id)?;
         let header = open_aead_header(stream, &user.cmd_key, &auth_id)?;
         let parsed = parse_request_header(&header)?;
-        if parsed.options & OPTION_AUTHENTICATED_LENGTH != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "vmess authenticated length is not implemented",
-            ));
-        }
         if parsed.security != VmessSecurity::None && parsed.options & OPTION_CHUNK_STREAM == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -334,10 +329,12 @@ impl VmessServer {
             request.options,
             request.security,
         )?;
-        let mut response_body = VmessBodyWriter::new(
+        let mut response_body = VmessBodyWriter::new_with_length_seed(
             client_writer,
             request.response_body_key,
             request.response_body_iv,
+            request.request_body_key,
+            request.request_body_iv,
             request.options,
             request.security,
         )?;
@@ -389,9 +386,11 @@ impl VmessServer {
             request.options,
             request.security,
         );
-        let mut response_body = VmessBodyEncoder::new(
+        let mut response_body = VmessBodyEncoder::new_with_length_seed(
             request.response_body_key,
             request.response_body_iv,
+            request.request_body_key,
+            request.request_body_iv,
             request.options,
             request.security,
         );
@@ -514,7 +513,7 @@ struct VmessBodyDecoder {
     nonce: ChunkNonce,
     options: u8,
     buffer: Vec<u8>,
-    size_bytes: [u8; 2],
+    size_bytes: Vec<u8>,
     size_read: usize,
     chunk: Vec<u8>,
     chunk_read: usize,
@@ -532,7 +531,24 @@ struct VmessBodyEncoder {
 }
 
 struct VmessSizeParser {
-    shake: Option<sha3::Shake128Reader>,
+    codec: VmessSizeCodec,
+}
+
+enum VmessSizeCodec {
+    Plain,
+    Masked {
+        shake: sha3::Shake128Reader,
+    },
+    Authenticated {
+        auth: VmessLengthAuthenticator,
+        padding: Option<sha3::Shake128Reader>,
+    },
+}
+
+struct VmessLengthAuthenticator {
+    security: VmessSecurity,
+    key: [u8; 16],
+    nonce: ChunkNonce,
 }
 
 #[derive(Clone, Copy)]
@@ -554,18 +570,54 @@ impl<R: Read> VmessBodyReader<R> {
             decoder: VmessBodyDecoder::new(key, iv, options, security),
         })
     }
+
+    #[cfg(test)]
+    fn new_with_length_seed(
+        reader: R,
+        key: [u8; 16],
+        iv: [u8; 16],
+        length_key_seed: [u8; 16],
+        length_iv_seed: [u8; 16],
+        options: u8,
+        security: VmessSecurity,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            reader,
+            decoder: VmessBodyDecoder::new_with_length_seed(
+                key,
+                iv,
+                length_key_seed,
+                length_iv_seed,
+                options,
+                security,
+            ),
+        })
+    }
 }
 
 impl VmessBodyDecoder {
     fn new(key: [u8; 16], iv: [u8; 16], options: u8, security: VmessSecurity) -> Self {
+        Self::new_with_length_seed(key, iv, key, iv, options, security)
+    }
+
+    fn new_with_length_seed(
+        key: [u8; 16],
+        iv: [u8; 16],
+        length_key_seed: [u8; 16],
+        length_iv_seed: [u8; 16],
+        options: u8,
+        security: VmessSecurity,
+    ) -> Self {
+        let size = VmessSizeParser::new(iv, length_key_seed, length_iv_seed, options, security);
+        let size_bytes = vec![0u8; size.size_bytes()];
         Self {
             security,
             key,
-            size: VmessSizeParser::new(iv, options),
+            size,
             nonce: ChunkNonce { iv, count: 0 },
             options,
             buffer: Vec::new(),
-            size_bytes: [0; 2],
+            size_bytes,
             size_read: 0,
             chunk: Vec::new(),
             chunk_read: 0,
@@ -620,7 +672,7 @@ impl VmessBodyDecoder {
             }
 
             let padding = self.padding_len()?;
-            let size = self.size.decode(self.size_bytes) as usize;
+            let size = self.size.decode(&self.size_bytes)? as usize;
             self.size_read = 0;
             let overhead = self.security.overhead();
             if size == overhead + padding {
@@ -685,6 +737,7 @@ impl<R: Read> Read for VmessBodyReader<R> {
 }
 
 impl<W: Write> VmessBodyWriter<W> {
+    #[cfg(test)]
     fn new(
         writer: W,
         key: [u8; 16],
@@ -695,6 +748,28 @@ impl<W: Write> VmessBodyWriter<W> {
         Ok(Self {
             writer,
             encoder: VmessBodyEncoder::new(key, iv, options, security),
+        })
+    }
+
+    fn new_with_length_seed(
+        writer: W,
+        key: [u8; 16],
+        iv: [u8; 16],
+        length_key_seed: [u8; 16],
+        length_iv_seed: [u8; 16],
+        options: u8,
+        security: VmessSecurity,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            writer,
+            encoder: VmessBodyEncoder::new_with_length_seed(
+                key,
+                iv,
+                length_key_seed,
+                length_iv_seed,
+                options,
+                security,
+            ),
         })
     }
 
@@ -709,11 +784,23 @@ impl<W: Write> VmessBodyWriter<W> {
 }
 
 impl VmessBodyEncoder {
+    #[cfg(test)]
     fn new(key: [u8; 16], iv: [u8; 16], options: u8, security: VmessSecurity) -> Self {
+        Self::new_with_length_seed(key, iv, key, iv, options, security)
+    }
+
+    fn new_with_length_seed(
+        key: [u8; 16],
+        iv: [u8; 16],
+        length_key_seed: [u8; 16],
+        length_iv_seed: [u8; 16],
+        options: u8,
+        security: VmessSecurity,
+    ) -> Self {
         Self {
             security,
             key,
-            size: VmessSizeParser::new(iv, options),
+            size: VmessSizeParser::new(iv, length_key_seed, length_iv_seed, options, security),
             nonce: ChunkNonce { iv, count: 0 },
             options,
             finished: false,
@@ -768,7 +855,7 @@ impl VmessBodyEncoder {
                 "vmess chunk is too large",
             ));
         }
-        let encoded = self.size.encode(total_size as u16);
+        let encoded = self.size.encode(total_size as u16)?;
         write_all_wait(writer, &encoded)?;
         write_all_wait(writer, &payload)?;
         if padding > 0 {
@@ -820,48 +907,176 @@ impl VmessSecurity {
 }
 
 impl VmessSizeParser {
-    fn new(seed: [u8; 16], options: u8) -> Self {
-        if options & OPTION_CHUNK_MASKING == 0 {
-            return Self { shake: None };
+    fn new(
+        mask_seed: [u8; 16],
+        length_key_seed: [u8; 16],
+        length_iv_seed: [u8; 16],
+        options: u8,
+        security: VmessSecurity,
+    ) -> Self {
+        if options & OPTION_AUTHENTICATED_LENGTH != 0
+            && matches!(
+                security,
+                VmessSecurity::Aes128Gcm | VmessSecurity::ChaCha20Poly1305
+            )
+        {
+            return Self {
+                codec: VmessSizeCodec::Authenticated {
+                    auth: VmessLengthAuthenticator::new(security, length_key_seed, length_iv_seed),
+                    padding: if options & OPTION_GLOBAL_PADDING != 0 {
+                        Some(Self::shake(mask_seed))
+                    } else {
+                        None
+                    },
+                },
+            };
         }
-        let mut shake = Shake128::default();
-        Update::update(&mut shake, &seed);
+
+        if options & OPTION_CHUNK_MASKING != 0 {
+            return Self {
+                codec: VmessSizeCodec::Masked {
+                    shake: Self::shake(mask_seed),
+                },
+            };
+        }
+
         Self {
-            shake: Some(shake.finalize_xof()),
+            codec: VmessSizeCodec::Plain,
         }
     }
 
-    fn decode(&mut self, bytes: [u8; 2]) -> u16 {
-        let value = u16::from_be_bytes(bytes);
-        match self.next_mask() {
-            Some(mask) => value ^ mask,
-            None => value,
+    fn size_bytes(&self) -> usize {
+        match &self.codec {
+            VmessSizeCodec::Authenticated { .. } => 18,
+            VmessSizeCodec::Plain | VmessSizeCodec::Masked { .. } => 2,
         }
     }
 
-    fn encode(&mut self, value: u16) -> [u8; 2] {
-        let value = match self.next_mask() {
-            Some(mask) => value ^ mask,
-            None => value,
-        };
-        value.to_be_bytes()
+    fn decode(&mut self, bytes: &[u8]) -> io::Result<u16> {
+        match &mut self.codec {
+            VmessSizeCodec::Plain => Self::decode_plain_size(bytes),
+            VmessSizeCodec::Masked { shake } => {
+                let value = Self::decode_plain_size(bytes)?;
+                Ok(value ^ Self::next_mask_from(shake))
+            }
+            VmessSizeCodec::Authenticated { auth, .. } => auth.open_size(bytes),
+        }
+    }
+
+    fn encode(&mut self, value: u16) -> io::Result<Vec<u8>> {
+        match &mut self.codec {
+            VmessSizeCodec::Plain => Ok(value.to_be_bytes().to_vec()),
+            VmessSizeCodec::Masked { shake } => {
+                Ok((value ^ Self::next_mask_from(shake)).to_be_bytes().to_vec())
+            }
+            VmessSizeCodec::Authenticated { auth, .. } => auth.seal_size(value),
+        }
     }
 
     fn next_padding_len(&mut self) -> io::Result<usize> {
-        let Some(mask) = self.next_mask() else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "vmess padding requires chunk masking",
-            ));
+        let mask = match &mut self.codec {
+            VmessSizeCodec::Masked { shake } => Self::next_mask_from(shake),
+            VmessSizeCodec::Authenticated { padding, .. } => {
+                let Some(shake) = padding.as_mut() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "vmess padding requires chunk masking",
+                    ));
+                };
+                Self::next_mask_from(shake)
+            }
+            VmessSizeCodec::Plain => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "vmess padding requires chunk masking",
+                ));
+            }
         };
         Ok((mask % 64) as usize)
     }
 
-    fn next_mask(&mut self) -> Option<u16> {
-        let reader = self.shake.as_mut()?;
+    fn decode_plain_size(bytes: &[u8]) -> io::Result<u16> {
+        let bytes: [u8; 2] = bytes.try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid vmess chunk size length",
+            )
+        })?;
+        Ok(u16::from_be_bytes(bytes))
+    }
+
+    fn shake(seed: [u8; 16]) -> sha3::Shake128Reader {
+        let mut shake = Shake128::default();
+        Update::update(&mut shake, &seed);
+        shake.finalize_xof()
+    }
+
+    fn next_mask_from(reader: &mut sha3::Shake128Reader) -> u16 {
         let mut bytes = [0u8; 2];
         let _ = reader.read(&mut bytes);
-        Some(u16::from_be_bytes(bytes))
+        u16::from_be_bytes(bytes)
+    }
+}
+
+impl VmessLengthAuthenticator {
+    fn new(security: VmessSecurity, key_seed: [u8; 16], iv_seed: [u8; 16]) -> Self {
+        Self {
+            security,
+            key: kdf16(&key_seed, &[AUTHENTICATED_LENGTH_KEY]),
+            nonce: ChunkNonce {
+                iv: iv_seed,
+                count: 0,
+            },
+        }
+    }
+
+    fn open_size(&mut self, bytes: &[u8]) -> io::Result<u16> {
+        if bytes.len() != 18 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid vmess authenticated length size",
+            ));
+        }
+        let nonce = self.nonce.next();
+        let plain = match self.security {
+            VmessSecurity::Aes128Gcm => aes_gcm_open(&self.key, &nonce, bytes, &[])?,
+            VmessSecurity::ChaCha20Poly1305 => chacha20_open(&self.key, &nonce, bytes, &[])?,
+            VmessSecurity::None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "vmess authenticated length requires aead security",
+                ));
+            }
+        };
+        let size = VmessSizeParser::decode_plain_size(&plain)?;
+        size.checked_add(16).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "vmess authenticated length is too large",
+            )
+        })
+    }
+
+    fn seal_size(&mut self, size: u16) -> io::Result<Vec<u8>> {
+        let encoded = size.checked_sub(16).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "vmess authenticated length is too small",
+            )
+        })?;
+        let nonce = self.nonce.next();
+        match self.security {
+            VmessSecurity::Aes128Gcm => {
+                aes_gcm_seal(&self.key, &nonce, &encoded.to_be_bytes(), &[])
+            }
+            VmessSecurity::ChaCha20Poly1305 => {
+                chacha20_seal(&self.key, &nonce, &encoded.to_be_bytes(), &[])
+            }
+            VmessSecurity::None => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "vmess authenticated length requires aead security",
+            )),
+        }
     }
 }
 
@@ -1307,8 +1522,9 @@ mod tests {
     use super::{
         create_auth_id, fnv1a, kdf, parse_uuid_bytes, vmess_cmd_key, write_response_header,
         VmessBodyReader, VmessBodyWriter, VmessRequest, VmessSecurity, VmessServer,
-        VmessServerConfig, ATYP_IPV4, COMMAND_TCP, OPTION_CHUNK_MASKING, OPTION_CHUNK_STREAM,
-        OPTION_GLOBAL_PADDING, SECURITY_AES128_GCM, VERSION,
+        VmessServerConfig, ATYP_IPV4, COMMAND_TCP, OPTION_AUTHENTICATED_LENGTH,
+        OPTION_CHUNK_MASKING, OPTION_CHUNK_STREAM, OPTION_GLOBAL_PADDING, SECURITY_AES128_GCM,
+        VERSION,
     };
     use crate::socks5::SocksTarget;
     use crate::tls::TlsAcceptor;
@@ -1336,12 +1552,23 @@ mod tests {
     }
 
     fn vmess_request(target: std::net::SocketAddr, payload: &[u8]) -> (Vec<u8>, VmessRequest) {
+        vmess_request_with_options(
+            target,
+            payload,
+            OPTION_CHUNK_STREAM | OPTION_CHUNK_MASKING | OPTION_GLOBAL_PADDING,
+        )
+    }
+
+    fn vmess_request_with_options(
+        target: std::net::SocketAddr,
+        payload: &[u8],
+        options: u8,
+    ) -> (Vec<u8>, VmessRequest) {
         let uuid = parse_uuid_bytes(&user().uuid).expect("uuid");
         let cmd_key = vmess_cmd_key(&uuid);
         let request_body_key = [0x22u8; 16];
         let request_body_iv = [0x33u8; 16];
         let response_header = 0x44;
-        let options = OPTION_CHUNK_STREAM | OPTION_CHUNK_MASKING | OPTION_GLOBAL_PADDING;
         let security = VmessSecurity::Aes128Gcm;
         let mut header = Vec::new();
         header.push(VERSION);
@@ -1671,6 +1898,64 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|vmess|1");
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn proxies_tcp_with_authenticated_length() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vmess bind");
+        let vmess_addr = listener.local_addr().expect("vmess addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vmess accept");
+            server_clone.handle_tcp_client(stream)
+        });
+
+        let (request_bytes, request) = vmess_request_with_options(
+            echo_addr,
+            b"ping",
+            OPTION_CHUNK_STREAM
+                | OPTION_CHUNK_MASKING
+                | OPTION_GLOBAL_PADDING
+                | OPTION_AUTHENTICATED_LENGTH,
+        );
+        let mut client = TcpStream::connect(vmess_addr).expect("client connect");
+        client.write_all(&request_bytes).expect("client request");
+        decode_response_header(&mut client, &request);
+        let mut body = VmessBodyReader::new_with_length_seed(
+            client,
+            request.response_body_key,
+            request.response_body_iv,
+            request.request_body_key,
+            request.request_body_iv,
+            request.options,
+            request.security,
+        )
+        .expect("response body");
+        let mut echoed = [0u8; 4];
+        body.read_exact(&mut echoed).expect("client read payload");
+        assert_eq!(&echoed, b"ping");
+        drop(body);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
     }
