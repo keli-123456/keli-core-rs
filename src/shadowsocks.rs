@@ -4,7 +4,7 @@ use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,7 @@ pub struct ShadowsocksServerConfig {
 #[derive(Clone, Debug)]
 pub struct ShadowsocksServer {
     config: ShadowsocksServerConfig,
+    users: Arc<RwLock<Vec<CoreUser>>>,
     router: RouteMatcher,
     traffic: Arc<Mutex<TrafficRegistry>>,
     sessions: UserSessionTracker,
@@ -133,9 +134,11 @@ impl ShadowsocksServer {
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
+        let users = active_user_list(&config.users);
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,
+            users: Arc::new(RwLock::new(users)),
             traffic,
             sessions,
             bandwidth,
@@ -188,6 +191,18 @@ impl ShadowsocksServer {
             .lock()
             .expect("traffic registry lock poisoned")
             .drain_minimum(minimum_bytes)
+    }
+
+    pub fn replace_users(&self, users: Vec<CoreUser>) {
+        let mut current = self.users.write().expect("shadowsocks users lock poisoned");
+        *current = active_user_list(&users);
+    }
+
+    fn active_users(&self) -> Vec<CoreUser> {
+        self.users
+            .read()
+            .expect("shadowsocks users lock poisoned")
+            .clone()
     }
 
     pub fn serve_udp(&self, udp: UdpSocket, stop: Arc<AtomicBool>) -> io::Result<()> {
@@ -245,7 +260,7 @@ impl ShadowsocksServer {
         let mut encrypted_len = vec![0u8; 2 + TAG_LEN];
         client.read_exact(&mut encrypted_len)?;
 
-        for user in self.config.users.iter().filter(|user| !user.is_empty()) {
+        for user in self.active_users() {
             let mut cipher = ShadowsocksCipher::new(method, user.credential(), &salt)?;
             let mut len_bytes = encrypted_len.clone();
             if cipher.decrypt(&mut len_bytes).is_err() || len_bytes.len() != 2 {
@@ -262,7 +277,7 @@ impl ShadowsocksServer {
             cipher.decrypt(&mut encrypted_payload)?;
             let (target, initial_payload) = parse_request_payload(encrypted_payload)?;
             return Ok(ShadowsocksRequest {
-                user: user.clone(),
+                user,
                 target,
                 initial_payload,
                 client_reader: ShadowsocksReader::with_cipher(client, cipher),
@@ -288,7 +303,7 @@ impl ShadowsocksServer {
             ));
         }
         let (salt, encrypted_payload) = packet.split_at(method.salt_len());
-        for user in self.config.users.iter().filter(|user| !user.is_empty()) {
+        for user in self.active_users() {
             let mut payload = encrypted_payload.to_vec();
             let mut cipher = ShadowsocksCipher::new(method, user.credential(), salt)?;
             if cipher.decrypt(&mut payload).is_err() {
@@ -296,7 +311,7 @@ impl ShadowsocksServer {
             }
             let (target, payload) = parse_request_payload(payload)?;
             return Ok(ShadowsocksUdpRequest {
-                user: user.clone(),
+                user,
                 target,
                 payload,
             });
@@ -533,6 +548,14 @@ fn prune_udp_sessions(
         client_sessions.remove(&client_addr);
         remotes.retain(|_, context| context.client_addr != client_addr);
     }
+}
+
+fn active_user_list(users: &[CoreUser]) -> Vec<CoreUser> {
+    users
+        .iter()
+        .filter(|user| !user.is_empty())
+        .cloned()
+        .collect()
 }
 
 impl ShadowsocksMethod {
@@ -850,7 +873,7 @@ fn read_string<R: Read>(reader: &mut R, len: usize) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::io::{Read, Write};
+    use std::io::{self, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -869,6 +892,17 @@ mod tests {
             id: 1,
             uuid: "ss-password".to_string(),
             password: None,
+            email: None,
+            speed_limit: 0,
+            device_limit: 0,
+        }
+    }
+
+    fn user_b() -> CoreUser {
+        CoreUser {
+            id: 2,
+            uuid: "ss-user-b".to_string(),
+            password: Some("secret-b".to_string()),
             email: None,
             speed_limit: 0,
             device_limit: 0,
@@ -965,6 +999,31 @@ mod tests {
         assert_eq!(parsed.host, "127.0.0.1");
         assert_eq!(parsed.port, 443);
         assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn replaces_users_without_rebuilding_shadowsocks_server() {
+        let server = server();
+        let method = ShadowsocksMethod::parse("aes-128-gcm").expect("method");
+        let target = "127.0.0.1:443"
+            .parse::<std::net::SocketAddr>()
+            .expect("target");
+
+        server.replace_users(vec![user_b()]);
+
+        let old_packet = shadowsocks_udp_packet(method, "ss-password", target, b"old");
+        let error = match server.read_udp_request(&old_packet, method) {
+            Ok(_) => panic!("old user should fail after replacement"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+        let new_packet = shadowsocks_udp_packet(method, "secret-b", target, b"new");
+        let request = server
+            .read_udp_request(&new_packet, method)
+            .expect("new user should authenticate");
+        assert_eq!(request.user.uuid, "ss-user-b");
+        assert_eq!(request.payload, b"new");
     }
 
     #[test]
