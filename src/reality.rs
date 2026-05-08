@@ -18,8 +18,12 @@ const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 0x14;
 const TLS_RECORD_ALERT: u8 = 0x15;
 const TLS_RECORD_APPLICATION_DATA: u8 = 0x17;
 const TLS_HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
+const TLS_HANDSHAKE_SERVER_HELLO: u8 = 0x02;
+const TLS_VERSION_1_2: u16 = 0x0303;
+const TLS_VERSION_1_3: u16 = 0x0304;
 const EXT_SERVER_NAME: u16 = 0x0000;
 const EXT_KEY_SHARE: u16 = 0x0033;
+const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const GROUP_X25519: u16 = 0x001d;
 const MAX_TLS_RECORD_LEN: usize = 64 * 1024;
 
@@ -45,6 +49,23 @@ pub struct RealityTlsRecord {
     pub record_type: u8,
     pub version: u16,
     pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RealityServerHello {
+    pub legacy_version: u16,
+    pub random: [u8; 32],
+    pub session_id: Vec<u8>,
+    pub cipher_suite: u16,
+    pub compression_method: u8,
+    pub selected_version: Option<u16>,
+    pub key_share: Option<RealityKeyShare>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RealityKeyShare {
+    pub group: u16,
+    pub key: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -271,6 +292,101 @@ pub fn parse_tls_records(input: &[u8]) -> Result<Vec<RealityTlsRecord>, RealityA
         });
     }
     Ok(records)
+}
+
+pub fn parse_reality_server_hello(
+    record: &RealityTlsRecord,
+) -> Result<RealityServerHello, RealityAuthError> {
+    if record.record_type != TLS_RECORD_HANDSHAKE {
+        return Err(invalid("reality server hello record must be a handshake"));
+    }
+    if record.version != TLS_VERSION_1_2 {
+        return Err(invalid(
+            "reality server hello record must use TLS 1.2 legacy version",
+        ));
+    }
+
+    let mut cursor = Cursor::new(&record.payload);
+    let handshake_type = cursor.read_u8()?;
+    if handshake_type != TLS_HANDSHAKE_SERVER_HELLO {
+        return Err(invalid("reality handshake record is not server hello"));
+    }
+    let handshake_len = cursor.read_u24()? as usize;
+    let hello = cursor.read_slice(handshake_len)?;
+    if cursor.remaining() != 0 {
+        return Err(invalid("reality server hello record has trailing bytes"));
+    }
+    let mut cursor = Cursor::new(hello);
+    let legacy_version = cursor.read_u16()?;
+    let random = cursor.read_array::<32>()?;
+    let session_id_len = cursor.read_u8()? as usize;
+    let session_id = cursor.read_slice(session_id_len)?.to_vec();
+    let cipher_suite = cursor.read_u16()?;
+    let compression_method = cursor.read_u8()?;
+    let extensions_len = cursor.read_u16()? as usize;
+    let extensions = cursor.read_slice(extensions_len)?;
+    if cursor.remaining() != 0 {
+        return Err(invalid("reality server hello has trailing bytes"));
+    }
+
+    let mut selected_version = None;
+    let mut key_share = None;
+    let mut extensions = Cursor::new(extensions);
+    while extensions.remaining() > 0 {
+        let ext_type = extensions.read_u16()?;
+        let ext_len = extensions.read_u16()? as usize;
+        let ext = extensions.read_slice(ext_len)?;
+        match ext_type {
+            EXT_SUPPORTED_VERSIONS => {
+                if ext.len() != 2 {
+                    return Err(invalid(
+                        "server hello supported_versions extension is invalid",
+                    ));
+                }
+                selected_version = Some(u16::from_be_bytes([ext[0], ext[1]]));
+            }
+            EXT_KEY_SHARE => {
+                key_share = Some(parse_server_key_share_extension(ext)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(RealityServerHello {
+        legacy_version,
+        random,
+        session_id,
+        cipher_suite,
+        compression_method,
+        selected_version,
+        key_share,
+    })
+}
+
+pub fn validate_reality_server_hello(
+    record: &RealityTlsRecord,
+) -> Result<RealityServerHello, RealityAuthError> {
+    let hello = parse_reality_server_hello(record)?;
+    if hello.legacy_version != TLS_VERSION_1_2 {
+        return Err(invalid(
+            "reality server hello legacy_version must be TLS 1.2",
+        ));
+    }
+    if hello.selected_version != Some(TLS_VERSION_1_3) {
+        return Err(invalid("reality server hello must negotiate TLS 1.3"));
+    }
+    if !is_tls13_cipher_suite(hello.cipher_suite) {
+        return Err(invalid(
+            "reality server hello selected a non-TLS 1.3 cipher",
+        ));
+    }
+    let Some(key_share) = hello.key_share.as_ref() else {
+        return Err(invalid("reality server hello is missing key_share"));
+    };
+    if key_share.group != GROUP_X25519 || key_share.key.len() != 32 {
+        return Err(invalid("reality server hello key_share must be X25519"));
+    }
+    Ok(hello)
 }
 
 impl PrefixedTcpStream {
@@ -525,6 +641,23 @@ fn parse_key_share_extension(input: &[u8]) -> Result<Option<[u8; 32]>, RealityAu
     Ok(None)
 }
 
+fn parse_server_key_share_extension(input: &[u8]) -> Result<RealityKeyShare, RealityAuthError> {
+    let mut cursor = Cursor::new(input);
+    let group = cursor.read_u16()?;
+    let len = cursor.read_u16()? as usize;
+    let key = cursor.read_slice(len)?.to_vec();
+    if cursor.remaining() != 0 {
+        return Err(invalid(
+            "server hello key_share extension has trailing bytes",
+        ));
+    }
+    Ok(RealityKeyShare { group, key })
+}
+
+fn is_tls13_cipher_suite(value: u16) -> bool {
+    matches!(value, 0x1301 | 0x1302 | 0x1303)
+}
+
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     let value = value.trim();
     if value.len() % 2 != 0 {
@@ -593,6 +726,12 @@ impl<'a> Cursor<'a> {
         Ok(value)
     }
 
+    fn read_u24(&mut self) -> Result<u32, RealityAuthError> {
+        let value = read_u24(self.input, self.offset)?;
+        self.offset += 3;
+        Ok(value)
+    }
+
     fn read_array<const N: usize>(&mut self) -> Result<[u8; N], RealityAuthError> {
         let bytes = self.read_slice(N)?;
         let mut output = [0u8; N];
@@ -649,8 +788,9 @@ mod tests {
 
     use crate::reality::{
         authenticate_reality_client_hello, decode_reality_private_key, decode_short_id,
-        handle_reality_preface, parse_tls_records, RealityAuthConfig, RealityAuthError,
-        RealityGatewayConfig, RealityGatewayResult,
+        handle_reality_preface, parse_reality_server_hello, parse_tls_records,
+        validate_reality_server_hello, RealityAuthConfig, RealityAuthError, RealityGatewayConfig,
+        RealityGatewayResult,
     };
 
     #[test]
@@ -773,6 +913,70 @@ mod tests {
         assert_eq!(records[1].payload, [1]);
         assert_eq!(records[2].record_type, TLS_RECORD_APPLICATION_DATA);
         assert_eq!(records[2].payload, b"encrypted");
+    }
+
+    #[test]
+    fn parses_and_validates_reality_server_hello() {
+        let session_id = [0x55u8; 32];
+        let server_key = [0x9au8; 32];
+        let record = tls_record(
+            TLS_RECORD_HANDSHAKE,
+            &server_hello_payload(
+                &session_id,
+                0x1301,
+                TLS_VERSION_1_3,
+                GROUP_X25519,
+                &server_key,
+            ),
+        );
+        let records = parse_tls_records(&record).expect("records");
+
+        let parsed = parse_reality_server_hello(&records[0]).expect("parse server hello");
+        assert_eq!(parsed.selected_version, Some(TLS_VERSION_1_3));
+
+        let hello = validate_reality_server_hello(&records[0]).expect("server hello");
+
+        assert_eq!(hello.legacy_version, TLS_VERSION_1_2);
+        assert_eq!(hello.session_id, session_id);
+        assert_eq!(hello.cipher_suite, 0x1301);
+        assert_eq!(hello.selected_version, Some(TLS_VERSION_1_3));
+        assert_eq!(hello.key_share.expect("key share").key, server_key.to_vec());
+    }
+
+    #[test]
+    fn rejects_reality_server_hello_without_tls13() {
+        let session_id = [0x55u8; 32];
+        let server_key = [0x9au8; 32];
+        let record = tls_record(
+            TLS_RECORD_HANDSHAKE,
+            &server_hello_payload(
+                &session_id,
+                0x1301,
+                TLS_VERSION_1_2,
+                GROUP_X25519,
+                &server_key,
+            ),
+        );
+        let records = parse_tls_records(&record).expect("records");
+
+        let error = validate_reality_server_hello(&records[0]).expect_err("reject tls12");
+
+        assert!(error.to_string().contains("TLS 1.3"));
+    }
+
+    #[test]
+    fn rejects_reality_server_hello_without_x25519_share() {
+        let session_id = [0x55u8; 32];
+        let server_key = [0x9au8; 32];
+        let record = tls_record(
+            TLS_RECORD_HANDSHAKE,
+            &server_hello_payload(&session_id, 0x1301, TLS_VERSION_1_3, 0x0017, &server_key),
+        );
+        let records = parse_tls_records(&record).expect("records");
+
+        let error = validate_reality_server_hello(&records[0]).expect_err("reject group");
+
+        assert!(error.to_string().contains("X25519"));
     }
 
     #[test]
@@ -1010,9 +1214,12 @@ mod tests {
     const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 0x14;
     const TLS_RECORD_APPLICATION_DATA: u8 = 0x17;
     const TLS_HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
+    const TLS_HANDSHAKE_SERVER_HELLO: u8 = 0x02;
     const TLS_VERSION_1_2: u16 = 0x0303;
+    const TLS_VERSION_1_3: u16 = 0x0304;
     const EXT_SERVER_NAME: u16 = 0x0000;
     const EXT_KEY_SHARE: u16 = 0x0033;
+    const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
     const GROUP_X25519: u16 = 0x001d;
 
     fn sni_extension(server_name: &str) -> Vec<u8> {
@@ -1041,6 +1248,42 @@ mod tests {
         output.extend_from_slice(&ext_type.to_be_bytes());
         output.extend_from_slice(&(value.len() as u16).to_be_bytes());
         output.extend_from_slice(value);
+    }
+
+    fn server_hello_payload(
+        session_id: &[u8],
+        cipher_suite: u16,
+        selected_version: u16,
+        key_share_group: u16,
+        key_share: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&TLS_VERSION_1_2.to_be_bytes());
+        body.extend_from_slice(&[0x44; 32]);
+        body.push(session_id.len() as u8);
+        body.extend_from_slice(session_id);
+        body.extend_from_slice(&cipher_suite.to_be_bytes());
+        body.push(0);
+
+        let mut extensions = Vec::new();
+        extension(
+            &mut extensions,
+            EXT_SUPPORTED_VERSIONS,
+            &selected_version.to_be_bytes(),
+        );
+        let mut key_share_ext = Vec::new();
+        key_share_ext.extend_from_slice(&key_share_group.to_be_bytes());
+        key_share_ext.extend_from_slice(&(key_share.len() as u16).to_be_bytes());
+        key_share_ext.extend_from_slice(key_share);
+        extension(&mut extensions, EXT_KEY_SHARE, &key_share_ext);
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let mut payload = Vec::new();
+        payload.push(TLS_HANDSHAKE_SERVER_HELLO);
+        push_u24(&mut payload, body.len() as u32);
+        payload.extend_from_slice(&body);
+        payload
     }
 
     fn tls_record(record_type: u8, payload: &[u8]) -> Vec<u8> {
