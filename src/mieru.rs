@@ -1000,9 +1000,11 @@ fn relay_mieru_streams(
 mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
+    use crate::config::{OutboundConfig, RouteAction, RouteRule};
     use crate::mieru::{
         apply_nonce_user_hint, derive_mieru_key, encode_segment_body, parse_socks_request,
         rounded_unix_time, MieruMetadata, MieruReader, MieruServer, MieruServerConfig, MieruWriter,
@@ -1153,6 +1155,204 @@ mod tests {
         assert_eq!(records[0].download, 4);
     }
 
+    #[test]
+    fn block_route_rejects_mieru_tcp_connect() {
+        let server = MieruServer::new(MieruServerConfig {
+            node_tag: "panel|mieru|1".to_string(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            users: vec![user()],
+            routes: vec![RouteRule {
+                targets: vec!["domain:blocked.example".to_string()],
+                action: RouteAction::Block,
+                outbound: None,
+            }],
+            connect_timeout: Duration::from_secs(5),
+        });
+        let listener = server.bind().expect("server bind");
+        let listen_addr = listener.local_addr().expect("listen addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let err = server
+                .handle_tcp_client(stream)
+                .expect_err("block route should reject");
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        });
+
+        let client = TcpStream::connect(listen_addr).expect("connect");
+        let mut writer = test_client_writer(client.try_clone().expect("clone"), &user(), 90);
+        writer
+            .write_client_segment(
+                OPEN_SESSION_REQUEST,
+                &socks_connect_domain_request("blocked.example", 443),
+            )
+            .expect("open");
+
+        let err = MieruReader::accept(client, &[user()]).expect_err("server should close");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        drop(writer);
+        server_thread.join().expect("server thread");
+    }
+
+    #[test]
+    fn route_rule_sends_mieru_tcp_connect_through_socks_outbound() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let (target_tx, target_rx) = mpsc::channel();
+        let proxy_thread = thread::spawn(move || {
+            let (mut stream, _) = proxy.accept().expect("accept proxy");
+            let mut hello = [0u8; 3];
+            stream.read_exact(&mut hello).expect("hello");
+            assert_eq!(hello, [0x05, 0x01, 0x00]);
+            stream.write_all(&[0x05, 0x00]).expect("method");
+            let target = read_socks5_connect_target(&mut stream).expect("connect target");
+            target_tx.send(target).expect("send target");
+            stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .expect("connect ok");
+            let mut payload = [0u8; 4];
+            stream.read_exact(&mut payload).expect("payload");
+            assert_eq!(&payload, b"ping");
+            stream.write_all(b"pong").expect("response");
+        });
+
+        let server = MieruServer::new(MieruServerConfig {
+            node_tag: "panel|mieru|1".to_string(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            users: vec![user()],
+            routes: vec![RouteRule {
+                targets: vec!["domain:example.com".to_string()],
+                action: RouteAction::Outbound("socks-out".to_string()),
+                outbound: Some(OutboundConfig {
+                    tag: "socks-out".to_string(),
+                    protocol: "socks".to_string(),
+                    address: Some(proxy_addr.ip().to_string()),
+                    port: Some(proxy_addr.port()),
+                    username: None,
+                    password: None,
+                }),
+            }],
+            connect_timeout: Duration::from_secs(5),
+        });
+        let listener = server.bind().expect("server bind");
+        let listen_addr = listener.local_addr().expect("listen addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            server.handle_tcp_client(stream).expect("handle");
+            server.drain_traffic(1)
+        });
+
+        let client = TcpStream::connect(listen_addr).expect("connect");
+        let mut writer = test_client_writer(client.try_clone().expect("clone"), &user(), 91);
+        writer
+            .write_client_segment(
+                OPEN_SESSION_REQUEST,
+                &socks_connect_domain_request("example.com", 443),
+            )
+            .expect("open");
+        let mut reader = MieruReader::accept(client, &[user()]).expect("client reader");
+        assert_eq!(
+            reader
+                .take_initial_segment()
+                .expect("open response")
+                .metadata
+                .protocol_type,
+            OPEN_SESSION_RESPONSE
+        );
+        writer
+            .write_client_segment(DATA_CLIENT_TO_SERVER, b"ping")
+            .expect("data");
+        let mut echoed = [0u8; 4];
+        reader.read_exact(&mut echoed).expect("read echo");
+        assert_eq!(&echoed, b"pong");
+
+        let target = target_rx.recv().expect("target");
+        assert_eq!(target.host, "example.com");
+        assert_eq!(target.port, 443);
+        drop(writer);
+        proxy_thread.join().expect("proxy thread");
+        let records = server_thread.join().expect("server thread");
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn wildcard_route_sends_mieru_tcp_connect_through_http_outbound() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let (request_tx, request_rx) = mpsc::channel();
+        let proxy_thread = thread::spawn(move || {
+            let (mut stream, _) = proxy.accept().expect("accept proxy");
+            let request = read_http_connect_request(&mut stream).expect("connect request");
+            request_tx.send(request).expect("send request");
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .expect("response");
+            let mut payload = [0u8; 4];
+            stream.read_exact(&mut payload).expect("payload");
+            assert_eq!(&payload, b"ping");
+            stream.write_all(b"pong").expect("response payload");
+        });
+
+        let server = MieruServer::new(MieruServerConfig {
+            node_tag: "panel|mieru|1".to_string(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            users: vec![user()],
+            routes: vec![RouteRule {
+                targets: vec!["*".to_string()],
+                action: RouteAction::Outbound("http-out".to_string()),
+                outbound: Some(OutboundConfig {
+                    tag: "http-out".to_string(),
+                    protocol: "http".to_string(),
+                    address: Some(proxy_addr.ip().to_string()),
+                    port: Some(proxy_addr.port()),
+                    username: Some("user".to_string()),
+                    password: Some("pass".to_string()),
+                }),
+            }],
+            connect_timeout: Duration::from_secs(5),
+        });
+        let listener = server.bind().expect("server bind");
+        let listen_addr = listener.local_addr().expect("listen addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            server.handle_tcp_client(stream).expect("handle");
+            server.drain_traffic(1)
+        });
+
+        let client = TcpStream::connect(listen_addr).expect("connect");
+        let mut writer = test_client_writer(client.try_clone().expect("clone"), &user(), 92);
+        writer
+            .write_client_segment(
+                OPEN_SESSION_REQUEST,
+                &socks_connect_domain_request("default.example", 8443),
+            )
+            .expect("open");
+        let mut reader = MieruReader::accept(client, &[user()]).expect("client reader");
+        assert_eq!(
+            reader
+                .take_initial_segment()
+                .expect("open response")
+                .metadata
+                .protocol_type,
+            OPEN_SESSION_RESPONSE
+        );
+        writer
+            .write_client_segment(DATA_CLIENT_TO_SERVER, b"ping")
+            .expect("data");
+        let mut echoed = [0u8; 4];
+        reader.read_exact(&mut echoed).expect("read echo");
+        assert_eq!(&echoed, b"pong");
+
+        let request = request_rx.recv().expect("request");
+        assert!(request.starts_with("CONNECT default.example:8443 HTTP/1.1\r\n"));
+        assert!(request.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+        drop(writer);
+        proxy_thread.join().expect("proxy thread");
+        let records = server_thread.join().expect("server thread");
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
     struct TestClientWriter {
         inner: MieruWriter,
     }
@@ -1197,6 +1397,58 @@ mod tests {
         }
         request.extend_from_slice(&addr.port().to_be_bytes());
         request
+    }
+
+    fn socks_connect_domain_request(host: &str, port: u16) -> Vec<u8> {
+        let host_bytes = host.as_bytes();
+        assert!(host_bytes.len() <= u8::MAX as usize);
+        let mut request = vec![0x05, 0x01, 0x00, 0x03, host_bytes.len() as u8];
+        request.extend_from_slice(host_bytes);
+        request.extend_from_slice(&port.to_be_bytes());
+        request
+    }
+
+    fn read_socks5_connect_target(stream: &mut TcpStream) -> std::io::Result<crate::SocksTarget> {
+        let mut header = [0u8; 4];
+        stream.read_exact(&mut header)?;
+        assert_eq!(&header[..3], &[0x05, 0x01, 0x00]);
+        let host = match header[3] {
+            0x01 => {
+                let mut bytes = [0u8; 4];
+                stream.read_exact(&mut bytes)?;
+                std::net::Ipv4Addr::from(bytes).to_string()
+            }
+            0x03 => {
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len)?;
+                let mut bytes = vec![0u8; usize::from(len[0])];
+                stream.read_exact(&mut bytes)?;
+                String::from_utf8(bytes).expect("domain utf8")
+            }
+            0x04 => {
+                let mut bytes = [0u8; 16];
+                stream.read_exact(&mut bytes)?;
+                std::net::Ipv6Addr::from(bytes).to_string()
+            }
+            other => panic!("unsupported atyp {other}"),
+        };
+        let mut port = [0u8; 2];
+        stream.read_exact(&mut port)?;
+        Ok(crate::SocksTarget {
+            host,
+            port: u16::from_be_bytes(port),
+        })
+    }
+
+    fn read_http_connect_request(stream: &mut TcpStream) -> std::io::Result<String> {
+        let mut request = Vec::new();
+        let mut byte = [0u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte)?;
+            request.push(byte[0]);
+        }
+        String::from_utf8(request)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8"))
     }
 
     #[test]
