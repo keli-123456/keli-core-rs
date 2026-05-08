@@ -3,6 +3,7 @@ pub mod config;
 pub mod config_io;
 pub mod control;
 pub mod control_server;
+pub mod grpc;
 pub mod http_proxy;
 pub mod httpupgrade;
 pub mod hysteria2;

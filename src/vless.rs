@@ -114,7 +114,15 @@ impl VlessServer {
     }
 
     pub fn handle_websocket_client(&self, client: TcpStream, path: Option<&str>) -> io::Result<()> {
-        let (mut reader, mut writer) = accept_websocket(client, path)?;
+        let (reader, writer) = accept_websocket(client, path)?;
+        self.handle_split_client(reader, writer)
+    }
+
+    pub fn handle_split_client<R, W>(&self, mut reader: R, mut writer: W) -> io::Result<()>
+    where
+        R: Read + Send + 'static,
+        W: Write,
+    {
         let request = self.read_request(&mut reader)?;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user)?;

@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::anytls::{AnyTlsServer, AnyTlsServerConfig};
 use crate::config::{CoreConfig, InboundConfig, TransportConfig, ValidationError};
+use crate::grpc::{
+    run_grpc_listener, GrpcHunkReader, GrpcHunkWriter, GrpcStreamHandler, GrpcTlsConfig,
+};
 use crate::http_proxy::{HttpProxyServer, HttpProxyServerConfig};
 use crate::httpupgrade::{accept_httpupgrade, accept_httpupgrade_tls};
 use crate::hysteria2::{Hysteria2ObfsConfig, Hysteria2Server, Hysteria2ServerConfig};
@@ -195,6 +198,85 @@ impl Drop for CoreService {
     }
 }
 
+fn start_grpc_transport_listener(
+    inbound: &InboundConfig,
+    protocol: Protocol,
+    handler: GrpcStreamHandler,
+) -> Result<ListenerHandle, CoreServiceError> {
+    let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
+        CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        }
+    })?;
+    let listener =
+        std::net::TcpListener::bind(listen).map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+    let listener = {
+        let _guard = runtime.enter();
+        tokio::net::TcpListener::from_std(listener).map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?
+    };
+    let tls = inbound.tls.as_ref().map(|tls| GrpcTlsConfig {
+        cert_file: tls.cert_file.clone().unwrap_or_default(),
+        key_file: tls.key_file.clone().unwrap_or_default(),
+        server_name: tls.server_name.clone(),
+        alpn: tls.alpn.clone(),
+        reject_unknown_sni: tls.reject_unknown_sni,
+    });
+    let service_name = inbound
+        .transport
+        .service_name
+        .clone()
+        .unwrap_or_else(|| "GunService".to_string());
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = stop.clone();
+    let workers = Arc::new(Mutex::new(Vec::new()));
+    let join = thread::spawn(move || {
+        let _ = runtime.block_on(run_grpc_listener(
+            listener,
+            stop_for_thread,
+            service_name,
+            tls,
+            handler,
+        ));
+    });
+
+    Ok(ListenerHandle {
+        status: ListenerStatus {
+            tag: inbound.tag.clone(),
+            protocol,
+            local_addr,
+        },
+        stop,
+        workers,
+        join: Some(join),
+    })
+}
+
 fn start_vmess_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
@@ -220,6 +302,14 @@ fn start_vmess_listener(
         sessions,
         bandwidth,
     );
+    if inbound.transport.network.trim() == "grpc" {
+        let server = server.clone();
+        let handler: GrpcStreamHandler =
+            Arc::new(move |reader: GrpcHunkReader, writer: GrpcHunkWriter| {
+                let _ = server.handle_split_client(reader, writer);
+            });
+        return start_grpc_transport_listener(inbound, Protocol::Vmess, handler);
+    }
     let listener = server.bind().map_err(|source| CoreServiceError::Bind {
         tag: inbound.tag.clone(),
         source,
@@ -658,6 +748,14 @@ fn start_trojan_listener(
         sessions,
         bandwidth,
     );
+    if inbound.transport.network.trim() == "grpc" {
+        let server = server.clone();
+        let handler: GrpcStreamHandler =
+            Arc::new(move |reader: GrpcHunkReader, writer: GrpcHunkWriter| {
+                let _ = server.handle_split_client(reader, writer);
+            });
+        return start_grpc_transport_listener(inbound, Protocol::Trojan, handler);
+    }
     let listener = server.bind().map_err(|source| CoreServiceError::Bind {
         tag: inbound.tag.clone(),
         source,
@@ -773,6 +871,14 @@ fn start_vless_listener(
         sessions,
         bandwidth,
     );
+    if inbound.transport.network.trim() == "grpc" {
+        let server = server.clone();
+        let handler: GrpcStreamHandler =
+            Arc::new(move |reader: GrpcHunkReader, writer: GrpcHunkWriter| {
+                let _ = server.handle_split_client(reader, writer);
+            });
+        return start_grpc_transport_listener(inbound, Protocol::Vless, handler);
+    }
     let listener = server.bind().map_err(|source| CoreServiceError::Bind {
         tag: inbound.tag.clone(),
         source,
@@ -1069,6 +1175,7 @@ fn resolve_listen_addr(listen: &str, port: u16) -> io::Result<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
@@ -1077,6 +1184,7 @@ mod tests {
     use crate::config::{
         CoreConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig, TransportConfig,
     };
+    use crate::grpc::{decode_hunk_message, encode_grpc_hunk, take_grpc_message};
     use crate::protocol::Protocol;
     use crate::service::CoreService;
     use crate::user::CoreUser;
@@ -1124,6 +1232,87 @@ mod tests {
             routes: Vec::new(),
             stats: StatsConfig::default(),
         }
+    }
+
+    fn uuid_bytes(value: &str) -> [u8; 16] {
+        let compact = value.replace('-', "");
+        let mut bytes = [0u8; 16];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&compact[index * 2..index * 2 + 2], 16).expect("uuid byte");
+        }
+        bytes
+    }
+
+    fn vless_tcp_request(target: std::net::SocketAddr) -> Vec<u8> {
+        let mut request = Vec::new();
+        request.push(0x00);
+        request.extend_from_slice(&uuid_bytes("11111111-1111-1111-1111-111111111111"));
+        request.push(0x00);
+        request.push(0x01);
+        request.extend_from_slice(&target.port().to_be_bytes());
+        request.push(0x01);
+        request.extend_from_slice(
+            &target
+                .ip()
+                .to_string()
+                .parse::<std::net::Ipv4Addr>()
+                .expect("ipv4")
+                .octets(),
+        );
+        request
+    }
+
+    fn run_grpc_vless_client(proxy_addr: std::net::SocketAddr, echo_addr: std::net::SocketAddr) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async move {
+            let stream = tokio::net::TcpStream::connect(proxy_addr)
+                .await
+                .expect("grpc connect");
+            let (mut client, connection) =
+                h2::client::handshake(stream).await.expect("h2 handshake");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            let request = http::Request::builder()
+                .method("POST")
+                .uri("/GunService/Tun")
+                .header("content-type", "application/grpc")
+                .body(())
+                .expect("grpc request");
+            let (response, mut send) = client.send_request(request, false).expect("send request");
+            send.send_data(
+                Bytes::from(encode_grpc_hunk(&vless_tcp_request(echo_addr))),
+                false,
+            )
+            .expect("send vless request");
+            send.send_data(Bytes::from(encode_grpc_hunk(b"ping")), true)
+                .expect("send vless payload");
+
+            let response = response.await.expect("grpc response");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let mut body = response.into_body();
+            let mut frames = Vec::new();
+            let mut plain = Vec::new();
+            while plain.len() < 6 {
+                let chunk = body
+                    .data()
+                    .await
+                    .expect("grpc data")
+                    .expect("grpc data chunk");
+                let len = chunk.len();
+                frames.extend_from_slice(&chunk);
+                let _ = body.flow_control().release_capacity(len);
+                while let Some(message) = take_grpc_message(&mut frames).expect("grpc frame") {
+                    plain.extend_from_slice(&decode_hunk_message(&message).expect("grpc hunk"));
+                }
+            }
+            assert_eq!(&plain[..2], &[0x00, 0x00]);
+            assert_eq!(&plain[2..6], b"ping");
+        });
     }
 
     #[test]
@@ -1240,6 +1429,43 @@ mod tests {
         assert_eq!(listeners.len(), 1);
         assert_eq!(listeners[0].protocol, Protocol::Vless);
         service.stop();
+    }
+
+    #[test]
+    fn proxies_vless_grpc_and_records_traffic() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+        });
+
+        let mut config = config(free_port());
+        config.inbounds[0].tag = "panel|vless|1".to_string();
+        config.inbounds[0].protocol = Protocol::Vless;
+        config.inbounds[0].users[0].uuid = "11111111-1111-1111-1111-111111111111".to_string();
+        config.inbounds[0].transport.network = "grpc".to_string();
+        config.inbounds[0].transport.service_name = Some("GunService".to_string());
+        let mut service = CoreService::start(config).expect("service start");
+        let grpc_addr = service.listeners()[0].local_addr;
+
+        run_grpc_vless_client(grpc_addr, echo_addr);
+        echo_thread.join().expect("echo thread");
+
+        for _ in 0..50 {
+            let records = service.drain_traffic(1);
+            if !records.is_empty() {
+                assert_eq!(records[0].upload, 4);
+                assert_eq!(records[0].download, 4);
+                service.stop();
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        service.stop();
+        panic!("traffic was not recorded");
     }
 
     #[test]
