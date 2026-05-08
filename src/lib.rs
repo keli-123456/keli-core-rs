@@ -12,6 +12,7 @@ pub mod socks5;
 pub mod stream;
 pub mod traffic;
 pub mod user;
+pub mod vless;
 
 pub use config::{
     CoreConfig, InboundConfig, OutboundConfig, RouteAction, RouteRule, SniffingConfig, StatsConfig,
@@ -32,5 +33,6 @@ pub use service::{CoreService, CoreServiceError, ListenerStatus};
 pub use socks5::{Socks5Server, Socks5ServerConfig, SocksTarget};
 pub use traffic::{TrafficDelta, TrafficKey, TrafficRegistry};
 pub use user::CoreUser;
+pub use vless::{VlessServer, VlessServerConfig};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

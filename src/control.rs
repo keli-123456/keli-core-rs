@@ -233,7 +233,7 @@ mod tests {
         let mut controller = CoreController::new();
 
         let response = controller.handle(CoreCommand::ApplyConfig {
-            config: config(Protocol::Vless),
+            config: config(Protocol::Vmess),
         });
 
         match response {

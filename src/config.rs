@@ -165,6 +165,15 @@ impl InboundConfig {
                 self.tag
             )));
         }
+        if self.protocol == Protocol::Vless {
+            let network = self.transport.network.trim();
+            if network != "tcp" || self.tls.is_some() {
+                return Err(ValidationError::new(format!(
+                    "{} vless currently supports only plain tcp without tls/reality",
+                    self.tag
+                )));
+            }
+        }
 
         Ok(())
     }
@@ -206,7 +215,8 @@ mod tests {
     use crate::user::CoreUser;
 
     use super::{
-        CoreConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig, TransportConfig,
+        CoreConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig, TlsConfig,
+        TransportConfig,
     };
 
     fn user() -> CoreUser {
@@ -262,5 +272,32 @@ mod tests {
         };
 
         assert!(inbound.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_vless_tls_until_data_path_supports_it() {
+        let inbound = InboundConfig {
+            tag: "panel|vless|1".to_string(),
+            protocol: Protocol::Vless,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![user()],
+            transport: TransportConfig::default(),
+            tls: Some(TlsConfig {
+                server_name: "example.com".to_string(),
+                cert_file: None,
+                key_file: None,
+                alpn: Vec::new(),
+                reject_unknown_sni: false,
+                reality: None,
+            }),
+            sniffing: SniffingConfig::default(),
+        };
+
+        let error = inbound
+            .validate()
+            .expect_err("vless tls should not be accepted yet");
+
+        assert!(error.to_string().contains("plain tcp"));
     }
 }
