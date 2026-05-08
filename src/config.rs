@@ -585,6 +585,21 @@ impl InboundConfig {
                 )));
             }
         }
+        if self.protocol == Protocol::Mieru {
+            let network = self.transport.network.trim().to_ascii_lowercase();
+            if network != "tcp" || self.tls.is_some() {
+                return Err(ValidationError::new(format!(
+                    "{} mieru currently supports only plain tcp transport",
+                    self.tag
+                )));
+            }
+            if self.users.is_empty() {
+                return Err(ValidationError::new(format!(
+                    "{} mieru requires at least one user",
+                    self.tag
+                )));
+            }
+        }
         if self.protocol == Protocol::Tuic {
             let network = self.transport.network.trim();
             if network != "tuic" {

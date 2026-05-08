@@ -1,0 +1,1300 @@
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
+
+use crate::limits::{
+    BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
+};
+use crate::socks5::SocksTarget;
+use crate::stream::copy_count_best_effort_limited;
+use crate::traffic::TrafficRegistry;
+use crate::user::CoreUser;
+use crate::{connect_tcp_outbound, route_protocol_labels, RouteDecision, RouteMatcher};
+
+const NONCE_LEN: usize = 24;
+const METADATA_LEN: usize = 32;
+const TAG_LEN: usize = 16;
+const ENCRYPTED_METADATA_LEN: usize = METADATA_LEN + TAG_LEN;
+const MAX_TCP_FRAGMENT_LEN: usize = 32 * 1024;
+const MAX_SESSION_PAYLOAD_LEN: usize = 1024;
+const MAX_PADDING_SCAN: usize = 8192;
+const KEY_WINDOW_SECS: i64 = 120;
+const OPEN_SESSION_REQUEST: u8 = 2;
+const OPEN_SESSION_RESPONSE: u8 = 3;
+const CLOSE_SESSION_REQUEST: u8 = 4;
+const CLOSE_SESSION_RESPONSE: u8 = 5;
+const DATA_CLIENT_TO_SERVER: u8 = 6;
+const DATA_SERVER_TO_CLIENT: u8 = 7;
+const ACK_CLIENT_TO_SERVER: u8 = 8;
+const ACK_SERVER_TO_CLIENT: u8 = 9;
+const STATUS_OK: u8 = 0;
+const SOCKS_VERSION: u8 = 5;
+const SOCKS_CMD_CONNECT: u8 = 1;
+const ATYP_IPV4: u8 = 1;
+const ATYP_DOMAIN: u8 = 3;
+const ATYP_IPV6: u8 = 4;
+
+type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Clone, Debug)]
+pub struct MieruServerConfig {
+    pub node_tag: String,
+    pub listen: SocketAddr,
+    pub users: Vec<CoreUser>,
+    pub routes: Vec<crate::RouteRule>,
+    pub connect_timeout: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct MieruServer {
+    config: MieruServerConfig,
+    users: Arc<RwLock<Vec<CoreUser>>>,
+    router: RouteMatcher,
+    traffic: Arc<Mutex<TrafficRegistry>>,
+    sessions: UserSessionTracker,
+    bandwidth: UserBandwidthLimiters,
+}
+
+#[derive(Clone, Debug)]
+struct MieruCredential {
+    user: CoreUser,
+    username: String,
+    password: String,
+    key: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MieruMetadata {
+    protocol_type: u8,
+    session_id: u32,
+    sequence: u32,
+    status_code: u8,
+    payload_len: usize,
+    prefix_len: usize,
+    suffix_len: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MieruSegment {
+    metadata: MieruMetadata,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct MieruReader {
+    stream: TcpStream,
+    buffer: Vec<u8>,
+    pending: VecDeque<u8>,
+    initial_segment: Option<MieruSegment>,
+    user: CoreUser,
+    key: [u8; 32],
+    nonce: [u8; NONCE_LEN],
+    session_id: u32,
+    closed: bool,
+}
+
+#[derive(Debug)]
+struct MieruWriter {
+    stream: TcpStream,
+    key: [u8; 32],
+    nonce: [u8; NONCE_LEN],
+    session_id: u32,
+    sequence: u32,
+    sent_nonce: bool,
+}
+
+#[derive(Debug)]
+enum SegmentAttempt {
+    Complete {
+        segment: MieruSegment,
+        consumed: usize,
+        next_nonce: [u8; NONCE_LEN],
+    },
+    NeedMore,
+    Invalid,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SocksParseResult {
+    Complete {
+        target: SocksTarget,
+        consumed: usize,
+    },
+    NeedMore,
+}
+
+impl MieruServer {
+    pub fn new(config: MieruServerConfig) -> Self {
+        Self::with_traffic(config, Arc::new(Mutex::new(TrafficRegistry::default())))
+    }
+
+    pub fn with_traffic(config: MieruServerConfig, traffic: Arc<Mutex<TrafficRegistry>>) -> Self {
+        Self::with_shared_limits(
+            config,
+            traffic,
+            UserSessionTracker::default(),
+            UserBandwidthLimiters::default(),
+        )
+    }
+
+    pub fn with_shared_limits(
+        config: MieruServerConfig,
+        traffic: Arc<Mutex<TrafficRegistry>>,
+        sessions: UserSessionTracker,
+        bandwidth: UserBandwidthLimiters,
+    ) -> Self {
+        let users = active_user_list(&config.users);
+        Self {
+            router: RouteMatcher::new(config.routes.clone()),
+            config,
+            users: Arc::new(RwLock::new(users)),
+            traffic,
+            sessions,
+            bandwidth,
+        }
+    }
+
+    pub fn bind(&self) -> io::Result<TcpListener> {
+        TcpListener::bind(self.config.listen)
+    }
+
+    pub fn handle_tcp_client(&self, client: TcpStream) -> io::Result<()> {
+        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        let mut reader = MieruReader::accept(client.try_clone()?, &self.active_users())?;
+        let user = reader.user().clone();
+        let initial = reader.take_initial_segment().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing mieru open session request",
+            )
+        })?;
+        if initial.metadata.protocol_type != OPEN_SESSION_REQUEST {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "first mieru segment is not an open session request",
+            ));
+        }
+        let mut request_bytes = initial.payload;
+        let (target, consumed) = read_socks_request_from_mieru(&mut reader, &mut request_bytes)?;
+        let initial_payload = request_bytes.split_off(consumed);
+        let _session = self.acquire_user_session(&user, client_ip)?;
+        let bandwidth = self.bandwidth.limiter_for(Some(&user));
+        let protocol_labels = route_protocol_labels("tcp", &initial_payload);
+        let mut remote =
+            match self
+                .router
+                .decide_target(&target.host, target.port, &protocol_labels)
+            {
+                RouteDecision::Direct => connect_target(&target, self.config.connect_timeout)?,
+                RouteDecision::Outbound(outbound) => {
+                    connect_tcp_outbound(&outbound, &target, self.config.connect_timeout)?
+                }
+                RouteDecision::Block => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "target blocked by route",
+                    ));
+                }
+                RouteDecision::UnsupportedOutbound(tag) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("outbound route {tag} is not implemented"),
+                    ));
+                }
+            };
+
+        let mut writer = MieruWriter::server(client, &user, reader.session_id())?;
+        writer.write_open_response()?;
+        let mut upload = 0u64;
+        if !initial_payload.is_empty() {
+            if let Some(limiter) = bandwidth.as_deref() {
+                limiter.wait_for(initial_payload.len());
+            }
+            remote.write_all(&initial_payload)?;
+            upload = initial_payload.len() as u64;
+        }
+
+        let (relayed_upload, download) = relay_mieru_streams(reader, writer, remote, bandwidth)?;
+        upload = upload.saturating_add(relayed_upload);
+        self.traffic
+            .lock()
+            .expect("traffic registry lock poisoned")
+            .add_with_ip(
+                self.config.node_tag.clone(),
+                user.uuid,
+                upload,
+                download,
+                client_ip,
+            );
+        Ok(())
+    }
+
+    pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
+        self.traffic
+            .lock()
+            .expect("traffic registry lock poisoned")
+            .drain_minimum(minimum_bytes)
+    }
+
+    pub fn replace_users(&self, users: Vec<CoreUser>) {
+        let mut current = self.users.write().expect("mieru users lock poisoned");
+        *current = active_user_list(&users);
+    }
+
+    fn active_users(&self) -> Vec<CoreUser> {
+        self.users
+            .read()
+            .expect("mieru users lock poisoned")
+            .clone()
+    }
+
+    fn acquire_user_session(
+        &self,
+        user: &CoreUser,
+        client_ip: Option<IpAddr>,
+    ) -> io::Result<Option<UserSessionGuard>> {
+        self.sessions
+            .try_acquire_for_ip(Some(user), client_ip)
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))
+    }
+}
+
+impl MieruReader {
+    fn accept(mut stream: TcpStream, users: &[CoreUser]) -> io::Result<Self> {
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let mut buffer = Vec::new();
+        loop {
+            let mut temp = [0u8; 4096];
+            let read = stream.read(&mut temp)?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "mieru connection closed before first segment",
+                ));
+            }
+            buffer.extend_from_slice(&temp[..read]);
+
+            let credentials = candidate_credentials(users, &buffer);
+            for offset in 0..buffer
+                .len()
+                .saturating_sub(NONCE_LEN + ENCRYPTED_METADATA_LEN)
+                + 1
+            {
+                let nonce = &buffer[offset..offset + NONCE_LEN];
+                for credential in credentials
+                    .iter()
+                    .filter(|credential| nonce_matches_user_hint(nonce, &credential.username))
+                {
+                    let mut nonce_bytes = [0u8; NONCE_LEN];
+                    nonce_bytes.copy_from_slice(nonce);
+                    match try_decode_segment(&buffer, offset, true, &credential.key, nonce_bytes) {
+                        SegmentAttempt::Complete {
+                            segment,
+                            consumed,
+                            next_nonce,
+                        } => {
+                            let remaining = buffer.split_off(consumed);
+                            let session_id = segment.metadata.session_id;
+                            buffer = remaining;
+                            return Ok(Self {
+                                stream,
+                                buffer,
+                                pending: VecDeque::new(),
+                                initial_segment: Some(segment),
+                                user: credential.user.clone(),
+                                key: credential.key,
+                                nonce: next_nonce,
+                                session_id,
+                                closed: false,
+                            });
+                        }
+                        SegmentAttempt::NeedMore => break,
+                        SegmentAttempt::Invalid => {}
+                    }
+                }
+            }
+
+            if buffer.len() > MAX_PADDING_SCAN + NONCE_LEN + ENCRYPTED_METADATA_LEN {
+                let drain = buffer.len() - (NONCE_LEN + ENCRYPTED_METADATA_LEN);
+                buffer.drain(..drain.min(MAX_PADDING_SCAN));
+            }
+        }
+    }
+
+    fn user(&self) -> &CoreUser {
+        &self.user
+    }
+
+    fn session_id(&self) -> u32 {
+        self.session_id
+    }
+
+    fn take_initial_segment(&mut self) -> Option<MieruSegment> {
+        self.initial_segment.take()
+    }
+
+    fn read_segment(&mut self) -> io::Result<Option<MieruSegment>> {
+        loop {
+            for offset in 0..self.buffer.len().saturating_sub(ENCRYPTED_METADATA_LEN) + 1 {
+                match try_decode_segment(&self.buffer, offset, false, &self.key, self.nonce) {
+                    SegmentAttempt::Complete {
+                        segment,
+                        consumed,
+                        next_nonce,
+                    } => {
+                        self.buffer.drain(..consumed);
+                        self.nonce = next_nonce;
+                        return Ok(Some(segment));
+                    }
+                    SegmentAttempt::NeedMore => break,
+                    SegmentAttempt::Invalid => {}
+                }
+            }
+
+            if self.buffer.len() > MAX_PADDING_SCAN + ENCRYPTED_METADATA_LEN {
+                let drain = self.buffer.len() - ENCRYPTED_METADATA_LEN;
+                self.buffer.drain(..drain.min(MAX_PADDING_SCAN));
+            }
+
+            let mut temp = [0u8; 4096];
+            let read = self.stream.read(&mut temp)?;
+            if read == 0 {
+                return Ok(None);
+            }
+            self.buffer.extend_from_slice(&temp[..read]);
+        }
+    }
+}
+
+impl Read for MieruReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        while self.pending.is_empty() && !self.closed {
+            if let Some(segment) = self.initial_segment.take() {
+                match segment.metadata.protocol_type {
+                    DATA_CLIENT_TO_SERVER | DATA_SERVER_TO_CLIENT => {
+                        self.pending.extend(segment.payload)
+                    }
+                    CLOSE_SESSION_REQUEST | CLOSE_SESSION_RESPONSE => self.closed = true,
+                    _ => {}
+                }
+                if !self.pending.is_empty() || self.closed {
+                    break;
+                }
+            }
+            let Some(segment) = self.read_segment()? else {
+                self.closed = true;
+                break;
+            };
+            match segment.metadata.protocol_type {
+                DATA_CLIENT_TO_SERVER | DATA_SERVER_TO_CLIENT => {
+                    self.pending.extend(segment.payload)
+                }
+                CLOSE_SESSION_REQUEST | CLOSE_SESSION_RESPONSE => {
+                    self.closed = true;
+                    break;
+                }
+                ACK_CLIENT_TO_SERVER
+                | ACK_SERVER_TO_CLIENT
+                | OPEN_SESSION_REQUEST
+                | OPEN_SESSION_RESPONSE => {}
+                _ => {}
+            }
+        }
+
+        let mut written = 0;
+        while written < output.len() {
+            let Some(byte) = self.pending.pop_front() else {
+                break;
+            };
+            output[written] = byte;
+            written += 1;
+        }
+        Ok(written)
+    }
+}
+
+impl MieruWriter {
+    fn server(stream: TcpStream, user: &CoreUser, session_id: u32) -> io::Result<Self> {
+        let username = mieru_username(user);
+        let password = mieru_password(user);
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        apply_nonce_user_hint(&mut nonce, &username);
+        Ok(Self {
+            stream,
+            key: derive_mieru_key(&username, &password, rounded_unix_time(now_unix_secs())),
+            nonce,
+            session_id,
+            sequence: 0,
+            sent_nonce: false,
+        })
+    }
+
+    fn write_open_response(&mut self) -> io::Result<()> {
+        let metadata = MieruMetadata {
+            protocol_type: OPEN_SESSION_RESPONSE,
+            session_id: self.session_id,
+            sequence: self.sequence,
+            status_code: STATUS_OK,
+            payload_len: 0,
+            prefix_len: 0,
+            suffix_len: 0,
+        };
+        self.sequence = self.sequence.saturating_add(1);
+        self.write_segment(metadata, &[])
+    }
+
+    fn write_close_response(&mut self) -> io::Result<()> {
+        let metadata = MieruMetadata {
+            protocol_type: CLOSE_SESSION_RESPONSE,
+            session_id: self.session_id,
+            sequence: self.sequence,
+            status_code: STATUS_OK,
+            payload_len: 0,
+            prefix_len: 0,
+            suffix_len: 0,
+        };
+        self.sequence = self.sequence.saturating_add(1);
+        self.write_segment(metadata, &[])
+    }
+
+    fn write_data_segment(&mut self, payload: &[u8]) -> io::Result<()> {
+        let metadata = MieruMetadata {
+            protocol_type: DATA_SERVER_TO_CLIENT,
+            session_id: self.session_id,
+            sequence: self.sequence,
+            status_code: STATUS_OK,
+            payload_len: payload.len(),
+            prefix_len: 0,
+            suffix_len: 0,
+        };
+        self.sequence = self.sequence.saturating_add(1);
+        self.write_segment(metadata, payload)
+    }
+
+    fn write_segment(&mut self, metadata: MieruMetadata, payload: &[u8]) -> io::Result<()> {
+        let mut segment = Vec::new();
+        if !self.sent_nonce {
+            segment.extend_from_slice(&self.nonce);
+            self.sent_nonce = true;
+        }
+        encode_segment_body(&mut segment, &self.key, &mut self.nonce, &metadata, payload)?;
+        self.stream.write_all(&segment)
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.write_close_response();
+        let _ = self.stream.shutdown(Shutdown::Write);
+    }
+}
+
+impl Write for MieruWriter {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if input.is_empty() {
+            return Ok(0);
+        }
+        for chunk in input.chunks(MAX_TCP_FRAGMENT_LEN) {
+            self.write_data_segment(chunk)?;
+        }
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+fn try_decode_segment(
+    input: &[u8],
+    offset: usize,
+    has_nonce: bool,
+    key: &[u8; 32],
+    nonce: [u8; NONCE_LEN],
+) -> SegmentAttempt {
+    let metadata_offset = offset + if has_nonce { NONCE_LEN } else { 0 };
+    if input.len() < metadata_offset + ENCRYPTED_METADATA_LEN {
+        return SegmentAttempt::NeedMore;
+    }
+
+    let metadata_bytes = match decrypt_aead(
+        key,
+        &nonce,
+        &input[metadata_offset..metadata_offset + ENCRYPTED_METADATA_LEN],
+    ) {
+        Ok(bytes) => bytes,
+        Err(_) => return SegmentAttempt::Invalid,
+    };
+    let Some(metadata) = parse_metadata(&metadata_bytes) else {
+        return SegmentAttempt::Invalid;
+    };
+    let mut next_nonce = nonce;
+    increment_nonce(&mut next_nonce);
+
+    let payload_offset = metadata_offset + ENCRYPTED_METADATA_LEN + metadata.prefix_len;
+    let encrypted_payload_len = if metadata.payload_len == 0 {
+        0
+    } else {
+        metadata.payload_len + TAG_LEN
+    };
+    let consumed = payload_offset + encrypted_payload_len + metadata.suffix_len;
+    if input.len() < consumed {
+        return SegmentAttempt::NeedMore;
+    }
+    let payload = if metadata.payload_len == 0 {
+        Vec::new()
+    } else {
+        let payload = match decrypt_aead(
+            key,
+            &next_nonce,
+            &input[payload_offset..payload_offset + encrypted_payload_len],
+        ) {
+            Ok(bytes) => bytes,
+            Err(_) => return SegmentAttempt::Invalid,
+        };
+        if payload.len() != metadata.payload_len {
+            return SegmentAttempt::Invalid;
+        }
+        increment_nonce(&mut next_nonce);
+        payload
+    };
+
+    SegmentAttempt::Complete {
+        segment: MieruSegment { metadata, payload },
+        consumed,
+        next_nonce,
+    }
+}
+
+fn encode_segment_body(
+    output: &mut Vec<u8>,
+    key: &[u8; 32],
+    nonce: &mut [u8; NONCE_LEN],
+    metadata: &MieruMetadata,
+    payload: &[u8],
+) -> io::Result<()> {
+    let metadata_bytes = encode_metadata(metadata)?;
+    output.extend(encrypt_aead(key, nonce, &metadata_bytes)?);
+    increment_nonce(nonce);
+    if !payload.is_empty() {
+        output.extend(encrypt_aead(key, nonce, payload)?);
+        increment_nonce(nonce);
+    }
+    Ok(())
+}
+
+fn parse_metadata(input: &[u8]) -> Option<MieruMetadata> {
+    if input.len() != METADATA_LEN {
+        return None;
+    }
+    let protocol_type = input[0];
+    if !matches!(
+        protocol_type,
+        OPEN_SESSION_REQUEST
+            | OPEN_SESSION_RESPONSE
+            | CLOSE_SESSION_REQUEST
+            | CLOSE_SESSION_RESPONSE
+            | DATA_CLIENT_TO_SERVER
+            | DATA_SERVER_TO_CLIENT
+            | ACK_CLIENT_TO_SERVER
+            | ACK_SERVER_TO_CLIENT
+    ) {
+        return None;
+    }
+
+    let timestamp = u32::from_be_bytes([input[2], input[3], input[4], input[5]]);
+    if !timestamp_is_close(timestamp) {
+        return None;
+    }
+
+    let session_id = u32::from_be_bytes([input[6], input[7], input[8], input[9]]);
+    let sequence = u32::from_be_bytes([input[10], input[11], input[12], input[13]]);
+    match protocol_type {
+        OPEN_SESSION_REQUEST
+        | OPEN_SESSION_RESPONSE
+        | CLOSE_SESSION_REQUEST
+        | CLOSE_SESSION_RESPONSE => {
+            let status_code = input[14];
+            let payload_len = u16::from_be_bytes([input[15], input[16]]) as usize;
+            if payload_len > MAX_SESSION_PAYLOAD_LEN {
+                return None;
+            }
+            Some(MieruMetadata {
+                protocol_type,
+                session_id,
+                sequence,
+                status_code,
+                payload_len,
+                prefix_len: 0,
+                suffix_len: input[17] as usize,
+            })
+        }
+        DATA_CLIENT_TO_SERVER
+        | DATA_SERVER_TO_CLIENT
+        | ACK_CLIENT_TO_SERVER
+        | ACK_SERVER_TO_CLIENT => {
+            let payload_len = u16::from_be_bytes([input[22], input[23]]) as usize;
+            if payload_len > MAX_TCP_FRAGMENT_LEN {
+                return None;
+            }
+            Some(MieruMetadata {
+                protocol_type,
+                session_id,
+                sequence,
+                status_code: STATUS_OK,
+                payload_len,
+                prefix_len: input[21] as usize,
+                suffix_len: input[24] as usize,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn encode_metadata(metadata: &MieruMetadata) -> io::Result<[u8; METADATA_LEN]> {
+    if metadata.payload_len > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mieru payload too large",
+        ));
+    }
+    let mut output = [0u8; METADATA_LEN];
+    output[0] = metadata.protocol_type;
+    output[2..6].copy_from_slice(&((now_unix_secs() / 60) as u32).to_be_bytes());
+    output[6..10].copy_from_slice(&metadata.session_id.to_be_bytes());
+    output[10..14].copy_from_slice(&metadata.sequence.to_be_bytes());
+    match metadata.protocol_type {
+        OPEN_SESSION_REQUEST
+        | OPEN_SESSION_RESPONSE
+        | CLOSE_SESSION_REQUEST
+        | CLOSE_SESSION_RESPONSE => {
+            output[14] = metadata.status_code;
+            output[15..17].copy_from_slice(&(metadata.payload_len as u16).to_be_bytes());
+            output[17] = metadata.suffix_len as u8;
+        }
+        DATA_CLIENT_TO_SERVER
+        | DATA_SERVER_TO_CLIENT
+        | ACK_CLIENT_TO_SERVER
+        | ACK_SERVER_TO_CLIENT => {
+            output[18..20].copy_from_slice(&(64u16).to_be_bytes());
+            output[21] = metadata.prefix_len as u8;
+            output[22..24].copy_from_slice(&(metadata.payload_len as u16).to_be_bytes());
+            output[24] = metadata.suffix_len as u8;
+        }
+        _ => {}
+    }
+    Ok(output)
+}
+
+fn encrypt_aead(key: &[u8; 32], nonce: &[u8; NONCE_LEN], plaintext: &[u8]) -> io::Result<Vec<u8>> {
+    let cipher = <XChaCha20Poly1305 as KeyInit>::new_from_slice(key)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
+    cipher
+        .encrypt(XNonce::from_slice(nonce), plaintext)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "mieru encrypt failed"))
+}
+
+fn decrypt_aead(key: &[u8; 32], nonce: &[u8; NONCE_LEN], ciphertext: &[u8]) -> io::Result<Vec<u8>> {
+    let cipher = <XChaCha20Poly1305 as KeyInit>::new_from_slice(key)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
+    cipher
+        .decrypt(XNonce::from_slice(nonce), ciphertext)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "mieru decrypt failed"))
+}
+
+fn candidate_credentials(users: &[CoreUser], input: &[u8]) -> Vec<MieruCredential> {
+    let now = rounded_unix_time(now_unix_secs());
+    let time_slots = [now - KEY_WINDOW_SECS, now, now + KEY_WINDOW_SECS];
+    users
+        .iter()
+        .flat_map(|user| {
+            let username = mieru_username(user);
+            let password = mieru_password(user);
+            time_slots
+                .into_iter()
+                .map(move |time_slot| MieruCredential {
+                    user: user.clone(),
+                    username: username.clone(),
+                    password: password.clone(),
+                    key: derive_mieru_key(&username, &password, time_slot),
+                })
+        })
+        .filter(|credential| {
+            input.windows(NONCE_LEN).any(|nonce| {
+                nonce_matches_user_hint(nonce, &credential.username)
+                    && credential.password == mieru_password(&credential.user)
+            })
+        })
+        .collect()
+}
+
+fn mieru_username(user: &CoreUser) -> String {
+    user.uuid.trim().to_string()
+}
+
+fn mieru_password(user: &CoreUser) -> String {
+    user.credential().trim().to_string()
+}
+
+fn derive_mieru_key(username: &str, password: &str, rounded_unix: i64) -> [u8; 32] {
+    let mut password_hasher = Sha256::new();
+    password_hasher.update(password.as_bytes());
+    password_hasher.update([0]);
+    password_hasher.update(username.as_bytes());
+    let hashed_password = password_hasher.finalize();
+
+    let mut time_hasher = Sha256::new();
+    time_hasher.update((rounded_unix as u64).to_be_bytes());
+    let time_salt = time_hasher.finalize();
+
+    let mut key = [0u8; 32];
+    pbkdf2_hmac_sha256(&hashed_password, &time_salt, 64, &mut key);
+    key
+}
+
+fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32, output: &mut [u8]) {
+    let mut block_index = 1u32;
+    let mut offset = 0usize;
+    while offset < output.len() {
+        let mut mac =
+            <HmacSha256 as Mac>::new_from_slice(password).expect("hmac accepts any key length");
+        mac.update(salt);
+        mac.update(&block_index.to_be_bytes());
+        let mut u = mac.finalize().into_bytes().to_vec();
+        let mut block = u.clone();
+        for _ in 1..iterations {
+            let mut mac =
+                <HmacSha256 as Mac>::new_from_slice(password).expect("hmac accepts any key length");
+            mac.update(&u);
+            u = mac.finalize().into_bytes().to_vec();
+            for (left, right) in block.iter_mut().zip(&u) {
+                *left ^= *right;
+            }
+        }
+
+        let take = (output.len() - offset).min(block.len());
+        output[offset..offset + take].copy_from_slice(&block[..take]);
+        offset += take;
+        block_index = block_index.saturating_add(1);
+    }
+}
+
+fn nonce_matches_user_hint(nonce: &[u8], username: &str) -> bool {
+    if nonce.len() != NONCE_LEN {
+        return false;
+    }
+    let mut expected = [0u8; 4];
+    expected.copy_from_slice(&nonce_user_hint(&nonce[..16], username));
+    nonce[20..24] == expected
+}
+
+fn apply_nonce_user_hint(nonce: &mut [u8; NONCE_LEN], username: &str) {
+    let hint = nonce_user_hint(&nonce[..16], username);
+    nonce[20..24].copy_from_slice(&hint);
+}
+
+fn nonce_user_hint(nonce_prefix: &[u8], username: &str) -> [u8; 4] {
+    let mut hasher = Sha256::new();
+    hasher.update(username.as_bytes());
+    hasher.update(nonce_prefix);
+    let digest = hasher.finalize();
+    [digest[0], digest[1], digest[2], digest[3]]
+}
+
+fn increment_nonce(nonce: &mut [u8; NONCE_LEN]) {
+    for byte in nonce.iter_mut().rev() {
+        let (next, overflow) = byte.overflowing_add(1);
+        *byte = next;
+        if !overflow {
+            break;
+        }
+    }
+}
+
+fn rounded_unix_time(unix_secs: i64) -> i64 {
+    ((unix_secs + KEY_WINDOW_SECS / 2) / KEY_WINDOW_SECS) * KEY_WINDOW_SECS
+}
+
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn timestamp_is_close(minutes: u32) -> bool {
+    let now = (now_unix_secs() / 60) as i64;
+    (now - i64::from(minutes)).abs() <= 10
+}
+
+fn active_user_list(users: &[CoreUser]) -> Vec<CoreUser> {
+    users
+        .iter()
+        .filter(|user| !user.is_empty())
+        .cloned()
+        .collect()
+}
+
+fn read_socks_request_from_mieru<R: Read>(
+    reader: &mut R,
+    bytes: &mut Vec<u8>,
+) -> io::Result<(SocksTarget, usize)> {
+    loop {
+        match parse_socks_request(bytes)? {
+            SocksParseResult::Complete { target, consumed } => return Ok((target, consumed)),
+            SocksParseResult::NeedMore => {
+                let mut temp = [0u8; 1024];
+                let read = reader.read(&mut temp)?;
+                if read == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "mieru socks request ended early",
+                    ));
+                }
+                bytes.extend_from_slice(&temp[..read]);
+            }
+        }
+    }
+}
+
+fn parse_socks_request(input: &[u8]) -> io::Result<SocksParseResult> {
+    let Some(offset) = socks_request_offset(input)? else {
+        return Ok(SocksParseResult::NeedMore);
+    };
+    if input.len() < offset + 4 {
+        return Ok(SocksParseResult::NeedMore);
+    }
+    let header = &input[offset..offset + 4];
+    if header[0] != SOCKS_VERSION || header[2] != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid mieru socks request header",
+        ));
+    }
+    if header[1] != SOCKS_CMD_CONNECT {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "mieru currently supports only socks connect requests",
+        ));
+    }
+
+    let mut cursor = offset + 4;
+    let host = match header[3] {
+        ATYP_IPV4 => {
+            if input.len() < cursor + 4 {
+                return Ok(SocksParseResult::NeedMore);
+            }
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&input[cursor..cursor + 4]);
+            cursor += 4;
+            Ipv4Addr::from(bytes).to_string()
+        }
+        ATYP_IPV6 => {
+            if input.len() < cursor + 16 {
+                return Ok(SocksParseResult::NeedMore);
+            }
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&input[cursor..cursor + 16]);
+            cursor += 16;
+            Ipv6Addr::from(bytes).to_string()
+        }
+        ATYP_DOMAIN => {
+            if input.len() < cursor + 1 {
+                return Ok(SocksParseResult::NeedMore);
+            }
+            let len = input[cursor] as usize;
+            cursor += 1;
+            if input.len() < cursor + len {
+                return Ok(SocksParseResult::NeedMore);
+            }
+            let host = String::from_utf8(input[cursor..cursor + len].to_vec()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid mieru socks domain")
+            })?;
+            cursor += len;
+            host
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported mieru socks address type",
+            ));
+        }
+    };
+    if input.len() < cursor + 2 {
+        return Ok(SocksParseResult::NeedMore);
+    }
+    let port = u16::from_be_bytes([input[cursor], input[cursor + 1]]);
+    cursor += 2;
+    Ok(SocksParseResult::Complete {
+        target: SocksTarget { host, port },
+        consumed: cursor,
+    })
+}
+
+fn socks_request_offset(input: &[u8]) -> io::Result<Option<usize>> {
+    if input.len() < 2 {
+        return Ok(None);
+    }
+    if input[0] != SOCKS_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mieru payload is not a socks request",
+        ));
+    }
+    if input.len() >= 4 && input[2] == 0 && matches!(input[3], ATYP_IPV4 | ATYP_DOMAIN | ATYP_IPV6)
+    {
+        return Ok(Some(0));
+    }
+
+    let greeting_len = 2 + input[1] as usize;
+    if input.len() < greeting_len {
+        return Ok(None);
+    }
+    Ok(Some(greeting_len))
+}
+
+fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStream> {
+    crate::dns::connect_tcp(&target.host, target.port, timeout)
+}
+
+fn relay_mieru_streams(
+    mut reader: MieruReader,
+    mut writer: MieruWriter,
+    remote: TcpStream,
+    limiter: Option<Arc<BandwidthLimiter>>,
+) -> io::Result<(u64, u64)> {
+    let mut remote_read = remote.try_clone()?;
+    let mut remote_write = remote;
+    let upload_limiter = limiter.clone();
+    let upload_thread = thread::spawn(move || {
+        let upload = copy_count_best_effort_limited(
+            &mut reader,
+            &mut remote_write,
+            upload_limiter.as_deref(),
+        );
+        let _ = remote_write.shutdown(Shutdown::Write);
+        upload
+    });
+    let download =
+        copy_count_best_effort_limited(&mut remote_read, &mut writer, limiter.as_deref());
+    writer.shutdown();
+    let upload = upload_thread
+        .join()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "mieru upload thread panicked"))?;
+
+    Ok((upload, download))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
+
+    use crate::mieru::{
+        apply_nonce_user_hint, derive_mieru_key, encode_segment_body, parse_socks_request,
+        rounded_unix_time, MieruMetadata, MieruReader, MieruServer, MieruServerConfig, MieruWriter,
+        SocksParseResult, DATA_CLIENT_TO_SERVER, DATA_SERVER_TO_CLIENT, OPEN_SESSION_REQUEST,
+        OPEN_SESSION_RESPONSE, STATUS_OK,
+    };
+    use crate::user::CoreUser;
+
+    fn user() -> CoreUser {
+        CoreUser {
+            id: 1,
+            uuid: "user-a".to_string(),
+            password: None,
+            email: None,
+            speed_limit: 0,
+            device_limit: 0,
+        }
+    }
+
+    #[test]
+    fn key_derivation_changes_with_user_password_and_time() {
+        let rounded = rounded_unix_time(1777650625);
+        let key = derive_mieru_key("user-a", "pass-a", rounded);
+
+        assert_eq!(key.len(), 32);
+        assert_ne!(key, derive_mieru_key("user-b", "pass-a", rounded));
+        assert_ne!(key, derive_mieru_key("user-a", "pass-b", rounded));
+        assert_ne!(key, derive_mieru_key("user-a", "pass-a", rounded + 120));
+    }
+
+    #[test]
+    fn parses_socks_request_with_optional_greeting() {
+        let request = vec![
+            0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
+            b'.', b'c', b'o', b'm', 0x01, 0xbb,
+        ];
+
+        let parsed = parse_socks_request(&request).expect("parse");
+
+        assert_eq!(
+            parsed,
+            SocksParseResult::Complete {
+                target: crate::socks5::SocksTarget {
+                    host: "example.com".to_string(),
+                    port: 443
+                },
+                consumed: request.len()
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_first_segment_with_nonce_hint() {
+        let user = user();
+        let mut stream_bytes = Vec::new();
+        let mut nonce = [7u8; 24];
+        apply_nonce_user_hint(&mut nonce, &user.uuid);
+        stream_bytes.extend_from_slice(&[0xaa, 0xbb]);
+        stream_bytes.extend_from_slice(&nonce);
+        let mut write_nonce = nonce;
+        let key = derive_mieru_key(
+            &user.uuid,
+            &user.uuid,
+            rounded_unix_time(super::now_unix_secs()),
+        );
+        let metadata = MieruMetadata {
+            protocol_type: OPEN_SESSION_REQUEST,
+            session_id: 42,
+            sequence: 0,
+            status_code: STATUS_OK,
+            payload_len: 4,
+            prefix_len: 0,
+            suffix_len: 0,
+        };
+        encode_segment_body(
+            &mut stream_bytes,
+            &key,
+            &mut write_nonce,
+            &metadata,
+            b"ping",
+        )
+        .expect("encode");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let sender = thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).expect("connect");
+            client.write_all(&stream_bytes).expect("write");
+        });
+        let (server, _) = listener.accept().expect("accept");
+        let mut reader = MieruReader::accept(server, &[user]).expect("accept mieru");
+
+        assert_eq!(reader.session_id(), 42);
+        let initial = reader.take_initial_segment().expect("initial");
+        assert_eq!(initial.metadata.protocol_type, OPEN_SESSION_REQUEST);
+        assert_eq!(initial.payload, b"ping");
+        sender.join().expect("sender");
+    }
+
+    #[test]
+    fn server_proxies_mieru_tcp_connect() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+        });
+
+        let server = MieruServer::new(MieruServerConfig {
+            node_tag: "panel|mieru|1".to_string(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            users: vec![user()],
+            routes: Vec::new(),
+            connect_timeout: Duration::from_secs(5),
+        });
+        let listener = server.bind().expect("server bind");
+        let listen_addr = listener.local_addr().expect("listen addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            server.handle_tcp_client(stream).expect("handle");
+            server.drain_traffic(1)
+        });
+
+        let client = TcpStream::connect(listen_addr).expect("connect");
+        let mut writer = test_client_writer(client.try_clone().expect("clone"), &user(), 9);
+        let request = socks_connect_request(echo_addr);
+        writer
+            .write_client_segment(OPEN_SESSION_REQUEST, &request)
+            .expect("open");
+        let mut reader = MieruReader::accept(client, &[user()]).expect("client reader");
+        let open_response = reader.take_initial_segment().expect("open");
+        assert_eq!(open_response.metadata.protocol_type, OPEN_SESSION_RESPONSE);
+
+        writer
+            .write_client_segment(DATA_CLIENT_TO_SERVER, b"ping")
+            .expect("data");
+        let mut echoed = [0u8; 4];
+        reader.read_exact(&mut echoed).expect("read echo");
+        assert_eq!(&echoed, b"ping");
+
+        drop(writer);
+        echo_thread.join().expect("echo thread");
+        let records = server_thread.join().expect("server thread");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    struct TestClientWriter {
+        inner: MieruWriter,
+    }
+
+    impl TestClientWriter {
+        fn write_client_segment(
+            &mut self,
+            protocol_type: u8,
+            payload: &[u8],
+        ) -> std::io::Result<()> {
+            let metadata = MieruMetadata {
+                protocol_type,
+                session_id: self.inner.session_id,
+                sequence: self.inner.sequence,
+                status_code: STATUS_OK,
+                payload_len: payload.len(),
+                prefix_len: 0,
+                suffix_len: 0,
+            };
+            self.inner.sequence += 1;
+            self.inner.write_segment(metadata, payload)
+        }
+    }
+
+    fn test_client_writer(stream: TcpStream, user: &CoreUser, session_id: u32) -> TestClientWriter {
+        let mut writer = MieruWriter::server(stream, user, session_id).expect("writer");
+        writer.sent_nonce = false;
+        TestClientWriter { inner: writer }
+    }
+
+    fn socks_connect_request(addr: std::net::SocketAddr) -> Vec<u8> {
+        let mut request = vec![0x05, 0x01, 0x00];
+        match addr.ip() {
+            std::net::IpAddr::V4(ip) => {
+                request.push(0x01);
+                request.extend_from_slice(&ip.octets());
+            }
+            std::net::IpAddr::V6(ip) => {
+                request.push(0x04);
+                request.extend_from_slice(&ip.octets());
+            }
+        }
+        request.extend_from_slice(&addr.port().to_be_bytes());
+        request
+    }
+
+    #[test]
+    fn writer_emits_data_segments() {
+        let test_user = user();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = MieruReader::accept(stream, &[test_user]).expect("reader");
+            let segment = reader.read_segment().expect("read").expect("segment");
+            assert_eq!(segment.metadata.protocol_type, DATA_SERVER_TO_CLIENT);
+            assert_eq!(segment.payload, b"pong");
+        });
+        let client = TcpStream::connect(addr).expect("connect");
+        let mut writer = MieruWriter::server(client, &user(), 10).expect("writer");
+        writer.write_open_response().expect("open response");
+        writer.write_all(b"pong").expect("write");
+        server_thread.join().expect("server thread");
+    }
+
+    #[test]
+    fn reader_read_trait_accepts_server_to_client_data() {
+        let test_user = user();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = MieruReader::accept(stream, &[test_user]).expect("reader");
+            let initial = reader.take_initial_segment().expect("initial");
+            assert_eq!(initial.metadata.protocol_type, OPEN_SESSION_RESPONSE);
+            let mut bytes = [0u8; 4];
+            reader.read_exact(&mut bytes).expect("read bytes");
+            assert_eq!(&bytes, b"pong");
+        });
+        let client = TcpStream::connect(addr).expect("connect");
+        let mut writer = MieruWriter::server(client, &user(), 10).expect("writer");
+        writer.write_open_response().expect("open response");
+        writer.write_all(b"pong").expect("write");
+        writer.shutdown();
+        server_thread.join().expect("server thread");
+    }
+
+    #[test]
+    fn reader_decodes_client_data_after_open_request() {
+        let test_user = user();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = MieruReader::accept(stream, &[test_user]).expect("reader");
+            let initial = reader.take_initial_segment().expect("initial");
+            assert_eq!(initial.metadata.protocol_type, OPEN_SESSION_REQUEST);
+            let mut bytes = [0u8; 4];
+            reader.read_exact(&mut bytes).expect("read data");
+            assert_eq!(&bytes, b"ping");
+        });
+        let client = TcpStream::connect(addr).expect("connect");
+        let mut writer = test_client_writer(client, &user(), 11);
+        writer
+            .write_client_segment(OPEN_SESSION_REQUEST, &socks_connect_request(addr))
+            .expect("open");
+        writer
+            .write_client_segment(DATA_CLIENT_TO_SERVER, b"ping")
+            .expect("data");
+        server_thread.join().expect("server thread");
+    }
+
+    #[test]
+    fn full_duplex_open_response_then_client_data() {
+        let test_user = user();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader =
+                MieruReader::accept(stream.try_clone().expect("clone"), &[test_user.clone()])
+                    .expect("reader");
+            let initial = reader.take_initial_segment().expect("initial");
+            assert_eq!(initial.metadata.protocol_type, OPEN_SESSION_REQUEST);
+            let mut writer =
+                MieruWriter::server(stream, &test_user, reader.session_id()).expect("writer");
+            writer.write_open_response().expect("open response");
+            let mut bytes = [0u8; 4];
+            reader.read_exact(&mut bytes).expect("read data");
+            assert_eq!(&bytes, b"ping");
+        });
+        let client = TcpStream::connect(addr).expect("connect");
+        let mut writer = test_client_writer(client.try_clone().expect("clone"), &user(), 12);
+        writer
+            .write_client_segment(OPEN_SESSION_REQUEST, &socks_connect_request(addr))
+            .expect("open");
+        let mut reader = MieruReader::accept(client, &[user()]).expect("client reader");
+        let response = reader.take_initial_segment().expect("response");
+        assert_eq!(response.metadata.protocol_type, OPEN_SESSION_RESPONSE);
+        writer
+            .write_client_segment(DATA_CLIENT_TO_SERVER, b"ping")
+            .expect("data");
+        server_thread.join().expect("server thread");
+    }
+}

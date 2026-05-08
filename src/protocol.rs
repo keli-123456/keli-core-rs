@@ -28,7 +28,7 @@ pub enum ProtocolPlacement {
 impl Protocol {
     pub fn placement(&self) -> ProtocolPlacement {
         match self {
-            Protocol::Naive | Protocol::Mieru => ProtocolPlacement::ExternalSidecar,
+            Protocol::Naive => ProtocolPlacement::ExternalSidecar,
             Protocol::Shadowsocks
             | Protocol::Vmess
             | Protocol::Vless
@@ -36,6 +36,7 @@ impl Protocol {
             | Protocol::Hysteria2
             | Protocol::Tuic
             | Protocol::AnyTls
+            | Protocol::Mieru
             | Protocol::Socks
             | Protocol::Http => ProtocolPlacement::CorePlanned,
         }
@@ -56,10 +57,8 @@ mod tests {
             Protocol::Naive.placement(),
             ProtocolPlacement::ExternalSidecar
         );
-        assert_eq!(
-            Protocol::Mieru.placement(),
-            ProtocolPlacement::ExternalSidecar
-        );
+        assert_eq!(Protocol::Mieru.placement(), ProtocolPlacement::CorePlanned);
         assert!(Protocol::Vless.can_enter_core_plan());
+        assert!(Protocol::Mieru.can_enter_core_plan());
     }
 }

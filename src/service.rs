@@ -18,6 +18,7 @@ use crate::http_proxy::{HttpProxyServer, HttpProxyServerConfig};
 use crate::httpupgrade::{accept_httpupgrade, accept_httpupgrade_tls};
 use crate::hysteria2::{Hysteria2ObfsConfig, Hysteria2Server, Hysteria2ServerConfig};
 use crate::limits::{UserBandwidthLimiters, UserSessionTracker};
+use crate::mieru::{MieruServer, MieruServerConfig};
 use crate::protocol::Protocol;
 use crate::reality::{
     decode_reality_private_key, decode_short_id, generate_reality_temporary_certificate,
@@ -99,6 +100,7 @@ enum ListenerRuntime {
     AnyTls(AnyTlsServer),
     Tuic(TuicServer),
     Hysteria2(Hysteria2Server),
+    Mieru(MieruServer),
 }
 
 impl ListenerRuntime {
@@ -113,6 +115,7 @@ impl ListenerRuntime {
             ListenerRuntime::AnyTls(server) => server.replace_users(users),
             ListenerRuntime::Tuic(server) => server.replace_users(users),
             ListenerRuntime::Hysteria2(server) => server.replace_users(users),
+            ListenerRuntime::Mieru(server) => server.replace_users(users),
         }
     }
 }
@@ -188,6 +191,13 @@ impl CoreService {
                     bandwidth.clone(),
                 )?,
                 Protocol::Hysteria2 => start_hysteria2_listener(
+                    &inbound,
+                    routes.clone(),
+                    traffic.clone(),
+                    sessions.clone(),
+                    bandwidth.clone(),
+                )?,
+                Protocol::Mieru => start_mieru_listener(
                     &inbound,
                     routes.clone(),
                     traffic.clone(),
@@ -1198,6 +1208,87 @@ fn start_socks_listener(
     })
 }
 
+fn start_mieru_listener(
+    inbound: &InboundConfig,
+    routes: Vec<crate::RouteRule>,
+    traffic: Arc<Mutex<TrafficRegistry>>,
+    sessions: UserSessionTracker,
+    bandwidth: UserBandwidthLimiters,
+) -> Result<ListenerHandle, CoreServiceError> {
+    let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
+        CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        }
+    })?;
+    let server = MieruServer::with_shared_limits(
+        MieruServerConfig {
+            node_tag: inbound.tag.clone(),
+            listen,
+            users: inbound.users.clone(),
+            routes,
+            connect_timeout: Duration::from_secs(10),
+        },
+        traffic,
+        sessions,
+        bandwidth,
+    );
+    let listener = server.bind().map_err(|source| CoreServiceError::Bind {
+        tag: inbound.tag.clone(),
+        source,
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = stop.clone();
+    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers_for_thread = workers.clone();
+    let runtime_server = server.clone();
+    let join = thread::spawn(move || {
+        while !stop_for_thread.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let server = server.clone();
+                    let worker = thread::spawn(move || {
+                        let _ = server.handle_tcp_client(stream);
+                    });
+                    workers_for_thread
+                        .lock()
+                        .expect("worker list lock poisoned")
+                        .push(worker);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok(ListenerHandle {
+        status: ListenerStatus {
+            tag: inbound.tag.clone(),
+            protocol: Protocol::Mieru,
+            local_addr,
+        },
+        runtime: ListenerRuntime::Mieru(runtime_server),
+        stop,
+        workers,
+        join: Some(join),
+    })
+}
+
 fn start_http_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
@@ -1799,6 +1890,21 @@ mod tests {
         }
         service.stop();
         panic!("traffic was not recorded");
+    }
+
+    #[test]
+    fn starts_mieru_listener_from_core_config() {
+        let mut config = config(free_port());
+        config.inbounds[0].tag = "panel|mieru|1".to_string();
+        config.inbounds[0].protocol = Protocol::Mieru;
+        config.inbounds[0].transport.network = "tcp".to_string();
+
+        let mut service = CoreService::start(config).expect("service start");
+        let listeners = service.listeners();
+
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].protocol, Protocol::Mieru);
+        service.stop();
     }
 
     #[test]
