@@ -76,7 +76,14 @@ impl HttpProxyServer {
 
     pub fn handle_tcp_client(&self, mut client: TcpStream) -> io::Result<()> {
         let mut reader = BufReader::new(client.try_clone()?);
-        let request = self.read_request(&mut reader)?;
+        let request = match self.read_request(&mut reader) {
+            Ok(request) => request,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                write_auth_required_response(&mut client)?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         if request.method.eq_ignore_ascii_case("CONNECT") {
             self.handle_connect(client, request)
         } else {
@@ -326,6 +333,12 @@ fn auth_required() -> io::Error {
     )
 }
 
+fn write_auth_required_response(writer: &mut impl Write) -> io::Result<()> {
+    writer.write_all(
+        b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nConnection: close\r\n\r\n",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -471,5 +484,26 @@ mod tests {
             .expect_err("auth should fail");
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn writes_407_for_missing_auth_on_tcp_connection() {
+        let server = server();
+        let listener = server.bind().expect("proxy bind");
+        let proxy_addr = listener.local_addr().expect("proxy addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let _ = server_clone.serve_tcp_once(&listener);
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).expect("client connect");
+        client
+            .write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .expect("request");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).expect("response");
+
+        server_thread.join().expect("server thread");
+        assert!(String::from_utf8_lossy(&response).contains("407 Proxy Authentication Required"));
     }
 }
