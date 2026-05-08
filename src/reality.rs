@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::io::{self, Cursor as IoCursor, Read, Write};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, KeyInit};
@@ -9,11 +11,14 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use crate::stream::relay_tcp_streams_limited;
+
 const TLS_RECORD_HANDSHAKE: u8 = 0x16;
 const TLS_HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
 const EXT_SERVER_NAME: u16 = 0x0000;
 const EXT_KEY_SHARE: u16 = 0x0033;
 const GROUP_X25519: u16 = 0x001d;
+const MAX_TLS_RECORD_LEN: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RealityAuthConfig {
@@ -30,6 +35,35 @@ pub struct RealityClientAuth {
     pub client_version: [u8; 3],
     pub client_time: SystemTime,
     pub short_id: [u8; 8],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RealityGatewayConfig {
+    pub auth: RealityAuthConfig,
+    pub dest: String,
+    pub connect_timeout: Duration,
+}
+
+#[derive(Debug)]
+pub enum RealityGatewayResult {
+    Authenticated(RealityAuthenticatedStream),
+    Fallback {
+        reason: RealityAuthError,
+        upload: u64,
+        download: u64,
+    },
+}
+
+#[derive(Debug)]
+pub struct RealityAuthenticatedStream {
+    pub auth: RealityClientAuth,
+    pub stream: PrefixedTcpStream,
+}
+
+#[derive(Debug)]
+pub struct PrefixedTcpStream {
+    prefix: IoCursor<Vec<u8>>,
+    socket: TcpStream,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +110,29 @@ impl fmt::Display for RealityAuthError {
 }
 
 impl std::error::Error for RealityAuthError {}
+
+pub fn handle_reality_preface(
+    mut client: TcpStream,
+    config: &RealityGatewayConfig,
+) -> io::Result<RealityGatewayResult> {
+    let first_record = read_first_tls_record(&mut client)?;
+    match authenticate_reality_client_hello(&first_record, &config.auth) {
+        Ok(auth) => Ok(RealityGatewayResult::Authenticated(
+            RealityAuthenticatedStream {
+                auth,
+                stream: PrefixedTcpStream::new(client, first_record),
+            },
+        )),
+        Err(reason) => {
+            let (upload, download) = fallback_to_dest(client, first_record, &config.dest, config)?;
+            Ok(RealityGatewayResult::Fallback {
+                reason,
+                upload,
+                download,
+            })
+        }
+    }
+}
 
 pub fn authenticate_reality_client_hello(
     raw_record: &[u8],
@@ -177,6 +234,96 @@ pub fn decode_short_id(value: &str) -> Result<[u8; 8], RealityAuthError> {
     let mut short_id = [0u8; 8];
     short_id[..bytes.len()].copy_from_slice(&bytes);
     Ok(short_id)
+}
+
+impl PrefixedTcpStream {
+    pub fn new(socket: TcpStream, prefix: Vec<u8>) -> Self {
+        Self {
+            prefix: IoCursor::new(prefix),
+            socket,
+        }
+    }
+
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.socket.set_nonblocking(nonblocking)
+    }
+
+    pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        self.socket.shutdown(how)
+    }
+
+    pub fn into_inner(self) -> TcpStream {
+        self.socket
+    }
+}
+
+impl Read for PrefixedTcpStream {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if (self.prefix.position() as usize) < self.prefix.get_ref().len() {
+            return self.prefix.read(output);
+        }
+        self.socket.read(output)
+    }
+}
+
+impl Write for PrefixedTcpStream {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        self.socket.write(input)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.socket.flush()
+    }
+}
+
+fn read_first_tls_record(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header)?;
+    if header[0] != TLS_RECORD_HANDSHAKE {
+        return Ok(header.to_vec());
+    }
+    let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if record_len > MAX_TLS_RECORD_LEN {
+        return Ok(header.to_vec());
+    }
+    let mut record = Vec::with_capacity(5 + record_len);
+    record.extend_from_slice(&header);
+    record.resize(5 + record_len, 0);
+    stream.read_exact(&mut record[5..])?;
+    Ok(record)
+}
+
+fn fallback_to_dest(
+    client: TcpStream,
+    first_record: Vec<u8>,
+    dest: &str,
+    config: &RealityGatewayConfig,
+) -> io::Result<(u64, u64)> {
+    let mut remote = connect_dest(dest, config.connect_timeout)?;
+    remote.write_all(&first_record)?;
+    let initial_upload = first_record.len() as u64;
+    let (upload, download) = relay_tcp_streams_limited(client, remote, None)?;
+    Ok((initial_upload.saturating_add(upload), download))
+}
+
+fn connect_dest(dest: &str, timeout: Duration) -> io::Result<TcpStream> {
+    let addrs = dest.to_socket_addrs()?;
+    let mut last_error = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "reality dest did not resolve to any socket address",
+        )
+    }))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -396,6 +543,10 @@ fn hex_digit(value: u8) -> char {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::{Duration, UNIX_EPOCH};
 
     use aes_gcm::aead::{Aead, KeyInit};
@@ -406,7 +557,8 @@ mod tests {
 
     use crate::reality::{
         authenticate_reality_client_hello, decode_reality_private_key, decode_short_id,
-        RealityAuthConfig, RealityAuthError,
+        handle_reality_preface, RealityAuthConfig, RealityAuthError, RealityGatewayConfig,
+        RealityGatewayResult,
     };
 
     #[test]
@@ -509,6 +661,133 @@ mod tests {
             .expect("private key");
 
         assert_eq!(key, [7u8; 32]);
+    }
+
+    #[test]
+    fn gateway_returns_authenticated_prefixed_stream() {
+        let server_secret = StaticSecret::from([7u8; 32]);
+        let client_secret = StaticSecret::from([9u8; 32]);
+        let short_id = [0x6b, 0xa8, 0x51, 0x79, 0xe3, 0x0d, 0x4f, 0xc2];
+        let record = build_reality_client_hello(
+            &client_secret,
+            &PublicKey::from(&server_secret),
+            "www.example.test",
+            [1, 8, 23],
+            1_777_650_625,
+            short_id,
+        );
+        let record_for_server = record.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind reality");
+        let addr = listener.local_addr().expect("reality addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept reality");
+            let config = gateway_config(server_secret, short_id, "127.0.0.1:9".to_string());
+            let result = handle_reality_preface(stream, &config).expect("reality preface");
+            let RealityGatewayResult::Authenticated(mut authenticated) = result else {
+                panic!("expected authenticated reality stream");
+            };
+            assert_eq!(authenticated.auth.server_name, "www.example.test");
+
+            let mut replayed = vec![0u8; record_for_server.len()];
+            authenticated
+                .stream
+                .read_exact(&mut replayed)
+                .expect("read replayed record");
+            assert_eq!(replayed, record_for_server);
+
+            let mut after = [0u8; 5];
+            authenticated
+                .stream
+                .read_exact(&mut after)
+                .expect("read after bytes");
+            assert_eq!(&after, b"after");
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect reality");
+        client.write_all(&record).expect("write record");
+        client.write_all(b"after").expect("write after bytes");
+        client.shutdown(Shutdown::Write).expect("shutdown client");
+
+        server_thread.join().expect("server thread");
+    }
+
+    #[test]
+    fn gateway_falls_back_to_dest_for_invalid_reality_auth() {
+        let fallback = TcpListener::bind("127.0.0.1:0").expect("bind fallback");
+        let fallback_addr = fallback.local_addr().expect("fallback addr");
+        let (captured_tx, captured_rx) = mpsc::channel();
+        let fallback_thread = thread::spawn(move || {
+            let (mut stream, _) = fallback.accept().expect("accept fallback");
+            let mut captured = Vec::new();
+            stream.read_to_end(&mut captured).expect("read fallback");
+            captured_tx.send(captured).expect("send captured");
+            stream.write_all(b"fallback-ok").expect("write fallback");
+        });
+
+        let server_secret = StaticSecret::from([7u8; 32]);
+        let client_secret = StaticSecret::from([9u8; 32]);
+        let valid_short_id = [0x6b, 0xa8, 0x51, 0x79, 0xe3, 0x0d, 0x4f, 0xc2];
+        let wrong_short_id = [0xb1, 0, 0, 0, 0, 0, 0, 0];
+        let record = build_reality_client_hello(
+            &client_secret,
+            &PublicKey::from(&server_secret),
+            "www.example.test",
+            [1, 8, 23],
+            1_777_650_625,
+            wrong_short_id,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind reality");
+        let addr = listener.local_addr().expect("reality addr");
+        let record_len = record.len();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept reality");
+            let config = gateway_config(server_secret, valid_short_id, fallback_addr.to_string());
+            let result = handle_reality_preface(stream, &config).expect("reality preface");
+            let RealityGatewayResult::Fallback {
+                reason,
+                upload,
+                download,
+            } = result
+            else {
+                panic!("expected reality fallback");
+            };
+            assert!(matches!(reason, RealityAuthError::ShortIdMismatch(_)));
+            assert_eq!(upload, (record_len + 5) as u64);
+            assert_eq!(download, b"fallback-ok".len() as u64);
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect reality");
+        client.write_all(&record).expect("write record");
+        client.write_all(b"plain").expect("write payload");
+        client.shutdown(Shutdown::Write).expect("shutdown write");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).expect("read response");
+        assert_eq!(response, b"fallback-ok");
+
+        server_thread.join().expect("server thread");
+        fallback_thread.join().expect("fallback thread");
+        let captured = captured_rx.recv().expect("captured fallback");
+        let mut expected = record;
+        expected.extend_from_slice(b"plain");
+        assert_eq!(captured, expected);
+    }
+
+    fn gateway_config(
+        server_secret: StaticSecret,
+        short_id: [u8; 8],
+        dest: String,
+    ) -> RealityGatewayConfig {
+        RealityGatewayConfig {
+            auth: RealityAuthConfig {
+                private_key: server_secret.to_bytes(),
+                server_names: HashSet::from(["www.example.test".to_string()]),
+                short_ids: HashSet::from([short_id]),
+                max_time_diff: Some(Duration::from_secs(30)),
+                now: UNIX_EPOCH + Duration::from_secs(1_777_650_625),
+            },
+            dest,
+            connect_timeout: Duration::from_secs(3),
+        }
     }
 
     fn build_reality_client_hello(
