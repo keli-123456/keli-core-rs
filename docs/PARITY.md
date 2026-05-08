@@ -74,7 +74,7 @@ keliboard -> kelinode-rs -> keli-core-rs
 | Direct outbound | Code path | Built-in direct egress plus freedom route outbounds. |
 | Block routing | Code path | Exact/wildcard/suffix, `domain:`/`full:`/`keyword:`, `regexp:`, `geosite:`, numeric IP/CIDR, `geoip:`, port/range, `network:`, and `protocol:` matching. |
 | Custom outbound routing | Partial | Freedom outbounds render and execute, including optional `address`/`port` redirects. SOCKS5 and HTTP outbounds render and execute for TCP routes, including username/password. SOCKS5 outbounds also execute UDP routes through UDP ASSOCIATE; HTTP UDP remains rejected. |
-| DNS execution | Partial | Native core accepts DNS server config, selects servers by domain route rules, and resolves direct TCP/UDP targets through UDP DNS with `UseIPv4` default. DoH/DoT/TCP DNS and cache policy are not implemented yet. |
+| DNS execution | Partial | Native core accepts DNS server config, selects servers by domain route rules, and resolves direct TCP/UDP targets through UDP or `tcp://` DNS with `UseIPv4` default. DoH/DoT and cache policy are not implemented yet. |
 | Hot user patching | Rejected | Requires runtime user table update without full core reload. |
 | Realtime integration | Rejected | Belongs first in `kelinode-rs` runtime control. |
 | Production packaging | Rejected | Release profile exists, but artifacts/signing/install flow are not complete. |
