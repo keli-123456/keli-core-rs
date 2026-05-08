@@ -8,7 +8,7 @@ pub enum Protocol {
     Vmess,
     Vless,
     Trojan,
-    #[serde(rename = "hysteria2")]
+    #[serde(rename = "hysteria2", alias = "hysteria")]
     Hysteria2,
     Tuic,
     #[serde(rename = "anytls")]

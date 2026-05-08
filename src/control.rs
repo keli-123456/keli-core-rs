@@ -230,15 +230,15 @@ mod tests {
     }
 
     #[test]
-    fn apply_config_reports_unimplemented_protocol_errors() {
+    fn apply_config_reports_sidecar_protocol_errors() {
         let mut controller = CoreController::new();
 
         let response = controller.handle(CoreCommand::ApplyConfig {
-            config: config(Protocol::Hysteria2),
+            config: config(Protocol::Naive),
         });
 
         match response {
-            CoreResponse::Error { message } => assert!(message.contains("not implemented")),
+            CoreResponse::Error { message } => assert!(message.contains("external sidecar")),
             response => panic!("unexpected response: {response:?}"),
         }
     }

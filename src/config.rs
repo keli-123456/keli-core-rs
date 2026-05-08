@@ -263,6 +263,22 @@ impl InboundConfig {
                 )));
             }
         }
+        if self.protocol == Protocol::Hysteria2 {
+            let network = self.transport.network.trim();
+            if !matches!(network, "hysteria" | "hysteria2") {
+                return Err(ValidationError::new(format!(
+                    "{} hysteria2 currently requires hysteria transport",
+                    self.tag
+                )));
+            }
+            validate_quic_tls_config("hysteria2", &self.tag, self.tls.as_ref())?;
+            if self.users.is_empty() {
+                return Err(ValidationError::new(format!(
+                    "{} hysteria2 requires at least one user",
+                    self.tag
+                )));
+            }
+        }
 
         Ok(())
     }

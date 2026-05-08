@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::anytls::{AnyTlsServer, AnyTlsServerConfig};
 use crate::config::{CoreConfig, InboundConfig, ValidationError};
 use crate::http_proxy::{HttpProxyServer, HttpProxyServerConfig};
+use crate::hysteria2::{Hysteria2Server, Hysteria2ServerConfig};
 use crate::limits::{UserBandwidthLimiters, UserSessionTracker};
 use crate::protocol::Protocol;
 use crate::shadowsocks::{ShadowsocksServer, ShadowsocksServerConfig};
@@ -132,6 +133,13 @@ impl CoreService {
                     bandwidth.clone(),
                 )?,
                 Protocol::Tuic => start_tuic_listener(
+                    &inbound,
+                    config.routes.clone(),
+                    traffic.clone(),
+                    sessions.clone(),
+                    bandwidth.clone(),
+                )?,
+                Protocol::Hysteria2 => start_hysteria2_listener(
                     &inbound,
                     config.routes.clone(),
                     traffic.clone(),
@@ -279,6 +287,78 @@ fn start_vmess_listener(
         status: ListenerStatus {
             tag: inbound.tag.clone(),
             protocol: Protocol::Vmess,
+            local_addr,
+        },
+        stop,
+        workers,
+        join: Some(join),
+    })
+}
+
+fn start_hysteria2_listener(
+    inbound: &InboundConfig,
+    routes: Vec<crate::RouteRule>,
+    traffic: Arc<Mutex<TrafficRegistry>>,
+    sessions: UserSessionTracker,
+    bandwidth: UserBandwidthLimiters,
+) -> Result<ListenerHandle, CoreServiceError> {
+    let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
+        CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        }
+    })?;
+    let tls = inbound.tls.as_ref().ok_or_else(|| CoreServiceError::Bind {
+        tag: inbound.tag.clone(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, "hysteria2 requires tls config"),
+    })?;
+    let server = Hysteria2Server::with_shared_limits(
+        Hysteria2ServerConfig {
+            node_tag: inbound.tag.clone(),
+            listen,
+            users: inbound.users.clone(),
+            routes,
+            cert_file: tls.cert_file.clone().unwrap_or_default(),
+            key_file: tls.key_file.clone().unwrap_or_default(),
+            alpn: tls.alpn.clone(),
+            connect_timeout: Duration::from_secs(10),
+        },
+        traffic,
+        sessions,
+        bandwidth,
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+    let endpoint = {
+        let _guard = runtime.enter();
+        server.bind().map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?
+    };
+    let local_addr = endpoint
+        .local_addr()
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = stop.clone();
+    let workers = Arc::new(Mutex::new(Vec::new()));
+    let join = thread::spawn(move || {
+        runtime.block_on(server.run(endpoint, stop_for_thread));
+    });
+
+    Ok(ListenerHandle {
+        status: ListenerStatus {
+            tag: inbound.tag.clone(),
+            protocol: Protocol::Hysteria2,
             local_addr,
         },
         stop,
@@ -1036,13 +1116,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unimplemented_core_protocols() {
+    fn rejects_external_sidecar_protocols() {
         let mut config = config(free_port());
-        config.inbounds[0].protocol = Protocol::Hysteria2;
+        config.inbounds[0].protocol = Protocol::Naive;
 
-        let error = CoreService::start(config).expect_err("hysteria2 should not start yet");
+        let error = CoreService::start(config).expect_err("naive should not start in core");
 
-        assert!(error.to_string().contains("not implemented"));
+        assert!(error.to_string().contains("external sidecar"));
     }
 
     #[test]
