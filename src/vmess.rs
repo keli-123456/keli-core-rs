@@ -30,7 +30,7 @@ use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 use crate::websocket::{accept_websocket, accept_websocket_tls};
 use crate::{
-    connect_tcp_outbound, outbound_udp_target, route_protocol_labels, RouteDecision, RouteMatcher,
+    connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
 };
 
 const VERSION: u8 = 0x01;
@@ -672,9 +672,9 @@ impl VmessServer {
         let decision = self
             .router
             .decide_target(&target.host, target.port, &protocol_labels);
-        let target = match &decision {
-            RouteDecision::Direct => target.clone(),
-            RouteDecision::Outbound(outbound) => outbound_udp_target(outbound, target)?,
+        let outbound = match &decision {
+            RouteDecision::Direct => None,
+            RouteDecision::Outbound(outbound) => Some(outbound),
             RouteDecision::Block => return Ok((0, None)),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(
@@ -686,6 +686,21 @@ impl VmessServer {
 
         if let Some(limiter) = bandwidth {
             limiter.wait_for(payload.len());
+        }
+
+        if let Some(outbound) = outbound {
+            return match send_udp_outbound(outbound, target, payload, self.config.connect_timeout) {
+                Ok((_, response)) => Ok((payload.len() as u64, Some(response))),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    Ok((payload.len() as u64, None))
+                }
+                Err(error) => Err(error),
+            };
         }
 
         let remote_addr = resolve_udp_target(&target)?;

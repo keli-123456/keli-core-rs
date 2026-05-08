@@ -73,7 +73,7 @@ keliboard -> kelinode-rs -> keli-core-rs
 | Per-user speed limit | Code path | Enforced by shared bandwidth limiter for native listeners. |
 | Direct outbound | Code path | Built-in direct egress plus freedom route outbounds. |
 | Block routing | Code path | Exact/wildcard/suffix, `domain:`/`full:`/`keyword:`, `regexp:`, `geosite:`, numeric IP/CIDR, `geoip:`, port/range, `network:`, and `protocol:` matching. |
-| Custom outbound routing | Partial | Freedom outbounds render and execute, including optional `address`/`port` redirects. SOCKS5 and HTTP outbounds render and execute for TCP routes, including username/password; UDP through non-freedom outbounds remains rejected. |
+| Custom outbound routing | Partial | Freedom outbounds render and execute, including optional `address`/`port` redirects. SOCKS5 and HTTP outbounds render and execute for TCP routes, including username/password. SOCKS5 outbounds also execute UDP routes through UDP ASSOCIATE; HTTP UDP remains rejected. |
 | DNS execution | Rejected | `kelinode-rs` must not render DNS routes into native core until implemented. |
 | Hot user patching | Rejected | Requires runtime user table update without full core reload. |
 | Realtime integration | Rejected | Belongs first in `kelinode-rs` runtime control. |

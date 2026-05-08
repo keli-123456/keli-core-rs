@@ -1,5 +1,5 @@
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -36,6 +36,41 @@ pub fn outbound_udp_target(
     }
 }
 
+pub fn send_udp_outbound(
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    payload: &[u8],
+    timeout: Duration,
+) -> io::Result<(SocketAddr, Vec<u8>)> {
+    match outbound.protocol.trim().to_ascii_lowercase().as_str() {
+        "freedom" => send_direct_udp(&freedom_target(outbound, target), payload, timeout),
+        "socks" | "socks5" => send_socks5_udp(outbound, target, payload, timeout),
+        protocol => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("outbound protocol {protocol} does not support udp in keli-core-rs yet"),
+        )),
+    }
+}
+
+pub async fn send_udp_outbound_tokio(
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    payload: &[u8],
+    timeout: Duration,
+) -> io::Result<(SocketAddr, Vec<u8>)> {
+    let outbound = outbound.clone();
+    let target = target.clone();
+    let payload = payload.to_vec();
+    tokio::task::spawn_blocking(move || send_udp_outbound(&outbound, &target, &payload, timeout))
+        .await
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("outbound udp task failed: {error}"),
+            )
+        })?
+}
+
 pub async fn connect_tcp_outbound_tokio(
     outbound: &OutboundConfig,
     target: &SocksTarget,
@@ -54,6 +89,22 @@ pub async fn connect_tcp_outbound_tokio(
             })??;
     stream.set_nonblocking(true)?;
     tokio::net::TcpStream::from_std(stream)
+}
+
+fn send_direct_udp(
+    target: &SocksTarget,
+    payload: &[u8],
+    timeout: Duration,
+) -> io::Result<(SocketAddr, Vec<u8>)> {
+    let remote_addr = resolve_socket_addr(target)?;
+    let udp = UdpSocket::bind(udp_bind_addr_for_remote(remote_addr))?;
+    udp.set_read_timeout(Some(timeout))?;
+    udp.set_write_timeout(Some(timeout))?;
+    udp.send_to(payload, remote_addr)?;
+    let mut response = vec![0u8; 65_535];
+    let (read, source) = udp.recv_from(&mut response)?;
+    response.truncate(read);
+    Ok((source, response))
 }
 
 fn freedom_target(outbound: &OutboundConfig, target: &SocksTarget) -> SocksTarget {
@@ -172,6 +223,69 @@ fn connect_socks5(
     Ok(stream)
 }
 
+fn send_socks5_udp(
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    payload: &[u8],
+    timeout: Duration,
+) -> io::Result<(SocketAddr, Vec<u8>)> {
+    let mut control = connect_proxy(outbound, timeout)?;
+    negotiate_socks5(&mut control, outbound)?;
+
+    let mut request = vec![0x05, 0x03, 0x00];
+    write_socks5_address(&mut request, "0.0.0.0")?;
+    request.extend_from_slice(&0u16.to_be_bytes());
+    control.write_all(&request)?;
+
+    let relay = read_socks5_reply_target(&mut control)?;
+    let relay = relay_socket_addr(outbound, relay)?;
+    let udp = UdpSocket::bind(udp_bind_addr_for_remote(relay))?;
+    udp.set_read_timeout(Some(timeout))?;
+    udp.set_write_timeout(Some(timeout))?;
+
+    let request = encode_socks5_udp_packet(target, payload)?;
+    udp.send_to(&request, relay)?;
+    let mut response = vec![0u8; 65_535];
+    let (read, _) = udp.recv_from(&mut response)?;
+    let (source, payload) = parse_socks5_udp_packet(&response[..read])?;
+    let source = resolve_socket_addr(&source)?;
+    Ok((source, payload))
+}
+
+fn negotiate_socks5(stream: &mut TcpStream, outbound: &OutboundConfig) -> io::Result<()> {
+    let auth = outbound
+        .username
+        .as_deref()
+        .or(outbound.password.as_deref());
+    let methods = if auth.is_some() {
+        [0x05, 0x02, 0x00, 0x02].as_slice()
+    } else {
+        [0x05, 0x01, 0x00].as_slice()
+    };
+    stream.write_all(methods)?;
+
+    let mut response = [0u8; 2];
+    stream.read_exact(&mut response)?;
+    if response[0] != 0x05 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid socks5 outbound version",
+        ));
+    }
+    match response[1] {
+        0x00 => Ok(()),
+        0x02 => authenticate_socks5(stream, outbound),
+        0xff => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socks5 outbound rejected authentication methods",
+        )),
+        method => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported socks5 outbound auth method {method}"),
+        )),
+    }
+}
+
 fn authenticate_socks5(stream: &mut TcpStream, outbound: &OutboundConfig) -> io::Result<()> {
     let username = outbound.username.as_deref().unwrap_or_default().as_bytes();
     let password = outbound.password.as_deref().unwrap_or_default().as_bytes();
@@ -247,6 +361,162 @@ fn drain_socks5_bound_address(stream: &mut TcpStream, atyp: u8) -> io::Result<()
     }
 }
 
+fn read_socks5_reply_target(stream: &mut TcpStream) -> io::Result<SocksTarget> {
+    let mut head = [0u8; 4];
+    stream.read_exact(&mut head)?;
+    if head[0] != 0x05 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid socks5 outbound response version",
+        ));
+    }
+    if head[1] != 0x00 {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("socks5 outbound request failed with reply {}", head[1]),
+        ));
+    }
+    read_socks5_target_body(stream, head[3])
+}
+
+fn read_socks5_target_body(stream: &mut TcpStream, atyp: u8) -> io::Result<SocksTarget> {
+    let host = match atyp {
+        0x01 => {
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes)?;
+            Ipv4Addr::from(bytes).to_string()
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len)?;
+            let mut bytes = vec![0u8; usize::from(len[0])];
+            stream.read_exact(&mut bytes)?;
+            String::from_utf8(bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid socks5 domain"))?
+        }
+        0x04 => {
+            let mut bytes = [0u8; 16];
+            stream.read_exact(&mut bytes)?;
+            Ipv6Addr::from(bytes).to_string()
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid socks5 outbound address type",
+            ));
+        }
+    };
+    let mut port = [0u8; 2];
+    stream.read_exact(&mut port)?;
+    Ok(SocksTarget {
+        host,
+        port: u16::from_be_bytes(port),
+    })
+}
+
+fn encode_socks5_udp_packet(target: &SocksTarget, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(10 + payload.len());
+    output.extend_from_slice(&[0, 0, 0]);
+    write_socks5_address(&mut output, &target.host)?;
+    output.extend_from_slice(&target.port.to_be_bytes());
+    output.extend_from_slice(payload);
+    Ok(output)
+}
+
+fn parse_socks5_udp_packet(input: &[u8]) -> io::Result<(SocksTarget, Vec<u8>)> {
+    if input.len() < 4 || input[0] != 0 || input[1] != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid socks5 udp response header",
+        ));
+    }
+    if input[2] != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "fragmented socks5 udp responses are not supported",
+        ));
+    }
+    let mut cursor = io::Cursor::new(&input[4..]);
+    let source = read_socks5_target_body_from_read(&mut cursor, input[3])?;
+    let offset = 4 + usize::try_from(cursor.position()).unwrap_or(usize::MAX);
+    if offset > input.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated socks5 udp response",
+        ));
+    }
+    Ok((source, input[offset..].to_vec()))
+}
+
+fn read_socks5_target_body_from_read<R: Read>(reader: &mut R, atyp: u8) -> io::Result<SocksTarget> {
+    let host = match atyp {
+        0x01 => {
+            let mut bytes = [0u8; 4];
+            reader.read_exact(&mut bytes)?;
+            Ipv4Addr::from(bytes).to_string()
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            reader.read_exact(&mut len)?;
+            let mut bytes = vec![0u8; usize::from(len[0])];
+            reader.read_exact(&mut bytes)?;
+            String::from_utf8(bytes).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid socks5 udp domain")
+            })?
+        }
+        0x04 => {
+            let mut bytes = [0u8; 16];
+            reader.read_exact(&mut bytes)?;
+            Ipv6Addr::from(bytes).to_string()
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid socks5 udp address type",
+            ));
+        }
+    };
+    let mut port = [0u8; 2];
+    reader.read_exact(&mut port)?;
+    Ok(SocksTarget {
+        host,
+        port: u16::from_be_bytes(port),
+    })
+}
+
+fn relay_socket_addr(outbound: &OutboundConfig, relay: SocksTarget) -> io::Result<SocketAddr> {
+    let host = relay
+        .host
+        .parse::<IpAddr>()
+        .ok()
+        .filter(|ip| !ip.is_unspecified())
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| outbound.address.clone().unwrap_or(relay.host));
+    resolve_socket_addr(&SocksTarget {
+        host,
+        port: relay.port,
+    })
+}
+
+fn resolve_socket_addr(target: &SocksTarget) -> io::Result<SocketAddr> {
+    (target.host.as_str(), target.port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "target did not resolve to any socket address",
+            )
+        })
+}
+
+fn udp_bind_addr_for_remote(remote: SocketAddr) -> SocketAddr {
+    match remote {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    }
+}
+
 fn connect_http(
     outbound: &OutboundConfig,
     target: &SocksTarget,
@@ -315,12 +585,12 @@ fn target_authority(host: &str, port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, UdpSocket};
     use std::thread;
     use std::time::Duration;
 
     use crate::config::OutboundConfig;
-    use crate::outbound::connect_tcp_outbound;
+    use crate::outbound::{connect_tcp_outbound, send_udp_outbound};
     use crate::socks5::SocksTarget;
 
     #[test]
@@ -408,6 +678,65 @@ mod tests {
         let mut payload = [0u8; 4];
         stream.read_exact(&mut payload).expect("payload");
         assert_eq!(&payload, b"pong");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn sends_udp_through_socks5_outbound() {
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("bind relay");
+        relay
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("relay timeout");
+        let relay_addr = relay.local_addr().expect("relay addr");
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let server = thread::spawn(move || {
+            let (mut control, _) = proxy.accept().expect("accept proxy");
+            let mut hello = [0u8; 3];
+            control.read_exact(&mut hello).expect("hello");
+            assert_eq!(hello, [0x05, 0x01, 0x00]);
+            control.write_all(&[0x05, 0x00]).expect("method");
+            let mut associate = [0u8; 10];
+            control.read_exact(&mut associate).expect("associate");
+            assert_eq!(associate, [0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            let mut response = vec![0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1];
+            response.extend_from_slice(&relay_addr.port().to_be_bytes());
+            control.write_all(&response).expect("associate ok");
+
+            let mut packet = [0u8; 512];
+            let (read, client_addr) = relay.recv_from(&mut packet).expect("relay recv");
+            assert_eq!(&packet[..5], &[0, 0, 0, 0x03, 11]);
+            assert_eq!(&packet[5..16], b"example.com");
+            assert_eq!(u16::from_be_bytes([packet[16], packet[17]]), 443);
+            assert_eq!(&packet[18..read], b"ping");
+
+            let mut udp_response = vec![0, 0, 0, 0x01, 127, 0, 0, 1];
+            udp_response.extend_from_slice(&443u16.to_be_bytes());
+            udp_response.extend_from_slice(b"pong");
+            relay
+                .send_to(&udp_response, client_addr)
+                .expect("relay response");
+        });
+
+        let outbound = OutboundConfig {
+            tag: "socks-out".to_string(),
+            protocol: "socks".to_string(),
+            address: Some(proxy_addr.ip().to_string()),
+            port: Some(proxy_addr.port()),
+            username: None,
+            password: None,
+        };
+        let target = SocksTarget {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+        let (source, payload) =
+            send_udp_outbound(&outbound, &target, b"ping", Duration::from_secs(2))
+                .expect("udp outbound");
+
+        assert_eq!(source.ip().to_string(), "127.0.0.1");
+        assert_eq!(source.port(), 443);
+        assert_eq!(payload, b"pong");
         server.join().expect("server");
     }
 }

@@ -42,7 +42,10 @@ pub use limits::{
     BandwidthLimiter, DeviceLimitExceeded, UserBandwidthLimiters, UserSessionGuard,
     UserSessionTracker,
 };
-pub use outbound::{connect_tcp_outbound, connect_tcp_outbound_tokio, outbound_udp_target};
+pub use outbound::{
+    connect_tcp_outbound, connect_tcp_outbound_tokio, outbound_udp_target, send_udp_outbound,
+    send_udp_outbound_tokio,
+};
 pub use protocol::{Protocol, ProtocolPlacement};
 pub use routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 pub use runtime::{CorePlan, CoreStatus, ReloadDecision, RuntimeState};

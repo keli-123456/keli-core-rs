@@ -20,7 +20,7 @@ use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
-use crate::{connect_tcp_outbound_tokio, outbound_udp_target};
+use crate::{connect_tcp_outbound_tokio, send_udp_outbound_tokio};
 
 const TCP_REQUEST_ID: u64 = 0x401;
 const RESPONSE_OK: u8 = 0x00;
@@ -409,9 +409,9 @@ impl Hysteria2Server {
         let decision =
             self.router
                 .decide_target(&message.target.host, message.target.port, &protocol_labels);
-        let target = match &decision {
-            RouteDecision::Direct => message.target.clone(),
-            RouteDecision::Outbound(outbound) => outbound_udp_target(outbound, &message.target)?,
+        let outbound = match &decision {
+            RouteDecision::Direct => None,
+            RouteDecision::Outbound(outbound) => Some(outbound),
             RouteDecision::Block => return Ok(()),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(
@@ -421,6 +421,69 @@ impl Hysteria2Server {
             }
         };
 
+        if let Some(outbound) = outbound {
+            bandwidth.wait_upload(message.data.len());
+            match send_udp_outbound_tokio(
+                outbound,
+                &message.target,
+                &message.data,
+                self.config.connect_timeout,
+            )
+            .await
+            {
+                Ok((source, response)) => {
+                    bandwidth.wait_download(response.len());
+                    let address = format_socket_addr(&source);
+                    let datagram = encode_udp_datagram(
+                        message.session_id,
+                        message.packet_id,
+                        0,
+                        1,
+                        &address,
+                        &response,
+                    )?;
+                    if let Some(max_size) = connection.max_datagram_size() {
+                        if datagram.len() <= max_size {
+                            connection
+                                .send_datagram_wait(Bytes::from(datagram))
+                                .await
+                                .map_err(io_other)?;
+                        }
+                    }
+                    self.traffic
+                        .lock()
+                        .expect("traffic registry lock poisoned")
+                        .add_with_ip(
+                            self.config.node_tag.clone(),
+                            user_uuid.to_string(),
+                            message.data.len() as u64,
+                            response.len() as u64,
+                            Some(client_ip),
+                        );
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    self.traffic
+                        .lock()
+                        .expect("traffic registry lock poisoned")
+                        .add_with_ip(
+                            self.config.node_tag.clone(),
+                            user_uuid.to_string(),
+                            message.data.len() as u64,
+                            0,
+                            Some(client_ip),
+                        );
+                }
+                Err(error) => return Err(error),
+            }
+            return Ok(());
+        }
+
+        let target = message.target.clone();
         let target_addr = resolve_udp_target(&target, self.config.connect_timeout).await?;
         let session = self
             .get_udp_session(

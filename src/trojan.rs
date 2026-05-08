@@ -19,7 +19,7 @@ use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 use crate::websocket::{accept_websocket, accept_websocket_tls, relay_websocket_tls_stream};
 use crate::{
-    connect_tcp_outbound, outbound_udp_target, route_protocol_labels, RouteDecision, RouteMatcher,
+    connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
 };
 
 const COMMAND_TCP: u8 = 0x01;
@@ -527,9 +527,9 @@ impl TrojanServer {
         let decision = self
             .router
             .decide_target(&target.host, target.port, &protocol_labels);
-        let target = match &decision {
-            RouteDecision::Direct => target.clone(),
-            RouteDecision::Outbound(outbound) => outbound_udp_target(outbound, &target)?,
+        let outbound = match &decision {
+            RouteDecision::Direct => None,
+            RouteDecision::Outbound(outbound) => Some(outbound),
             RouteDecision::Block => return Ok((0, 0)),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(
@@ -541,6 +541,25 @@ impl TrojanServer {
 
         if let Some(limiter) = bandwidth {
             limiter.wait_for(payload.len());
+        }
+
+        if let Some(outbound) = outbound {
+            return match send_udp_outbound(outbound, target, payload, self.config.connect_timeout) {
+                Ok((source, response)) => {
+                    let packet = encode_trojan_udp_packet(source, &response);
+                    writer.write_all(&packet)?;
+                    Ok((payload.len() as u64, response.len() as u64))
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    Ok((payload.len() as u64, 0))
+                }
+                Err(error) => Err(error),
+            };
         }
 
         let remote_addr = resolve_udp_target(&target)?;

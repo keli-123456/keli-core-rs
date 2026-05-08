@@ -14,7 +14,7 @@ use crate::stream::relay_tcp_streams_limited;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 use crate::{
-    connect_tcp_outbound, outbound_udp_target, route_protocol_labels, RouteDecision, RouteMatcher,
+    connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
 };
 
 const SOCKS5_VERSION: u8 = 0x05;
@@ -381,9 +381,28 @@ impl Socks5Server {
                                 if let Some(limiter) = bandwidth.as_deref() {
                                     limiter.wait_for(payload.len());
                                 }
-                                let remote_target = outbound_udp_target(outbound, &target)?;
-                                let remote_addr = resolve_udp_target(&remote_target)?;
-                                udp.send_to(payload, remote_addr)?;
+                                match send_udp_outbound(
+                                    outbound,
+                                    &target,
+                                    payload,
+                                    self.config.connect_timeout,
+                                ) {
+                                    Ok((source, response_payload)) => {
+                                        if let Some(client_addr) = client_udp_addr {
+                                            let response =
+                                                encode_udp_response(source, &response_payload);
+                                            udp.send_to(&response, client_addr)?;
+                                            download = download
+                                                .saturating_add(response_payload.len() as u64);
+                                        }
+                                    }
+                                    Err(error)
+                                        if matches!(
+                                            error.kind(),
+                                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                                        ) => {}
+                                    Err(error) => return Err(error),
+                                }
                                 upload = upload.saturating_add(payload.len() as u64);
                             }
                             RouteDecision::Block => {}

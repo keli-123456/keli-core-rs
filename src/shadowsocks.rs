@@ -24,7 +24,7 @@ use crate::stream::copy_count_best_effort_limited;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 use crate::{
-    connect_tcp_outbound, outbound_udp_target, route_protocol_labels, RouteDecision, RouteMatcher,
+    connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
 };
 
 const ATYP_IPV4: u8 = 0x01;
@@ -205,6 +205,7 @@ impl ShadowsocksServer {
                     if let Ok(request) = self.read_udp_request(packet, method) {
                         self.handle_udp_request(
                             &udp,
+                            method,
                             source,
                             request,
                             &mut remotes,
@@ -310,6 +311,7 @@ impl ShadowsocksServer {
     fn handle_udp_request(
         &self,
         udp: &UdpSocket,
+        method: ShadowsocksMethod,
         client_addr: SocketAddr,
         request: ShadowsocksUdpRequest,
         remotes: &mut HashMap<SocketAddr, UdpClientContext>,
@@ -319,9 +321,9 @@ impl ShadowsocksServer {
         let decision =
             self.router
                 .decide_target(&request.target.host, request.target.port, &protocol_labels);
-        let target = match &decision {
-            RouteDecision::Direct => request.target.clone(),
-            RouteDecision::Outbound(outbound) => outbound_udp_target(outbound, &request.target)?,
+        let outbound = match &decision {
+            RouteDecision::Direct => None,
+            RouteDecision::Outbound(outbound) => Some(outbound),
             RouteDecision::Block => return Ok(()),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(
@@ -341,6 +343,46 @@ impl ShadowsocksServer {
         if let Some(limiter) = self.bandwidth.limiter_for(Some(&request.user)).as_deref() {
             limiter.wait_for(request.payload.len());
         }
+        if let Some(outbound) = outbound {
+            match send_udp_outbound(
+                outbound,
+                &request.target,
+                &request.payload,
+                self.config.connect_timeout,
+            ) {
+                Ok((source, response_payload)) => {
+                    let context = UdpClientContext {
+                        client_addr,
+                        user: request.user.clone(),
+                    };
+                    let response = encode_udp_packet(method, &context, source, &response_payload)?;
+                    udp.send_to(&response, client_addr)?;
+                    self.record_udp_traffic(
+                        &request.user.uuid,
+                        request.payload.len() as u64,
+                        response_payload.len() as u64,
+                        Some(client_addr.ip()),
+                    );
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    self.record_udp_traffic(
+                        &request.user.uuid,
+                        request.payload.len() as u64,
+                        0,
+                        Some(client_addr.ip()),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+            return Ok(());
+        }
+
+        let target = request.target.clone();
         let remote_addr = resolve_udp_target(&target)?;
         udp.send_to(&request.payload, remote_addr)?;
         remotes.insert(
@@ -1075,6 +1117,7 @@ mod tests {
         server
             .handle_udp_request(
                 &relay,
+                method,
                 "127.0.0.1:30001".parse().expect("client one"),
                 request,
                 &mut remotes,
@@ -1094,6 +1137,7 @@ mod tests {
         server
             .handle_udp_request(
                 &relay,
+                method,
                 "127.0.0.1:30002".parse().expect("client two"),
                 request,
                 &mut remotes,

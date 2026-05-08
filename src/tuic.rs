@@ -18,7 +18,7 @@ use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
-use crate::{connect_tcp_outbound_tokio, outbound_udp_target};
+use crate::{connect_tcp_outbound_tokio, send_udp_outbound_tokio};
 
 const VERSION: u8 = 0x05;
 const COMMAND_AUTHENTICATE: u8 = 0x00;
@@ -420,9 +420,9 @@ impl TuicServer {
         let decision = self
             .router
             .decide_target(&target.host, target.port, &protocol_labels);
-        let target = match &decision {
-            RouteDecision::Direct => target.clone(),
-            RouteDecision::Outbound(outbound) => outbound_udp_target(outbound, &target)?,
+        let outbound = match &decision {
+            RouteDecision::Direct => None,
+            RouteDecision::Outbound(outbound) => Some(outbound),
             RouteDecision::Block => return Ok(()),
             RouteDecision::UnsupportedOutbound(tag) => {
                 return Err(io::Error::new(
@@ -431,6 +431,78 @@ impl TuicServer {
                 ));
             }
         };
+
+        if let Some(outbound) = outbound {
+            if let Some(limiter) = bandwidth.as_deref() {
+                limiter.wait_for(packet.payload.len());
+            }
+            match send_udp_outbound_tokio(
+                outbound,
+                &target,
+                &packet.payload,
+                self.config.connect_timeout,
+            )
+            .await
+            {
+                Ok((source, response)) => {
+                    let response_target = socket_addr_to_target(&source);
+                    let command = encode_udp_packet(
+                        packet.assoc_id,
+                        packet.packet_id,
+                        1,
+                        0,
+                        Some(&response_target),
+                        &response,
+                    )?;
+                    match reply_mode {
+                        UdpReplyMode::Datagram => {
+                            if let Some(max_size) = connection.max_datagram_size() {
+                                if command.len() <= max_size {
+                                    connection
+                                        .send_datagram_wait(Bytes::from(command))
+                                        .await
+                                        .map_err(io_other)?;
+                                }
+                            }
+                        }
+                        UdpReplyMode::UniStream => {
+                            let mut send = connection.open_uni().await.map_err(io_other)?;
+                            send.write_all(&command).await.map_err(io_other)?;
+                            let _ = send.finish();
+                        }
+                    }
+                    self.traffic
+                        .lock()
+                        .expect("traffic registry lock poisoned")
+                        .add_with_ip(
+                            self.config.node_tag.clone(),
+                            user_uuid.to_string(),
+                            packet.payload.len() as u64,
+                            response.len() as u64,
+                            Some(client_ip),
+                        );
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    self.traffic
+                        .lock()
+                        .expect("traffic registry lock poisoned")
+                        .add_with_ip(
+                            self.config.node_tag.clone(),
+                            user_uuid.to_string(),
+                            packet.payload.len() as u64,
+                            0,
+                            Some(client_ip),
+                        );
+                }
+                Err(error) => return Err(error),
+            }
+            return Ok(());
+        }
 
         let target_addr = resolve_udp_target(&target, self.config.connect_timeout).await?;
         let session = self
