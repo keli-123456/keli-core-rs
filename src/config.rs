@@ -429,6 +429,9 @@ fn dest_has_explicit_port(dest: &str) -> bool {
             .and_then(|(_, port)| port.parse::<u16>().ok())
             .is_some();
     }
+    if dest.matches(':').count() > 1 {
+        return false;
+    }
     dest.rsplit_once(':')
         .and_then(|(_, port)| port.parse::<u16>().ok())
         .is_some()
@@ -745,6 +748,38 @@ mod tests {
         };
 
         inbound.validate().expect("vless reality config");
+    }
+
+    #[test]
+    fn validates_vless_reality_ipv6_dest_with_separate_port() {
+        let inbound = InboundConfig {
+            tag: "panel|vless|reality|1".to_string(),
+            protocol: Protocol::Vless,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![user()],
+            cipher: None,
+            flow: "xtls-rprx-vision".to_string(),
+            transport: TransportConfig::default(),
+            tls: Some(TlsConfig {
+                server_name: "www.example.com".to_string(),
+                cert_file: None,
+                key_file: None,
+                alpn: Vec::new(),
+                reject_unknown_sni: false,
+                reality: Some(RealityConfig {
+                    dest: "2607:f358:1a:e::d4d9:5831".to_string(),
+                    server_port: Some(443),
+                    private_key: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".to_string(),
+                    short_id: "6ba85179e30d4fc2".to_string(),
+                    xver: 0,
+                    mldsa65_seed: None,
+                }),
+            }),
+            sniffing: SniffingConfig::default(),
+        };
+
+        inbound.validate().expect("vless reality ipv6 dest");
     }
 
     #[test]

@@ -1,10 +1,10 @@
 use std::fmt;
 use std::io;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +18,10 @@ use crate::httpupgrade::{accept_httpupgrade, accept_httpupgrade_tls};
 use crate::hysteria2::{Hysteria2ObfsConfig, Hysteria2Server, Hysteria2ServerConfig};
 use crate::limits::{UserBandwidthLimiters, UserSessionTracker};
 use crate::protocol::Protocol;
+use crate::reality::{
+    decode_reality_private_key, decode_short_id, handle_reality_preface, RealityAuthConfig,
+    RealityGatewayConfig, RealityGatewayResult,
+};
 use crate::shadowsocks::{ShadowsocksServer, ShadowsocksServerConfig};
 use crate::socks5::{Socks5Server, Socks5ServerConfig};
 use crate::tls::TlsAcceptor;
@@ -890,10 +894,7 @@ fn start_vless_listener(
         .and_then(|tls| tls.reality.as_ref())
         .is_some()
     {
-        return Err(CoreServiceError::UnsupportedFeature {
-            tag: inbound.tag.clone(),
-            message: "vless reality handshake runtime is not wired yet".to_string(),
-        });
+        return start_vless_reality_listener(inbound, listen);
     }
     let listener = server.bind().map_err(|source| CoreServiceError::Bind {
         tag: inbound.tag.clone(),
@@ -1143,6 +1144,136 @@ fn start_http_listener(
     })
 }
 
+fn start_vless_reality_listener(
+    inbound: &InboundConfig,
+    listen: SocketAddr,
+) -> Result<ListenerHandle, CoreServiceError> {
+    let gateway = reality_gateway_config(inbound)?;
+    let listener = TcpListener::bind(listen).map_err(|source| CoreServiceError::Bind {
+        tag: inbound.tag.clone(),
+        source,
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = stop.clone();
+    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers_for_thread = workers.clone();
+    let join = thread::spawn(move || {
+        while !stop_for_thread.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let gateway = gateway.clone();
+                    let worker = thread::spawn(move || {
+                        let result = handle_reality_preface(stream, &gateway);
+                        if let Ok(RealityGatewayResult::Authenticated(_authenticated)) = result {
+                            // Full REALITY TLS handshake continuation is wired in the next stage.
+                        }
+                    });
+                    workers_for_thread
+                        .lock()
+                        .expect("worker list lock poisoned")
+                        .push(worker);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok(ListenerHandle {
+        status: ListenerStatus {
+            tag: inbound.tag.clone(),
+            protocol: Protocol::Vless,
+            local_addr,
+        },
+        stop,
+        workers,
+        join: Some(join),
+    })
+}
+
+fn reality_gateway_config(
+    inbound: &InboundConfig,
+) -> Result<RealityGatewayConfig, CoreServiceError> {
+    let tls = inbound.tls.as_ref().ok_or_else(|| CoreServiceError::Bind {
+        tag: inbound.tag.clone(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, "vless reality requires tls"),
+    })?;
+    let reality = tls.reality.as_ref().ok_or_else(|| CoreServiceError::Bind {
+        tag: inbound.tag.clone(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "vless reality requires reality config",
+        ),
+    })?;
+    let private_key = decode_reality_private_key(&reality.private_key).map_err(|error| {
+        CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source: io::Error::new(io::ErrorKind::InvalidInput, error),
+        }
+    })?;
+    let short_id = decode_short_id(&reality.short_id).map_err(|error| CoreServiceError::Bind {
+        tag: inbound.tag.clone(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, error),
+    })?;
+    let server_name = tls.server_name.trim().to_string();
+    let dest = reality_dest(&reality.dest, reality.server_port);
+
+    Ok(RealityGatewayConfig {
+        auth: RealityAuthConfig {
+            private_key,
+            server_names: std::collections::HashSet::from([server_name]),
+            short_ids: std::collections::HashSet::from([short_id]),
+            max_time_diff: Some(Duration::from_secs(30)),
+            now: SystemTime::now(),
+        },
+        dest,
+        connect_timeout: Duration::from_secs(10),
+    })
+}
+
+fn reality_dest(dest: &str, server_port: Option<u16>) -> String {
+    let dest = dest.trim();
+    if has_explicit_port(dest) {
+        return dest.to_string();
+    }
+    match (dest.contains(':'), server_port) {
+        (true, Some(port)) => format!("[{dest}]:{port}"),
+        (_, Some(port)) => format!("{dest}:{port}"),
+        _ => dest.to_string(),
+    }
+}
+
+fn has_explicit_port(dest: &str) -> bool {
+    let dest = dest.trim();
+    if let Some(rest) = dest.strip_prefix('[') {
+        return rest
+            .split_once("]:")
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .is_some();
+    }
+    if dest.matches(':').count() > 1 {
+        return false;
+    }
+    dest.rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .is_some()
+}
+
 fn join_workers(workers: &Arc<Mutex<Vec<JoinHandle<()>>>>) {
     loop {
         let worker = workers.lock().expect("worker list lock poisoned").pop();
@@ -1198,7 +1329,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1262,6 +1393,14 @@ mod tests {
     }
 
     fn vless_reality_config(port: u16) -> CoreConfig {
+        vless_reality_config_with_dest(port, "www.example.com:443".to_string(), None)
+    }
+
+    fn vless_reality_config_with_dest(
+        port: u16,
+        dest: String,
+        server_port: Option<u16>,
+    ) -> CoreConfig {
         CoreConfig {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
@@ -1281,8 +1420,8 @@ mod tests {
                     alpn: Vec::new(),
                     reject_unknown_sni: false,
                     reality: Some(RealityConfig {
-                        dest: "www.example.com:443".to_string(),
-                        server_port: None,
+                        dest,
+                        server_port,
                         private_key: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".to_string(),
                         short_id: "6ba85179e30d4fc2".to_string(),
                         xver: 0,
@@ -1536,12 +1675,50 @@ mod tests {
     }
 
     #[test]
-    fn reports_vless_reality_runtime_as_not_wired_yet() {
-        let config = vless_reality_config(free_port());
+    fn starts_vless_reality_listener_from_core_config() {
+        let mut service =
+            CoreService::start(vless_reality_config(free_port())).expect("service start");
+        let listeners = service.listeners();
 
-        let error = CoreService::start(config).expect_err("vless reality runtime should fail");
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].protocol, Protocol::Vless);
+        service.stop();
+    }
 
-        assert!(error.to_string().contains("reality handshake runtime"));
+    #[test]
+    fn vless_reality_listener_falls_back_to_dest_for_invalid_preface() {
+        let fallback = TcpListener::bind("127.0.0.1:0").expect("fallback bind");
+        let fallback_addr = fallback.local_addr().expect("fallback addr");
+        let (captured_tx, captured_rx) = mpsc::channel();
+        let fallback_thread = thread::spawn(move || {
+            let (mut stream, _) = fallback.accept().expect("fallback accept");
+            let mut captured = Vec::new();
+            stream.read_to_end(&mut captured).expect("fallback read");
+            captured_tx.send(captured).expect("captured send");
+            stream.write_all(b"fallback-ok").expect("fallback write");
+        });
+
+        let mut service = CoreService::start(vless_reality_config_with_dest(
+            free_port(),
+            fallback_addr.ip().to_string(),
+            Some(fallback_addr.port()),
+        ))
+        .expect("service start");
+        let reality_addr = service.listeners()[0].local_addr;
+
+        let mut client = TcpStream::connect(reality_addr).expect("client connect");
+        client.write_all(b"hello").expect("write preface");
+        client.write_all(b"-world").expect("write payload");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown write");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).expect("read response");
+
+        assert_eq!(response, b"fallback-ok");
+        service.stop();
+        fallback_thread.join().expect("fallback thread");
+        assert_eq!(captured_rx.recv().expect("captured"), b"hello-world");
     }
 
     #[test]
