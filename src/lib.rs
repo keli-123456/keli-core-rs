@@ -9,6 +9,7 @@ pub mod httpupgrade;
 pub mod hysteria2;
 pub mod limits;
 pub mod protocol;
+pub mod reality;
 pub mod routing;
 pub mod runtime;
 mod salamander;
