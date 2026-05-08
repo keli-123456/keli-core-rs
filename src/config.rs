@@ -418,6 +418,15 @@ fn validate_reality_tls_config(
             "{tag} vless reality xver must be 0, 1 or 2"
         )));
     }
+    if reality
+        .mldsa65_seed
+        .as_deref()
+        .is_some_and(|seed| !seed.trim().is_empty())
+    {
+        return Err(ValidationError::new(format!(
+            "{tag} vless reality mldsa65_seed is not implemented in keli-core-rs yet"
+        )));
+    }
     Ok(())
 }
 
@@ -855,6 +864,44 @@ mod tests {
             .expect_err("vless reality key should fail");
 
         assert!(error.to_string().contains("private_key is invalid"));
+    }
+
+    #[test]
+    fn rejects_unimplemented_vless_reality_mldsa_seed() {
+        let inbound = InboundConfig {
+            tag: "panel|vless|reality|1".to_string(),
+            protocol: Protocol::Vless,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![user()],
+            cipher: None,
+            flow: String::new(),
+            transport: TransportConfig::default(),
+            tls: Some(TlsConfig {
+                server_name: "www.example.com".to_string(),
+                cert_file: None,
+                key_file: None,
+                alpn: Vec::new(),
+                reject_unknown_sni: false,
+                reality: Some(RealityConfig {
+                    dest: "www.example.com:443".to_string(),
+                    server_port: None,
+                    private_key: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".to_string(),
+                    short_id: "6ba85179e30d4fc2".to_string(),
+                    xver: 0,
+                    mldsa65_seed: Some("seed".to_string()),
+                }),
+            }),
+            sniffing: SniffingConfig::default(),
+        };
+
+        let error = inbound
+            .validate()
+            .expect_err("vless reality mldsa seed should fail");
+
+        assert!(error
+            .to_string()
+            .contains("mldsa65_seed is not implemented"));
     }
 
     #[test]
