@@ -685,7 +685,10 @@ fn connect_dest(dest: &str, timeout: Duration) -> io::Result<TcpStream> {
     let mut last_error = None;
     for addr in addrs {
         match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
             Err(error) => last_error = Some(error),
         }
     }

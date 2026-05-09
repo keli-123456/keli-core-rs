@@ -20,7 +20,10 @@ pub fn connect_tcp(host: &str, port: u16, timeout: Duration) -> io::Result<TcpSt
     let mut last_error = None;
     for addr in addrs {
         match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
             Err(error) => last_error = Some(error),
         }
     }
@@ -41,7 +44,10 @@ pub async fn connect_tcp_tokio(
     let mut last_error = None;
     for addr in addrs {
         match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Ok(stream)) => {
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
             Ok(Err(error)) => last_error = Some(error),
             Err(_) => {
                 last_error = Some(io::Error::new(

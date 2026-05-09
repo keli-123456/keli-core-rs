@@ -1692,6 +1692,7 @@ where
                             }
                             if let Ok(stream) = stream.into_std() {
                                 let _ = stream.set_nonblocking(false);
+                                let _ = stream.set_nodelay(true);
                                 let handler = Arc::clone(&handler);
                                 spawn_connection_worker(&workers, move || handler(stream));
                             }
