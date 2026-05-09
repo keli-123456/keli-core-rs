@@ -1,7 +1,8 @@
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -20,8 +21,8 @@ pub struct NativeRelayHandle<T> {
 }
 
 struct NativeRelayPool {
-    sender: mpsc::Sender<NativeRelayJob>,
-    receiver: Arc<Mutex<mpsc::Receiver<NativeRelayJob>>>,
+    queue: Mutex<VecDeque<NativeRelayJob>>,
+    ready: Condvar,
     worker_count: AtomicUsize,
     idle_count: AtomicUsize,
     pending_count: AtomicUsize,
@@ -158,10 +159,9 @@ fn tcp_relay_blocking_threads() -> usize {
 
 impl NativeRelayPool {
     fn new() -> Self {
-        let (sender, receiver) = mpsc::channel();
         Self {
-            sender,
-            receiver: Arc::new(Mutex::new(receiver)),
+            queue: Mutex::new(VecDeque::new()),
+            ready: Condvar::new(),
             worker_count: AtomicUsize::new(0),
             idle_count: AtomicUsize::new(0),
             pending_count: AtomicUsize::new(0),
@@ -178,13 +178,11 @@ impl NativeRelayPool {
         }
 
         self.pending_count.fetch_add(1, Ordering::Relaxed);
-        if self.sender.send(job).is_err() {
-            self.pending_count.fetch_sub(1, Ordering::Relaxed);
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "native relay worker queue closed",
-            ));
+        {
+            let mut queue = self.queue.lock().expect("native relay queue lock poisoned");
+            queue.push_back(job);
         }
+        self.ready.notify_one();
         self.spawn_extra_worker_if_needed();
         Ok(())
     }
@@ -232,31 +230,35 @@ impl NativeRelayPool {
 
     fn run_worker(&'static self) {
         loop {
-            self.idle_count.fetch_add(1, Ordering::Relaxed);
-            let job = {
-                let receiver = self
-                    .receiver
-                    .lock()
-                    .expect("native relay queue lock poisoned");
-                receiver.recv_timeout(native_relay_idle_timeout())
+            let Some(job) = self.wait_for_job() else {
+                self.worker_count.fetch_sub(1, Ordering::AcqRel);
+                break;
             };
-            self.idle_count.fetch_sub(1, Ordering::Relaxed);
+            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            job();
+        }
+    }
 
-            match job {
-                Ok(job) => {
-                    self.pending_count.fetch_sub(1, Ordering::Relaxed);
-                    job();
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if self.pending_count.load(Ordering::Acquire) == 0 {
-                        self.worker_count.fetch_sub(1, Ordering::AcqRel);
-                        break;
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    self.worker_count.fetch_sub(1, Ordering::AcqRel);
-                    break;
-                }
+    fn wait_for_job(&'static self) -> Option<NativeRelayJob> {
+        let mut queue = self.queue.lock().expect("native relay queue lock poisoned");
+        loop {
+            if let Some(job) = queue.pop_front() {
+                return Some(job);
+            }
+
+            self.idle_count.fetch_add(1, Ordering::Relaxed);
+            let (next_queue, wait_result) = self
+                .ready
+                .wait_timeout(queue, native_relay_idle_timeout())
+                .expect("native relay queue lock poisoned");
+            self.idle_count.fetch_sub(1, Ordering::Relaxed);
+            queue = next_queue;
+
+            if wait_result.timed_out()
+                && queue.is_empty()
+                && self.pending_count.load(Ordering::Acquire) == 0
+            {
+                return None;
             }
         }
     }
@@ -382,5 +384,22 @@ mod tests {
         let error = join_native_blocking_relay::<()>(handle, "native relay panicked")
             .expect_err("panic should be reported");
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn native_relay_pool_handles_bursts() {
+        let handles = (0..64)
+            .map(|index| spawn_native_blocking_relay(move || index).expect("spawn native relay"))
+            .collect::<Vec<_>>();
+
+        let mut values = handles
+            .into_iter()
+            .map(|handle| {
+                join_native_blocking_relay(handle, "native relay panicked").expect("join")
+            })
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+
+        assert_eq!(values, (0..64).collect::<Vec<_>>());
     }
 }
