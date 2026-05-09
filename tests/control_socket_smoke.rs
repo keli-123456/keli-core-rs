@@ -111,6 +111,7 @@ fn config(port: u16, user_uuid: &str) -> CoreConfig {
             tag: "direct".to_string(),
             protocol: "freedom".to_string(),
             method: None,
+            alter_id: None,
             address: None,
             port: None,
             username: None,

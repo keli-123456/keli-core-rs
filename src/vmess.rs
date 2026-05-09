@@ -69,6 +69,8 @@ const RESPONSE_HEADER_PAYLOAD_KEY: &[u8] = b"AEAD Resp Header Key";
 const RESPONSE_HEADER_PAYLOAD_IV: &[u8] = b"AEAD Resp Header IV";
 const AUTHENTICATED_LENGTH_KEY: &[u8] = b"auth_len";
 const CMD_KEY_SALT: &[u8] = b"c48619fe-8f02-49e0-b9e9-edf763e17e21";
+const ALTER_ID_SALT: &[u8] = b"16167dc8-16b6-4e6d-b8bb-65dd68113a81";
+const ALTER_ID_RETRY_SALT: &[u8] = b"533eff8a-4113-4b10-b5ce-0f5d76b98cd2";
 const MAX_HEADER_LEN: usize = 4096;
 const MAX_CHUNK_SIZE: usize = 16 * 1024;
 const AUTH_ID_WINDOW_SECONDS: i64 = 120;
@@ -123,12 +125,26 @@ struct VmessRequest {
     response_header: u8,
     options: u8,
     security: VmessSecurity,
+    header_mode: VmessHeaderMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VmessCommand {
     Tcp,
     Udp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VmessHeaderMode {
+    Aead,
+    Legacy,
+}
+
+struct Aes128Cfb {
+    cipher: Aes128,
+    feedback: [u8; 16],
+    stream: [u8; 16],
+    offset: usize,
 }
 
 struct VmessUdpRelayState {
@@ -337,6 +353,7 @@ impl VmessServer {
             response_header: parsed.response_header,
             options: parsed.options,
             security: parsed.security,
+            header_mode: VmessHeaderMode::Aead,
         })
     }
 
@@ -2110,6 +2127,12 @@ fn write_vmess_request<W: Write>(
 ) -> io::Result<VmessRequest> {
     let uuid = vmess_outbound_user_id(outbound)?;
     let cmd_key = vmess_cmd_key(&uuid);
+    let alter_id = outbound.alter_id.unwrap_or(0);
+    let header_mode = if alter_id == 0 {
+        VmessHeaderMode::Aead
+    } else {
+        VmessHeaderMode::Legacy
+    };
     let request_body_key = random_array::<16>()?;
     let request_body_iv = random_array::<16>()?;
     let response_header = random_array::<1>()?[0];
@@ -2131,12 +2154,39 @@ fn write_vmess_request<W: Write>(
     let checksum = fnv1a(&header);
     header.extend_from_slice(&checksum.to_be_bytes());
 
-    let auth_id = create_auth_id(&cmd_key, unix_timestamp(), random_array::<4>()?);
-    let nonce = random_array::<8>()?;
-    writer.write_all(&seal_request_header(&cmd_key, &auth_id, &nonce, &header)?)?;
+    match header_mode {
+        VmessHeaderMode::Aead => {
+            let auth_id = create_auth_id(&cmd_key, unix_timestamp(), random_array::<4>()?);
+            let nonce = random_array::<8>()?;
+            writer.write_all(&seal_request_header(&cmd_key, &auth_id, &nonce, &header)?)?;
+        }
+        VmessHeaderMode::Legacy => {
+            let alter_ids = vmess_alter_ids(&uuid, alter_id);
+            let auth_uuid = alter_ids
+                .get(random_index(alter_ids.len())?)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "vmess alter_id requires at least one generated id",
+                    )
+                })?;
+            writer.write_all(&seal_legacy_request_header(
+                &cmd_key,
+                auth_uuid,
+                unix_timestamp(),
+                &header,
+            )?)?;
+        }
+    }
 
-    let response_body_key = first_16_sha256(&request_body_key);
-    let response_body_iv = first_16_sha256(&request_body_iv);
+    let response_body_key = match header_mode {
+        VmessHeaderMode::Aead => first_16_sha256(&request_body_key),
+        VmessHeaderMode::Legacy => md5_16(&request_body_key),
+    };
+    let response_body_iv = match header_mode {
+        VmessHeaderMode::Aead => first_16_sha256(&request_body_iv),
+        VmessHeaderMode::Legacy => md5_16(&request_body_iv),
+    };
     Ok(VmessRequest {
         command,
         user_key: format_uuid_compact(&uuid),
@@ -2155,6 +2205,7 @@ fn write_vmess_request<W: Write>(
         response_header,
         options,
         security,
+        header_mode,
     })
 }
 
@@ -2224,6 +2275,10 @@ fn seal_request_header(
 }
 
 fn read_vmess_response_header<R: Read>(reader: &mut R, request: &VmessRequest) -> io::Result<()> {
+    if request.header_mode == VmessHeaderMode::Legacy {
+        return read_legacy_vmess_response_header(reader, request);
+    }
+
     let mut len_cipher = [0u8; 18];
     reader.read_exact(&mut len_cipher)?;
     let len_key = kdf16(&request.response_body_key, &[RESPONSE_HEADER_LENGTH_KEY]);
@@ -2252,6 +2307,48 @@ fn read_vmess_response_header<R: Read>(reader: &mut R, request: &VmessRequest) -
             io::ErrorKind::InvalidData,
             "invalid vmess response header",
         ));
+    }
+    Ok(())
+}
+
+fn seal_legacy_request_header(
+    primary_cmd_key: &[u8; 16],
+    auth_uuid: &[u8; 16],
+    timestamp: i64,
+    header: &[u8],
+) -> io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(16 + header.len());
+    output.extend_from_slice(&vmess_legacy_auth_hash(auth_uuid, timestamp)?);
+    let mut encrypted_header = header.to_vec();
+    let iv = legacy_header_iv(timestamp);
+    Aes128Cfb::new(primary_cmd_key, &iv)?.encrypt(&mut encrypted_header);
+    output.extend_from_slice(&encrypted_header);
+    Ok(output)
+}
+
+fn read_legacy_vmess_response_header<R: Read>(
+    reader: &mut R,
+    request: &VmessRequest,
+) -> io::Result<()> {
+    let mut cipher = Aes128Cfb::new(&request.response_body_key, &request.response_body_iv)?;
+    let mut header = [0u8; 4];
+    reader.read_exact(&mut header)?;
+    cipher.decrypt(&mut header);
+    if header[0] != request.response_header {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid vmess legacy response header",
+        ));
+    }
+    let command_len = if header[2] == 0 {
+        0
+    } else {
+        usize::from(header[3])
+    };
+    if command_len > 0 {
+        let mut command = vec![0u8; command_len];
+        reader.read_exact(&mut command)?;
+        cipher.decrypt(&mut command);
     }
     Ok(())
 }
@@ -2637,6 +2734,96 @@ fn create_auth_id(cmd_key: &[u8; 16], timestamp: i64, random: [u8; 4]) -> [u8; 1
     block.as_slice().try_into().expect("auth id block")
 }
 
+fn vmess_alter_ids(primary: &[u8; 16], alter_id_count: u16) -> Vec<[u8; 16]> {
+    let mut ids = Vec::with_capacity(alter_id_count as usize);
+    let mut previous = *primary;
+    for _ in 0..alter_id_count {
+        let next = next_vmess_alter_id(&previous);
+        ids.push(next);
+        previous = next;
+    }
+    ids
+}
+
+fn next_vmess_alter_id(previous: &[u8; 16]) -> [u8; 16] {
+    let mut input = Vec::with_capacity(16 + ALTER_ID_SALT.len() + ALTER_ID_RETRY_SALT.len());
+    input.extend_from_slice(previous);
+    input.extend_from_slice(ALTER_ID_SALT);
+    loop {
+        let next: [u8; 16] = Md5::digest(&input).into();
+        if &next != previous {
+            return next;
+        }
+        input.extend_from_slice(ALTER_ID_RETRY_SALT);
+    }
+}
+
+fn random_index(len: usize) -> io::Result<usize> {
+    if len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "random index requires non-empty input",
+        ));
+    }
+    let bytes = random_array::<8>()?;
+    Ok((u64::from_be_bytes(bytes) as usize) % len)
+}
+
+fn vmess_legacy_auth_hash(auth_uuid: &[u8; 16], timestamp: i64) -> io::Result<[u8; 16]> {
+    let mut mac = <Hmac<Md5> as Mac>::new_from_slice(auth_uuid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid vmess legacy id"))?;
+    Mac::update(&mut mac, &(timestamp as u64).to_be_bytes());
+    Ok(mac.finalize().into_bytes().into())
+}
+
+fn legacy_header_iv(timestamp: i64) -> [u8; 16] {
+    let bytes = (timestamp as u64).to_be_bytes();
+    let mut input = [0u8; 32];
+    for chunk in input.chunks_exact_mut(8) {
+        chunk.copy_from_slice(&bytes);
+    }
+    Md5::digest(input).into()
+}
+
+fn md5_16(bytes: &[u8]) -> [u8; 16] {
+    Md5::digest(bytes).into()
+}
+
+impl Aes128Cfb {
+    fn new(key: &[u8; 16], iv: &[u8; 16]) -> io::Result<Self> {
+        let cipher = Aes128::new_from_slice(key)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid aes-128-cfb key"))?;
+        Ok(Self {
+            cipher,
+            feedback: *iv,
+            stream: [0u8; 16],
+            offset: 0,
+        })
+    }
+
+    fn encrypt(&mut self, bytes: &mut [u8]) {
+        self.apply(bytes, false);
+    }
+
+    fn decrypt(&mut self, bytes: &mut [u8]) {
+        self.apply(bytes, true);
+    }
+
+    fn apply(&mut self, bytes: &mut [u8], decrypt: bool) {
+        for byte in bytes {
+            if self.offset == 0 {
+                let mut block = aes::cipher::Block::<Aes128>::clone_from_slice(&self.feedback);
+                self.cipher.encrypt_block(&mut block);
+                self.stream.copy_from_slice(block.as_slice());
+            }
+            let input = *byte;
+            *byte ^= self.stream[self.offset];
+            self.feedback[self.offset] = if decrypt { input } else { *byte };
+            self.offset = (self.offset + 1) % self.feedback.len();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -2656,9 +2843,10 @@ mod tests {
     use super::{
         connect_vmess_tcp_outbound, create_auth_id, fnv1a, kdf, parse_uuid_bytes,
         send_vmess_udp_outbound, vmess_cmd_key, write_response_header, VmessBodyReader,
-        VmessBodyWriter, VmessCommand, VmessRequest, VmessSecurity, VmessServer, VmessServerConfig,
-        ATYP_IPV4, COMMAND_TCP, COMMAND_UDP, OPTION_AUTHENTICATED_LENGTH, OPTION_CHUNK_MASKING,
-        OPTION_CHUNK_STREAM, OPTION_GLOBAL_PADDING, SECURITY_AES128_GCM, VERSION,
+        VmessBodyWriter, VmessCommand, VmessHeaderMode, VmessRequest, VmessSecurity, VmessServer,
+        VmessServerConfig, ATYP_IPV4, COMMAND_TCP, COMMAND_UDP, OPTION_AUTHENTICATED_LENGTH,
+        OPTION_CHUNK_MASKING, OPTION_CHUNK_STREAM, OPTION_GLOBAL_PADDING, SECURITY_AES128_GCM,
+        VERSION,
     };
     use crate::config::{OutboundConfig, OutboundTransportConfig};
     use crate::grpc::{run_grpc_listener, GrpcStreamHandler};
@@ -2721,6 +2909,7 @@ mod tests {
             tag: "vmess-out".to_string(),
             protocol: "vmess".to_string(),
             method: Some("aes-128-gcm".to_string()),
+            alter_id: None,
             address: Some(proxy_addr.ip().to_string()),
             port: Some(proxy_addr.port()),
             username: Some("11111111-1111-1111-1111-111111111111".to_string()),
@@ -2835,6 +3024,7 @@ mod tests {
             response_header,
             options,
             security,
+            header_mode: VmessHeaderMode::Aead,
         };
 
         let mut output = encrypted_header;
@@ -2912,6 +3102,65 @@ mod tests {
         let payload = super::aes_gcm_open(&payload_key, &payload_nonce, &payload_cipher, &[])
             .expect("response payload open");
         assert_eq!(payload, [request.response_header, 0, 0, 0]);
+    }
+
+    fn read_legacy_vmess_request_header<R: Read>(
+        stream: &mut R,
+        primary_uuid: &str,
+        alter_id_count: u16,
+    ) -> VmessRequest {
+        let mut auth = [0u8; 16];
+        stream.read_exact(&mut auth).expect("legacy auth");
+        let uuid = parse_uuid_bytes(primary_uuid).expect("uuid");
+        let alter_ids = super::vmess_alter_ids(&uuid, alter_id_count);
+        let now = super::unix_timestamp();
+        let timestamp = (-120..=120)
+            .flat_map(|delta| now.checked_add(delta).into_iter())
+            .find(|timestamp| {
+                alter_ids.iter().any(|alter_id| {
+                    super::vmess_legacy_auth_hash(alter_id, *timestamp).expect("auth hash") == auth
+                })
+            })
+            .expect("legacy auth should match an alter id");
+
+        let cmd_key = vmess_cmd_key(&uuid);
+        let mut cfb =
+            super::Aes128Cfb::new(&cmd_key, &super::legacy_header_iv(timestamp)).expect("cfb");
+        let mut header = vec![0u8; 49];
+        stream
+            .read_exact(&mut header)
+            .expect("legacy encrypted request header");
+        cfb.decrypt(&mut header);
+        let parsed = super::parse_request_header(&header).expect("legacy header");
+        assert_eq!(
+            parsed.security,
+            VmessSecurity::Aes128Gcm,
+            "legacy auth can still use AEAD body security"
+        );
+
+        VmessRequest {
+            command: parsed.command,
+            user_key: super::format_uuid_compact(&uuid),
+            user_uuid: primary_uuid.to_string(),
+            target: parsed.target,
+            client_ip: None,
+            request_body_key: parsed.request_body_key,
+            request_body_iv: parsed.request_body_iv,
+            response_body_key: super::md5_16(&parsed.request_body_key),
+            response_body_iv: super::md5_16(&parsed.request_body_iv),
+            response_header: parsed.response_header,
+            options: parsed.options,
+            security: parsed.security,
+            header_mode: VmessHeaderMode::Legacy,
+        }
+    }
+
+    fn write_legacy_vmess_response_header<W: Write>(writer: &mut W, request: &VmessRequest) {
+        let mut header = [request.response_header, 0, 0, 0];
+        super::Aes128Cfb::new(&request.response_body_key, &request.response_body_iv)
+            .expect("cfb")
+            .encrypt(&mut header);
+        writer.write_all(&header).expect("legacy response header");
     }
 
     fn websocket_request(path: &str) -> Vec<u8> {
@@ -3113,6 +3362,73 @@ mod tests {
             .expect("connect outbound");
 
         assert_outbound_reaches_echo(stream, echo_thread);
+        proxy_thread.join().expect("proxy thread");
+    }
+
+    #[test]
+    fn vmess_alter_id_outbound_uses_legacy_header_and_relays_stream() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let proxy_thread = thread::spawn(move || {
+            let (mut stream, _) = proxy.accept().expect("proxy accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("timeout");
+            let request = read_legacy_vmess_request_header(
+                &mut stream,
+                "11111111-1111-1111-1111-111111111111",
+                2,
+            );
+            assert_eq!(request.header_mode, VmessHeaderMode::Legacy);
+            assert_eq!(request.command, VmessCommand::Tcp);
+            assert_eq!(request.target.host, "127.0.0.1");
+            assert_eq!(request.target.port, 443);
+            write_legacy_vmess_response_header(&mut stream, &request);
+
+            let mut body = VmessBodyReader::new_with_length_seed(
+                stream.try_clone().expect("clone"),
+                request.request_body_key,
+                request.request_body_iv,
+                request.request_body_key,
+                request.request_body_iv,
+                request.options,
+                request.security,
+            )
+            .expect("request body");
+            let mut payload = [0u8; 4];
+            body.read_exact(&mut payload).expect("request payload");
+            assert_eq!(&payload, b"ping");
+
+            let mut response = VmessBodyWriter::new_with_length_seed(
+                stream,
+                request.response_body_key,
+                request.response_body_iv,
+                request.request_body_key,
+                request.request_body_iv,
+                request.options,
+                request.security,
+            )
+            .expect("response body");
+            response.write_all(b"pong").expect("response payload");
+            response.finish().expect("response finish");
+        });
+        let target = SocksTarget {
+            host: "127.0.0.1".to_string(),
+            port: 443,
+        };
+        let mut outbound = vmess_outbound(proxy_addr, None);
+        outbound.alter_id = Some(2);
+
+        let mut stream = connect_vmess_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+            .expect("connect legacy outbound");
+        stream.write_all(b"ping").expect("write payload");
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).expect("read response");
+        assert_eq!(&response, b"pong");
+
         proxy_thread.join().expect("proxy thread");
     }
 
@@ -3716,6 +4032,7 @@ mod tests {
             response_header: 0x77,
             options: OPTION_CHUNK_STREAM,
             security: VmessSecurity::Aes128Gcm,
+            header_mode: VmessHeaderMode::Aead,
         };
         let mut bytes = Vec::new();
 

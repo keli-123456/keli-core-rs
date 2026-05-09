@@ -210,6 +210,7 @@ mod tests {
                 tag: "direct".to_string(),
                 protocol: "freedom".to_string(),
                 method: None,
+                alter_id: None,
                 address: None,
                 port: None,
                 username: None,
