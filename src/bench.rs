@@ -89,6 +89,15 @@ pub fn run_bench(args: impl Iterator<Item = String>) -> Result<(), String> {
             );
             Ok(())
         }
+        Some("vless-tcp-stream") | Some("vless-stream") => {
+            let options = parse_bench_options(args)?;
+            let report = run_vless_tcp_stream_bench(&options).map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+            );
+            Ok(())
+        }
         Some("hy2-tcp") | Some("hysteria2-tcp") => {
             let options = parse_bench_options(args)?;
             let report = run_hy2_tcp_bench(&options).map_err(|error| error.to_string())?;
@@ -159,7 +168,7 @@ fn validate_bench_options(options: &BenchOptions) -> Result<(), String> {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]"
+        "bench commands:\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]"
     );
 }
 
@@ -310,6 +319,61 @@ async fn run_hy2_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
     })
 }
 
+fn run_vless_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let core_stop = Arc::new(AtomicBool::new(false));
+    let (core_addr, core_thread) = start_vless_server(echo_addr, core_stop.clone())?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        workers.push(thread::spawn(move || {
+            run_vless_tcp_stream_client(core_addr, echo_addr, stream_id, &options)
+        }));
+    }
+
+    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+    }
+    let elapsed = started.elapsed();
+
+    core_stop.store(true, Ordering::SeqCst);
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(core_addr);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(core_thread)?;
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+    Ok(BenchReport {
+        protocol: "vless-tcp",
+        mode: "connection-per-stream",
+        streams: options.streams,
+        requests_per_stream: options.requests,
+        payload_bytes: options.payload_size,
+        total_requests,
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed_ms: elapsed.as_millis(),
+        requests_per_second: total_requests as f64 / seconds,
+        roundtrip_mbps: ((upload_bytes + download_bytes) as f64 * 8.0) / seconds / 1_000_000.0,
+        latency: latency_report(&latencies),
+    })
+}
+
 fn start_echo_server(
     stop: Arc<AtomicBool>,
 ) -> io::Result<(SocketAddr, thread::JoinHandle<io::Result<()>>)> {
@@ -320,6 +384,8 @@ fn start_echo_server(
         while !stop.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_nodelay(true);
                     thread::spawn(move || {
                         let mut buffer = vec![0u8; 64 * 1024];
                         loop {
@@ -366,6 +432,8 @@ fn start_vless_server(
         while !stop.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_nodelay(true);
                     let server = server.clone();
                     thread::spawn(move || {
                         if let Err(error) = server.handle_tcp_client(stream) {
@@ -446,6 +514,57 @@ fn run_one_vless_tcp_request(
         ));
     }
     Ok(started.elapsed().as_micros())
+}
+
+fn run_vless_tcp_stream_client(
+    core_addr: SocketAddr,
+    echo_addr: SocketAddr,
+    stream_id: usize,
+    options: &BenchOptions,
+) -> io::Result<ClientStats> {
+    let payload = bench_payload(stream_id, options.payload_size);
+    let mut response = vec![0u8; payload.len()];
+    let mut latencies = Vec::with_capacity(options.requests);
+    let mut stream = TcpStream::connect(core_addr)?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    stream.write_all(&vless_tcp_request(echo_addr))?;
+    read_vless_response_header(&mut stream)?;
+
+    for request_index in 0..options.requests {
+        let started = Instant::now();
+        stream.write_all(&payload).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "stream {stream_id} request {} write failed: {error}",
+                    request_index + 1
+                ),
+            )
+        })?;
+        stream.read_exact(&mut response).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "stream {stream_id} request {} read failed: {error}",
+                    request_index + 1
+                ),
+            )
+        })?;
+        if response != payload {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bench echo payload mismatch",
+            ));
+        }
+        latencies.push(started.elapsed().as_micros());
+    }
+
+    Ok(ClientStats {
+        latencies,
+        retries: 0,
+    })
 }
 
 fn is_retryable_bench_error(error: &io::Error) -> bool {
@@ -788,7 +907,9 @@ fn join_server(handle: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_bench_options, run_vless_tcp_bench, BenchOptions};
+    use super::{
+        parse_bench_options, run_vless_tcp_bench, run_vless_tcp_stream_bench, BenchOptions,
+    };
 
     #[test]
     fn parses_bench_options() {
@@ -815,6 +936,21 @@ mod tests {
 
         assert_eq!(report.protocol, "vless-tcp");
         assert_eq!(report.mode, "connection-per-request");
+        assert_eq!(report.total_requests, 3);
+        assert!(report.download_bytes > 0);
+    }
+
+    #[test]
+    fn runs_vless_tcp_stream_bench_smoke() {
+        let report = run_vless_tcp_stream_bench(&BenchOptions {
+            streams: 1,
+            requests: 3,
+            payload_size: 16,
+        })
+        .expect("bench");
+
+        assert_eq!(report.protocol, "vless-tcp");
+        assert_eq!(report.mode, "connection-per-stream");
         assert_eq!(report.total_requests, 3);
         assert!(report.download_bytes > 0);
     }
