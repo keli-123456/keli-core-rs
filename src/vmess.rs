@@ -208,7 +208,8 @@ impl VmessServer {
         }
         let remote = self.connect_for_request(&request)?;
         write_response_header(&mut client, &request)?;
-        self.relay_split(client, remote, request, bandwidth)
+        client.set_nonblocking(true)?;
+        self.relay_single_io(client, remote, request, bandwidth)
     }
 
     pub fn handle_websocket_client(&self, client: TcpStream, path: Option<&str>) -> io::Result<()> {
@@ -414,17 +415,6 @@ impl VmessServer {
                 format!("outbound route {tag} is not implemented"),
             )),
         }
-    }
-
-    fn relay_split(
-        &self,
-        client: TcpStream,
-        remote: TcpStream,
-        request: VmessRequest,
-        bandwidth: Option<Arc<BandwidthLimiter>>,
-    ) -> io::Result<()> {
-        let reader = client.try_clone()?;
-        self.relay_split_io(reader, client, remote, request, bandwidth)
     }
 
     fn relay_split_io<R, W>(
