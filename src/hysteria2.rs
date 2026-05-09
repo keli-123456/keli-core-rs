@@ -488,15 +488,13 @@ impl Hysteria2Server {
             return Ok(());
         }
 
-        let target = message.target.clone();
-        let target_addr = resolve_udp_target(&target, self.config.connect_timeout).await?;
-        let session = self
+        let (session, target_addr) = self
             .get_udp_session(
                 connection,
                 user_uuid,
                 sessions,
                 message.session_id,
-                target_addr,
+                &message.target,
                 bandwidth.clone(),
                 client_ip,
             )
@@ -522,22 +520,31 @@ impl Hysteria2Server {
         user_uuid: &str,
         sessions: &Arc<Mutex<HashMap<u32, Arc<UdpRelaySession>>>>,
         session_id: u32,
-        target_addr: SocketAddr,
+        target: &SocksTarget,
         bandwidth: DirectionalLimiters,
         client_ip: IpAddr,
-    ) -> io::Result<Arc<UdpRelaySession>> {
-        if let Some(session) = sessions
-            .lock()
-            .expect("hysteria2 udp session lock poisoned")
-            .get(&session_id)
-            .cloned()
-        {
-            return Ok(session);
+    ) -> io::Result<(Arc<UdpRelaySession>, SocketAddr)> {
+        let existing = {
+            sessions
+                .lock()
+                .expect("hysteria2 udp session lock poisoned")
+                .get(&session_id)
+                .cloned()
+        };
+        if let Some(session) = existing {
+            if session.target == *target {
+                return Ok((session.clone(), session.target_addr));
+            }
+            let target_addr = resolve_udp_target(target, self.config.connect_timeout).await?;
+            return Ok((session, target_addr));
         }
 
+        let target_addr = resolve_udp_target(target, self.config.connect_timeout).await?;
         let socket = Arc::new(bind_udp_socket(target_addr.ip()).await?);
         let session = Arc::new(UdpRelaySession {
             socket,
+            target: target.clone(),
+            target_addr,
             next_packet_id: AtomicU16::new(0),
         });
         {
@@ -545,7 +552,10 @@ impl Hysteria2Server {
                 .lock()
                 .expect("hysteria2 udp session lock poisoned");
             if let Some(existing) = sessions.get(&session_id) {
-                return Ok(existing.clone());
+                if existing.target == *target {
+                    return Ok((existing.clone(), existing.target_addr));
+                }
+                return Ok((existing.clone(), target_addr));
             }
             sessions.insert(session_id, session.clone());
         }
@@ -562,7 +572,7 @@ impl Hysteria2Server {
             )
             .await;
         });
-        Ok(session)
+        Ok((session, target_addr))
     }
 
     fn response_cc_rx(&self) -> String {
@@ -637,6 +647,8 @@ impl DirectionalLimiters {
 #[derive(Debug)]
 struct UdpRelaySession {
     socket: Arc<UdpSocket>,
+    target: SocksTarget,
+    target_addr: SocketAddr,
     next_packet_id: AtomicU16,
 }
 
