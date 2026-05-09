@@ -316,7 +316,9 @@ fn start_grpc_transport_listener(
             tag: inbound.tag.clone(),
             source,
         })?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(quic_runtime_worker_threads())
+        .thread_name("keli-core-hysteria2")
         .enable_all()
         .build()
         .map_err(|source| CoreServiceError::Bind {
@@ -1730,6 +1732,13 @@ fn tcp_accept_worker_threads() -> usize {
         .map(usize::from)
         .unwrap_or(4)
         .clamp(2, 8)
+}
+
+fn quic_runtime_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .clamp(2, 16)
 }
 
 fn tls_acceptor_for(inbound: &InboundConfig) -> Result<Option<TlsAcceptor>, CoreServiceError> {
