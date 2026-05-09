@@ -34,6 +34,7 @@ use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
 use crate::outbound::recv_udp_response;
+use crate::quic::connect_quic_client_stream;
 use crate::socks5::SocksTarget;
 use crate::stream::copy_count_best_effort_limited;
 use crate::tls::TlsConnection;
@@ -1696,6 +1697,9 @@ pub(crate) fn connect_vmess_tcp_outbound(
     if matches!(network.as_str(), "h2" | "http") {
         return connect_vmess_h2_tcp_outbound(outbound, &server, target, timeout);
     }
+    if network == "quic" {
+        return connect_vmess_quic_tcp_outbound(outbound, &server, target, timeout);
+    }
     if network != "tcp" {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -1735,6 +1739,24 @@ fn connect_vmess_h2_tcp_outbound(
     read_vmess_response_header(&mut h2, &request)?;
     h2.set_nonblocking(true);
     local_bridge_for_vmess(h2, request)
+}
+
+fn connect_vmess_quic_tcp_outbound(
+    outbound: &OutboundConfig,
+    server: &SocksTarget,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let mut quic = connect_quic_client_stream(
+        server,
+        timeout,
+        outbound.tls.as_ref(),
+        outbound.transport.as_ref(),
+    )?;
+    let request = write_vmess_tcp_request(&mut quic, outbound, target)?;
+    read_vmess_response_header(&mut quic, &request)?;
+    quic.set_nonblocking(true)?;
+    local_bridge_for_vmess(quic, request)
 }
 
 fn connect_vmess_grpc_tcp_outbound(
@@ -1894,6 +1916,15 @@ pub(crate) fn send_vmess_udp_outbound(
             outbound_transport_headers(outbound),
         )?;
         return send_vmess_udp_over_stream(&mut h2, outbound, target, payload, timeout);
+    }
+    if network == "quic" {
+        let mut quic = connect_quic_client_stream(
+            &server,
+            timeout,
+            outbound.tls.as_ref(),
+            outbound.transport.as_ref(),
+        )?;
+        return send_vmess_udp_over_stream(&mut quic, outbound, target, payload, timeout);
     }
     if network != "tcp" {
         return Err(io::Error::new(
@@ -3468,6 +3499,7 @@ mod tests {
                 service_name: None,
                 method: None,
                 headers: Default::default(),
+                ..OutboundTransportConfig::default()
             }),
         );
 
@@ -3505,6 +3537,7 @@ mod tests {
                 service_name: None,
                 method: None,
                 headers: Default::default(),
+                ..OutboundTransportConfig::default()
             }),
         );
 
@@ -3564,6 +3597,7 @@ mod tests {
                 service_name: None,
                 method: Some("PUT".to_string()),
                 headers: Default::default(),
+                ..OutboundTransportConfig::default()
             }),
         );
 
@@ -3622,6 +3656,7 @@ mod tests {
                 service_name: Some("GunService".to_string()),
                 method: None,
                 headers: Default::default(),
+                ..OutboundTransportConfig::default()
             }),
         );
 

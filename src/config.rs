@@ -102,6 +102,12 @@ pub struct OutboundTransportConfig {
     pub method: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_security: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_header_type: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -496,7 +502,7 @@ fn validate_outbound_transport(
     }
     if !matches!(
         network.as_str(),
-        "tcp" | "ws" | "httpupgrade" | "grpc" | "h2" | "http"
+        "tcp" | "ws" | "httpupgrade" | "grpc" | "h2" | "http" | "quic"
     ) {
         return Err(ValidationError::new(format!(
             "outbound {} {} transport {} is not supported yet",
@@ -516,6 +522,23 @@ fn validate_outbound_transport(
         .map(str::trim)
         .unwrap_or_default();
     let headers = &transport.headers;
+    let quic_security = transport
+        .quic_security
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("none");
+    let quic_key = transport
+        .quic_key
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    let quic_header_type = transport
+        .quic_header_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("none");
     if !matches!(network.as_str(), "ws" | "httpupgrade" | "h2" | "http")
         && (!path.is_empty() || !host.is_empty())
     {
@@ -541,6 +564,36 @@ fn validate_outbound_transport(
             "outbound {} h2 headers are supported only for h2 transport",
             outbound.tag
         )));
+    }
+    if network != "quic"
+        && (!quic_security.eq_ignore_ascii_case("none")
+            || !quic_key.is_empty()
+            || !quic_header_type.eq_ignore_ascii_case("none"))
+    {
+        return Err(ValidationError::new(format!(
+            "outbound {} quic settings are supported only for quic transport",
+            outbound.tag
+        )));
+    }
+    if network == "quic" {
+        if !quic_security.eq_ignore_ascii_case("none") {
+            return Err(ValidationError::new(format!(
+                "outbound {} quic security {} is not supported yet",
+                outbound.tag, quic_security
+            )));
+        }
+        if !quic_key.is_empty() {
+            return Err(ValidationError::new(format!(
+                "outbound {} quic key is supported only with encrypted quic security",
+                outbound.tag
+            )));
+        }
+        if !quic_header_type.eq_ignore_ascii_case("none") {
+            return Err(ValidationError::new(format!(
+                "outbound {} quic header {} is not supported yet",
+                outbound.tag, quic_header_type
+            )));
+        }
     }
     for (name, value) in headers {
         if name.trim().is_empty() {
@@ -1590,6 +1643,7 @@ mod tests {
             service_name: None,
             method: None,
             headers: BTreeMap::new(),
+            ..OutboundTransportConfig::default()
         });
         config
             .validate()
@@ -1602,6 +1656,7 @@ mod tests {
             service_name: None,
             method: None,
             headers: BTreeMap::new(),
+            ..OutboundTransportConfig::default()
         });
         config
             .validate()
@@ -1614,6 +1669,7 @@ mod tests {
             service_name: Some("GunService".to_string()),
             method: None,
             headers: BTreeMap::new(),
+            ..OutboundTransportConfig::default()
         });
         config
             .validate()
@@ -1686,6 +1742,7 @@ mod tests {
             service_name: None,
             method: None,
             headers: BTreeMap::new(),
+            ..OutboundTransportConfig::default()
         });
         config
             .validate()
@@ -1698,6 +1755,7 @@ mod tests {
             service_name: None,
             method: None,
             headers: BTreeMap::new(),
+            ..OutboundTransportConfig::default()
         });
         config
             .validate()
@@ -1710,6 +1768,7 @@ mod tests {
             service_name: Some("GunService".to_string()),
             method: None,
             headers: BTreeMap::new(),
+            ..OutboundTransportConfig::default()
         });
         config
             .validate()
@@ -1728,10 +1787,33 @@ mod tests {
             service_name: None,
             method: Some("POST".to_string()),
             headers: h2_headers,
+            ..OutboundTransportConfig::default()
         });
         config
             .validate()
             .expect("vless h2 outbound headers should validate");
+
+        config.outbounds[0].transport = Some(OutboundTransportConfig {
+            network: "quic".to_string(),
+            quic_security: Some("none".to_string()),
+            quic_header_type: Some("none".to_string()),
+            ..OutboundTransportConfig::default()
+        });
+        config
+            .validate()
+            .expect("vless plain quic outbound should validate");
+
+        config.outbounds[0].transport = Some(OutboundTransportConfig {
+            network: "quic".to_string(),
+            quic_security: Some("aes-128-gcm".to_string()),
+            quic_key: Some("secret".to_string()),
+            quic_header_type: Some("none".to_string()),
+            ..OutboundTransportConfig::default()
+        });
+        let error = config
+            .validate()
+            .expect_err("encrypted quic outbound should be rejected until packet wrapping exists");
+        assert!(error.to_string().contains("quic security"));
 
         config.outbounds[0].transport = None;
         config.outbounds[0].tls = None;

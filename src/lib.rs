@@ -13,6 +13,7 @@ pub mod limits;
 pub mod mieru;
 pub mod outbound;
 pub mod protocol;
+pub mod quic;
 pub mod reality;
 pub mod routing;
 pub mod runtime;

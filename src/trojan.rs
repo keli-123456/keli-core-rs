@@ -22,6 +22,7 @@ use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
 use crate::outbound::recv_udp_response;
+use crate::quic::connect_quic_client_stream;
 use crate::socks5::SocksTarget;
 use crate::stream::{copy_count_best_effort_limited, relay_tcp_streams_limited};
 use crate::tls::{relay_tls_stream, TlsConnection};
@@ -699,6 +700,9 @@ pub(crate) fn connect_trojan_tcp_outbound(
     if matches!(network.as_str(), "h2" | "http") {
         return connect_trojan_h2_tcp_outbound(outbound, &server, password, target, timeout);
     }
+    if network == "quic" {
+        return connect_trojan_quic_tcp_outbound(outbound, &server, password, target, timeout);
+    }
     if network != "tcp" {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -735,6 +739,23 @@ fn connect_trojan_h2_tcp_outbound(
     write_trojan_tcp_request(&mut h2, password, target)?;
     h2.flush()?;
     local_bridge_for_http2(h2)
+}
+
+fn connect_trojan_quic_tcp_outbound(
+    outbound: &OutboundConfig,
+    server: &SocksTarget,
+    password: &str,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let mut quic = connect_quic_client_stream(
+        server,
+        timeout,
+        outbound.tls.as_ref(),
+        outbound.transport.as_ref(),
+    )?;
+    write_trojan_tcp_request(&mut quic, password, target)?;
+    Ok(quic)
 }
 
 fn connect_trojan_grpc_tcp_outbound(
@@ -1880,6 +1901,7 @@ mod tests {
                 service_name: None,
                 method: None,
                 headers: Default::default(),
+                ..OutboundTransportConfig::default()
             }),
         };
         let target = SocksTarget {
@@ -1934,6 +1956,7 @@ mod tests {
                 service_name: None,
                 method: None,
                 headers: Default::default(),
+                ..OutboundTransportConfig::default()
             }),
         };
         let target = SocksTarget {
@@ -2011,6 +2034,7 @@ mod tests {
                 service_name: None,
                 method: Some("PUT".to_string()),
                 headers: Default::default(),
+                ..OutboundTransportConfig::default()
             }),
         };
         let target = SocksTarget {
@@ -2087,6 +2111,7 @@ mod tests {
                 service_name: Some("GunService".to_string()),
                 method: None,
                 headers: Default::default(),
+                ..OutboundTransportConfig::default()
             }),
         };
         let target = SocksTarget {
