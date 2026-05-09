@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
@@ -43,19 +44,24 @@ impl TrafficRegistry {
         download: u64,
         client_ip: Option<IpAddr>,
     ) {
-        let node_tag = node_tag.into();
-        let user_uuid = user_uuid.into();
         let key = TrafficKey {
-            node_tag: node_tag.clone(),
-            user_uuid: user_uuid.clone(),
+            node_tag: node_tag.into(),
+            user_uuid: user_uuid.into(),
         };
-        let entry = self.counters.entry(key).or_insert_with(|| TrafficDelta {
-            node_tag,
-            user_uuid,
-            upload: 0,
-            download: 0,
-            online_ips: Vec::new(),
-        });
+        let entry = match self.counters.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let key = entry.key();
+                let delta = TrafficDelta {
+                    node_tag: key.node_tag.clone(),
+                    user_uuid: key.user_uuid.clone(),
+                    upload: 0,
+                    download: 0,
+                    online_ips: Vec::new(),
+                };
+                entry.insert(delta)
+            }
+        };
         entry.upload = entry.upload.saturating_add(upload);
         entry.download = entry.download.saturating_add(download);
         if let Some(client_ip) = client_ip {
