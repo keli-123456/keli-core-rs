@@ -149,7 +149,9 @@ impl Hysteria2Server {
                     };
                     let server = self.clone();
                     tokio::spawn(async move {
-                        let _ = server.handle_incoming(incoming).await;
+                        if let Err(error) = server.handle_incoming(incoming).await {
+                            eprintln!("hysteria2 connection error: {error}");
+                        }
                     });
                 }
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {}
@@ -207,9 +209,12 @@ impl Hysteria2Server {
                     let user_uuid = auth.user.uuid.clone();
                     let bandwidth = bandwidth.clone();
                     tokio::spawn(async move {
-                        let _ = server
+                        if let Err(error) = server
                             .handle_tcp_stream(stream, user_uuid, bandwidth, client_ip)
-                            .await;
+                            .await
+                        {
+                            eprintln!("hysteria2 tcp stream error: {error}");
+                        }
                     });
                 }
                 Err(quinn::ConnectionError::ApplicationClosed { .. })

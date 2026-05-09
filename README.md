@@ -130,7 +130,9 @@ cargo run -- bench hy2-tcp --streams 8 --requests 1000 --payload 1024
 
 The benchmark command starts local loopback echo and core listeners, drives real protocol
 traffic through the core, and prints JSON metrics. The current `vless-tcp` benchmark is
-connection-per-request so it measures VLESS TCP setup plus one echo payload per request:
+connection-per-request so it measures VLESS TCP setup plus one echo payload per request.
+The `hy2-tcp` benchmark authenticates once and opens TCP request streams over a single
+QUIC connection, so the stream count represents HY2 multiplexed concurrency:
 
 ```bash
 cargo run --release -- bench vless-tcp --streams 16 --requests 5000 --payload 1024

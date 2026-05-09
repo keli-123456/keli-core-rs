@@ -249,14 +249,21 @@ async fn run_hy2_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
     let server_addr = endpoint.local_addr()?;
     let stop = Arc::new(AtomicBool::new(false));
     let server_task = tokio::spawn(server.run(endpoint, stop.clone()));
+    let client_endpoint = hy2_client_endpoint(cert.cert_der.clone())?;
+    let connection = client_endpoint
+        .connect(server_addr, "localhost")
+        .map_err(io_other)?
+        .await
+        .map_err(io_other)?;
+    authenticate_hy2(&connection).await?;
 
     let started = Instant::now();
     let mut workers = Vec::with_capacity(options.streams);
     for stream_id in 0..options.streams {
         let options = options.clone();
-        let cert_der = cert.cert_der.clone();
+        let connection = connection.clone();
         workers.push(tokio::spawn(async move {
-            run_hy2_tcp_client(server_addr, echo_addr, stream_id, &options, cert_der).await
+            run_hy2_tcp_client(connection, echo_addr, stream_id, &options).await
         }));
     }
 
@@ -271,6 +278,8 @@ async fn run_hy2_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
     }
     let elapsed = started.elapsed();
 
+    connection.close(0u32.into(), b"bench done");
+    client_endpoint.wait_idle().await;
     stop.store(true, Ordering::SeqCst);
     server_task
         .await
@@ -286,7 +295,7 @@ async fn run_hy2_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
     let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
     Ok(BenchReport {
         protocol: "hy2-tcp",
-        mode: "quic-connection-per-stream",
+        mode: "single-quic-connection",
         streams: options.streams,
         requests_per_stream: options.requests,
         payload_bytes: options.payload_size,
@@ -513,20 +522,11 @@ fn hy2_user() -> CoreUser {
 }
 
 async fn run_hy2_tcp_client(
-    server_addr: SocketAddr,
+    connection: quinn::Connection,
     echo_addr: SocketAddr,
     stream_id: usize,
     options: &BenchOptions,
-    cert_der: CertificateDer<'static>,
 ) -> io::Result<ClientStats> {
-    let endpoint = hy2_client_endpoint(cert_der)?;
-    let connection = endpoint
-        .connect(server_addr, "localhost")
-        .map_err(io_other)?
-        .await
-        .map_err(io_other)?;
-    authenticate_hy2(&connection).await?;
-
     let payload = bench_payload(stream_id, options.payload_size);
     let mut latencies = Vec::with_capacity(options.requests);
     let mut retries = 0usize;
@@ -558,8 +558,6 @@ async fn run_hy2_tcp_client(
         }
     }
 
-    connection.close(0u32.into(), b"bench done");
-    endpoint.wait_idle().await;
     Ok(ClientStats { latencies, retries })
 }
 
@@ -615,8 +613,14 @@ fn hy2_client_endpoint(cert_der: CertificateDer<'static>) -> io::Result<quinn::E
 async fn authenticate_hy2(connection: &quinn::Connection) -> io::Result<()> {
     let quic = h3_quinn::Connection::new(connection.clone());
     let (mut h3_connection, mut send_request) = h3::client::new(quic).await.map_err(io_other)?;
+    let (authenticated, stop_driver) = tokio::sync::oneshot::channel::<()>();
     let driver = tokio::spawn(async move {
-        let _ = poll_fn(|cx| h3_connection.poll_close(cx)).await;
+        tokio::select! {
+            _ = poll_fn(|cx| h3_connection.poll_close(cx)) => {}
+            _ = stop_driver => {
+                std::mem::forget(h3_connection);
+            }
+        }
     });
     let request = http::Request::builder()
         .method(http::Method::POST)
@@ -628,14 +632,18 @@ async fn authenticate_hy2(connection: &quinn::Connection) -> io::Result<()> {
     let mut stream = send_request.send_request(request).await.map_err(io_other)?;
     stream.finish().await.map_err(io_other)?;
     let response = stream.recv_response().await.map_err(io_other)?;
-    drop(send_request);
-    driver.abort();
     if response.status().as_u16() != 233 {
+        driver.abort();
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("hy2 auth failed with status {}", response.status()),
         ));
     }
+    std::mem::forget(send_request);
+    let _ = authenticated.send(());
+    driver
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "hy2 h3 driver panicked"))?;
     Ok(())
 }
 
@@ -821,7 +829,7 @@ mod tests {
         .expect("bench");
 
         assert_eq!(report.protocol, "hy2-tcp");
-        assert_eq!(report.mode, "quic-connection-per-stream");
+        assert_eq!(report.mode, "single-quic-connection");
         assert_eq!(report.total_requests, 2);
         assert!(report.download_bytes > 0);
     }
