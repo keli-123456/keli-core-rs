@@ -275,6 +275,9 @@ fn matches_geosite_domain(host: &str, rule: &str) -> bool {
     if let Some(rule) = rule.strip_prefix("regexp:") {
         return regex::Regex::new(rule).is_ok_and(|regex| regex.is_match(host));
     }
+    if let Some(rule) = rule.strip_prefix("domain:") {
+        return matches_domain_suffix(host, rule);
+    }
     if let Some(rule) = rule.strip_prefix("full:") {
         return host == rule.trim().trim_matches(['[', ']']);
     }
@@ -473,6 +476,8 @@ mod tests {
     use crate::config::{OutboundConfig, RouteAction, RouteRule};
     use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 
+    use super::matches_geosite_domain;
+
     #[test]
     fn matches_exact_and_suffix_block_rules() {
         let matcher = RouteMatcher::new(vec![
@@ -595,6 +600,19 @@ mod tests {
             matcher.decide_target("example.com", 443, "tcp,http"),
             RouteDecision::Direct
         );
+    }
+
+    #[test]
+    fn geosite_file_rules_accept_domain_prefix() {
+        assert!(matches_geosite_domain(
+            "api.example.com",
+            "domain:example.com"
+        ));
+        assert!(matches_geosite_domain("example.com", "domain:example.com"));
+        assert!(!matches_geosite_domain(
+            "badexample.com",
+            "domain:example.com"
+        ));
     }
 
     #[test]
