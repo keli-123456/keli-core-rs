@@ -972,12 +972,14 @@ async fn write_tcp_response(
     status: u8,
     message: &str,
 ) -> io::Result<()> {
-    send.write_all(&[status]).await.map_err(io_other)?;
-    write_varint(send, message.len() as u64).await?;
+    let mut response = Vec::with_capacity(1 + 16 + message.len());
+    response.push(status);
+    append_varint(&mut response, message.len() as u64)?;
     if !message.is_empty() {
-        send.write_all(message.as_bytes()).await.map_err(io_other)?;
+        response.extend_from_slice(message.as_bytes());
     }
-    write_varint(send, 0).await
+    append_varint(&mut response, 0)?;
+    send.write_all(&response).await.map_err(io_other)
 }
 
 async fn relay_streams(
@@ -1068,26 +1070,28 @@ fn read_varint_from(input: &[u8], offset: &mut usize) -> io::Result<u64> {
     })
 }
 
-async fn write_varint(send: &mut quinn::SendStream, value: u64) -> io::Result<()> {
-    let bytes = encode_varint(value)?;
-    send.write_all(&bytes).await.map_err(io_other)
+fn encode_varint(value: u64) -> io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(8);
+    append_varint(&mut output, value)?;
+    Ok(output)
 }
 
-fn encode_varint(value: u64) -> io::Result<Vec<u8>> {
+fn append_varint(output: &mut Vec<u8>, value: u64) -> io::Result<()> {
     if value < 2u64.pow(6) {
-        Ok(vec![value as u8])
+        output.push(value as u8);
     } else if value < 2u64.pow(14) {
-        Ok(((0b01u16 << 14) | value as u16).to_be_bytes().to_vec())
+        output.extend_from_slice(&((0b01u16 << 14) | value as u16).to_be_bytes());
     } else if value < 2u64.pow(30) {
-        Ok(((0b10u32 << 30) | value as u32).to_be_bytes().to_vec())
+        output.extend_from_slice(&((0b10u32 << 30) | value as u32).to_be_bytes());
     } else if value < 2u64.pow(62) {
-        Ok(((0b11u64 << 62) | value).to_be_bytes().to_vec())
+        output.extend_from_slice(&((0b11u64 << 62) | value).to_be_bytes());
     } else {
-        Err(io::Error::new(
+        return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "value too large for QUIC varint",
-        ))
+        ));
     }
+    Ok(())
 }
 
 async fn read_exact(stream: &mut quinn::RecvStream, output: &mut [u8]) -> io::Result<()> {
