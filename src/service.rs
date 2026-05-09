@@ -34,6 +34,8 @@ use crate::user::CoreUser;
 use crate::vless::{VlessServer, VlessServerConfig};
 use crate::vmess::{VmessServer, VmessServerConfig};
 
+const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 4096;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerStatus {
     pub tag: String,
@@ -434,7 +436,7 @@ fn start_vmess_listener(
                     let websocket_path = websocket_path.clone();
                     let httpupgrade_host = httpupgrade_host.clone();
                     let tls_acceptor = tls_acceptor.clone();
-                    let worker = thread::spawn(move || {
+                    spawn_connection_worker(&workers_for_thread, move || {
                         let result = if let Some(acceptor) = tls_acceptor {
                             acceptor
                                 .accept(stream)
@@ -465,10 +467,6 @@ fn start_vmess_listener(
                         };
                         let _ = result;
                     });
-                    workers_for_thread
-                        .lock()
-                        .expect("worker list lock poisoned")
-                        .push(worker);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -712,13 +710,9 @@ fn start_anytls_listener(
             match listener.accept() {
                 Ok((stream, _)) => {
                     let server = server.clone();
-                    let worker = thread::spawn(move || {
+                    spawn_connection_worker(&workers_for_thread, move || {
                         let _ = server.handle_tcp_client(stream);
                     });
-                    workers_for_thread
-                        .lock()
-                        .expect("worker list lock poisoned")
-                        .push(worker);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -821,13 +815,9 @@ fn start_shadowsocks_listener(
             match listener.accept() {
                 Ok((stream, _)) => {
                     let server = server.clone();
-                    let worker = thread::spawn(move || {
+                    spawn_connection_worker(&workers_for_thread, move || {
                         let _ = server.handle_tcp_client(stream);
                     });
-                    workers_for_thread
-                        .lock()
-                        .expect("worker list lock poisoned")
-                        .push(worker);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -931,7 +921,7 @@ fn start_trojan_listener(
                     let websocket_path = websocket_path.clone();
                     let httpupgrade_host = httpupgrade_host.clone();
                     let tls_acceptor = tls_acceptor.clone();
-                    let worker = thread::spawn(move || {
+                    spawn_connection_worker(&workers_for_thread, move || {
                         let result = if let Some(acceptor) = tls_acceptor {
                             acceptor
                                 .accept(stream)
@@ -962,10 +952,6 @@ fn start_trojan_listener(
                         };
                         let _ = result;
                     });
-                    workers_for_thread
-                        .lock()
-                        .expect("worker list lock poisoned")
-                        .push(worker);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -1070,7 +1056,7 @@ fn start_vless_listener(
                     let websocket_path = websocket_path.clone();
                     let httpupgrade_host = httpupgrade_host.clone();
                     let tls_acceptor = tls_acceptor.clone();
-                    let worker = thread::spawn(move || {
+                    spawn_connection_worker(&workers_for_thread, move || {
                         let result = if let Some(acceptor) = tls_acceptor {
                             acceptor
                                 .accept(stream)
@@ -1101,10 +1087,6 @@ fn start_vless_listener(
                         };
                         let _ = result;
                     });
-                    workers_for_thread
-                        .lock()
-                        .expect("worker list lock poisoned")
-                        .push(worker);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -1179,13 +1161,9 @@ fn start_socks_listener(
             match listener.accept() {
                 Ok((stream, _)) => {
                     let server = server.clone();
-                    let worker = thread::spawn(move || {
+                    spawn_connection_worker(&workers_for_thread, move || {
                         let _ = server.handle_tcp_client(stream);
                     });
-                    workers_for_thread
-                        .lock()
-                        .expect("worker list lock poisoned")
-                        .push(worker);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -1260,13 +1238,9 @@ fn start_mieru_listener(
             match listener.accept() {
                 Ok((stream, _)) => {
                     let server = server.clone();
-                    let worker = thread::spawn(move || {
+                    spawn_connection_worker(&workers_for_thread, move || {
                         let _ = server.handle_tcp_client(stream);
                     });
-                    workers_for_thread
-                        .lock()
-                        .expect("worker list lock poisoned")
-                        .push(worker);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -1341,13 +1315,9 @@ fn start_http_listener(
             match listener.accept() {
                 Ok((stream, _)) => {
                     let server = server.clone();
-                    let worker = thread::spawn(move || {
+                    spawn_connection_worker(&workers_for_thread, move || {
                         let _ = server.handle_tcp_client(stream);
                     });
-                    workers_for_thread
-                        .lock()
-                        .expect("worker list lock poisoned")
-                        .push(worker);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -1404,7 +1374,7 @@ fn start_vless_reality_listener(
                 Ok((stream, _)) => {
                     let gateway = gateway.clone();
                     let server = server.clone();
-                    let worker = thread::spawn(move || {
+                    spawn_connection_worker(&workers_for_thread, move || {
                         let result = handle_reality_preface(stream, &gateway);
                         if let Ok(RealityGatewayResult::Authenticated(mut authenticated)) = result {
                             let _ = authenticated.read_dest_handshake(8, Duration::from_secs(5));
@@ -1418,10 +1388,6 @@ fn start_vless_reality_listener(
                             }
                         }
                     });
-                    workers_for_thread
-                        .lock()
-                        .expect("worker list lock poisoned")
-                        .push(worker);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -1532,6 +1498,39 @@ fn join_workers(workers: &Arc<Mutex<Vec<JoinHandle<()>>>>) {
             None => break,
         }
     }
+}
+
+fn spawn_connection_worker<F>(workers: &Arc<Mutex<Vec<JoinHandle<()>>>>, task: F) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    let mut handles = workers.lock().expect("worker list lock poisoned");
+    prune_finished_workers(&mut handles);
+    if handles.len() >= MAX_CONNECTION_WORKERS_PER_LISTENER {
+        return false;
+    }
+    match thread::Builder::new()
+        .name("keli-core-tcp-worker".to_string())
+        .spawn(task)
+    {
+        Ok(worker) => {
+            handles.push(worker);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn prune_finished_workers(workers: &mut Vec<JoinHandle<()>>) {
+    let mut active = Vec::with_capacity(workers.len());
+    for worker in workers.drain(..) {
+        if worker.is_finished() {
+            let _ = worker.join();
+        } else {
+            active.push(worker);
+        }
+    }
+    *workers = active;
 }
 
 fn tls_acceptor_for(inbound: &InboundConfig) -> Result<Option<TlsAcceptor>, CoreServiceError> {
