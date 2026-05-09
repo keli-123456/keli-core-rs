@@ -2771,9 +2771,11 @@ mod tests {
         let echo_addr = echo.local_addr().expect("echo addr");
         let echo_thread = thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("echo accept");
-            let mut bytes = [0u8; 4];
-            stream.read_exact(&mut bytes).expect("echo read");
-            stream.write_all(&bytes).expect("echo write");
+            for _ in 0..2 {
+                let mut bytes = [0u8; 4];
+                stream.read_exact(&mut bytes).expect("echo read");
+                stream.write_all(&bytes).expect("echo write");
+            }
         });
 
         let server = server();
@@ -2797,6 +2799,10 @@ mod tests {
         let mut echoed = [0u8; 4];
         client.read_exact(&mut echoed).expect("client read payload");
         assert_eq!(&echoed, b"ping");
+        client.write_all(b"pong").expect("client write payload");
+        let mut echoed = [0u8; 4];
+        client.read_exact(&mut echoed).expect("client read payload");
+        assert_eq!(&echoed, b"pong");
         drop(client);
 
         server_thread
@@ -2809,8 +2815,8 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|vless|1");
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
-        assert_eq!(records[0].upload, 4);
-        assert_eq!(records[0].download, 4);
+        assert_eq!(records[0].upload, 8);
+        assert_eq!(records[0].download, 8);
     }
 
     #[test]
