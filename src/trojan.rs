@@ -800,9 +800,9 @@ fn connect_trojan_httpupgrade_tcp_outbound(
         let local_client = TcpStream::connect(local_addr)?;
         let (local_plain, _) = local_listener.accept()?;
 
-        thread::spawn(move || {
+        let _ = spawn_blocking_relay(move || {
             let _ = relay_plain_to_tls(local_plain, tls_stream);
-        });
+        })?;
 
         return Ok(local_client);
     }
@@ -861,9 +861,9 @@ fn connect_trojan_tls_tcp_outbound(
     let local_client = TcpStream::connect(local_addr)?;
     let (local_plain, _) = local_listener.accept()?;
 
-    thread::spawn(move || {
+    let _ = spawn_blocking_relay(move || {
         let _ = relay_plain_to_tls(local_plain, tls_stream);
-    });
+    })?;
 
     Ok(local_client)
 }
@@ -1105,9 +1105,9 @@ where
     let local_client = TcpStream::connect(local_addr)?;
     let (local_plain, _) = local_listener.accept()?;
 
-    thread::spawn(move || {
+    let _ = spawn_blocking_relay(move || {
         let _ = relay_plain_to_websocket(local_plain, websocket);
-    });
+    })?;
 
     Ok(local_client)
 }
@@ -1118,9 +1118,9 @@ fn local_bridge_for_grpc(grpc: GrpcClientStream) -> io::Result<TcpStream> {
     let local_client = TcpStream::connect(local_addr)?;
     let (local_plain, _) = local_listener.accept()?;
 
-    thread::spawn(move || {
+    let _ = spawn_blocking_relay(move || {
         let _ = relay_plain_to_grpc(local_plain, grpc);
-    });
+    })?;
 
     Ok(local_client)
 }
