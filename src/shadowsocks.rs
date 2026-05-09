@@ -21,8 +21,8 @@ use crate::limits::{
 use crate::outbound::recv_udp_response;
 use crate::socks5::SocksTarget;
 use crate::stream::{
-    copy_count_best_effort_limited, join_blocking_relay, join_native_blocking_relay,
-    spawn_blocking_relay, spawn_native_blocking_relay,
+    copy_count_best_effort_limited, join_native_blocking_relay, spawn_blocking_relay,
+    spawn_native_blocking_relay,
 };
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
@@ -467,7 +467,7 @@ impl ShadowsocksServer {
         let mut encrypted_client = request.client_reader;
         let mut remote_write = remote.try_clone()?;
         let upload_limiter = bandwidth.clone();
-        let upload_task = spawn_blocking_relay(move || {
+        let upload_task = spawn_native_blocking_relay(move || {
             let copied = copy_count_best_effort_limited(
                 &mut encrypted_client,
                 &mut remote_write,
@@ -483,7 +483,7 @@ impl ShadowsocksServer {
         let download =
             copy_count_best_effort_limited(&mut remote_read, &mut encrypted_writer, None);
         let _ = encrypted_writer.shutdown();
-        upload = upload.saturating_add(join_blocking_relay(
+        upload = upload.saturating_add(join_native_blocking_relay(
             upload_task,
             "upload relay task panicked",
         )?);
