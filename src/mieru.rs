@@ -6,7 +6,6 @@ use std::net::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -18,7 +17,8 @@ use crate::limits::{BandwidthLimiter, UserBandwidthLimiters, UserSessionTracker}
 use crate::outbound::recv_udp_response;
 use crate::socks5::SocksTarget;
 use crate::stream::{
-    copy_count_best_effort_limited, join_blocking_relay, spawn_blocking_relay, BlockingRelayHandle,
+    copy_count_best_effort_limited, join_blocking_relay, join_native_blocking_relay,
+    spawn_blocking_relay, spawn_native_blocking_relay, BlockingRelayHandle,
 };
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
@@ -1651,7 +1651,7 @@ where
     let mut remote_write = remote;
     let upload_limiter = limiter.clone();
     let stop_upload = reader.stop_handle();
-    let upload_thread = thread::spawn(move || {
+    let upload_task = spawn_native_blocking_relay(move || {
         let upload = copy_count_best_effort_limited(
             &mut reader,
             &mut remote_write,
@@ -1659,16 +1659,14 @@ where
         );
         let _ = remote_write.shutdown(Shutdown::Write);
         upload
-    });
+    })?;
     let download =
         copy_count_best_effort_limited(&mut remote_read, &mut writer, limiter.as_deref());
     if let Some(stop) = stop_upload {
         stop.store(true, Ordering::Relaxed);
     }
     writer.shutdown_session();
-    let upload = upload_thread
-        .join()
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "mieru upload thread panicked"))?;
+    let upload = join_native_blocking_relay(upload_task, "mieru upload task panicked")?;
 
     Ok((upload, download))
 }

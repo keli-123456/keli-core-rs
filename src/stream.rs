@@ -1,14 +1,32 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::limits::BandwidthLimiter;
 
 static TCP_RELAY_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static NATIVE_RELAY_POOL: OnceLock<NativeRelayPool> = OnceLock::new();
 
 pub type BlockingRelayHandle<T> = tokio::task::JoinHandle<T>;
+type NativeRelayJob = Box<dyn FnOnce() + Send + 'static>;
+
+pub struct NativeRelayHandle<T> {
+    receiver: mpsc::Receiver<thread::Result<T>>,
+}
+
+struct NativeRelayPool {
+    sender: mpsc::Sender<NativeRelayJob>,
+    receiver: Arc<Mutex<mpsc::Receiver<NativeRelayJob>>>,
+    worker_count: AtomicUsize,
+    idle_count: AtomicUsize,
+    pending_count: AtomicUsize,
+    max_workers: usize,
+}
 
 pub fn relay_tcp_streams(client: TcpStream, remote: TcpStream) -> io::Result<(u64, u64)> {
     relay_tcp_streams_limited(client, remote, None)
@@ -45,6 +63,33 @@ pub fn join_blocking_relay<T>(
     tcp_relay_runtime()?
         .block_on(handle)
         .map_err(|_| io::Error::new(io::ErrorKind::Other, panic_message))
+}
+
+pub fn spawn_native_blocking_relay<F, T>(task: F) -> io::Result<NativeRelayHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let job = Box::new(move || {
+        let _ = sender.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)));
+    });
+    native_relay_pool().submit(job)?;
+    Ok(NativeRelayHandle { receiver })
+}
+
+pub fn join_native_blocking_relay<T>(
+    handle: NativeRelayHandle<T>,
+    panic_message: &'static str,
+) -> io::Result<T> {
+    match handle.receiver.recv() {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err(io::Error::new(io::ErrorKind::Other, panic_message)),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "native relay task exited without result",
+        )),
+    }
 }
 
 fn relay_tcp_streams_async(
@@ -109,6 +154,131 @@ fn tcp_relay_blocking_threads() -> usize {
         .map(|threads| usize::from(threads).saturating_mul(64))
         .unwrap_or(128)
         .clamp(64, 512)
+}
+
+impl NativeRelayPool {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            sender,
+            receiver: Arc::new(Mutex::new(receiver)),
+            worker_count: AtomicUsize::new(0),
+            idle_count: AtomicUsize::new(0),
+            pending_count: AtomicUsize::new(0),
+            max_workers: native_relay_worker_threads(),
+        }
+    }
+
+    fn submit(&'static self, job: NativeRelayJob) -> io::Result<()> {
+        if !self.ensure_worker_available() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "failed to spawn native relay worker",
+            ));
+        }
+
+        self.pending_count.fetch_add(1, Ordering::Relaxed);
+        if self.sender.send(job).is_err() {
+            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "native relay worker queue closed",
+            ));
+        }
+        self.spawn_extra_worker_if_needed();
+        Ok(())
+    }
+
+    fn ensure_worker_available(&'static self) -> bool {
+        if self.worker_count.load(Ordering::Acquire) > 0 {
+            return true;
+        }
+        self.spawn_worker()
+    }
+
+    fn spawn_extra_worker_if_needed(&'static self) {
+        let pending = self.pending_count.load(Ordering::Relaxed);
+        let idle = self.idle_count.load(Ordering::Relaxed);
+        if pending > idle {
+            let _ = self.spawn_worker();
+        }
+    }
+
+    fn spawn_worker(&'static self) -> bool {
+        loop {
+            let current = self.worker_count.load(Ordering::Acquire);
+            if current >= self.max_workers {
+                return current > 0;
+            }
+            if self
+                .worker_count
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            let pool = self;
+            let spawned = thread::Builder::new()
+                .name("keli-core-native-relay".to_string())
+                .stack_size(native_relay_stack_size())
+                .spawn(move || pool.run_worker());
+            if spawned.is_ok() {
+                return true;
+            }
+            self.worker_count.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+    }
+
+    fn run_worker(&'static self) {
+        loop {
+            self.idle_count.fetch_add(1, Ordering::Relaxed);
+            let job = {
+                let receiver = self
+                    .receiver
+                    .lock()
+                    .expect("native relay queue lock poisoned");
+                receiver.recv_timeout(native_relay_idle_timeout())
+            };
+            self.idle_count.fetch_sub(1, Ordering::Relaxed);
+
+            match job {
+                Ok(job) => {
+                    self.pending_count.fetch_sub(1, Ordering::Relaxed);
+                    job();
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if self.pending_count.load(Ordering::Acquire) == 0 {
+                        self.worker_count.fetch_sub(1, Ordering::AcqRel);
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.worker_count.fetch_sub(1, Ordering::AcqRel);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn native_relay_pool() -> &'static NativeRelayPool {
+    NATIVE_RELAY_POOL.get_or_init(NativeRelayPool::new)
+}
+
+fn native_relay_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|threads| usize::from(threads).saturating_mul(128))
+        .unwrap_or(256)
+        .clamp(256, 4096)
+}
+
+fn native_relay_stack_size() -> usize {
+    512 * 1024
+}
+
+fn native_relay_idle_timeout() -> Duration {
+    Duration::from_secs(30)
 }
 
 async fn copy_count_best_effort_limited_async<R, W>(
@@ -181,7 +351,9 @@ mod tests {
     use std::io::Cursor;
 
     use crate::limits::BandwidthLimiter;
-    use crate::stream::copy_count_best_effort_limited;
+    use crate::stream::{
+        copy_count_best_effort_limited, join_native_blocking_relay, spawn_native_blocking_relay,
+    };
 
     #[test]
     fn limited_copy_still_counts_transferred_bytes() {
@@ -194,5 +366,21 @@ mod tests {
 
         assert_eq!(copied, 5);
         assert_eq!(output, b"hello");
+    }
+
+    #[test]
+    fn native_relay_pool_returns_task_result() {
+        let handle = spawn_native_blocking_relay(|| 42).expect("spawn native relay");
+        let value = join_native_blocking_relay(handle, "native relay panicked").expect("join");
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn native_relay_pool_reports_panics() {
+        let handle =
+            spawn_native_blocking_relay(|| panic!("expected panic")).expect("spawn native relay");
+        let error = join_native_blocking_relay::<()>(handle, "native relay panicked")
+            .expect_err("panic should be reported");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
     }
 }
