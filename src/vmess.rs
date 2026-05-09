@@ -36,7 +36,7 @@ use crate::limits::{
 use crate::outbound::recv_udp_response;
 use crate::quic::connect_quic_client_stream;
 use crate::socks5::SocksTarget;
-use crate::stream::copy_count_best_effort_limited;
+use crate::stream::{copy_count_best_effort_limited, spawn_blocking_relay};
 use crate::tls::TlsConnection;
 use crate::traffic::TrafficRegistry;
 use crate::user::{CoreUser, UserStore};
@@ -2405,9 +2405,9 @@ where
     let local_client = TcpStream::connect(local_addr)?;
     let (local_plain, _) = local_listener.accept()?;
 
-    thread::spawn(move || {
+    let _ = spawn_blocking_relay(move || {
         let _ = relay_plain_to_vmess(local_plain, remote, request);
-    });
+    })?;
 
     Ok(local_client)
 }
