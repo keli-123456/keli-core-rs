@@ -365,12 +365,12 @@ async fn handle_grpc_request(
     let (output_tx, output_rx) = unbounded_channel();
     let reader = GrpcHunkReader::new(input_rx);
     let writer = GrpcHunkWriter::new(output_tx);
-    let handler_thread = thread::spawn(move || handler(reader, writer));
+    let handler_task = tokio::task::spawn_blocking(move || handler(reader, writer));
 
     let request_task = read_grpc_hunks(request.into_body(), input_tx);
     let response_task = write_grpc_hunks(&mut send, output_rx);
     let (request_result, response_result) = tokio::join!(request_task, response_task);
-    let _ = handler_thread.join();
+    let _ = handler_task.await;
     request_result?;
     response_result
 }
