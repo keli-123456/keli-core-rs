@@ -768,10 +768,10 @@ pub(crate) fn connect_shadowsocks_tcp_outbound(
     remote_writer.write_chunk(&request)?;
     remote_writer.flush()?;
 
-    thread::spawn(move || {
+    let _ = spawn_blocking_relay(move || {
         let _ =
             relay_plain_to_shadowsocks(local_plain, remote_reader, remote_writer, method, password);
-    });
+    })?;
 
     Ok(local_client)
 }
