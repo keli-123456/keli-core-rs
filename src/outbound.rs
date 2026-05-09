@@ -7,7 +7,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use crate::config::OutboundConfig;
 use crate::socks5::SocksTarget;
 
-const MAX_UDP_CONNECTION_RESET_RETRIES: usize = 32;
+const MAX_UDP_CONNECTION_RESET_RETRIES: usize = 256;
 
 pub fn connect_tcp_outbound(
     outbound: &OutboundConfig,
