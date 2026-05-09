@@ -21,6 +21,7 @@ pub fn connect_tcp_outbound(
         "shadowsocks" => {
             crate::shadowsocks::connect_shadowsocks_tcp_outbound(outbound, target, timeout)
         }
+        "trojan" => crate::trojan::connect_trojan_tcp_outbound(outbound, target, timeout),
         protocol => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("outbound protocol {protocol} is not implemented"),

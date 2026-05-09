@@ -273,7 +273,7 @@ fn validate_outbound(outbound: &OutboundConfig) -> Result<(), ValidationError> {
     }
     if !matches!(
         outbound.protocol.trim().to_ascii_lowercase().as_str(),
-        "freedom" | "socks" | "socks5" | "http" | "shadowsocks"
+        "freedom" | "socks" | "socks5" | "http" | "shadowsocks" | "trojan"
     ) {
         return Err(ValidationError::new(format!(
             "outbound {} protocol {} is not implemented in keli-core-rs yet",
@@ -297,7 +297,7 @@ fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), Validatio
     }
     if matches!(
         protocol.as_str(),
-        "socks" | "socks5" | "http" | "shadowsocks"
+        "socks" | "socks5" | "http" | "shadowsocks" | "trojan"
     ) {
         if outbound
             .address
@@ -348,6 +348,19 @@ fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), Validatio
                 outbound.tag
             )));
         }
+    }
+    if protocol == "trojan"
+        && outbound
+            .password
+            .as_deref()
+            .map(str::trim)
+            .map(str::is_empty)
+            .unwrap_or(true)
+    {
+        return Err(ValidationError::new(format!(
+            "outbound {} password is required for trojan",
+            outbound.tag
+        )));
     }
     Ok(())
 }
@@ -1289,6 +1302,53 @@ mod tests {
         let error = config
             .validate()
             .expect_err("shadowsocks outbound without password should fail");
+        assert!(error.to_string().contains("password is required"));
+    }
+
+    #[test]
+    fn validates_trojan_route_outbound_credentials() {
+        let mut config = CoreConfig {
+            instance_id: "node-a".to_string(),
+            log_level: "info".to_string(),
+            dns: DnsConfig::default(),
+            inbounds: vec![InboundConfig {
+                tag: "panel|http|1".to_string(),
+                protocol: Protocol::Http,
+                listen: "0.0.0.0".to_string(),
+                port: 8080,
+                users: vec![user()],
+                cipher: None,
+                flow: String::new(),
+                padding_scheme: Vec::new(),
+                transport: TransportConfig::default(),
+                tls: None,
+                sniffing: SniffingConfig::default(),
+            }],
+            outbounds: vec![OutboundConfig {
+                tag: "trojan-out".to_string(),
+                protocol: "trojan".to_string(),
+                method: None,
+                address: Some("127.0.0.1".to_string()),
+                port: Some(443),
+                username: None,
+                password: Some("secret".to_string()),
+            }],
+            routes: vec![crate::config::RouteRule {
+                targets: vec!["domain:example.com".to_string()],
+                action: crate::config::RouteAction::Outbound("trojan-out".to_string()),
+                outbound: None,
+            }],
+            stats: StatsConfig::default(),
+        };
+
+        config
+            .validate()
+            .expect("plain trojan outbound should validate");
+
+        config.outbounds[0].password = None;
+        let error = config
+            .validate()
+            .expect_err("trojan outbound without password should fail");
         assert!(error.to_string().contains("password is required"));
     }
 

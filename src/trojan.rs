@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha224};
 
+use crate::config::OutboundConfig;
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
@@ -652,6 +653,77 @@ pub fn trojan_password_hash(password: &str) -> String {
     hex_lower(&digest)
 }
 
+pub(crate) fn connect_trojan_tcp_outbound(
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let server = trojan_outbound_server(outbound)?;
+    let mut stream = connect_target(&server, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let password = outbound
+        .password
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "outbound password is required for trojan",
+            )
+        })?;
+    write_trojan_tcp_request(&mut stream, password, target)?;
+    Ok(stream)
+}
+
+fn trojan_outbound_server(outbound: &OutboundConfig) -> io::Result<SocksTarget> {
+    let host = outbound
+        .address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "outbound address is required"))?
+        .to_string();
+    let port = outbound
+        .port
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "outbound port is required"))?;
+    Ok(SocksTarget { host, port })
+}
+
+fn write_trojan_tcp_request<W: Write>(
+    writer: &mut W,
+    password: &str,
+    target: &SocksTarget,
+) -> io::Result<()> {
+    writer.write_all(trojan_password_hash(password).as_bytes())?;
+    writer.write_all(b"\r\n")?;
+    writer.write_all(&[COMMAND_TCP])?;
+    write_trojan_target(writer, target)?;
+    writer.write_all(b"\r\n")
+}
+
+fn write_trojan_target<W: Write>(writer: &mut W, target: &SocksTarget) -> io::Result<()> {
+    if let Ok(ip) = target.host.parse::<Ipv4Addr>() {
+        writer.write_all(&[ATYP_IPV4])?;
+        writer.write_all(&ip.octets())?;
+    } else if let Ok(ip) = target.host.parse::<Ipv6Addr>() {
+        writer.write_all(&[ATYP_IPV6])?;
+        writer.write_all(&ip.octets())?;
+    } else {
+        let host = target.host.trim().trim_matches(['[', ']']);
+        if host.is_empty() || host.len() > u8::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "trojan target host is invalid",
+            ));
+        }
+        writer.write_all(&[ATYP_DOMAIN, host.len() as u8])?;
+        writer.write_all(host.as_bytes())?;
+    }
+    writer.write_all(&target.port.to_be_bytes())
+}
+
 fn read_trojan_target<R: Read>(reader: &mut R) -> io::Result<SocksTarget> {
     let host = match read_u8(reader)? {
         ATYP_IPV4 => {
@@ -792,8 +864,12 @@ mod tests {
     use rustls::pki_types::{CertificateDer, ServerName};
     use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
+    use crate::config::OutboundConfig;
+    use crate::socks5::SocksTarget;
     use crate::tls::TlsAcceptor;
-    use crate::trojan::{trojan_password_hash, TrojanServer, TrojanServerConfig};
+    use crate::trojan::{
+        connect_trojan_tcp_outbound, trojan_password_hash, TrojanServer, TrojanServerConfig,
+    };
     use crate::user::CoreUser;
 
     struct MemoryStream {
@@ -1082,6 +1158,48 @@ mod tests {
             .read_request(&mut new_stream)
             .expect("new user should authenticate");
         assert_eq!(request.user_uuid, "trojan-user-b");
+    }
+
+    #[test]
+    fn trojan_tcp_outbound_writes_request_and_relays_plain_stream() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let proxy_thread = thread::spawn(move || {
+            let (mut stream, _) = proxy.accept().expect("proxy accept");
+            let server = server();
+            let request = server.read_request(&mut stream).expect("trojan request");
+            assert_eq!(
+                request.password_hash,
+                trojan_password_hash("trojan-password")
+            );
+            assert_eq!(request.target.host, "example.com");
+            assert_eq!(request.target.port, 443);
+            let mut payload = [0u8; 4];
+            stream.read_exact(&mut payload).expect("payload");
+            assert_eq!(&payload, b"ping");
+            stream.write_all(b"pong").expect("response");
+        });
+
+        let outbound = OutboundConfig {
+            tag: "trojan-out".to_string(),
+            protocol: "trojan".to_string(),
+            method: None,
+            address: Some(proxy_addr.ip().to_string()),
+            port: Some(proxy_addr.port()),
+            username: None,
+            password: Some("trojan-password".to_string()),
+        };
+        let target = SocksTarget {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+        let mut stream = connect_trojan_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+            .expect("connect outbound");
+        stream.write_all(b"ping").expect("write payload");
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).expect("read response");
+        assert_eq!(&response, b"pong");
+        proxy_thread.join().expect("proxy thread");
     }
 
     #[test]
