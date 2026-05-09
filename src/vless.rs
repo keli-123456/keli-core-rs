@@ -23,7 +23,10 @@ use crate::limits::{
 use crate::outbound::recv_udp_response;
 use crate::quic::connect_quic_client_stream;
 use crate::socks5::SocksTarget;
-use crate::stream::{copy_count_best_effort_limited, relay_tcp_streams_limited};
+use crate::stream::{
+    copy_count_best_effort_limited, join_blocking_relay, relay_tcp_streams_limited,
+    spawn_blocking_relay,
+};
 use crate::tls::{relay_tls_stream, TlsConnection, TlsSocket};
 use crate::traffic::TrafficRegistry;
 use crate::user::{CoreUser, UserStore};
@@ -453,17 +456,15 @@ impl VlessServer {
             let mut remote_write = remote.try_clone()?;
             let mut remote_read = remote;
             let upload_limiter = bandwidth.clone();
-            let upload_thread = thread::spawn(move || {
+            let upload_task = spawn_blocking_relay(move || {
                 copy_count_best_effort_limited(
                     &mut reader,
                     &mut remote_write,
                     upload_limiter.as_deref(),
                 )
-            });
-            let download = copy_count_best_effort_limited(&mut remote_read, &mut writer, None);
-            let upload = upload_thread.join().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "upload relay thread panicked")
             })?;
+            let download = copy_count_best_effort_limited(&mut remote_read, &mut writer, None);
+            let upload = join_blocking_relay(upload_task, "upload relay task panicked")?;
             (upload, download)
         };
         self.traffic

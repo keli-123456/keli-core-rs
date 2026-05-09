@@ -8,6 +8,8 @@ use crate::limits::BandwidthLimiter;
 
 static TCP_RELAY_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
+pub type BlockingRelayHandle<T> = tokio::task::JoinHandle<T>;
+
 pub fn relay_tcp_streams(client: TcpStream, remote: TcpStream) -> io::Result<(u64, u64)> {
     relay_tcp_streams_limited(client, remote, None)
 }
@@ -18,6 +20,23 @@ pub fn relay_tcp_streams_limited(
     limiter: Option<Arc<BandwidthLimiter>>,
 ) -> io::Result<(u64, u64)> {
     relay_tcp_streams_async(client, remote, limiter)
+}
+
+pub fn spawn_blocking_relay<F, T>(task: F) -> io::Result<BlockingRelayHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    Ok(tcp_relay_runtime()?.spawn_blocking(task))
+}
+
+pub fn join_blocking_relay<T>(
+    handle: BlockingRelayHandle<T>,
+    panic_message: &'static str,
+) -> io::Result<T> {
+    tcp_relay_runtime()?
+        .block_on(handle)
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, panic_message))
 }
 
 fn relay_tcp_streams_async(
@@ -55,6 +74,7 @@ fn tcp_relay_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(tcp_relay_worker_threads())
+        .max_blocking_threads(tcp_relay_blocking_threads())
         .thread_name("keli-core-tcp-relay")
         .enable_io()
         .enable_time()
@@ -74,6 +94,13 @@ fn tcp_relay_worker_threads() -> usize {
         .map(usize::from)
         .unwrap_or(4)
         .clamp(2, 16)
+}
+
+fn tcp_relay_blocking_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|threads| usize::from(threads).saturating_mul(64))
+        .unwrap_or(128)
+        .clamp(64, 512)
 }
 
 async fn copy_count_best_effort_limited_async<R, W>(

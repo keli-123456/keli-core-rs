@@ -1,4 +1,4 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
@@ -21,7 +21,7 @@ use crate::limits::{
 };
 use crate::outbound::recv_udp_response;
 use crate::socks5::SocksTarget;
-use crate::stream::copy_count_best_effort_limited;
+use crate::stream::{copy_count_best_effort_limited, join_blocking_relay, spawn_blocking_relay};
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 use crate::{
@@ -465,7 +465,7 @@ impl ShadowsocksServer {
         let mut encrypted_client = request.client_reader;
         let mut remote_write = remote.try_clone()?;
         let upload_limiter = bandwidth.clone();
-        let upload_thread = thread::spawn(move || {
+        let upload_task = spawn_blocking_relay(move || {
             let copied = copy_count_best_effort_limited(
                 &mut encrypted_client,
                 &mut remote_write,
@@ -473,7 +473,7 @@ impl ShadowsocksServer {
             );
             let _ = remote_write.shutdown(Shutdown::Write);
             copied
-        });
+        })?;
 
         let mut remote_read = remote;
         let mut encrypted_writer =
@@ -481,10 +481,10 @@ impl ShadowsocksServer {
         let download =
             copy_count_best_effort_limited(&mut remote_read, &mut encrypted_writer, None);
         let _ = encrypted_writer.shutdown();
-        upload =
-            upload.saturating_add(upload_thread.join().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "upload relay thread panicked")
-            })?);
+        upload = upload.saturating_add(join_blocking_relay(
+            upload_task,
+            "upload relay task panicked",
+        )?);
 
         self.traffic
             .lock()
