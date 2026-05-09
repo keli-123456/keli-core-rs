@@ -125,6 +125,7 @@ cargo run -- run-config ./core.json --control 127.0.0.1:18080
 cargo run -- bench vless-tcp --streams 8 --requests 1000 --payload 1024
 cargo run -- bench vless-tcp-stream --streams 8 --requests 1000 --payload 1024
 cargo run -- bench hy2-tcp --streams 8 --requests 1000 --payload 1024
+cargo run -- bench hy2-tcp-stream --streams 8 --requests 1000 --payload 1024
 ```
 
 ## Local Benchmarks
@@ -135,12 +136,15 @@ connection-per-request so it measures VLESS TCP setup plus one echo payload per 
 The `vless-tcp-stream` benchmark opens one VLESS TCP connection per stream and sends
 all request payloads through that connection, so it isolates the steady-state relay path.
 The `hy2-tcp` benchmark authenticates once and opens TCP request streams over a single
-QUIC connection, so the stream count represents HY2 multiplexed concurrency:
+QUIC connection, so the stream count represents HY2 multiplexed concurrency.
+The `hy2-tcp-stream` benchmark opens one HY2 TCP stream per worker and sends all request
+payloads through that stream, isolating steady-state relay inside an established HY2 stream:
 
 ```bash
 cargo run --release -- bench vless-tcp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench vless-tcp-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-tcp --streams 16 --requests 5000 --payload 1024
+cargo run --release -- bench hy2-tcp-stream --streams 16 --requests 5000 --payload 1024
 ```
 
 Use the same host, release build, payload, stream count, and request count when comparing

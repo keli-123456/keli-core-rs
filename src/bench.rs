@@ -107,6 +107,15 @@ pub fn run_bench(args: impl Iterator<Item = String>) -> Result<(), String> {
             );
             Ok(())
         }
+        Some("hy2-tcp-stream") | Some("hysteria2-tcp-stream") | Some("hy2-stream") => {
+            let options = parse_bench_options(args)?;
+            let report = run_hy2_tcp_stream_bench(&options).map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+            );
+            Ok(())
+        }
         Some("--help") | Some("help") | None => {
             print_bench_usage();
             Ok(())
@@ -168,7 +177,7 @@ fn validate_bench_options(options: &BenchOptions) -> Result<(), String> {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]"
+        "bench commands:\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]"
     );
 }
 
@@ -232,6 +241,13 @@ fn run_hy2_tcp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
         .enable_all()
         .build()?
         .block_on(run_hy2_tcp_bench_async(options))
+}
+
+fn run_hy2_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_hy2_tcp_stream_bench_async(options))
 }
 
 async fn run_hy2_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchReport> {
@@ -305,6 +321,91 @@ async fn run_hy2_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
     Ok(BenchReport {
         protocol: "hy2-tcp",
         mode: "single-quic-connection",
+        streams: options.streams,
+        requests_per_stream: options.requests,
+        payload_bytes: options.payload_size,
+        total_requests,
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed_ms: elapsed.as_millis(),
+        requests_per_second: total_requests as f64 / seconds,
+        roundtrip_mbps: ((upload_bytes + download_bytes) as f64 * 8.0) / seconds / 1_000_000.0,
+        latency: latency_report(&latencies),
+    })
+}
+
+async fn run_hy2_tcp_stream_bench_async(options: &BenchOptions) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let cert = BenchCert::new("hy2-stream-bench")?;
+    let server = Hysteria2Server::new(Hysteria2ServerConfig {
+        node_tag: "bench|hy2|tcp-stream".to_string(),
+        listen: "127.0.0.1:0".parse().expect("valid listen addr"),
+        users: vec![hy2_user()],
+        routes: Vec::new(),
+        cert_file: cert.cert_path.to_string_lossy().to_string(),
+        key_file: cert.key_path.to_string_lossy().to_string(),
+        server_name: "localhost".to_string(),
+        alpn: vec!["h3".to_string()],
+        reject_unknown_sni: false,
+        connect_timeout: Duration::from_secs(3),
+        up_mbps: 0,
+        down_mbps: 0,
+        ignore_client_bandwidth: false,
+        obfs: None,
+    });
+    let endpoint = server.bind()?;
+    let server_addr = endpoint.local_addr()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_task = tokio::spawn(server.run(endpoint, stop.clone()));
+    let client_endpoint = hy2_client_endpoint(cert.cert_der.clone())?;
+    let connection = client_endpoint
+        .connect(server_addr, "localhost")
+        .map_err(io_other)?
+        .await
+        .map_err(io_other)?;
+    authenticate_hy2(&connection).await?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        let connection = connection.clone();
+        workers.push(tokio::spawn(async move {
+            run_hy2_tcp_stream_client(connection, echo_addr, stream_id, &options).await
+        }));
+    }
+
+    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker.await.map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "hy2 stream bench worker panicked")
+        })??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+    }
+    let elapsed = started.elapsed();
+
+    connection.close(0u32.into(), b"bench done");
+    client_endpoint.wait_idle().await;
+    stop.store(true, Ordering::SeqCst);
+    server_task
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "hy2 bench server task panicked"))?;
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+    Ok(BenchReport {
+        protocol: "hy2-tcp",
+        mode: "hy2-tcp-stream-per-worker",
         streams: options.streams,
         requests_per_stream: options.requests,
         payload_bytes: options.payload_size,
@@ -709,6 +810,57 @@ async fn run_one_hy2_tcp_request(
     Ok(started.elapsed().as_micros())
 }
 
+async fn run_hy2_tcp_stream_client(
+    connection: quinn::Connection,
+    echo_addr: SocketAddr,
+    stream_id: usize,
+    options: &BenchOptions,
+) -> io::Result<ClientStats> {
+    let payload = bench_payload(stream_id, options.payload_size);
+    let mut response = vec![0u8; payload.len()];
+    let mut latencies = Vec::with_capacity(options.requests);
+    let (mut send, mut recv) = connection.open_bi().await.map_err(io_other)?;
+    send.write_all(&hy2_tcp_request(echo_addr))
+        .await
+        .map_err(io_other)?;
+    read_hy2_tcp_response_header(&mut recv).await?;
+
+    for request_index in 0..options.requests {
+        let started = Instant::now();
+        send.write_all(&payload).await.map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "hy2 stream {stream_id} request {} write failed: {error}",
+                    request_index + 1
+                ),
+            )
+        })?;
+        recv.read_exact(&mut response).await.map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "hy2 stream {stream_id} request {} read failed: {error}",
+                    request_index + 1
+                ),
+            )
+        })?;
+        if response != payload {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "hy2 stream bench echo payload mismatch",
+            ));
+        }
+        latencies.push(started.elapsed().as_micros());
+    }
+
+    send.finish().map_err(io_other)?;
+    Ok(ClientStats {
+        latencies,
+        retries: 0,
+    })
+}
+
 fn hy2_client_endpoint(cert_der: CertificateDer<'static>) -> io::Result<quinn::Endpoint> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert_der).map_err(io_other)?;
@@ -967,6 +1119,21 @@ mod tests {
         assert_eq!(report.protocol, "hy2-tcp");
         assert_eq!(report.mode, "single-quic-connection");
         assert_eq!(report.total_requests, 2);
+        assert!(report.download_bytes > 0);
+    }
+
+    #[test]
+    fn runs_hy2_tcp_stream_bench_smoke() {
+        let report = super::run_hy2_tcp_stream_bench(&BenchOptions {
+            streams: 1,
+            requests: 3,
+            payload_size: 16,
+        })
+        .expect("bench");
+
+        assert_eq!(report.protocol, "hy2-tcp");
+        assert_eq!(report.mode, "hy2-tcp-stream-per-worker");
+        assert_eq!(report.total_requests, 3);
         assert!(report.download_bytes > 0);
     }
 }
