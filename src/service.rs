@@ -1490,6 +1490,9 @@ where
                     match tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
                     {
                         Ok(Ok((stream, _))) => {
+                            if stop.load(Ordering::SeqCst) {
+                                break;
+                            }
                             if let Ok(stream) = stream.into_std() {
                                 let _ = stream.set_nonblocking(false);
                                 let handler = Arc::clone(&handler);
