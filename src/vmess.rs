@@ -36,10 +36,7 @@ use crate::limits::{
 use crate::outbound::recv_udp_response;
 use crate::quic::connect_quic_client_stream;
 use crate::socks5::SocksTarget;
-use crate::stream::{
-    copy_count_best_effort_limited, join_native_blocking_relay, spawn_blocking_relay,
-    spawn_native_blocking_relay,
-};
+use crate::stream::{copy_count_best_effort_limited, spawn_blocking_relay};
 use crate::tls::TlsConnection;
 use crate::traffic::TrafficRegistry;
 use crate::user::{CoreUser, UserStore};
@@ -461,7 +458,7 @@ impl VmessServer {
             request.security,
         )?;
         let upload_limiter = bandwidth.clone();
-        let upload_task = spawn_native_blocking_relay(move || {
+        let upload_thread = thread::spawn(move || {
             let copied = copy_count_best_effort_limited(
                 &mut request_body,
                 &mut remote_write,
@@ -469,14 +466,16 @@ impl VmessServer {
             );
             let _ = remote_write.shutdown(Shutdown::Write);
             copied
-        })?;
+        });
         let download = copy_count_best_effort_limited(
             &mut remote_read,
             &mut response_body,
             bandwidth.as_deref(),
         );
         let _ = response_body.finish();
-        let upload = join_native_blocking_relay(upload_task, "upload relay thread panicked")?;
+        let upload = upload_thread
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "upload relay thread panicked"))?;
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
