@@ -1765,6 +1765,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1779,6 +1780,49 @@ mod tests {
     use crate::user::CoreUser;
 
     use super::reality_tls_acceptor;
+
+    #[test]
+    fn connection_worker_group_waits_for_submitted_jobs() {
+        let group = super::ConnectionWorkerGroup::new();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_for_worker = completed.clone();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        assert!(group.spawn(move || {
+            release_rx.recv().expect("release worker");
+            completed_for_worker.store(true, Ordering::SeqCst);
+        }));
+
+        let group_for_waiter = group.clone();
+        let (joined_tx, joined_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            group_for_waiter.join();
+            joined_tx.send(()).expect("send joined");
+        });
+
+        assert!(joined_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        release_tx.send(()).expect("release");
+        joined_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker group joined");
+        waiter.join().expect("waiter thread");
+        assert!(completed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn connection_worker_group_releases_panicking_jobs() {
+        let group = super::ConnectionWorkerGroup::new();
+        assert!(group.spawn(|| panic!("worker panic should be contained")));
+        group.join();
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_for_worker = completed.clone();
+        assert!(group.spawn(move || {
+            completed_for_worker.store(true, Ordering::SeqCst);
+        }));
+        group.join();
+        assert!(completed.load(Ordering::SeqCst));
+    }
 
     trait AsyncIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 
