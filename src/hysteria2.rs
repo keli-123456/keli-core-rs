@@ -427,7 +427,7 @@ impl Hysteria2Server {
         };
 
         if let Some(outbound) = outbound {
-            bandwidth.wait_upload(message.data.len());
+            bandwidth.wait_upload(message.data.len()).await;
             match send_udp_outbound_tokio(
                 outbound,
                 &message.target,
@@ -437,7 +437,7 @@ impl Hysteria2Server {
             .await
             {
                 Ok((source, response)) => {
-                    bandwidth.wait_download(response.len());
+                    bandwidth.wait_download(response.len()).await;
                     let address = format_socket_addr(&source);
                     let datagram = encode_udp_datagram(
                         message.session_id,
@@ -499,7 +499,7 @@ impl Hysteria2Server {
                 client_ip,
             )
             .await?;
-        bandwidth.wait_upload(message.data.len());
+        bandwidth.wait_upload(message.data.len()).await;
         session.socket.send_to(&message.data, target_addr).await?;
         self.traffic
             .lock()
@@ -631,15 +631,15 @@ struct DirectionalLimiters {
 }
 
 impl DirectionalLimiters {
-    fn wait_upload(&self, bytes: usize) {
+    async fn wait_upload(&self, bytes: usize) {
         for limiter in &self.upload {
-            limiter.wait_for(bytes);
+            limiter.wait_for_async(bytes).await;
         }
     }
 
-    fn wait_download(&self, bytes: usize) {
+    async fn wait_download(&self, bytes: usize) {
         for limiter in &self.download {
-            limiter.wait_for(bytes);
+            limiter.wait_for_async(bytes).await;
         }
     }
 }
@@ -751,7 +751,7 @@ async fn receive_udp_replies(
     let mut buffer = vec![0u8; UDP_PACKET_BUFFER_SIZE];
     loop {
         let (read, peer) = session.socket.recv_from(&mut buffer).await?;
-        bandwidth.wait_download(read);
+        bandwidth.wait_download(read).await;
         let packet_id = session.next_packet_id.fetch_add(1, Ordering::Relaxed);
         let address = format_socket_addr(&peer);
         let datagram = encode_udp_datagram(session_id, packet_id, 0, 1, &address, &buffer[..read])?;
@@ -991,7 +991,7 @@ async fn relay_streams(
                 let _ = remote_write.shutdown().await;
                 return Ok::<u64, io::Error>(total);
             };
-            bandwidth.wait_upload(read);
+            bandwidth.wait_upload(read).await;
             remote_write.write_all(&buffer[..read]).await?;
             total = total.saturating_add(read as u64);
         }
@@ -1005,7 +1005,7 @@ async fn relay_streams(
                 let _ = send.finish();
                 return Ok::<u64, io::Error>(total);
             }
-            bandwidth.wait_download(read);
+            bandwidth.wait_download(read).await;
             send.write_all(&buffer[..read]).await.map_err(io_other)?;
             total = total.saturating_add(read as u64);
         }
