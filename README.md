@@ -122,7 +122,23 @@ cargo run -- health
 cargo run -- check-config ./core.json
 cargo run -- run-config ./core.json
 cargo run -- run-config ./core.json --control 127.0.0.1:18080
+cargo run -- bench vless-tcp --streams 8 --requests 1000 --payload 1024
 ```
+
+## Local Benchmarks
+
+The benchmark command starts local loopback echo and core listeners, drives real protocol
+traffic through the core, and prints JSON metrics. The current `vless-tcp` benchmark is
+connection-per-request so it measures VLESS TCP setup plus one echo payload per request:
+
+```bash
+cargo run --release -- bench vless-tcp --streams 16 --requests 5000 --payload 1024
+```
+
+Use the same host, release build, payload, stream count, and request count when comparing
+against Xray or another core. The JSON `retries` field records retryable local socket
+EOF/reset noise seen while establishing benchmark requests; treat non-zero retries as
+environment noise when comparing results.
 
 ## Release Artifacts
 

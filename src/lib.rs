@@ -1,4 +1,5 @@
 pub mod anytls;
+pub mod bench;
 pub mod config;
 pub mod config_io;
 pub mod control;

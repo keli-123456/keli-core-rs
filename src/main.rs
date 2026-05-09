@@ -75,10 +75,13 @@ fn run() -> Result<(), String> {
                 handle.stop();
             }
         }
+        Some("bench") => {
+            keli_core_rs::bench::run_bench(args)?;
+        }
         _ => {
             println!("keli-core-rs {} experimental core skeleton", VERSION);
             println!(
-                "commands: version, health, check-config <path>, run-config <path> [--control <addr>]"
+                "commands: version, health, check-config <path>, run-config <path> [--control <addr>], bench <command>"
             );
         }
     }
