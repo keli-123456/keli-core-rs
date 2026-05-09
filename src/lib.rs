@@ -5,6 +5,7 @@ pub mod control;
 pub mod control_server;
 pub mod dns;
 pub mod grpc;
+pub mod http2;
 pub mod http_proxy;
 pub mod httpupgrade;
 pub mod hysteria2;

@@ -95,6 +95,8 @@ pub struct OutboundTransportConfig {
     pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,7 +489,10 @@ fn validate_outbound_transport(
             outbound.tag
         )));
     }
-    if !matches!(network.as_str(), "tcp" | "ws" | "httpupgrade" | "grpc") {
+    if !matches!(
+        network.as_str(),
+        "tcp" | "ws" | "httpupgrade" | "grpc" | "h2" | "http"
+    ) {
         return Err(ValidationError::new(format!(
             "outbound {} {} transport {} is not supported yet",
             outbound.tag, outbound.protocol, network
@@ -500,15 +505,28 @@ fn validate_outbound_transport(
         .as_deref()
         .map(str::trim)
         .unwrap_or_default();
-    if !matches!(network.as_str(), "ws" | "httpupgrade") && (!path.is_empty() || !host.is_empty()) {
+    let method = transport
+        .method
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    if !matches!(network.as_str(), "ws" | "httpupgrade" | "h2" | "http")
+        && (!path.is_empty() || !host.is_empty())
+    {
         return Err(ValidationError::new(format!(
-            "outbound {} transport path/host is supported only for ws/httpupgrade today",
+            "outbound {} transport path/host is supported only for ws/httpupgrade/h2 today",
             outbound.tag
         )));
     }
     if network != "grpc" && !service_name.is_empty() {
         return Err(ValidationError::new(format!(
             "outbound {} grpc service_name is supported only for grpc transport",
+            outbound.tag
+        )));
+    }
+    if !matches!(network.as_str(), "h2" | "http") && !method.is_empty() {
+        return Err(ValidationError::new(format!(
+            "outbound {} h2 method is supported only for h2 transport",
             outbound.tag
         )));
     }
@@ -1530,6 +1548,7 @@ mod tests {
             path: Some("/trojan".to_string()),
             host: Some("example.com".to_string()),
             service_name: None,
+            method: None,
         });
         config
             .validate()
@@ -1540,6 +1559,7 @@ mod tests {
             path: Some("/trojan".to_string()),
             host: Some("example.com".to_string()),
             service_name: None,
+            method: None,
         });
         config
             .validate()
@@ -1550,6 +1570,7 @@ mod tests {
             path: None,
             host: None,
             service_name: Some("GunService".to_string()),
+            method: None,
         });
         config
             .validate()
@@ -1619,6 +1640,7 @@ mod tests {
             path: Some("/vless".to_string()),
             host: Some("example.com".to_string()),
             service_name: None,
+            method: None,
         });
         config
             .validate()
@@ -1629,6 +1651,7 @@ mod tests {
             path: Some("/vless".to_string()),
             host: Some("example.com".to_string()),
             service_name: None,
+            method: None,
         });
         config
             .validate()
@@ -1639,6 +1662,7 @@ mod tests {
             path: None,
             host: None,
             service_name: Some("GunService".to_string()),
+            method: None,
         });
         config
             .validate()

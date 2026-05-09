@@ -15,6 +15,7 @@ use rustls::{
 
 use crate::config::{outbound_transport_network, OutboundConfig, OutboundTlsConfig};
 use crate::grpc::{connect_grpc_client, GrpcClientStream};
+use crate::http2::{connect_http2_client, local_bridge_for_http2};
 use crate::httpupgrade::connect_httpupgrade_client;
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
@@ -811,6 +812,9 @@ pub(crate) fn connect_vless_tcp_outbound(
     if network == "grpc" {
         return connect_vless_grpc_tcp_outbound(outbound, &server, &user_id, flow, target, timeout);
     }
+    if matches!(network.as_str(), "h2" | "http") {
+        return connect_vless_h2_tcp_outbound(outbound, &server, &user_id, flow, target, timeout);
+    }
     if network != "tcp" {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -826,6 +830,29 @@ pub(crate) fn connect_vless_tcp_outbound(
     write_vless_tcp_request(&mut stream, &user_id, flow, target)?;
     read_vless_response_header(&mut stream)?;
     Ok(stream)
+}
+
+fn connect_vless_h2_tcp_outbound(
+    outbound: &OutboundConfig,
+    server: &SocksTarget,
+    user_id: &[u8; 16],
+    flow: &str,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let host = outbound_transport_host(outbound, server);
+    let mut h2 = connect_http2_client(
+        server,
+        timeout,
+        outbound.tls.as_ref(),
+        outbound_transport_path(outbound),
+        &host,
+        outbound_transport_method(outbound),
+    )?;
+    write_vless_tcp_request(&mut h2, user_id, flow, target)?;
+    h2.flush()?;
+    read_vless_response_header(&mut h2)?;
+    local_bridge_for_http2(h2)
 }
 
 fn connect_vless_grpc_tcp_outbound(
@@ -1074,6 +1101,15 @@ fn outbound_transport_service_name(outbound: &OutboundConfig) -> Option<&str> {
         .transport
         .as_ref()
         .and_then(|transport| transport.service_name.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn outbound_transport_method(outbound: &OutboundConfig) -> Option<&str> {
+    outbound
+        .transport
+        .as_ref()
+        .and_then(|transport| transport.method.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty())
 }
@@ -1854,6 +1890,7 @@ mod tests {
 
     use crate::config::{OutboundConfig, OutboundTlsConfig, OutboundTransportConfig};
     use crate::grpc::{run_grpc_listener, GrpcStreamHandler};
+    use crate::http2::{run_http2_listener, Http2StreamHandler};
     use crate::httpupgrade::accept_httpupgrade;
     use crate::socks5::SocksTarget;
     use crate::tls::TlsAcceptor;
@@ -2376,6 +2413,7 @@ mod tests {
                 path: Some("/vless".to_string()),
                 host: Some("example.test".to_string()),
                 service_name: None,
+                method: None,
             }),
         };
         let target = SocksTarget {
@@ -2438,6 +2476,7 @@ mod tests {
                 path: Some("/vless".to_string()),
                 host: Some("localhost".to_string()),
                 service_name: None,
+                method: None,
             }),
         };
         let target = SocksTarget {
@@ -2490,6 +2529,83 @@ mod tests {
                 path: Some("/vless".to_string()),
                 host: Some("example.test".to_string()),
                 service_name: None,
+                method: None,
+            }),
+        };
+        let target = SocksTarget {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+
+        let mut stream = connect_vless_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+            .expect("connect outbound");
+        stream.write_all(b"ping").expect("write payload");
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).expect("read response");
+
+        assert_eq!(&response, b"pong");
+        proxy_thread.join().expect("proxy thread");
+    }
+
+    #[test]
+    fn vless_h2_outbound_writes_request_and_relays_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        listener
+            .set_nonblocking(true)
+            .expect("proxy listener nonblocking");
+        let proxy_addr = listener.local_addr().expect("proxy addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let handler_stop = stop.clone();
+        let proxy_thread = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let _guard = runtime.enter();
+            let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+            drop(_guard);
+            let handler: Http2StreamHandler = Arc::new(move |mut reader, mut writer| {
+                let request = server().read_request(&mut reader).expect("vless request");
+                assert_eq!(request.user_uuid, "11111111-1111-1111-1111-111111111111");
+                assert_eq!(request.target.host, "example.com");
+                assert_eq!(request.target.port, 443);
+
+                writer
+                    .write_all(&[super::VERSION, 0x00])
+                    .expect("response header");
+                let mut payload = [0u8; 4];
+                reader.read_exact(&mut payload).expect("payload");
+                assert_eq!(&payload, b"ping");
+                writer.write_all(b"pong").expect("response");
+                handler_stop.store(true, Ordering::SeqCst);
+            });
+            runtime
+                .block_on(run_http2_listener(
+                    listener,
+                    server_stop,
+                    "/vless".to_string(),
+                    "PUT".to_string(),
+                    None,
+                    handler,
+                ))
+                .expect("h2 listener");
+        });
+        let outbound = OutboundConfig {
+            tag: "vless-out".to_string(),
+            protocol: "vless".to_string(),
+            method: None,
+            address: Some(proxy_addr.ip().to_string()),
+            port: Some(proxy_addr.port()),
+            username: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            password: None,
+            tls: None,
+            transport: Some(OutboundTransportConfig {
+                network: "h2".to_string(),
+                path: Some("/vless".to_string()),
+                host: Some("example.test".to_string()),
+                service_name: None,
+                method: Some("PUT".to_string()),
             }),
         };
         let target = SocksTarget {
@@ -2564,6 +2680,7 @@ mod tests {
                 path: None,
                 host: Some("example.test".to_string()),
                 service_name: Some("GunService".to_string()),
+                method: None,
             }),
         };
         let target = SocksTarget {

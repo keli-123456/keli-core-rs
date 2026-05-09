@@ -28,6 +28,7 @@ use rustls::{
 
 use crate::config::{outbound_transport_network, OutboundConfig, OutboundTlsConfig};
 use crate::grpc::connect_grpc_client;
+use crate::http2::connect_http2_client;
 use crate::httpupgrade::connect_httpupgrade_client;
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
@@ -1675,6 +1676,9 @@ pub(crate) fn connect_vmess_tcp_outbound(
     if network == "grpc" {
         return connect_vmess_grpc_tcp_outbound(outbound, &server, target, timeout);
     }
+    if matches!(network.as_str(), "h2" | "http") {
+        return connect_vmess_h2_tcp_outbound(outbound, &server, target, timeout);
+    }
     if network != "tcp" {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -1691,6 +1695,28 @@ pub(crate) fn connect_vmess_tcp_outbound(
     read_vmess_response_header(&mut stream, &request)?;
     stream.set_nonblocking(true)?;
     local_bridge_for_vmess(stream, request)
+}
+
+fn connect_vmess_h2_tcp_outbound(
+    outbound: &OutboundConfig,
+    server: &SocksTarget,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let host = outbound_transport_host(outbound, server);
+    let mut h2 = connect_http2_client(
+        server,
+        timeout,
+        outbound.tls.as_ref(),
+        outbound_transport_path(outbound),
+        &host,
+        outbound_transport_method(outbound),
+    )?;
+    let request = write_vmess_tcp_request(&mut h2, outbound, target)?;
+    h2.flush()?;
+    read_vmess_response_header(&mut h2, &request)?;
+    h2.set_nonblocking(true);
+    local_bridge_for_vmess(h2, request)
 }
 
 fn connect_vmess_grpc_tcp_outbound(
@@ -1837,6 +1863,18 @@ pub(crate) fn send_vmess_udp_outbound(
             &host,
         )?;
         return send_vmess_udp_over_stream(&mut grpc, outbound, target, payload, timeout);
+    }
+    if matches!(network.as_str(), "h2" | "http") {
+        let host = outbound_transport_host(outbound, &server);
+        let mut h2 = connect_http2_client(
+            &server,
+            timeout,
+            outbound.tls.as_ref(),
+            outbound_transport_path(outbound),
+            &host,
+            outbound_transport_method(outbound),
+        )?;
+        return send_vmess_udp_over_stream(&mut h2, outbound, target, payload, timeout);
     }
     if network != "tcp" {
         return Err(io::Error::new(
@@ -2043,6 +2081,15 @@ fn outbound_transport_service_name(outbound: &OutboundConfig) -> Option<&str> {
         .transport
         .as_ref()
         .and_then(|transport| transport.service_name.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn outbound_transport_method(outbound: &OutboundConfig) -> Option<&str> {
+    outbound
+        .transport
+        .as_ref()
+        .and_then(|transport| transport.method.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty())
 }
@@ -2615,6 +2662,7 @@ mod tests {
     };
     use crate::config::{OutboundConfig, OutboundTransportConfig};
     use crate::grpc::{run_grpc_listener, GrpcStreamHandler};
+    use crate::http2::{run_http2_listener, Http2StreamHandler};
     use crate::httpupgrade::accept_httpupgrade;
     use crate::socks5::SocksTarget;
     use crate::tls::TlsAcceptor;
@@ -3090,6 +3138,7 @@ mod tests {
                 path: Some("/vmess".to_string()),
                 host: Some("example.test".to_string()),
                 service_name: None,
+                method: None,
             }),
         );
 
@@ -3125,6 +3174,65 @@ mod tests {
                 path: Some("/vmess".to_string()),
                 host: Some("example.test".to_string()),
                 service_name: None,
+                method: None,
+            }),
+        );
+
+        let stream = connect_vmess_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+            .expect("connect outbound");
+
+        assert_outbound_reaches_echo(stream, echo_thread);
+        proxy_thread.join().expect("proxy thread");
+    }
+
+    #[test]
+    fn vmess_h2_outbound_writes_request_and_relays_stream() {
+        let (echo_addr, echo_thread) = echo_server();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        listener
+            .set_nonblocking(true)
+            .expect("proxy listener nonblocking");
+        let proxy_addr = listener.local_addr().expect("proxy addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let handler_stop = stop.clone();
+        let proxy_thread = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let _guard = runtime.enter();
+            let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+            drop(_guard);
+            let handler: Http2StreamHandler = Arc::new(move |reader, writer| {
+                server()
+                    .handle_split_client(reader, writer)
+                    .expect("vmess h2 proxy");
+                handler_stop.store(true, Ordering::SeqCst);
+            });
+            runtime
+                .block_on(run_http2_listener(
+                    listener,
+                    server_stop,
+                    "/vmess".to_string(),
+                    "PUT".to_string(),
+                    None,
+                    handler,
+                ))
+                .expect("h2 listener");
+        });
+        let target = SocksTarget {
+            host: echo_addr.ip().to_string(),
+            port: echo_addr.port(),
+        };
+        let outbound = vmess_outbound(
+            proxy_addr,
+            Some(OutboundTransportConfig {
+                network: "h2".to_string(),
+                path: Some("/vmess".to_string()),
+                host: Some("example.test".to_string()),
+                service_name: None,
+                method: Some("PUT".to_string()),
             }),
         );
 
@@ -3181,6 +3289,7 @@ mod tests {
                 path: None,
                 host: Some("example.test".to_string()),
                 service_name: Some("GunService".to_string()),
+                method: None,
             }),
         );
 
