@@ -20,6 +20,14 @@ pub struct NativeRelayHandle<T> {
     receiver: mpsc::Receiver<thread::Result<T>>,
 }
 
+impl<T> std::fmt::Debug for NativeRelayHandle<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeRelayHandle")
+            .finish_non_exhaustive()
+    }
+}
+
 struct NativeRelayPool {
     queue: Mutex<VecDeque<NativeRelayJob>>,
     ready: Condvar,

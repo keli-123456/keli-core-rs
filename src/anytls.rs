@@ -14,7 +14,7 @@ use crate::limits::{
 };
 use crate::outbound::recv_udp_response;
 use crate::socks5::SocksTarget;
-use crate::stream::{join_blocking_relay, spawn_blocking_relay, BlockingRelayHandle};
+use crate::stream::{join_native_blocking_relay, spawn_native_blocking_relay, NativeRelayHandle};
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 use crate::{
@@ -75,7 +75,7 @@ struct AnyTlsSession {
     client_ip: Option<IpAddr>,
     writer: Arc<Mutex<TcpStream>>,
     remotes: HashMap<u32, AnyTlsRemote>,
-    workers: Vec<BlockingRelayHandle<()>>,
+    workers: Vec<NativeRelayHandle<()>>,
     traffic: Arc<Mutex<(u64, u64)>>,
     bandwidth: Option<Arc<BandwidthLimiter>>,
     settings_done: bool,
@@ -160,7 +160,7 @@ impl AnyTlsServer {
             }
         }
         for worker in session.workers {
-            let _ = join_blocking_relay(worker, "anytls downlink worker panicked");
+            let _ = join_native_blocking_relay(worker, "anytls downlink worker panicked");
         }
         let (upload, download) = *session.traffic.lock().expect("traffic lock poisoned");
         if upload > 0 || download > 0 {
@@ -395,7 +395,7 @@ impl AnyTlsServer {
         let mut remote_read = remote.try_clone()?;
         let writer = session.writer.clone();
         let traffic = session.traffic.clone();
-        session.workers.push(spawn_blocking_relay(move || {
+        session.workers.push(spawn_native_blocking_relay(move || {
             pump_downlink(stream_id, &mut remote_read, writer, traffic);
         })?);
         session.remotes.insert(stream_id, AnyTlsRemote::Tcp(remote));
