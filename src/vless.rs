@@ -6,7 +6,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::config::OutboundConfig;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    StreamOwned,
+};
+
+use crate::config::{OutboundConfig, OutboundTlsConfig};
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
@@ -763,9 +770,6 @@ pub(crate) fn connect_vless_tcp_outbound(
     timeout: Duration,
 ) -> io::Result<TcpStream> {
     let server = vless_outbound_server(outbound)?;
-    let mut stream = connect_target(&server, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
     let user_id = vless_outbound_user_id(outbound)?;
     let flow = outbound.method.as_deref().unwrap_or_default().trim();
     if !flow.is_empty() {
@@ -774,9 +778,94 @@ pub(crate) fn connect_vless_tcp_outbound(
             "vless outbound flow is not supported yet",
         ));
     }
+    if outbound.tls.is_some() {
+        return connect_vless_tls_tcp_outbound(outbound, &server, &user_id, flow, target, timeout);
+    }
+    let mut stream = connect_target(&server, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     write_vless_tcp_request(&mut stream, &user_id, flow, target)?;
     read_vless_response_header(&mut stream)?;
     Ok(stream)
+}
+
+fn connect_vless_tls_tcp_outbound(
+    outbound: &OutboundConfig,
+    server: &SocksTarget,
+    user_id: &[u8; 16],
+    flow: &str,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let remote = connect_target(server, timeout)?;
+    remote.set_read_timeout(Some(timeout))?;
+    remote.set_write_timeout(Some(timeout))?;
+    let tls_config = outbound
+        .tls
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "outbound tls is required"))?;
+    let server_name = vless_tls_server_name(tls_config, server)?;
+    let connection = ClientConnection::new(vless_tls_client_config(tls_config), server_name)
+        .map_err(tls_error)?;
+    let mut tls_stream = StreamOwned::new(connection, remote);
+    while tls_stream.conn.is_handshaking() {
+        tls_stream
+            .conn
+            .complete_io(&mut tls_stream.sock)
+            .map_err(tls_error)?;
+    }
+    write_vless_tcp_request(&mut tls_stream, user_id, flow, target)?;
+    tls_stream.flush()?;
+    read_vless_response_header(&mut tls_stream)?;
+
+    let local_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let local_addr = local_listener.local_addr()?;
+    let local_client = TcpStream::connect(local_addr)?;
+    let (local_plain, _) = local_listener.accept()?;
+
+    thread::spawn(move || {
+        let _ = relay_plain_to_tls(local_plain, tls_stream);
+    });
+
+    Ok(local_client)
+}
+
+fn vless_tls_client_config(tls: &OutboundTlsConfig) -> Arc<ClientConfig> {
+    let mut config = if tls.allow_insecure {
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth()
+    } else {
+        let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
+    config.alpn_protocols = tls
+        .alpn
+        .iter()
+        .map(|value| value.as_bytes().to_vec())
+        .collect();
+    Arc::new(config)
+}
+
+fn vless_tls_server_name(
+    tls: &OutboundTlsConfig,
+    server: &SocksTarget,
+) -> io::Result<ServerName<'static>> {
+    let value = tls.server_name.trim().trim_matches(['[', ']']).to_string();
+    let value = if value.is_empty() {
+        server.host.trim().trim_matches(['[', ']']).to_string()
+    } else {
+        value
+    };
+    ServerName::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "vless tls server_name is invalid",
+        )
+    })
 }
 
 fn vless_outbound_server(outbound: &OutboundConfig) -> io::Result<SocksTarget> {
@@ -896,6 +985,144 @@ fn write_vless_udp_payload<W: Write>(writer: &mut W, payload: &[u8]) -> io::Resu
     }
     writer.write_all(&(payload.len() as u16).to_be_bytes())?;
     writer.write_all(payload)
+}
+
+fn relay_plain_to_tls(
+    mut plain: TcpStream,
+    mut tls_stream: StreamOwned<ClientConnection, TcpStream>,
+) -> io::Result<()> {
+    plain.set_nonblocking(true)?;
+    tls_stream.sock.set_nonblocking(true)?;
+
+    let mut upload_done = false;
+    let mut download_done = false;
+    let mut upload_buffer = [0u8; 16 * 1024];
+    let mut download_buffer = [0u8; 16 * 1024];
+
+    while !upload_done || !download_done {
+        let mut progressed = false;
+
+        if !upload_done {
+            match plain.read(&mut upload_buffer) {
+                Ok(0) => {
+                    upload_done = true;
+                    tls_stream.conn.send_close_notify();
+                    let _ = tls_stream.flush();
+                    progressed = true;
+                }
+                Ok(read) => {
+                    write_all_wait_tls_bridge(&mut tls_stream, &upload_buffer[..read])?;
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    upload_done = true;
+                    tls_stream.conn.send_close_notify();
+                    let _ = tls_stream.flush();
+                    progressed = true;
+                }
+            }
+        }
+
+        if !download_done {
+            match tls_stream.read(&mut download_buffer) {
+                Ok(0) => {
+                    download_done = true;
+                    let _ = plain.shutdown(Shutdown::Write);
+                    progressed = true;
+                }
+                Ok(read) => {
+                    write_all_wait_tls_bridge(&mut plain, &download_buffer[..read])?;
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    download_done = true;
+                    let _ = plain.shutdown(Shutdown::Write);
+                    progressed = true;
+                }
+            }
+        }
+
+        if !progressed {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    let _ = plain.shutdown(Shutdown::Both);
+    let _ = tls_stream.sock.shutdown(Shutdown::Both);
+    Ok(())
+}
+
+fn write_all_wait_tls_bridge<W: Write>(writer: &mut W, mut input: &[u8]) -> io::Result<()> {
+    while !input.is_empty() {
+        match writer.write(input) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "socket write returned zero",
+                ));
+            }
+            Ok(written) => input = &input[written..],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    writer.flush()
+}
+
+fn tls_error(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+        ]
+    }
 }
 
 fn udp_bind_addr_for_remote(remote: SocketAddr) -> SocketAddr {
@@ -1204,7 +1431,7 @@ mod tests {
     use rustls::pki_types::{CertificateDer, ServerName};
     use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
-    use crate::config::OutboundConfig;
+    use crate::config::{OutboundConfig, OutboundTlsConfig};
     use crate::socks5::SocksTarget;
     use crate::tls::TlsAcceptor;
     use crate::user::CoreUser;
@@ -1561,6 +1788,58 @@ mod tests {
             username: Some("11111111-1111-1111-1111-111111111111".to_string()),
             password: None,
             tls: None,
+        };
+        let target = SocksTarget {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+
+        let mut stream = connect_vless_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+            .expect("connect outbound");
+        stream.write_all(b"ping").expect("write payload");
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).expect("read response");
+
+        assert_eq!(&response, b"pong");
+        proxy_thread.join().expect("proxy thread");
+    }
+
+    #[test]
+    fn vless_tls_tcp_outbound_writes_request_and_relays_stream() {
+        let cert = test_cert("vless-outbound");
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let proxy_thread = thread::spawn(move || {
+            let (stream, _) = proxy.accept().expect("proxy accept");
+            let mut stream = acceptor.accept(stream).expect("tls accept");
+            let request = server().read_request(&mut stream).expect("vless request");
+            assert_eq!(request.user_uuid, "11111111-1111-1111-1111-111111111111");
+            assert_eq!(request.target.host, "example.com");
+            assert_eq!(request.target.port, 443);
+
+            stream
+                .write_all(&[super::VERSION, 0x00])
+                .expect("response header");
+            let mut payload = [0u8; 4];
+            stream.read_exact(&mut payload).expect("payload");
+            assert_eq!(&payload, b"ping");
+            stream.write_all(b"pong").expect("response");
+        });
+        let outbound = OutboundConfig {
+            tag: "vless-out".to_string(),
+            protocol: "vless".to_string(),
+            method: None,
+            address: Some(proxy_addr.ip().to_string()),
+            port: Some(proxy_addr.port()),
+            username: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            password: None,
+            tls: Some(OutboundTlsConfig {
+                server_name: "localhost".to_string(),
+                allow_insecure: true,
+                alpn: Vec::new(),
+            }),
         };
         let target = SocksTarget {
             host: "example.com".to_string(),

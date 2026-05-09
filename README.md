@@ -56,7 +56,7 @@ Not implemented yet:
 
 - Real-client interop verification for the VLESS REALITY TLS 1.3 server path.
 - REALITY ML-DSA-65 certificate signing.
-- DoH/DoT DNS execution, cache policy, and custom outbounds beyond freedom/SOCKS/HTTP/Shadowsocks/Trojan TCP+TLS/VLESS plain TCP.
+- DoH/DoT DNS execution, cache policy, and custom outbounds beyond freedom/SOCKS/HTTP/Shadowsocks/Trojan TCP+TLS/VLESS TCP+TLS.
 - Realtime integration.
 - Broader release platform matrix and performance profiles.
 

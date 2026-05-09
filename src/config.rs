@@ -398,9 +398,9 @@ fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), Validatio
             )));
         }
     }
-    if outbound.tls.is_some() && !matches!(protocol.as_str(), "trojan") {
+    if outbound.tls.is_some() && !matches!(protocol.as_str(), "trojan" | "vless") {
         return Err(ValidationError::new(format!(
-            "outbound {} tls is supported only for trojan today",
+            "outbound {} tls is supported only for trojan and vless today",
             outbound.tag
         )));
     }
@@ -1150,8 +1150,8 @@ mod tests {
     use crate::user::CoreUser;
 
     use super::{
-        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, RealityConfig, SniffingConfig,
-        StatsConfig, TlsConfig, TransportConfig,
+        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, OutboundTlsConfig, RealityConfig,
+        SniffingConfig, StatsConfig, TlsConfig, TransportConfig,
     };
 
     fn user() -> CoreUser {
@@ -1458,6 +1458,16 @@ mod tests {
             .validate()
             .expect("plain vless outbound should validate");
 
+        config.outbounds[0].tls = Some(OutboundTlsConfig {
+            server_name: "proxy.example.com".to_string(),
+            allow_insecure: true,
+            alpn: Vec::new(),
+        });
+        config
+            .validate()
+            .expect("vless tls outbound should validate");
+
+        config.outbounds[0].tls = None;
         config.outbounds[0].username = Some("not-a-uuid".to_string());
         let error = config
             .validate()
