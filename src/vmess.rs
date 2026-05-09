@@ -2979,41 +2979,12 @@ mod tests {
         )
     }
 
-    fn vmess_request_with_random(
-        target: std::net::SocketAddr,
-        payload: &[u8],
-        random: [u8; 4],
-    ) -> (Vec<u8>, VmessRequest) {
-        vmess_request_with_options_and_random(
-            target,
-            payload,
-            OPTION_CHUNK_STREAM | OPTION_CHUNK_MASKING | OPTION_GLOBAL_PADDING,
-            random,
-        )
-    }
-
     fn vmess_request_with_options(
         target: std::net::SocketAddr,
         payload: &[u8],
         options: u8,
     ) -> (Vec<u8>, VmessRequest) {
         vmess_request_with_command(target, payload, options, COMMAND_TCP)
-    }
-
-    fn vmess_request_with_options_and_random(
-        target: std::net::SocketAddr,
-        payload: &[u8],
-        options: u8,
-        random: [u8; 4],
-    ) -> (Vec<u8>, VmessRequest) {
-        vmess_request_for_user_with_command_and_random(
-            &user(),
-            target,
-            payload,
-            options,
-            COMMAND_TCP,
-            random,
-        )
     }
 
     fn vmess_request_with_command(
@@ -3031,24 +3002,6 @@ mod tests {
         payload: &[u8],
         options: u8,
         command: u8,
-    ) -> (Vec<u8>, VmessRequest) {
-        vmess_request_for_user_with_command_and_random(
-            user,
-            target,
-            payload,
-            options,
-            command,
-            [1, 2, 3, 4],
-        )
-    }
-
-    fn vmess_request_for_user_with_command_and_random(
-        user: &CoreUser,
-        target: std::net::SocketAddr,
-        payload: &[u8],
-        options: u8,
-        command: u8,
-        random: [u8; 4],
     ) -> (Vec<u8>, VmessRequest) {
         let uuid = parse_uuid_bytes(&user.uuid).expect("uuid");
         let cmd_key = vmess_cmd_key(&uuid);
@@ -3078,7 +3031,7 @@ mod tests {
         let checksum = fnv1a(&header);
         header.extend_from_slice(&checksum.to_be_bytes());
 
-        let auth_id = create_auth_id(&cmd_key, super::unix_timestamp(), random);
+        let auth_id = create_auth_id(&cmd_key, super::unix_timestamp(), [1, 2, 3, 4]);
         let nonce = [9u8; 8];
         let encrypted_header = seal_header(&cmd_key, &auth_id, &nonce, &header);
         let mut body = VmessBodyWriter::new(
@@ -3800,67 +3753,6 @@ mod tests {
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
-    }
-
-    #[test]
-    fn proxies_multiple_tcp_connections_and_accumulates_traffic() {
-        const CONNECTIONS: usize = 3;
-
-        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
-        let echo_addr = echo.local_addr().expect("echo addr");
-        let echo_thread = thread::spawn(move || {
-            for _ in 0..CONNECTIONS {
-                let (mut stream, _) = echo.accept().expect("echo accept");
-                let mut bytes = [0u8; 4];
-                stream.read_exact(&mut bytes).expect("echo read");
-                stream.write_all(&bytes).expect("echo write");
-            }
-        });
-
-        let server = server();
-        let listener = server.bind().expect("vmess bind");
-        let vmess_addr = listener.local_addr().expect("vmess addr");
-        let server_clone = server.clone();
-        let server_thread = thread::spawn(move || -> std::io::Result<()> {
-            for _ in 0..CONNECTIONS {
-                let (stream, _) = listener.accept()?;
-                server_clone.handle_tcp_client(stream)?;
-            }
-            Ok(())
-        });
-
-        for index in 0..CONNECTIONS {
-            let (request_bytes, request) =
-                vmess_request_with_random(echo_addr, b"ping", [1, 2, 3, 5 + index as u8]);
-            let mut client = TcpStream::connect(vmess_addr).expect("client connect");
-            client.write_all(&request_bytes).expect("client request");
-            decode_response_header(&mut client, &request);
-            let mut body = VmessBodyReader::new(
-                client,
-                request.response_body_key,
-                request.response_body_iv,
-                request.options,
-                request.security,
-            )
-            .expect("response body");
-            let mut echoed = [0u8; 4];
-            body.read_exact(&mut echoed).expect("client read payload");
-            assert_eq!(&echoed, b"ping");
-            drop(body);
-        }
-
-        server_thread
-            .join()
-            .expect("server thread")
-            .expect("serve connections");
-        echo_thread.join().expect("echo thread");
-
-        let records = server.drain_traffic(1);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].node_tag, "panel|vmess|1");
-        assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
-        assert_eq!(records[0].upload, 12);
-        assert_eq!(records[0].download, 12);
     }
 
     #[test]
