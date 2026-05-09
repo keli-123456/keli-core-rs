@@ -1656,7 +1656,7 @@ where
     let mut remote_write = remote.try_clone()?;
     let mut remote_read = remote;
     let upload_limiter = limiter.clone();
-    let upload_thread = thread::spawn(move || {
+    let upload_task = spawn_blocking_relay(move || {
         let mut vision_reader = VisionReader::new(reader, user_id);
         let bytes = copy_count_best_effort_limited(
             &mut vision_reader,
@@ -1665,13 +1665,11 @@ where
         );
         let _ = remote_write.shutdown(Shutdown::Write);
         bytes
-    });
+    })?;
 
     let mut vision_writer = VisionWriter::new(writer, user_id);
     let download = copy_count_best_effort_limited(&mut remote_read, &mut vision_writer, None);
-    let upload = upload_thread
-        .join()
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "upload relay thread panicked"))?;
+    let upload = join_blocking_relay(upload_task, "vision upload relay task panicked")?;
 
     Ok((upload, download))
 }
