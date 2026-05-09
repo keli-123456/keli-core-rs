@@ -778,12 +778,26 @@ pub(crate) fn connect_vless_tcp_outbound(
     let user_id = vless_outbound_user_id(outbound)?;
     let flow = outbound.method.as_deref().unwrap_or_default().trim();
     if !flow.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "vless outbound flow is not supported yet",
-        ));
+        if flow != FLOW_XTLS_RPRX_VISION {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("vless outbound flow {flow} is not supported"),
+            ));
+        }
+        if outbound.tls.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "vless outbound flow is supported only with tls",
+            ));
+        }
     }
     let network = outbound_transport_network(outbound).to_ascii_lowercase();
+    if !flow.is_empty() && network != "tcp" {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "vless outbound flow is supported only on tcp transport",
+        ));
+    }
     if network == "ws" {
         return connect_vless_websocket_tcp_outbound(
             outbound, &server, &user_id, flow, target, timeout,
@@ -925,9 +939,16 @@ fn connect_vless_tls_tcp_outbound(
     let local_addr = local_listener.local_addr()?;
     let local_client = TcpStream::connect(local_addr)?;
     let (local_plain, _) = local_listener.accept()?;
+    let use_vision = flow == FLOW_XTLS_RPRX_VISION;
+    let user_id = *user_id;
 
     thread::spawn(move || {
-        let _ = relay_plain_to_tls(local_plain, tls_stream);
+        if use_vision {
+            let _ = tls_stream.sock.set_nonblocking(true);
+            let _ = relay_plain_to_vless_vision(local_plain, tls_stream, user_id);
+        } else {
+            let _ = relay_plain_to_tls(local_plain, tls_stream);
+        };
     });
 
     Ok(local_client)
@@ -1211,6 +1232,88 @@ fn relay_plain_to_tls(
 
     let _ = plain.shutdown(Shutdown::Both);
     let _ = tls_stream.sock.shutdown(Shutdown::Both);
+    Ok(())
+}
+
+fn relay_plain_to_vless_vision<S>(
+    mut plain: TcpStream,
+    mut remote: S,
+    user_id: [u8; 16],
+) -> io::Result<()>
+where
+    S: Read + Write,
+{
+    plain.set_nonblocking(true)?;
+
+    let mut upload_done = false;
+    let mut download_done = false;
+    let mut upload_buffer = [0u8; 16 * 1024];
+    let mut download_buffer = [0u8; 16 * 1024];
+    let mut decode_buffer = [0u8; 16 * 1024];
+    let mut vision_encoder = VisionEncoder::new(user_id);
+    let mut vision_decoder = VisionDecoder::new(user_id);
+
+    while !upload_done || !download_done {
+        let mut progressed = false;
+
+        if !upload_done {
+            match plain.read(&mut upload_buffer) {
+                Ok(0) => {
+                    upload_done = true;
+                    let _ = remote.flush();
+                    progressed = true;
+                }
+                Ok(read) => {
+                    let encoded = vision_encoder.encode(&upload_buffer[..read]);
+                    write_all_wait_tls_bridge(&mut remote, &encoded)?;
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    upload_done = true;
+                    let _ = remote.flush();
+                    progressed = true;
+                }
+            }
+        }
+
+        if !download_done {
+            let decoded = vision_decoder.read_decoded(&mut download_buffer)?;
+            if decoded > 0 {
+                write_all_wait_tls_bridge(&mut plain, &download_buffer[..decoded])?;
+                progressed = true;
+            } else {
+                match remote.read(&mut decode_buffer) {
+                    Ok(0) => {
+                        vision_decoder.finish();
+                        let decoded = vision_decoder.read_decoded(&mut download_buffer)?;
+                        if decoded > 0 {
+                            write_all_wait_tls_bridge(&mut plain, &download_buffer[..decoded])?;
+                        }
+                        download_done = true;
+                        let _ = plain.shutdown(Shutdown::Write);
+                        progressed = true;
+                    }
+                    Ok(read) => {
+                        vision_decoder.push(&decode_buffer[..read]);
+                        progressed = true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        download_done = true;
+                        let _ = plain.shutdown(Shutdown::Write);
+                        progressed = true;
+                    }
+                }
+            }
+        }
+
+        if !progressed {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    let _ = plain.shutdown(Shutdown::Both);
     Ok(())
 }
 
@@ -2153,6 +2256,65 @@ mod tests {
             tag: "vless-out".to_string(),
             protocol: "vless".to_string(),
             method: None,
+            address: Some(proxy_addr.ip().to_string()),
+            port: Some(proxy_addr.port()),
+            username: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            password: None,
+            tls: Some(OutboundTlsConfig {
+                server_name: "localhost".to_string(),
+                allow_insecure: true,
+                alpn: Vec::new(),
+            }),
+            transport: None,
+        };
+        let target = SocksTarget {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+
+        let mut stream = connect_vless_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+            .expect("connect outbound");
+        stream.write_all(b"ping").expect("write payload");
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).expect("read response");
+
+        assert_eq!(&response, b"pong");
+        proxy_thread.join().expect("proxy thread");
+    }
+
+    #[test]
+    fn vless_vision_tls_outbound_encodes_and_decodes_flow_stream() {
+        let cert = test_cert("vless-vision-outbound");
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let proxy_thread = thread::spawn(move || {
+            let (stream, _) = proxy.accept().expect("proxy accept");
+            let mut stream = acceptor.accept(stream).expect("tls accept");
+            let request = server_with_flow(super::FLOW_XTLS_RPRX_VISION)
+                .read_request(&mut stream)
+                .expect("vless request");
+            assert_eq!(request.user_uuid, "11111111-1111-1111-1111-111111111111");
+            assert_eq!(request.flow, super::FLOW_XTLS_RPRX_VISION);
+            assert_eq!(request.target.host, "example.com");
+            assert_eq!(request.target.port, 443);
+
+            stream
+                .write_all(&[super::VERSION, 0x00])
+                .expect("response header");
+            let mut reader = VisionReader::new(&mut stream, [0x11; 16]);
+            let mut payload = [0u8; 4];
+            reader.read_exact(&mut payload).expect("vision payload");
+            assert_eq!(&payload, b"ping");
+            let mut writer = VisionWriter::new(&mut stream, [0x11; 16]);
+            writer.write_all(b"pong").expect("vision response");
+            writer.flush().expect("vision response flush");
+        });
+        let outbound = OutboundConfig {
+            tag: "vless-out".to_string(),
+            protocol: "vless".to_string(),
+            method: Some(super::FLOW_XTLS_RPRX_VISION.to_string()),
             address: Some(proxy_addr.ip().to_string()),
             port: Some(proxy_addr.port()),
             username: Some("11111111-1111-1111-1111-111111111111".to_string()),

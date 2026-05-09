@@ -410,16 +410,24 @@ fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), Validatio
                 outbound.tag
             )));
         }
-        if outbound
+        let flow = outbound
             .method
             .as_deref()
             .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-        {
-            return Err(ValidationError::new(format!(
-                "outbound {} vless flow is not supported yet",
-                outbound.tag
-            )));
+            .unwrap_or_default();
+        if !flow.is_empty() {
+            if flow != "xtls-rprx-vision" {
+                return Err(ValidationError::new(format!(
+                    "outbound {} vless flow {} is not supported",
+                    outbound.tag, flow
+                )));
+            }
+            if outbound_transport_network(outbound) != "tcp" || outbound.tls.is_none() {
+                return Err(ValidationError::new(format!(
+                    "outbound {} vless flow is supported only for tcp tls outbound",
+                    outbound.tag
+                )));
+            }
         }
     }
     if protocol == "vmess" {
@@ -1646,10 +1654,20 @@ mod tests {
 
         config.outbounds[0].username = Some("11111111-1111-1111-1111-111111111111".to_string());
         config.outbounds[0].method = Some("xtls-rprx-vision".to_string());
+        config.outbounds[0].tls = Some(OutboundTlsConfig {
+            server_name: "proxy.example.com".to_string(),
+            allow_insecure: true,
+            alpn: Vec::new(),
+        });
+        config
+            .validate()
+            .expect("vless vision outbound should validate on tcp tls");
+
+        config.outbounds[0].tls = None;
         let error = config
             .validate()
-            .expect_err("vless outbound with flow should fail until supported");
-        assert!(error.to_string().contains("vless flow is not supported"));
+            .expect_err("vless outbound with flow without tls should fail");
+        assert!(error.to_string().contains("flow is supported only"));
     }
 
     #[test]
