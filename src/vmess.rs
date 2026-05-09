@@ -206,7 +206,7 @@ impl VmessServer {
         let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.command == VmessCommand::Udp {
             write_response_header(&mut client, &request)?;
-            return self.relay_udp_split(client.try_clone()?, client, request, bandwidth);
+            return self.relay_udp_single(client, request, bandwidth);
         }
         let remote = self.connect_for_request(&request)?;
         write_response_header(&mut client, &request)?;

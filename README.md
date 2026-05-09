@@ -123,6 +123,7 @@ cargo run -- check-config ./core.json
 cargo run -- run-config ./core.json
 cargo run -- run-config ./core.json --control 127.0.0.1:18080
 cargo run -- bench vless-tcp --streams 8 --requests 1000 --payload 1024
+cargo run -- bench hy2-tcp --streams 8 --requests 1000 --payload 1024
 ```
 
 ## Local Benchmarks
@@ -133,6 +134,7 @@ connection-per-request so it measures VLESS TCP setup plus one echo payload per 
 
 ```bash
 cargo run --release -- bench vless-tcp --streams 16 --requests 5000 --payload 1024
+cargo run --release -- bench hy2-tcp --streams 16 --requests 5000 --payload 1024
 ```
 
 Use the same host, release build, payload, stream count, and request count when comparing

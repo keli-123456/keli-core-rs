@@ -1,17 +1,26 @@
+use std::fs;
+use std::future::poll_fn;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use quinn::crypto::rustls::QuicClientConfig;
+use rustls::pki_types::CertificateDer;
 use serde::Serialize;
+use tokio::io::AsyncReadExt;
 
+use crate::hysteria2::{Hysteria2Server, Hysteria2ServerConfig};
 use crate::user::CoreUser;
 use crate::vless::{VlessServer, VlessServerConfig};
 
 const BENCH_USER_UUID: &str = "11111111-1111-1111-1111-111111111111";
 const BENCH_USER_BYTES: [u8; 16] = [0x11; 16];
+const HY2_PASSWORD: &str = "hy2-password";
+const HY2_TCP_REQUEST_ID: u64 = 0x401;
 const DEFAULT_STREAMS: usize = 4;
 const DEFAULT_REQUESTS: usize = 200;
 const DEFAULT_PAYLOAD_SIZE: usize = 1_024;
@@ -80,6 +89,15 @@ pub fn run_bench(args: impl Iterator<Item = String>) -> Result<(), String> {
             );
             Ok(())
         }
+        Some("hy2-tcp") | Some("hysteria2-tcp") => {
+            let options = parse_bench_options(args)?;
+            let report = run_hy2_tcp_bench(&options).map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+            );
+            Ok(())
+        }
         Some("--help") | Some("help") | None => {
             print_bench_usage();
             Ok(())
@@ -140,7 +158,9 @@ fn validate_bench_options(options: &BenchOptions) -> Result<(), String> {
 }
 
 fn print_bench_usage() {
-    println!("bench commands:\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]");
+    println!(
+        "bench commands:\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]"
+    );
 }
 
 fn run_vless_tcp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
@@ -184,6 +204,89 @@ fn run_vless_tcp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
     Ok(BenchReport {
         protocol: "vless-tcp",
         mode: "connection-per-request",
+        streams: options.streams,
+        requests_per_stream: options.requests,
+        payload_bytes: options.payload_size,
+        total_requests,
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed_ms: elapsed.as_millis(),
+        requests_per_second: total_requests as f64 / seconds,
+        roundtrip_mbps: ((upload_bytes + download_bytes) as f64 * 8.0) / seconds / 1_000_000.0,
+        latency: latency_report(&latencies),
+    })
+}
+
+fn run_hy2_tcp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_hy2_tcp_bench_async(options))
+}
+
+async fn run_hy2_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let cert = BenchCert::new("hy2-bench")?;
+    let server = Hysteria2Server::new(Hysteria2ServerConfig {
+        node_tag: "bench|hy2|tcp".to_string(),
+        listen: "127.0.0.1:0".parse().expect("valid listen addr"),
+        users: vec![hy2_user()],
+        routes: Vec::new(),
+        cert_file: cert.cert_path.to_string_lossy().to_string(),
+        key_file: cert.key_path.to_string_lossy().to_string(),
+        server_name: "localhost".to_string(),
+        alpn: vec!["h3".to_string()],
+        reject_unknown_sni: false,
+        connect_timeout: Duration::from_secs(3),
+        up_mbps: 0,
+        down_mbps: 0,
+        ignore_client_bandwidth: false,
+        obfs: None,
+    });
+    let endpoint = server.bind()?;
+    let server_addr = endpoint.local_addr()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_task = tokio::spawn(server.run(endpoint, stop.clone()));
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        let cert_der = cert.cert_der.clone();
+        workers.push(tokio::spawn(async move {
+            run_hy2_tcp_client(server_addr, echo_addr, stream_id, &options, cert_der).await
+        }));
+    }
+
+    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "hy2 bench worker panicked"))??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+    }
+    let elapsed = started.elapsed();
+
+    stop.store(true, Ordering::SeqCst);
+    server_task
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "hy2 bench server task panicked"))?;
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+    Ok(BenchReport {
+        protocol: "hy2-tcp",
+        mode: "quic-connection-per-stream",
         streams: options.streams,
         requests_per_stream: options.requests,
         payload_bytes: options.payload_size,
@@ -398,6 +501,259 @@ fn bench_user() -> CoreUser {
     }
 }
 
+fn hy2_user() -> CoreUser {
+    CoreUser {
+        id: 1,
+        uuid: HY2_PASSWORD.to_string(),
+        password: None,
+        email: None,
+        speed_limit: 0,
+        device_limit: 0,
+    }
+}
+
+async fn run_hy2_tcp_client(
+    server_addr: SocketAddr,
+    echo_addr: SocketAddr,
+    stream_id: usize,
+    options: &BenchOptions,
+    cert_der: CertificateDer<'static>,
+) -> io::Result<ClientStats> {
+    let endpoint = hy2_client_endpoint(cert_der)?;
+    let connection = endpoint
+        .connect(server_addr, "localhost")
+        .map_err(io_other)?
+        .await
+        .map_err(io_other)?;
+    authenticate_hy2(&connection).await?;
+
+    let payload = bench_payload(stream_id, options.payload_size);
+    let mut latencies = Vec::with_capacity(options.requests);
+    let mut retries = 0usize;
+    for request_index in 0..options.requests {
+        let mut attempts = 0usize;
+        loop {
+            match run_one_hy2_tcp_request(&connection, echo_addr, &payload).await {
+                Ok(latency) => {
+                    latencies.push(latency);
+                    break;
+                }
+                Err(error)
+                    if attempts < MAX_REQUEST_RETRIES && is_retryable_bench_error(&error) =>
+                {
+                    attempts = attempts.saturating_add(1);
+                    retries = retries.saturating_add(1);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "hy2 stream {stream_id} request {} failed: {error}",
+                            request_index + 1
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    connection.close(0u32.into(), b"bench done");
+    endpoint.wait_idle().await;
+    Ok(ClientStats { latencies, retries })
+}
+
+async fn run_one_hy2_tcp_request(
+    connection: &quinn::Connection,
+    echo_addr: SocketAddr,
+    payload: &[u8],
+) -> io::Result<u128> {
+    let started = Instant::now();
+    let mut response = vec![0u8; payload.len()];
+    let (mut send, mut recv) = connection.open_bi().await.map_err(io_other)?;
+    send.write_all(&hy2_tcp_request(echo_addr))
+        .await
+        .map_err(io_other)?;
+    read_hy2_tcp_response_header(&mut recv).await?;
+    send.write_all(payload).await.map_err(io_other)?;
+    send.finish().map_err(io_other)?;
+    recv.read_exact(&mut response).await.map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("stream finished before echo response: {error}"),
+        )
+    })?;
+    if response != payload {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hy2 bench echo payload mismatch",
+        ));
+    }
+    Ok(started.elapsed().as_micros())
+}
+
+fn hy2_client_endpoint(cert_der: CertificateDer<'static>) -> io::Result<quinn::Endpoint> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert_der).map_err(io_other)?;
+    let mut crypto = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    crypto.alpn_protocols = vec![b"h3".to_vec()];
+    let mut client_config = quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(crypto).map_err(io_other)?,
+    ));
+    let mut transport = quinn::TransportConfig::default();
+    transport
+        .datagram_receive_buffer_size(Some(1024 * 1024))
+        .datagram_send_buffer_size(1024 * 1024);
+    client_config.transport_config(Arc::new(transport));
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("valid client addr"))?;
+    endpoint.set_default_client_config(client_config);
+    Ok(endpoint)
+}
+
+async fn authenticate_hy2(connection: &quinn::Connection) -> io::Result<()> {
+    let quic = h3_quinn::Connection::new(connection.clone());
+    let (mut h3_connection, mut send_request) = h3::client::new(quic).await.map_err(io_other)?;
+    let driver = tokio::spawn(async move {
+        let _ = poll_fn(|cx| h3_connection.poll_close(cx)).await;
+    });
+    let request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri("https://hysteria/auth")
+        .header("Hysteria-Auth", HY2_PASSWORD)
+        .header("Hysteria-CC-RX", "0")
+        .body(())
+        .map_err(io_other)?;
+    let mut stream = send_request.send_request(request).await.map_err(io_other)?;
+    stream.finish().await.map_err(io_other)?;
+    let response = stream.recv_response().await.map_err(io_other)?;
+    drop(send_request);
+    driver.abort();
+    if response.status().as_u16() != 233 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("hy2 auth failed with status {}", response.status()),
+        ));
+    }
+    Ok(())
+}
+
+fn hy2_tcp_request(target: SocketAddr) -> Vec<u8> {
+    let address = format_socket_addr(&target);
+    let mut request = encode_hy2_varint(HY2_TCP_REQUEST_ID).expect("request id");
+    request.extend_from_slice(&encode_hy2_varint(address.len() as u64).expect("address length"));
+    request.extend_from_slice(address.as_bytes());
+    request.extend_from_slice(&encode_hy2_varint(0).expect("padding length"));
+    request
+}
+
+async fn read_hy2_tcp_response_header(recv: &mut quinn::RecvStream) -> io::Result<()> {
+    let mut status = [0u8; 1];
+    recv.read_exact(&mut status).await.map_err(io_other)?;
+    if status[0] != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "hy2 tcp request failed",
+        ));
+    }
+    let message_len = read_hy2_varint(recv).await?;
+    if message_len > 0 {
+        let mut message = vec![0u8; message_len as usize];
+        recv.read_exact(&mut message).await.map_err(io_other)?;
+    }
+    let padding_len = read_hy2_varint(recv).await?;
+    if padding_len > 0 {
+        let mut padding = vec![0u8; padding_len as usize];
+        recv.read_exact(&mut padding).await.map_err(io_other)?;
+    }
+    Ok(())
+}
+
+fn encode_hy2_varint(value: u64) -> io::Result<Vec<u8>> {
+    if value < (1 << 6) {
+        return Ok(vec![value as u8]);
+    }
+    if value < (1 << 14) {
+        let encoded = ((value as u16) | 0x4000).to_be_bytes();
+        return Ok(encoded.to_vec());
+    }
+    if value < (1 << 30) {
+        let encoded = ((value as u32) | 0x8000_0000).to_be_bytes();
+        return Ok(encoded.to_vec());
+    }
+    if value < (1 << 62) {
+        let encoded = (value | 0xc000_0000_0000_0000).to_be_bytes();
+        return Ok(encoded.to_vec());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "hy2 varint is too large",
+    ))
+}
+
+async fn read_hy2_varint(recv: &mut quinn::RecvStream) -> io::Result<u64> {
+    let first = recv.read_u8().await.map_err(io_other)?;
+    let tag = first >> 6;
+    let mut value = u64::from(first & 0x3f);
+    let extra = match tag {
+        0 => 0,
+        1 => 1,
+        2 => 3,
+        3 => 7,
+        _ => unreachable!(),
+    };
+    for _ in 0..extra {
+        value = (value << 8) | u64::from(recv.read_u8().await.map_err(io_other)?);
+    }
+    Ok(value)
+}
+
+fn format_socket_addr(addr: &SocketAddr) -> String {
+    match addr {
+        SocketAddr::V4(addr) => addr.to_string(),
+        SocketAddr::V6(addr) => format!("[{}]:{}", addr.ip(), addr.port()),
+    }
+}
+
+struct BenchCert {
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    cert_der: CertificateDer<'static>,
+}
+
+impl BenchCert {
+    fn new(label: &str) -> io::Result<Self> {
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).map_err(io_other)?;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io_other)?
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join(format!("keli-core-rs-bench-{label}-{nanos}.crt"));
+        let key_path = dir.join(format!("keli-core-rs-bench-{label}-{nanos}.key"));
+        fs::write(&cert_path, cert.cert.pem())?;
+        fs::write(&key_path, cert.key_pair.serialize_pem())?;
+        Ok(Self {
+            cert_path,
+            key_path,
+            cert_der: cert.cert.der().clone(),
+        })
+    }
+}
+
+impl Drop for BenchCert {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.cert_path);
+        let _ = fs::remove_file(&self.key_path);
+    }
+}
+
+fn io_other(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, error.to_string())
+}
+
 fn latency_report(values: &[u128]) -> LatencyReport {
     LatencyReport {
         min_us: *values.first().unwrap_or(&0),
@@ -452,6 +808,21 @@ mod tests {
         assert_eq!(report.protocol, "vless-tcp");
         assert_eq!(report.mode, "connection-per-request");
         assert_eq!(report.total_requests, 3);
+        assert!(report.download_bytes > 0);
+    }
+
+    #[test]
+    fn runs_hy2_tcp_bench_smoke() {
+        let report = super::run_hy2_tcp_bench(&BenchOptions {
+            streams: 1,
+            requests: 2,
+            payload_size: 16,
+        })
+        .expect("bench");
+
+        assert_eq!(report.protocol, "hy2-tcp");
+        assert_eq!(report.mode, "quic-connection-per-stream");
+        assert_eq!(report.total_requests, 2);
         assert!(report.download_bytes > 0);
     }
 }
