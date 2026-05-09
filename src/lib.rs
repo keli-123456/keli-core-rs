@@ -11,6 +11,7 @@ pub mod httpupgrade;
 pub mod hysteria2;
 pub mod limits;
 pub mod mieru;
+pub mod mkcp;
 pub mod outbound;
 pub mod protocol;
 pub mod quic;
