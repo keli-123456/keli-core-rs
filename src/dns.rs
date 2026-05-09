@@ -99,6 +99,10 @@ pub async fn resolve_socket_addrs_tokio(
     port: u16,
     timeout: Duration,
 ) -> io::Result<Vec<SocketAddr>> {
+    if let Some(addr) = literal_socket_addr(host, port) {
+        return Ok(vec![addr]);
+    }
+
     let host = host.to_string();
     tokio::task::spawn_blocking(move || resolve_socket_addrs(&host, port, timeout))
         .await
@@ -115,11 +119,11 @@ pub fn resolve_socket_addrs(
     port: u16,
     timeout: Duration,
 ) -> io::Result<Vec<SocketAddr>> {
-    let host = host.trim().trim_matches(['[', ']']);
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(vec![SocketAddr::new(ip, port)]);
+    if let Some(addr) = literal_socket_addr(host, port) {
+        return Ok(vec![addr]);
     }
 
+    let host = host.trim().trim_matches(['[', ']']);
     let config = current_config();
     if config.servers.is_empty() {
         return system_resolve(host, port);
@@ -273,6 +277,14 @@ fn query_tcp_dns(server_addr: SocketAddr, query: &[u8], timeout: Duration) -> io
 
 fn system_resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     (host, port).to_socket_addrs().map(|addrs| addrs.collect())
+}
+
+fn literal_socket_addr(host: &str, port: u16) -> Option<SocketAddr> {
+    host.trim()
+        .trim_matches(['[', ']'])
+        .parse::<IpAddr>()
+        .ok()
+        .map(|ip| SocketAddr::new(ip, port))
 }
 
 fn encode_query(query_id: u16, host: &str, qtype: u16) -> io::Result<Vec<u8>> {
@@ -536,6 +548,29 @@ mod tests {
             resolve_socket_addrs("api.example.net", 443, Duration::from_secs(2)).expect("resolve");
         assert_eq!(addrs, vec!["203.0.113.12:443".parse().unwrap()]);
         server.join().expect("server");
+        configure(DnsConfig::default());
+    }
+
+    #[tokio::test]
+    async fn async_resolves_literal_ips_without_dns_lookup() {
+        configure(DnsConfig {
+            servers: vec![DnsServerConfig {
+                address: "udp://192.0.2.1:53".to_string(),
+                domains: Vec::new(),
+            }],
+            query_strategy: "UseIPv4".to_string(),
+        });
+
+        let ipv4 = resolve_socket_addrs_tokio("127.0.0.1", 443, Duration::from_millis(1))
+            .await
+            .expect("ipv4 literal");
+        assert_eq!(ipv4, vec!["127.0.0.1:443".parse().unwrap()]);
+
+        let ipv6 = resolve_socket_addrs_tokio("[::1]", 443, Duration::from_millis(1))
+            .await
+            .expect("ipv6 literal");
+        assert_eq!(ipv6, vec!["[::1]:443".parse().unwrap()]);
+
         configure(DnsConfig::default());
     }
 }
