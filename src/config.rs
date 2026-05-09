@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
 
+use http::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
 use crate::config::RouteAction::{Block, Direct, Outbound};
@@ -99,6 +100,8 @@ pub struct OutboundTransportConfig {
     pub service_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -512,6 +515,7 @@ fn validate_outbound_transport(
         .as_deref()
         .map(str::trim)
         .unwrap_or_default();
+    let headers = &transport.headers;
     if !matches!(network.as_str(), "ws" | "httpupgrade" | "h2" | "http")
         && (!path.is_empty() || !host.is_empty())
     {
@@ -531,6 +535,32 @@ fn validate_outbound_transport(
             "outbound {} h2 method is supported only for h2 transport",
             outbound.tag
         )));
+    }
+    if !matches!(network.as_str(), "h2" | "http") && !headers.is_empty() {
+        return Err(ValidationError::new(format!(
+            "outbound {} h2 headers are supported only for h2 transport",
+            outbound.tag
+        )));
+    }
+    for (name, value) in headers {
+        if name.trim().is_empty() {
+            return Err(ValidationError::new(format!(
+                "outbound {} h2 header name must not be empty",
+                outbound.tag
+            )));
+        }
+        if HeaderName::from_bytes(name.as_bytes()).is_err() {
+            return Err(ValidationError::new(format!(
+                "outbound {} h2 header {name} is invalid",
+                outbound.tag
+            )));
+        }
+        if HeaderValue::from_str(value).is_err() {
+            return Err(ValidationError::new(format!(
+                "outbound {} h2 header {name} value is invalid",
+                outbound.tag
+            )));
+        }
     }
     Ok(())
 }
@@ -1274,6 +1304,8 @@ impl Default for StatsConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use crate::protocol::Protocol;
     use crate::user::CoreUser;
 
@@ -1557,6 +1589,7 @@ mod tests {
             host: Some("example.com".to_string()),
             service_name: None,
             method: None,
+            headers: BTreeMap::new(),
         });
         config
             .validate()
@@ -1568,6 +1601,7 @@ mod tests {
             host: Some("example.com".to_string()),
             service_name: None,
             method: None,
+            headers: BTreeMap::new(),
         });
         config
             .validate()
@@ -1579,6 +1613,7 @@ mod tests {
             host: None,
             service_name: Some("GunService".to_string()),
             method: None,
+            headers: BTreeMap::new(),
         });
         config
             .validate()
@@ -1650,6 +1685,7 @@ mod tests {
             host: Some("example.com".to_string()),
             service_name: None,
             method: None,
+            headers: BTreeMap::new(),
         });
         config
             .validate()
@@ -1661,6 +1697,7 @@ mod tests {
             host: Some("example.com".to_string()),
             service_name: None,
             method: None,
+            headers: BTreeMap::new(),
         });
         config
             .validate()
@@ -1672,10 +1709,29 @@ mod tests {
             host: None,
             service_name: Some("GunService".to_string()),
             method: None,
+            headers: BTreeMap::new(),
         });
         config
             .validate()
             .expect("vless grpc outbound should validate");
+
+        let mut h2_headers = BTreeMap::new();
+        h2_headers.insert(
+            "referer".to_string(),
+            "https://example.com/?x_padding=XXXX".to_string(),
+        );
+        h2_headers.insert("content-type".to_string(), "application/grpc".to_string());
+        config.outbounds[0].transport = Some(OutboundTransportConfig {
+            network: "h2".to_string(),
+            path: Some("/vless/".to_string()),
+            host: Some("example.com".to_string()),
+            service_name: None,
+            method: Some("POST".to_string()),
+            headers: h2_headers,
+        });
+        config
+            .validate()
+            .expect("vless h2 outbound headers should validate");
 
         config.outbounds[0].transport = None;
         config.outbounds[0].tls = None;

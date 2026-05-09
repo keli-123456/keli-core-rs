@@ -46,7 +46,7 @@ Implemented in this first skeleton:
 - VMess AEAD TCP/UDP inbound with TCP, TLS, WebSocket, TLS WebSocket, authenticated length, and replay protection.
 - VLESS Vision flow for TLS and TCP relay paths.
 - Trojan TLS, WebSocket, and TLS WebSocket TCP/UDP data paths.
-- VLESS / VMess / Trojan HTTP/2 and gRPC transport listeners/outbounds.
+- VLESS / VMess / Trojan HTTP/2 and gRPC transport listeners/outbounds, including H2 outbound request headers for XHTTP stream-one interop.
 - Hysteria2 QUIC TCP and UDP data paths, including salamander obfs validation.
 - TUIC QUIC TCP and UDP data paths, including cubic/bbr/new_reno congestion selection.
 - VLESS REALITY config validation, client ClientHello authentication, fallback routing, dest ServerHello validation, dest handshake capture, temporary certificate generation, REALITY certificate signature embedding, rustls TLS accept, and VLESS/Vision handoff.
@@ -56,7 +56,7 @@ Not implemented yet:
 
 - Real-client interop verification for the VLESS REALITY TLS 1.3 server path.
 - REALITY ML-DSA-65 certificate signing.
-- DoH/DoT DNS execution, cache policy, and custom outbounds beyond freedom/SOCKS/HTTP/Shadowsocks/Trojan TCP+TLS+WS+HTTPUpgrade+H2+gRPC/VLESS TCP+TLS+WS+HTTPUpgrade+H2+gRPC+Vision TCP TLS/VMess TCP+TLS+WS+HTTPUpgrade+H2+gRPC+UDP-over-stream+legacy alterId auth.
+- DoH/DoT DNS execution, cache policy, and custom outbounds beyond freedom/SOCKS/HTTP/Shadowsocks/Trojan TCP+TLS+WS+HTTPUpgrade+H2+gRPC/VLESS TCP+TLS+WS+HTTPUpgrade+H2+gRPC+Vision TCP TLS/VMess TCP+TLS+WS+HTTPUpgrade+H2+gRPC+UDP-over-stream+legacy alterId auth/XHTTP stream-one rendered as H2.
 - Realtime integration.
 - Broader release platform matrix and performance profiles.
 

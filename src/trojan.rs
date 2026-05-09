@@ -730,6 +730,7 @@ fn connect_trojan_h2_tcp_outbound(
         outbound_transport_path(outbound),
         &host,
         outbound_transport_method(outbound),
+        outbound_transport_headers(outbound),
     )?;
     write_trojan_tcp_request(&mut h2, password, target)?;
     h2.flush()?;
@@ -961,6 +962,16 @@ fn outbound_transport_method(outbound: &OutboundConfig) -> Option<&str> {
         .and_then(|transport| transport.method.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn outbound_transport_headers(
+    outbound: &OutboundConfig,
+) -> Option<&std::collections::BTreeMap<String, String>> {
+    outbound
+        .transport
+        .as_ref()
+        .map(|transport| &transport.headers)
+        .filter(|headers| !headers.is_empty())
 }
 
 fn write_trojan_tcp_request<W: Write>(
@@ -1868,6 +1879,7 @@ mod tests {
                 host: Some("example.test".to_string()),
                 service_name: None,
                 method: None,
+                headers: Default::default(),
             }),
         };
         let target = SocksTarget {
@@ -1921,6 +1933,7 @@ mod tests {
                 host: Some("example.test".to_string()),
                 service_name: None,
                 method: None,
+                headers: Default::default(),
             }),
         };
         let target = SocksTarget {
@@ -1997,6 +2010,7 @@ mod tests {
                 host: Some("example.test".to_string()),
                 service_name: None,
                 method: Some("PUT".to_string()),
+                headers: Default::default(),
             }),
         };
         let target = SocksTarget {
@@ -2072,6 +2086,7 @@ mod tests {
                 host: Some("example.test".to_string()),
                 service_name: Some("GunService".to_string()),
                 method: None,
+                headers: Default::default(),
             }),
         };
         let target = SocksTarget {

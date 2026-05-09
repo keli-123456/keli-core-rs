@@ -59,8 +59,8 @@ keliboard -> kelinode-rs -> keli-core-rs
 | REALITY | VLESS only | Partial | TCP only. ML-DSA-65 is rejected. |
 | QUIC/Hysteria2 | Hysteria2 | Partial | TCP and UDP relay paths exist. |
 | QUIC/TUIC | TUIC | Partial | TCP and UDP relay paths exist. |
-| H2 custom outbound transport | Native route outbounds | Partial | VLESS, VMess, and Trojan route outbounds can carry TCP streams over HTTP/2 `httpSettings`; TLS and h2c are supported. |
-| KCP/QUIC/XHTTP | Xray production path only | Rejected | Do not render into `keli-core-rs` until native data paths exist. |
+| H2 custom outbound transport | Native route outbounds | Partial | VLESS, VMess, and Trojan route outbounds can carry TCP streams over HTTP/2 `httpSettings`; TLS, h2c, custom method, and request headers are supported. `kelinode-rs` may map XHTTP/splithttp `stream-one` route outbounds onto this H2 path with the required XHTTP-compatible headers. |
+| KCP/QUIC/XHTTP packet-up/stream-up/H3 | Xray production path only | Rejected | Do not render into `keli-core-rs` until native data paths exist. |
 
 ## Runtime Capability Matrix
 
@@ -74,7 +74,7 @@ keliboard -> kelinode-rs -> keli-core-rs
 | Per-user speed limit | Code path | Enforced by shared bandwidth limiter for native listeners. |
 | Direct outbound | Code path | Built-in direct egress plus freedom route outbounds. |
 | Block routing | Code path | Exact/wildcard/suffix, `domain:`/`full:`/`keyword:`, `regexp:`, `geosite:`, numeric IP/CIDR, `geoip:`, port/range, `network:`, and `protocol:` matching. |
-| Custom outbound routing | Partial | Freedom outbounds render and execute, including optional `address`/`port` redirects. SOCKS5 and HTTP outbounds render and execute for TCP routes, including username/password. SOCKS5 outbounds also execute UDP routes through UDP ASSOCIATE. Shadowsocks AEAD outbounds execute TCP and UDP routes for `aes-128-gcm`, `aes-256-gcm`, and `chacha20-ietf-poly1305`. Trojan, VLESS, and VMess TCP, TLS TCP, WS TCP, HTTPUpgrade TCP, H2 TCP, and gRPC TCP outbounds execute TCP routes. VLESS `xtls-rprx-vision` route outbounds execute on TCP+TLS. VMess route outbounds execute UDP packets over TCP/TLS/WS/HTTPUpgrade/H2/gRPC streams, and VMess `alterId > 0` route outbounds use legacy MD5/AES-CFB header auth. HTTP UDP, Trojan UDP, and VLESS UDP/non-TCP flow remain rejected. |
+| Custom outbound routing | Partial | Freedom outbounds render and execute, including optional `address`/`port` redirects. SOCKS5 and HTTP outbounds render and execute for TCP routes, including username/password. SOCKS5 outbounds also execute UDP routes through UDP ASSOCIATE. Shadowsocks AEAD outbounds execute TCP and UDP routes for `aes-128-gcm`, `aes-256-gcm`, and `chacha20-ietf-poly1305`. Trojan, VLESS, and VMess TCP, TLS TCP, WS TCP, HTTPUpgrade TCP, H2 TCP, and gRPC TCP outbounds execute TCP routes. H2 route outbounds accept request headers for XHTTP/splithttp `stream-one` interop. VLESS `xtls-rprx-vision` route outbounds execute on TCP+TLS. VMess route outbounds execute UDP packets over TCP/TLS/WS/HTTPUpgrade/H2/gRPC streams, and VMess `alterId > 0` route outbounds use legacy MD5/AES-CFB header auth. HTTP UDP, Trojan UDP, VLESS UDP/non-TCP flow, KCP, QUIC, and XHTTP packet-up/stream-up/H3 remain rejected. |
 | DNS execution | Partial | Native core accepts DNS server config, selects servers by domain route rules, and resolves direct TCP/UDP targets through UDP or `tcp://` DNS with `UseIPv4` default. DoH/DoT and cache policy are not implemented yet. |
 | Hot user patching | Code path | `ApplyConfig` returns `updated` for user-only changes and replaces protocol user tables in-place. |
 | Realtime integration | Rejected | Belongs first in `kelinode-rs` runtime control. |

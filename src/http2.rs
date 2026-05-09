@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::Ipv6Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -106,6 +107,7 @@ pub(crate) fn connect_http2_client(
     path: Option<&str>,
     host: &str,
     method: Option<&str>,
+    headers: Option<&BTreeMap<String, String>>,
 ) -> io::Result<Http2ClientStream> {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (input_tx, input_rx) = mpsc::channel();
@@ -115,6 +117,14 @@ pub(crate) fn connect_http2_client(
     let path = normalize_path(path.unwrap_or(DEFAULT_H2_PATH));
     let host = host.trim().trim_matches(['[', ']']).to_string();
     let method = method.unwrap_or(DEFAULT_H2_METHOD).trim().to_string();
+    let headers: Vec<(String, String)> = headers
+        .map(|headers| {
+            headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
 
     thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -134,6 +144,7 @@ pub(crate) fn connect_http2_client(
             path,
             host,
             method,
+            headers,
             input_tx,
             output_rx,
             ready_tx.clone(),
@@ -183,6 +194,7 @@ async fn run_http2_client(
     path: String,
     host: String,
     method: String,
+    headers: Vec<(String, String)>,
     input_tx: mpsc::Sender<Vec<u8>>,
     output_rx: UnboundedReceiver<Vec<u8>>,
     ready_tx: mpsc::Sender<io::Result<()>>,
@@ -204,6 +216,7 @@ async fn run_http2_client(
             request_host,
             path,
             method,
+            headers,
             input_tx,
             output_rx,
             ready_tx,
@@ -216,6 +229,7 @@ async fn run_http2_client(
             request_host,
             path,
             method,
+            headers,
             input_tx,
             output_rx,
             ready_tx,
@@ -230,6 +244,7 @@ async fn run_http2_client_stream<S>(
     host: String,
     path: String,
     method: String,
+    headers: Vec<(String, String)>,
     input_tx: mpsc::Sender<Vec<u8>>,
     output_rx: UnboundedReceiver<Vec<u8>>,
     ready_tx: mpsc::Sender<io::Result<()>>,
@@ -243,11 +258,11 @@ where
     });
 
     let uri = http2_request_uri(tls, &host, &path);
-    let request = Request::builder()
-        .method(http2_method(&method)?)
-        .uri(uri)
-        .body(())
-        .map_err(io_other)?;
+    let mut request = Request::builder().method(http2_method(&method)?).uri(uri);
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let request = request.body(()).map_err(io_other)?;
     let (response, mut send) = client.send_request(request, false).map_err(io_other)?;
     let response = response.await.map_err(io_other)?;
     if response.status() != StatusCode::OK {
@@ -742,6 +757,7 @@ mod tests {
             Some("/h2"),
             "example.test",
             Some("PUT"),
+            None,
         )
         .expect("connect h2");
         stream.write_all(b"ping").expect("write");

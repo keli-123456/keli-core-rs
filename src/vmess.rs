@@ -1728,6 +1728,7 @@ fn connect_vmess_h2_tcp_outbound(
         outbound_transport_path(outbound),
         &host,
         outbound_transport_method(outbound),
+        outbound_transport_headers(outbound),
     )?;
     let request = write_vmess_tcp_request(&mut h2, outbound, target)?;
     h2.flush()?;
@@ -1890,6 +1891,7 @@ pub(crate) fn send_vmess_udp_outbound(
             outbound_transport_path(outbound),
             &host,
             outbound_transport_method(outbound),
+            outbound_transport_headers(outbound),
         )?;
         return send_vmess_udp_over_stream(&mut h2, outbound, target, payload, timeout);
     }
@@ -2109,6 +2111,16 @@ fn outbound_transport_method(outbound: &OutboundConfig) -> Option<&str> {
         .and_then(|transport| transport.method.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn outbound_transport_headers(
+    outbound: &OutboundConfig,
+) -> Option<&std::collections::BTreeMap<String, String>> {
+    outbound
+        .transport
+        .as_ref()
+        .map(|transport| &transport.headers)
+        .filter(|headers| !headers.is_empty())
 }
 
 fn write_vmess_tcp_request<W: Write>(
@@ -3455,6 +3467,7 @@ mod tests {
                 host: Some("example.test".to_string()),
                 service_name: None,
                 method: None,
+                headers: Default::default(),
             }),
         );
 
@@ -3491,6 +3504,7 @@ mod tests {
                 host: Some("example.test".to_string()),
                 service_name: None,
                 method: None,
+                headers: Default::default(),
             }),
         );
 
@@ -3549,6 +3563,7 @@ mod tests {
                 host: Some("example.test".to_string()),
                 service_name: None,
                 method: Some("PUT".to_string()),
+                headers: Default::default(),
             }),
         );
 
@@ -3606,6 +3621,7 @@ mod tests {
                 host: Some("example.test".to_string()),
                 service_name: Some("GunService".to_string()),
                 method: None,
+                headers: Default::default(),
             }),
         );
 
