@@ -2,7 +2,8 @@ use std::fmt;
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
@@ -35,7 +36,9 @@ use crate::vless::{VlessServer, VlessServerConfig};
 use crate::vmess::{VmessServer, VmessServerConfig};
 
 const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 4096;
+const CONNECTION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 static TCP_ACCEPT_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static CONNECTION_WORKER_POOL: OnceLock<ConnectionWorkerPool> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerStatus {
@@ -88,7 +91,7 @@ struct ListenerHandle {
     status: ListenerStatus,
     runtime: ListenerRuntime,
     stop: Arc<AtomicBool>,
-    workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    workers: ConnectionWorkerGroup,
     join: Option<JoinHandle<()>>,
 }
 
@@ -265,7 +268,7 @@ impl CoreService {
             if let Some(join) = handle.join.take() {
                 let _ = join.join();
             }
-            join_workers(&handle.workers);
+            handle.workers.join();
         }
     }
 }
@@ -341,7 +344,7 @@ fn start_grpc_transport_listener(
         .unwrap_or_else(|| "GunService".to_string());
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
-    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers = ConnectionWorkerGroup::new();
     let join = thread::spawn(move || {
         let _ = runtime.block_on(run_grpc_listener(
             listener,
@@ -421,7 +424,7 @@ fn start_vmess_listener(
         })?;
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
-    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers = ConnectionWorkerGroup::new();
     let workers_for_thread = workers.clone();
     let network = inbound.transport.network.trim().to_string();
     let websocket_path = inbound.transport.path.clone();
@@ -543,7 +546,7 @@ fn start_hysteria2_listener(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
-    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers = ConnectionWorkerGroup::new();
     let runtime_server = server.clone();
     let join = thread::spawn(move || {
         runtime.block_on(server.run(endpoint, stop_for_thread));
@@ -632,7 +635,7 @@ fn start_tuic_listener(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
-    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers = ConnectionWorkerGroup::new();
     let runtime_server = server.clone();
     let join = thread::spawn(move || {
         runtime.block_on(server.run(endpoint, stop_for_thread));
@@ -695,7 +698,7 @@ fn start_anytls_listener(
         })?;
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
-    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers = ConnectionWorkerGroup::new();
     let workers_for_thread = workers.clone();
     let runtime_server = server.clone();
     let join = spawn_tcp_accept_loop(
@@ -782,17 +785,21 @@ fn start_shadowsocks_listener(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
-    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers = ConnectionWorkerGroup::new();
     if let Some(udp) = udp {
         let server = server.clone();
         let stop_for_udp = stop.clone();
-        let udp_worker = thread::spawn(move || {
+        if !workers.spawn(move || {
             let _ = server.serve_udp(udp, stop_for_udp);
-        });
-        workers
-            .lock()
-            .expect("worker list lock poisoned")
-            .push(udp_worker);
+        }) {
+            return Err(CoreServiceError::Bind {
+                tag: inbound.tag.clone(),
+                source: io::Error::new(
+                    io::ErrorKind::Other,
+                    "failed to spawn shadowsocks udp worker",
+                ),
+            });
+        }
     }
     let workers_for_thread = workers.clone();
     let runtime_server = server.clone();
@@ -884,7 +891,7 @@ fn start_trojan_listener(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
-    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers = ConnectionWorkerGroup::new();
     let workers_for_thread = workers.clone();
     let network = inbound.transport.network.trim().to_string();
     let websocket_path = inbound.transport.path.clone();
@@ -1011,7 +1018,7 @@ fn start_vless_listener(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
-    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers = ConnectionWorkerGroup::new();
     let workers_for_thread = workers.clone();
     let network = inbound.transport.network.trim().to_string();
     let websocket_path = inbound.transport.path.clone();
@@ -1116,7 +1123,7 @@ fn start_socks_listener(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
-    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers = ConnectionWorkerGroup::new();
     let workers_for_thread = workers.clone();
     let runtime_server = server.clone();
     let join = spawn_tcp_accept_loop(
@@ -1186,7 +1193,7 @@ fn start_mieru_listener(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
-    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers = ConnectionWorkerGroup::new();
     let workers_for_thread = workers.clone();
     let runtime_server = server.clone();
     let join = spawn_tcp_accept_loop(
@@ -1256,7 +1263,7 @@ fn start_http_listener(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
-    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers = ConnectionWorkerGroup::new();
     let workers_for_thread = workers.clone();
     let runtime_server = server.clone();
     let join = spawn_tcp_accept_loop(
@@ -1307,7 +1314,7 @@ fn start_vless_reality_listener(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
-    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers = ConnectionWorkerGroup::new();
     let workers_for_thread = workers.clone();
     let runtime_server = server.clone();
     let join = spawn_tcp_accept_loop(
@@ -1423,55 +1430,233 @@ fn has_explicit_port(dest: &str) -> bool {
         .is_some()
 }
 
-fn join_workers(workers: &Arc<Mutex<Vec<JoinHandle<()>>>>) {
-    loop {
-        let worker = workers.lock().expect("worker list lock poisoned").pop();
-        match worker {
-            Some(worker) => {
-                let _ = worker.join();
-            }
-            None => break,
+type ConnectionWorkerJob = Box<dyn FnOnce() + Send + 'static>;
+
+#[derive(Debug, Clone)]
+struct ConnectionWorkerGroup {
+    state: Arc<ConnectionWorkerGroupState>,
+}
+
+#[derive(Debug)]
+struct ConnectionWorkerGroupState {
+    active: Mutex<usize>,
+    finished: Condvar,
+}
+
+struct ConnectionWorkerPool {
+    sender: mpsc::Sender<ConnectionWorkerJob>,
+    receiver: Arc<Mutex<mpsc::Receiver<ConnectionWorkerJob>>>,
+    worker_count: std::sync::atomic::AtomicUsize,
+    idle_count: std::sync::atomic::AtomicUsize,
+    pending_count: std::sync::atomic::AtomicUsize,
+    max_workers: usize,
+}
+
+impl std::fmt::Debug for ConnectionWorkerPool {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectionWorkerPool")
+            .field("worker_count", &self.worker_count.load(Ordering::Relaxed))
+            .field("idle_count", &self.idle_count.load(Ordering::Relaxed))
+            .field("pending_count", &self.pending_count.load(Ordering::Relaxed))
+            .field("max_workers", &self.max_workers)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConnectionWorkerGroup {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(ConnectionWorkerGroupState {
+                active: Mutex::new(0),
+                finished: Condvar::new(),
+            }),
+        }
+    }
+
+    fn spawn<F>(&self, task: F) -> bool
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        if !self.state.acquire() {
+            return false;
+        }
+
+        let state = Arc::clone(&self.state);
+        let job = Box::new(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+            state.release();
+        });
+
+        if connection_worker_pool().submit(job) {
+            true
+        } else {
+            self.state.release();
+            false
+        }
+    }
+
+    fn join(&self) {
+        self.state.wait_until_idle();
+    }
+}
+
+impl ConnectionWorkerGroupState {
+    fn acquire(&self) -> bool {
+        let mut active = self.active.lock().expect("worker group lock poisoned");
+        if *active >= MAX_CONNECTION_WORKERS_PER_LISTENER {
+            return false;
+        }
+        *active += 1;
+        true
+    }
+
+    fn release(&self) {
+        let mut active = self.active.lock().expect("worker group lock poisoned");
+        *active = active.saturating_sub(1);
+        if *active == 0 {
+            self.finished.notify_all();
+        }
+    }
+
+    fn wait_until_idle(&self) {
+        let mut active = self.active.lock().expect("worker group lock poisoned");
+        while *active > 0 {
+            active = self
+                .finished
+                .wait(active)
+                .expect("worker group lock poisoned");
         }
     }
 }
 
-fn spawn_connection_worker<F>(workers: &Arc<Mutex<Vec<JoinHandle<()>>>>, task: F) -> bool
+impl ConnectionWorkerPool {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            sender,
+            receiver: Arc::new(Mutex::new(receiver)),
+            worker_count: std::sync::atomic::AtomicUsize::new(0),
+            idle_count: std::sync::atomic::AtomicUsize::new(0),
+            pending_count: std::sync::atomic::AtomicUsize::new(0),
+            max_workers: connection_worker_threads(),
+        }
+    }
+
+    fn submit(&'static self, job: ConnectionWorkerJob) -> bool {
+        if !self.ensure_worker_available() {
+            return false;
+        }
+
+        self.pending_count.fetch_add(1, Ordering::Relaxed);
+        if self.sender.send(job).is_err() {
+            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        self.spawn_extra_worker_if_needed();
+        true
+    }
+
+    fn ensure_worker_available(&'static self) -> bool {
+        if self.worker_count.load(Ordering::Acquire) > 0 {
+            return true;
+        }
+        self.spawn_worker()
+    }
+
+    fn spawn_extra_worker_if_needed(&'static self) {
+        let pending = self.pending_count.load(Ordering::Relaxed);
+        let idle = self.idle_count.load(Ordering::Relaxed);
+        if pending > idle {
+            let _ = self.spawn_worker();
+        }
+    }
+
+    fn spawn_worker(&'static self) -> bool {
+        loop {
+            let current = self.worker_count.load(Ordering::Acquire);
+            if current >= self.max_workers {
+                return current > 0;
+            }
+            if self
+                .worker_count
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            let pool = self;
+            let spawned = thread::Builder::new()
+                .name("keli-core-connection-worker".to_string())
+                .stack_size(connection_worker_stack_size())
+                .spawn(move || pool.run_worker());
+            if spawned.is_ok() {
+                return true;
+            }
+            self.worker_count.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+    }
+
+    fn run_worker(&'static self) {
+        loop {
+            self.idle_count.fetch_add(1, Ordering::Relaxed);
+            let job = {
+                let receiver = self
+                    .receiver
+                    .lock()
+                    .expect("connection worker queue lock poisoned");
+                receiver.recv_timeout(CONNECTION_WORKER_IDLE_TIMEOUT)
+            };
+            self.idle_count.fetch_sub(1, Ordering::Relaxed);
+
+            match job {
+                Ok(job) => {
+                    self.pending_count.fetch_sub(1, Ordering::Relaxed);
+                    job();
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if self.pending_count.load(Ordering::Acquire) == 0 {
+                        self.worker_count.fetch_sub(1, Ordering::AcqRel);
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.worker_count.fetch_sub(1, Ordering::AcqRel);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn connection_worker_pool() -> &'static ConnectionWorkerPool {
+    CONNECTION_WORKER_POOL.get_or_init(ConnectionWorkerPool::new)
+}
+
+fn connection_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .saturating_mul(128)
+        .clamp(256, MAX_CONNECTION_WORKERS_PER_LISTENER)
+}
+
+fn connection_worker_stack_size() -> usize {
+    512 * 1024
+}
+
+fn spawn_connection_worker<F>(workers: &ConnectionWorkerGroup, task: F) -> bool
 where
     F: FnOnce() + Send + 'static,
 {
-    let mut handles = workers.lock().expect("worker list lock poisoned");
-    prune_finished_workers(&mut handles);
-    if handles.len() >= MAX_CONNECTION_WORKERS_PER_LISTENER {
-        return false;
-    }
-    match thread::Builder::new()
-        .name("keli-core-tcp-worker".to_string())
-        .spawn(task)
-    {
-        Ok(worker) => {
-            handles.push(worker);
-            true
-        }
-        Err(_) => false,
-    }
-}
-
-fn prune_finished_workers(workers: &mut Vec<JoinHandle<()>>) {
-    let mut active = Vec::with_capacity(workers.len());
-    for worker in workers.drain(..) {
-        if worker.is_finished() {
-            let _ = worker.join();
-        } else {
-            active.push(worker);
-        }
-    }
-    *workers = active;
+    workers.spawn(task)
 }
 
 fn spawn_tcp_accept_loop<F>(
     listener: TcpListener,
     stop: Arc<AtomicBool>,
-    workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    workers: ConnectionWorkerGroup,
     handler: F,
 ) -> JoinHandle<()>
 where
