@@ -21,8 +21,7 @@ use crate::limits::{
 use crate::outbound::recv_udp_response;
 use crate::socks5::SocksTarget;
 use crate::stream::{
-    copy_count_best_effort_limited, join_native_blocking_relay, spawn_blocking_relay,
-    spawn_native_blocking_relay,
+    copy_count_best_effort_limited, join_native_blocking_relay, spawn_native_blocking_relay,
 };
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
@@ -770,7 +769,7 @@ pub(crate) fn connect_shadowsocks_tcp_outbound(
     remote_writer.write_chunk(&request)?;
     remote_writer.flush()?;
 
-    let _ = spawn_blocking_relay(move || {
+    let _ = spawn_native_blocking_relay(move || {
         let _ =
             relay_plain_to_shadowsocks(local_plain, remote_reader, remote_writer, method, password);
     })?;
