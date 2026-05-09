@@ -25,7 +25,7 @@ use crate::quic::connect_quic_client_stream;
 use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort_limited, join_native_blocking_relay, relay_tcp_streams_limited,
-    spawn_blocking_relay, spawn_native_blocking_relay,
+    spawn_native_blocking_relay,
 };
 use crate::tls::{relay_tls_stream, TlsConnection, TlsSocket};
 use crate::traffic::TrafficRegistry;
@@ -925,7 +925,7 @@ fn connect_vless_httpupgrade_tcp_outbound(
         let local_client = TcpStream::connect(local_addr)?;
         let (local_plain, _) = local_listener.accept()?;
 
-        let _ = spawn_blocking_relay(move || {
+        let _ = spawn_native_blocking_relay(move || {
             let _ = relay_plain_to_tls(local_plain, tls_stream);
         })?;
 
@@ -994,7 +994,7 @@ fn connect_vless_tls_tcp_outbound(
     let use_vision = flow == FLOW_XTLS_RPRX_VISION;
     let user_id = *user_id;
 
-    let _ = spawn_blocking_relay(move || {
+    let _ = spawn_native_blocking_relay(move || {
         if use_vision {
             let _ = tls_stream.sock.set_nonblocking(true);
             let _ = relay_plain_to_vless_vision(local_plain, tls_stream, user_id);
@@ -1397,7 +1397,7 @@ where
     let local_client = TcpStream::connect(local_addr)?;
     let (local_plain, _) = local_listener.accept()?;
 
-    let _ = spawn_blocking_relay(move || {
+    let _ = spawn_native_blocking_relay(move || {
         let _ = relay_plain_to_websocket(local_plain, websocket);
     })?;
 
@@ -1410,7 +1410,7 @@ fn local_bridge_for_grpc(grpc: GrpcClientStream) -> io::Result<TcpStream> {
     let local_client = TcpStream::connect(local_addr)?;
     let (local_plain, _) = local_listener.accept()?;
 
-    let _ = spawn_blocking_relay(move || {
+    let _ = spawn_native_blocking_relay(move || {
         let _ = relay_plain_to_grpc(local_plain, grpc);
     })?;
 
