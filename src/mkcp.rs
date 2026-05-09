@@ -1,10 +1,15 @@
 use std::io;
 
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes128Gcm, Nonce as AesNonce};
+use sha2::{Digest, Sha256};
+
 const FNV_OFFSET: u32 = 0x811c9dc5;
 const FNV_PRIME: u32 = 0x01000193;
 
 pub const DATA_SEGMENT_OVERHEAD: usize = 18;
 pub const SIMPLE_AUTH_OVERHEAD: usize = 6;
+pub const AES_GCM_AUTH_OVERHEAD: usize = 28;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MkcpCommand {
@@ -293,6 +298,42 @@ pub fn open_simple_auth(ciphertext: &[u8]) -> io::Result<Vec<u8>> {
     Ok(output[SIMPLE_AUTH_OVERHEAD..].to_vec())
 }
 
+pub fn seal_aes_gcm_seed_auth(seed: &str, plain: &[u8]) -> io::Result<Vec<u8>> {
+    let cipher = mkcp_seed_cipher(seed)?;
+    let mut nonce = [0u8; 12];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+    let mut output = Vec::with_capacity(plain.len() + AES_GCM_AUTH_OVERHEAD);
+    output.extend_from_slice(&nonce);
+    let encrypted = cipher
+        .encrypt(AesNonce::from_slice(&nonce), plain)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "mkcp aes-gcm seal failed"))?;
+    output.extend_from_slice(&encrypted);
+    Ok(output)
+}
+
+pub fn open_aes_gcm_seed_auth(seed: &str, ciphertext: &[u8]) -> io::Result<Vec<u8>> {
+    if ciphertext.len() <= AES_GCM_AUTH_OVERHEAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mkcp aes-gcm packet is too short",
+        ));
+    }
+    let cipher = mkcp_seed_cipher(seed)?;
+    let (nonce, encrypted) = ciphertext.split_at(12);
+    cipher
+        .decrypt(AesNonce::from_slice(nonce), encrypted)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid mkcp aes-gcm auth"))
+}
+
+fn mkcp_seed_cipher(seed: &str) -> io::Result<Aes128Gcm> {
+    let mut hasher = Sha256::new();
+    hasher.update(seed.as_bytes());
+    let digest = hasher.finalize();
+    Aes128Gcm::new_from_slice(&digest[..16])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
+}
+
 fn fnv1a32(input: &[u8]) -> u32 {
     let mut hash = FNV_OFFSET;
     for byte in input {
@@ -395,5 +436,27 @@ mod tests {
         let last = sealed.len() - 1;
         sealed[last] ^= 0x01;
         assert!(open_simple_auth(&sealed).is_err());
+    }
+
+    #[test]
+    fn aes_gcm_seed_auth_round_trips_segments() {
+        let segment = MkcpSegment::Command(MkcpCommandSegment {
+            conv: 11,
+            command: MkcpCommand::Ping,
+            option: 0,
+            sending_next: 7,
+            receiving_next: 8,
+            peer_rto: 125,
+        });
+        let mut encoded = Vec::new();
+        segment.serialize(&mut encoded);
+
+        let sealed = seal_aes_gcm_seed_auth("seed-value", &encoded).expect("seal");
+        assert_eq!(sealed.len(), encoded.len() + AES_GCM_AUTH_OVERHEAD);
+        assert_eq!(
+            open_aes_gcm_seed_auth("seed-value", &sealed).expect("open"),
+            encoded
+        );
+        assert!(open_aes_gcm_seed_auth("other-seed", &sealed).is_err());
     }
 }
