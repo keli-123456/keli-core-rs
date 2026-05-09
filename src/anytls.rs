@@ -4,7 +4,6 @@ use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
 use std::sync::{Arc, Mutex, RwLock};
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use md5::Md5;
@@ -15,6 +14,7 @@ use crate::limits::{
 };
 use crate::outbound::recv_udp_response;
 use crate::socks5::SocksTarget;
+use crate::stream::{join_blocking_relay, spawn_blocking_relay, BlockingRelayHandle};
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 use crate::{
@@ -75,7 +75,7 @@ struct AnyTlsSession {
     client_ip: Option<IpAddr>,
     writer: Arc<Mutex<TcpStream>>,
     remotes: HashMap<u32, AnyTlsRemote>,
-    workers: Vec<JoinHandle<()>>,
+    workers: Vec<BlockingRelayHandle<()>>,
     traffic: Arc<Mutex<(u64, u64)>>,
     bandwidth: Option<Arc<BandwidthLimiter>>,
     settings_done: bool,
@@ -160,7 +160,7 @@ impl AnyTlsServer {
             }
         }
         for worker in session.workers {
-            let _ = worker.join();
+            let _ = join_blocking_relay(worker, "anytls downlink worker panicked");
         }
         let (upload, download) = *session.traffic.lock().expect("traffic lock poisoned");
         if upload > 0 || download > 0 {
@@ -395,9 +395,9 @@ impl AnyTlsServer {
         let mut remote_read = remote.try_clone()?;
         let writer = session.writer.clone();
         let traffic = session.traffic.clone();
-        session.workers.push(thread::spawn(move || {
+        session.workers.push(spawn_blocking_relay(move || {
             pump_downlink(stream_id, &mut remote_read, writer, traffic);
-        }));
+        })?);
         session.remotes.insert(stream_id, AnyTlsRemote::Tcp(remote));
         write_frame(&session.writer, CMD_SYNACK, stream_id, &[])?;
 
