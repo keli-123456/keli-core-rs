@@ -88,6 +88,10 @@ pub async fn connect_tcp_outbound_tokio(
     target: &SocksTarget,
     timeout: Duration,
 ) -> io::Result<tokio::net::TcpStream> {
+    if outbound.protocol.trim().eq_ignore_ascii_case("freedom") {
+        return connect_direct_tokio(&freedom_target(outbound, target), timeout).await;
+    }
+
     let outbound = outbound.clone();
     let target = target.clone();
     let stream =
@@ -101,6 +105,13 @@ pub async fn connect_tcp_outbound_tokio(
             })??;
     stream.set_nonblocking(true)?;
     tokio::net::TcpStream::from_std(stream)
+}
+
+async fn connect_direct_tokio(
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<tokio::net::TcpStream> {
+    crate::dns::connect_tcp_tokio(&target.host, target.port, timeout).await
 }
 
 fn send_direct_udp(
@@ -622,8 +633,43 @@ mod tests {
     use std::time::Duration;
 
     use crate::config::OutboundConfig;
-    use crate::outbound::{connect_tcp_outbound, send_udp_outbound};
+    use crate::outbound::{connect_tcp_outbound, connect_tcp_outbound_tokio, send_udp_outbound};
     use crate::socks5::SocksTarget;
+    use tokio::io::AsyncReadExt as _;
+
+    #[tokio::test]
+    async fn connects_through_async_freedom_outbound() {
+        let remote = TcpListener::bind("127.0.0.1:0").expect("bind remote");
+        let remote_addr = remote.local_addr().expect("remote addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = remote.accept().expect("accept remote");
+            stream.write_all(b"pong").expect("payload");
+        });
+
+        let outbound = OutboundConfig {
+            tag: "direct-out".to_string(),
+            protocol: "freedom".to_string(),
+            method: None,
+            alter_id: None,
+            address: Some(remote_addr.ip().to_string()),
+            port: Some(remote_addr.port()),
+            username: None,
+            password: None,
+            tls: None,
+            transport: None,
+        };
+        let target = SocksTarget {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+        let mut stream = connect_tcp_outbound_tokio(&outbound, &target, Duration::from_secs(2))
+            .await
+            .expect("connect");
+        let mut payload = [0u8; 4];
+        stream.read_exact(&mut payload).await.expect("payload");
+        assert_eq!(&payload, b"pong");
+        server.join().expect("server");
+    }
 
     #[test]
     fn connects_through_socks5_outbound_with_password_auth() {
