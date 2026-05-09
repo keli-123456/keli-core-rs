@@ -30,6 +30,14 @@ where
     Ok(tcp_relay_runtime()?.spawn_blocking(task))
 }
 
+pub fn spawn_background_io<F>(future: F) -> io::Result<tokio::task::JoinHandle<F::Output>>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    Ok(tcp_relay_runtime()?.spawn(future))
+}
+
 pub fn join_blocking_relay<T>(
     handle: BlockingRelayHandle<T>,
     panic_message: &'static str,

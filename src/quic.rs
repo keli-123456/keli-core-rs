@@ -1,7 +1,6 @@
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::sync::{mpsc, Arc};
-use std::thread;
 use std::time::Duration;
 
 use quinn::crypto::rustls::QuicClientConfig;
@@ -14,6 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::config::{OutboundTlsConfig, OutboundTransportConfig};
 use crate::quic_packet::{QuicPacketSecurity, QuicPacketUdpSocket};
 use crate::socks5::SocksTarget;
+use crate::stream::spawn_background_io;
 
 const INTERNAL_QUIC_DOMAIN: &str = "quic.internal.v2fly.org";
 
@@ -37,29 +37,20 @@ pub(crate) fn connect_quic_client_stream(
     let tls = tls.cloned();
     let transport = transport.cloned();
 
-    thread::spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                let _ = ready_tx.send(Err(io_other(error)));
-                return;
-            }
-        };
-        let result = runtime.block_on(run_quic_client(
+    spawn_background_io(async move {
+        let result = run_quic_client(
             server,
             timeout,
             tls,
             transport,
             local_plain,
             ready_tx.clone(),
-        ));
+        )
+        .await;
         if let Err(error) = result {
             let _ = ready_tx.send(Err(error));
         }
-    });
+    })?;
 
     match ready_rx.recv_timeout(timeout) {
         Ok(Ok(())) => Ok(local_client),

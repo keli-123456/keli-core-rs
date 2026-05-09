@@ -1,7 +1,6 @@
 use std::io::{self, Read, Write};
 use std::net::Ipv6Addr;
 use std::sync::{mpsc, Arc};
-use std::thread;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -17,6 +16,7 @@ use tokio_rustls::{TlsAcceptor as TokioTlsAcceptor, TlsConnector};
 
 use crate::config::OutboundTlsConfig;
 use crate::socks5::SocksTarget;
+use crate::stream::spawn_background_io;
 use crate::tls::server_config_from_files;
 
 const DEFAULT_SERVICE_NAME: &str = "GunService";
@@ -110,18 +110,8 @@ pub(crate) fn connect_grpc_client(
     let service_name = service_name.unwrap_or(DEFAULT_SERVICE_NAME).to_string();
     let host = host.trim().trim_matches(['[', ']']).to_string();
 
-    thread::spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                let _ = ready_tx.send(Err(io_other(error)));
-                return;
-            }
-        };
-        let result = runtime.block_on(run_grpc_client(
+    spawn_background_io(async move {
+        let result = run_grpc_client(
             server,
             timeout,
             tls,
@@ -130,11 +120,12 @@ pub(crate) fn connect_grpc_client(
             input_tx,
             output_rx,
             ready_tx.clone(),
-        ));
+        )
+        .await;
         if let Err(error) = result {
             let _ = ready_tx.send(Err(error));
         }
-    });
+    })?;
 
     match ready_rx.recv_timeout(timeout) {
         Ok(Ok(())) => Ok(GrpcClientStream::new(input_rx, output_tx)),

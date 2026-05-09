@@ -19,6 +19,7 @@ use tokio_rustls::{TlsAcceptor as TokioTlsAcceptor, TlsConnector};
 
 use crate::config::OutboundTlsConfig;
 use crate::socks5::SocksTarget;
+use crate::stream::{spawn_background_io, spawn_blocking_relay};
 use crate::tls::server_config_from_files;
 
 const DEFAULT_H2_PATH: &str = "/";
@@ -126,18 +127,8 @@ pub(crate) fn connect_http2_client(
         })
         .unwrap_or_default();
 
-    thread::spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                let _ = ready_tx.send(Err(io_other(error)));
-                return;
-            }
-        };
-        let result = runtime.block_on(run_http2_client(
+    spawn_background_io(async move {
+        let result = run_http2_client(
             server,
             timeout,
             tls,
@@ -148,11 +139,12 @@ pub(crate) fn connect_http2_client(
             input_tx,
             output_rx,
             ready_tx.clone(),
-        ));
+        )
+        .await;
         if let Err(error) = result {
             let _ = ready_tx.send(Err(error));
         }
-    });
+    })?;
 
     match ready_rx.recv_timeout(timeout) {
         Ok(Ok(())) => Ok(Http2ClientStream::new(input_rx, output_tx)),
@@ -180,9 +172,9 @@ pub(crate) fn local_bridge_for_http2(
     let (local_plain, _) = local_listener.accept()?;
     http2.set_nonblocking(true);
 
-    thread::spawn(move || {
+    let _ = spawn_blocking_relay(move || {
         let _ = relay_plain_to_http2(local_plain, http2);
-    });
+    })?;
 
     Ok(local_client)
 }
