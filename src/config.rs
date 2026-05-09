@@ -204,25 +204,13 @@ impl CoreConfig {
     fn validate_outbounds(&self) -> Result<(), ValidationError> {
         let mut tags = HashSet::new();
         for outbound in &self.outbounds {
-            if outbound.tag.trim().is_empty() {
-                return Err(ValidationError::new("outbound tag is required"));
-            }
             if !tags.insert(outbound.tag.as_str()) {
                 return Err(ValidationError::new(format!(
                     "duplicate outbound tag: {}",
                     outbound.tag
                 )));
             }
-            if !matches!(
-                outbound.protocol.trim().to_ascii_lowercase().as_str(),
-                "freedom" | "socks" | "socks5" | "http"
-            ) {
-                return Err(ValidationError::new(format!(
-                    "outbound {} protocol {} is not implemented in keli-core-rs yet",
-                    outbound.tag, outbound.protocol
-                )));
-            }
-            validate_outbound_endpoint(outbound)?;
+            validate_outbound(outbound)?;
         }
         Ok(())
     }
@@ -245,7 +233,7 @@ impl CoreConfig {
                                 outbound.tag
                             )));
                         }
-                        validate_outbound_endpoint(outbound)?;
+                        validate_outbound(outbound)?;
                     } else if !outbound_tags.contains(tag.as_str()) {
                         return Err(ValidationError::new(format!(
                             "route outbound {tag} is not configured"
@@ -275,6 +263,22 @@ impl CoreConfig {
             })
             .collect()
     }
+}
+
+fn validate_outbound(outbound: &OutboundConfig) -> Result<(), ValidationError> {
+    if outbound.tag.trim().is_empty() {
+        return Err(ValidationError::new("outbound tag is required"));
+    }
+    if !matches!(
+        outbound.protocol.trim().to_ascii_lowercase().as_str(),
+        "freedom" | "socks" | "socks5" | "http"
+    ) {
+        return Err(ValidationError::new(format!(
+            "outbound {} protocol {} is not implemented in keli-core-rs yet",
+            outbound.tag, outbound.protocol
+        )));
+    }
+    validate_outbound_endpoint(outbound)
 }
 
 fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), ValidationError> {
@@ -1192,6 +1196,47 @@ mod tests {
             .validate()
             .expect_err("proxy outbound without port should fail");
         assert!(error.to_string().contains("port is required"));
+    }
+
+    #[test]
+    fn validates_embedded_route_outbound_protocols() {
+        let config = CoreConfig {
+            instance_id: "node-a".to_string(),
+            log_level: "info".to_string(),
+            dns: DnsConfig::default(),
+            inbounds: vec![InboundConfig {
+                tag: "panel|http|1".to_string(),
+                protocol: Protocol::Http,
+                listen: "0.0.0.0".to_string(),
+                port: 8080,
+                users: vec![user()],
+                cipher: None,
+                flow: String::new(),
+                padding_scheme: Vec::new(),
+                transport: TransportConfig::default(),
+                tls: None,
+                sniffing: SniffingConfig::default(),
+            }],
+            outbounds: Vec::new(),
+            routes: vec![crate::config::RouteRule {
+                targets: vec!["domain:example.com".to_string()],
+                action: crate::config::RouteAction::Outbound("proxy".to_string()),
+                outbound: Some(OutboundConfig {
+                    tag: "proxy".to_string(),
+                    protocol: "vless".to_string(),
+                    address: Some("127.0.0.1".to_string()),
+                    port: Some(1080),
+                    username: None,
+                    password: None,
+                }),
+            }],
+            stats: StatsConfig::default(),
+        };
+
+        let error = config
+            .validate()
+            .expect_err("embedded unsupported outbounds should fail before runtime");
+        assert!(error.to_string().contains("protocol vless"));
     }
 
     #[test]
