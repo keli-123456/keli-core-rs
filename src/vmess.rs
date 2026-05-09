@@ -1787,6 +1787,112 @@ fn connect_vmess_tls_tcp_outbound(
     local_bridge_for_vmess(tls_stream, request)
 }
 
+pub(crate) fn send_vmess_udp_outbound(
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    payload: &[u8],
+    timeout: Duration,
+) -> io::Result<(SocketAddr, Vec<u8>)> {
+    let server = vmess_outbound_server(outbound)?;
+    let network = outbound_transport_network(outbound).to_ascii_lowercase();
+    if network == "ws" {
+        if outbound.tls.is_some() {
+            let tls_stream = connect_vmess_tls_stream(outbound, &server, timeout)?;
+            let host = outbound_transport_host(outbound, &server);
+            let mut websocket =
+                connect_websocket_client(tls_stream, outbound_transport_path(outbound), &host)?;
+            return send_vmess_udp_over_stream(&mut websocket, outbound, target, payload, timeout);
+        }
+        let remote = connect_target(&server, timeout)?;
+        remote.set_read_timeout(Some(timeout))?;
+        remote.set_write_timeout(Some(timeout))?;
+        let host = outbound_transport_host(outbound, &server);
+        let mut websocket =
+            connect_websocket_client(remote, outbound_transport_path(outbound), &host)?;
+        return send_vmess_udp_over_stream(&mut websocket, outbound, target, payload, timeout);
+    }
+    if network == "httpupgrade" {
+        if outbound.tls.is_some() {
+            let tls_stream = connect_vmess_tls_stream(outbound, &server, timeout)?;
+            let host = outbound_transport_host(outbound, &server);
+            let mut stream =
+                connect_httpupgrade_client(tls_stream, outbound_transport_path(outbound), &host)?;
+            return send_vmess_udp_over_stream(&mut stream, outbound, target, payload, timeout);
+        }
+        let remote = connect_target(&server, timeout)?;
+        remote.set_read_timeout(Some(timeout))?;
+        remote.set_write_timeout(Some(timeout))?;
+        let host = outbound_transport_host(outbound, &server);
+        let mut stream =
+            connect_httpupgrade_client(remote, outbound_transport_path(outbound), &host)?;
+        return send_vmess_udp_over_stream(&mut stream, outbound, target, payload, timeout);
+    }
+    if network == "grpc" {
+        let host = outbound_transport_host(outbound, &server);
+        let mut grpc = connect_grpc_client(
+            &server,
+            timeout,
+            outbound.tls.as_ref(),
+            outbound_transport_service_name(outbound),
+            &host,
+        )?;
+        return send_vmess_udp_over_stream(&mut grpc, outbound, target, payload, timeout);
+    }
+    if network != "tcp" {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("vmess outbound transport {network} is not supported yet"),
+        ));
+    }
+    if outbound.tls.is_some() {
+        let mut tls_stream = connect_vmess_tls_stream(outbound, &server, timeout)?;
+        return send_vmess_udp_over_stream(&mut tls_stream, outbound, target, payload, timeout);
+    }
+    let mut stream = connect_target(&server, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    send_vmess_udp_over_stream(&mut stream, outbound, target, payload, timeout)
+}
+
+fn send_vmess_udp_over_stream<S: Read + Write>(
+    stream: &mut S,
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    payload: &[u8],
+    timeout: Duration,
+) -> io::Result<(SocketAddr, Vec<u8>)> {
+    let request = write_vmess_request(stream, outbound, target, VmessCommand::Udp)?;
+    stream.flush()?;
+    read_vmess_response_header(stream, &request)?;
+    let mut request_body = VmessBodyEncoder::new_with_length_seed(
+        request.request_body_key,
+        request.request_body_iv,
+        request.request_body_key,
+        request.request_body_iv,
+        request.options,
+        request.security,
+    );
+    request_body.write_packet(stream, payload)?;
+    request_body.finish(stream)?;
+    let mut response_body = VmessBodyDecoder::new_with_length_seed(
+        request.response_body_key,
+        request.response_body_iv,
+        request.request_body_key,
+        request.request_body_iv,
+        request.options,
+        request.security,
+    );
+    let response = response_body.read_packet(stream)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "vmess udp outbound returned no response packet",
+        )
+    })?;
+    let source = resolve_udp_target(target)
+        .or_else(|_| crate::dns::resolve_socket_addr(&target.host, target.port, timeout))?;
+    Ok((source, response))
+}
+
 fn connect_vmess_tls_stream(
     outbound: &OutboundConfig,
     server: &SocksTarget,
@@ -1946,6 +2052,15 @@ fn write_vmess_tcp_request<W: Write>(
     outbound: &OutboundConfig,
     target: &SocksTarget,
 ) -> io::Result<VmessRequest> {
+    write_vmess_request(writer, outbound, target, VmessCommand::Tcp)
+}
+
+fn write_vmess_request<W: Write>(
+    writer: &mut W,
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    command: VmessCommand,
+) -> io::Result<VmessRequest> {
     let uuid = vmess_outbound_user_id(outbound)?;
     let cmd_key = vmess_cmd_key(&uuid);
     let request_body_key = random_array::<16>()?;
@@ -1961,7 +2076,10 @@ fn write_vmess_tcp_request<W: Write>(
     header.push(options);
     header.push(vmess_security_byte(security));
     header.push(0);
-    header.push(COMMAND_TCP);
+    header.push(match command {
+        VmessCommand::Tcp => COMMAND_TCP,
+        VmessCommand::Udp => COMMAND_UDP,
+    });
     write_vmess_target_header(&mut header, target)?;
     let checksum = fnv1a(&header);
     header.extend_from_slice(&checksum.to_be_bytes());
@@ -1973,7 +2091,7 @@ fn write_vmess_tcp_request<W: Write>(
     let response_body_key = first_16_sha256(&request_body_key);
     let response_body_iv = first_16_sha256(&request_body_iv);
     Ok(VmessRequest {
-        command: VmessCommand::Tcp,
+        command,
         user_key: format_uuid_compact(&uuid),
         user_uuid: outbound
             .username
@@ -2489,11 +2607,11 @@ mod tests {
     use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
     use super::{
-        connect_vmess_tcp_outbound, create_auth_id, fnv1a, kdf, parse_uuid_bytes, vmess_cmd_key,
-        write_response_header, VmessBodyReader, VmessBodyWriter, VmessCommand, VmessRequest,
-        VmessSecurity, VmessServer, VmessServerConfig, ATYP_IPV4, COMMAND_TCP, COMMAND_UDP,
-        OPTION_AUTHENTICATED_LENGTH, OPTION_CHUNK_MASKING, OPTION_CHUNK_STREAM,
-        OPTION_GLOBAL_PADDING, SECURITY_AES128_GCM, VERSION,
+        connect_vmess_tcp_outbound, create_auth_id, fnv1a, kdf, parse_uuid_bytes,
+        send_vmess_udp_outbound, vmess_cmd_key, write_response_header, VmessBodyReader,
+        VmessBodyWriter, VmessCommand, VmessRequest, VmessSecurity, VmessServer, VmessServerConfig,
+        ATYP_IPV4, COMMAND_TCP, COMMAND_UDP, OPTION_AUTHENTICATED_LENGTH, OPTION_CHUNK_MASKING,
+        OPTION_CHUNK_STREAM, OPTION_GLOBAL_PADDING, SECURITY_AES128_GCM, VERSION,
     };
     use crate::config::{OutboundConfig, OutboundTransportConfig};
     use crate::grpc::{run_grpc_listener, GrpcStreamHandler};
@@ -3071,6 +3189,43 @@ mod tests {
 
         assert_outbound_reaches_echo(stream, echo_thread);
         proxy_thread.join().expect("proxy thread");
+    }
+
+    #[test]
+    fn vmess_udp_outbound_sends_packet_and_decodes_response() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let mut bytes = [0u8; 1024];
+            let (read, source) = echo.recv_from(&mut bytes).expect("echo read");
+            assert_eq!(&bytes[..read], b"ping");
+            echo.send_to(b"pong", source).expect("echo write");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vmess bind");
+        let vmess_addr = listener.local_addr().expect("vmess addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vmess accept");
+            server_clone.handle_tcp_client(stream)
+        });
+
+        let outbound = vmess_outbound(vmess_addr, None);
+        let target = SocksTarget {
+            host: echo_addr.ip().to_string(),
+            port: echo_addr.port(),
+        };
+        let (_, response) =
+            send_vmess_udp_outbound(&outbound, &target, b"ping", Duration::from_secs(2))
+                .expect("vmess udp outbound");
+
+        assert_eq!(response, b"pong");
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
     }
 
     #[test]

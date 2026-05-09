@@ -56,6 +56,7 @@ pub fn send_udp_outbound(
         "shadowsocks" => {
             crate::shadowsocks::send_shadowsocks_udp_outbound(outbound, target, payload, timeout)
         }
+        "vmess" => crate::vmess::send_vmess_udp_outbound(outbound, target, payload, timeout),
         protocol => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("outbound protocol {protocol} does not support udp in keli-core-rs yet"),
