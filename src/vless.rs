@@ -24,8 +24,8 @@ use crate::outbound::recv_udp_response;
 use crate::quic::connect_quic_client_stream;
 use crate::socks5::SocksTarget;
 use crate::stream::{
-    copy_count_best_effort_limited, join_blocking_relay, relay_tcp_streams_limited,
-    spawn_blocking_relay,
+    copy_count_best_effort_limited, join_native_blocking_relay, relay_tcp_streams_limited,
+    spawn_blocking_relay, spawn_native_blocking_relay,
 };
 use crate::tls::{relay_tls_stream, TlsConnection, TlsSocket};
 use crate::traffic::TrafficRegistry;
@@ -456,7 +456,7 @@ impl VlessServer {
             let mut remote_write = remote.try_clone()?;
             let mut remote_read = remote;
             let upload_limiter = bandwidth.clone();
-            let upload_task = spawn_blocking_relay(move || {
+            let upload_task = spawn_native_blocking_relay(move || {
                 copy_count_best_effort_limited(
                     &mut reader,
                     &mut remote_write,
@@ -464,7 +464,7 @@ impl VlessServer {
                 )
             })?;
             let download = copy_count_best_effort_limited(&mut remote_read, &mut writer, None);
-            let upload = join_blocking_relay(upload_task, "upload relay task panicked")?;
+            let upload = join_native_blocking_relay(upload_task, "upload relay task panicked")?;
             (upload, download)
         };
         self.traffic
@@ -1656,7 +1656,7 @@ where
     let mut remote_write = remote.try_clone()?;
     let mut remote_read = remote;
     let upload_limiter = limiter.clone();
-    let upload_task = spawn_blocking_relay(move || {
+    let upload_task = spawn_native_blocking_relay(move || {
         let mut vision_reader = VisionReader::new(reader, user_id);
         let bytes = copy_count_best_effort_limited(
             &mut vision_reader,
@@ -1669,7 +1669,7 @@ where
 
     let mut vision_writer = VisionWriter::new(writer, user_id);
     let download = copy_count_best_effort_limited(&mut remote_read, &mut vision_writer, None);
-    let upload = join_blocking_relay(upload_task, "vision upload relay task panicked")?;
+    let upload = join_native_blocking_relay(upload_task, "vision upload relay task panicked")?;
 
     Ok((upload, download))
 }
