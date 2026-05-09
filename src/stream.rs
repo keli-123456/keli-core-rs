@@ -1,10 +1,12 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::limits::BandwidthLimiter;
+
+static TCP_RELAY_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 pub fn relay_tcp_streams(client: TcpStream, remote: TcpStream) -> io::Result<(u64, u64)> {
     relay_tcp_streams_limited(client, remote, None)
@@ -25,11 +27,7 @@ fn relay_tcp_streams_async(
 ) -> io::Result<(u64, u64)> {
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()?;
-    runtime.block_on(async move {
+    tcp_relay_runtime()?.block_on(async move {
         let client = tokio::net::TcpStream::from_std(client)?;
         let remote = tokio::net::TcpStream::from_std(remote)?;
         let (mut client_read, mut client_write) = client.into_split();
@@ -48,6 +46,34 @@ fn relay_tcp_streams_async(
         let (upload, download) = tokio::join!(upload, download);
         Ok((upload, download))
     })
+}
+
+fn tcp_relay_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
+    if let Some(runtime) = TCP_RELAY_RUNTIME.get() {
+        return Ok(runtime);
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(tcp_relay_worker_threads())
+        .thread_name("keli-core-tcp-relay")
+        .enable_io()
+        .enable_time()
+        .build()?;
+    match TCP_RELAY_RUNTIME.set(runtime) {
+        Ok(()) => Ok(TCP_RELAY_RUNTIME
+            .get()
+            .expect("tcp relay runtime initialized")),
+        Err(_) => Ok(TCP_RELAY_RUNTIME
+            .get()
+            .expect("tcp relay runtime initialized by another thread")),
+    }
+}
+
+fn tcp_relay_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .clamp(2, 16)
 }
 
 async fn copy_count_best_effort_limited_async<R, W>(
