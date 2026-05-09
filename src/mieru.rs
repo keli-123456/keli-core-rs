@@ -2114,6 +2114,123 @@ mod tests {
     }
 
     #[test]
+    fn route_rule_sends_mieru_udp_associate_through_socks_outbound() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("relay bind");
+        let relay_addr = relay.local_addr().expect("relay addr");
+        let (target_tx, target_rx) = mpsc::channel();
+        let proxy_thread = thread::spawn(move || {
+            let (mut control, _) = proxy.accept().expect("accept proxy");
+            let mut hello = [0u8; 3];
+            control.read_exact(&mut hello).expect("hello");
+            assert_eq!(hello, [0x05, 0x01, 0x00]);
+            control.write_all(&[0x05, 0x00]).expect("method");
+
+            let mut request = [0u8; 10];
+            control.read_exact(&mut request).expect("udp associate");
+            assert_eq!(&request[..4], &[0x05, 0x03, 0x00, 0x01]);
+            control
+                .write_all(&[
+                    0x05,
+                    0x00,
+                    0x00,
+                    0x01,
+                    127,
+                    0,
+                    0,
+                    1,
+                    (relay_addr.port() >> 8) as u8,
+                    relay_addr.port() as u8,
+                ])
+                .expect("udp relay reply");
+
+            let mut bytes = [0u8; 512];
+            let (read, peer) = relay.recv_from(&mut bytes).expect("relay udp read");
+            let (target, payload) =
+                parse_socks_udp_packet(&bytes[..read]).expect("parse relay packet");
+            target_tx.send(target).expect("send target");
+            assert_eq!(payload, b"ping");
+            let response = encode_socks_udp_packet(
+                &crate::socks5::SocksTarget {
+                    host: "127.0.0.1".to_string(),
+                    port: 5353,
+                },
+                b"pong",
+            )
+            .expect("encode relay response");
+            relay.send_to(&response, peer).expect("relay udp write");
+        });
+
+        let server = MieruServer::new(MieruServerConfig {
+            node_tag: "panel|mieru|1".to_string(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            users: vec![user()],
+            routes: vec![RouteRule {
+                targets: vec!["domain:example.com".to_string()],
+                action: RouteAction::Outbound("socks-out".to_string()),
+                outbound: Some(OutboundConfig {
+                    tag: "socks-out".to_string(),
+                    protocol: "socks".to_string(),
+                    address: Some(proxy_addr.ip().to_string()),
+                    port: Some(proxy_addr.port()),
+                    username: None,
+                    password: None,
+                }),
+            }],
+            connect_timeout: Duration::from_secs(5),
+        });
+        let listener = server.bind().expect("server bind");
+        let listen_addr = listener.local_addr().expect("listen addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            server.handle_tcp_client(stream).expect("handle");
+            server.drain_traffic(1)
+        });
+
+        let client = TcpStream::connect(listen_addr).expect("connect");
+        let mut writer = test_client_writer(client.try_clone().expect("clone"), &user(), 92);
+        writer
+            .write_client_segment(OPEN_SESSION_REQUEST, &socks_udp_associate_request())
+            .expect("open");
+        let mut reader = MieruReader::accept(client, &[user()]).expect("client reader");
+        let open_response = reader.take_initial_segment().expect("open");
+        assert_eq!(open_response.metadata.protocol_type, OPEN_SESSION_RESPONSE);
+        assert_socks_connect_success(&mut reader);
+
+        let udp_packet = encode_socks_udp_packet(
+            &crate::socks5::SocksTarget {
+                host: "example.com".to_string(),
+                port: 53,
+            },
+            b"ping",
+        )
+        .expect("encode socks udp");
+        let frame = encode_mieru_udp_frame(&udp_packet).expect("encode mieru udp");
+        writer
+            .write_client_segment(DATA_CLIENT_TO_SERVER, &frame)
+            .expect("write udp");
+
+        let response_frame =
+            read_mieru_udp_frame(&mut reader, &mut Vec::new()).expect("read frame");
+        let (response_target, response_payload) =
+            parse_socks_udp_packet(&response_frame.expect("response frame")).expect("parse udp");
+        assert_eq!(response_target.host, "127.0.0.1");
+        assert_eq!(response_target.port, 5353);
+        assert_eq!(response_payload, b"pong");
+
+        let target = target_rx.recv().expect("target");
+        assert_eq!(target.host, "example.com");
+        assert_eq!(target.port, 53);
+        drop(writer);
+        drop(reader);
+        proxy_thread.join().expect("proxy thread");
+        let records = server_thread.join().expect("server thread");
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
     fn wildcard_route_sends_mieru_tcp_connect_through_http_outbound() {
         let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
         let proxy_addr = proxy.local_addr().expect("proxy addr");
