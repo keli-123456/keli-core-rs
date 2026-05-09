@@ -88,6 +88,8 @@ enum VlessCommand {
 struct VlessUdpRelayState {
     ipv4: Option<UdpSocket>,
     ipv6: Option<UdpSocket>,
+    target: Option<SocksTarget>,
+    target_addr: Option<SocketAddr>,
     timeout: Duration,
 }
 
@@ -654,7 +656,7 @@ impl VlessServer {
             };
         }
 
-        let remote_addr = resolve_udp_target(&target)?;
+        let remote_addr = state.remote_addr_for(target)?;
         let udp = state.socket_for(remote_addr)?;
         udp.send_to(payload, remote_addr)?;
         let mut response = vec![0u8; MAX_UDP_PACKET_SIZE];
@@ -720,8 +722,22 @@ impl VlessUdpRelayState {
         Self {
             ipv4: None,
             ipv6: None,
+            target: None,
+            target_addr: None,
             timeout,
         }
+    }
+
+    fn remote_addr_for(&mut self, target: &SocksTarget) -> io::Result<SocketAddr> {
+        if self.target.as_ref() == Some(target) {
+            if let Some(target_addr) = self.target_addr {
+                return Ok(target_addr);
+            }
+        }
+        let target_addr = resolve_udp_target(target)?;
+        self.target = Some(target.clone());
+        self.target_addr = Some(target_addr);
+        Ok(target_addr)
     }
 
     fn socket_for(&mut self, remote: SocketAddr) -> io::Result<&UdpSocket> {
