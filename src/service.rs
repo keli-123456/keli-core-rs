@@ -1,8 +1,8 @@
-﻿use std::fmt;
+use std::fmt;
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
@@ -35,6 +35,7 @@ use crate::vless::{VlessServer, VlessServerConfig};
 use crate::vmess::{VmessServer, VmessServerConfig};
 
 const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 4096;
+static TCP_ACCEPT_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerStatus {
@@ -427,54 +428,46 @@ fn start_vmess_listener(
     let httpupgrade_host = inbound.transport.host.clone();
     let tls_acceptor = tls_acceptor_for(inbound)?;
     let runtime_server = server.clone();
-    let join = thread::spawn(move || {
-        while !stop_for_thread.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let server = server.clone();
-                    let network = network.clone();
-                    let websocket_path = websocket_path.clone();
-                    let httpupgrade_host = httpupgrade_host.clone();
-                    let tls_acceptor = tls_acceptor.clone();
-                    spawn_connection_worker(&workers_for_thread, move || {
-                        let result = if let Some(acceptor) = tls_acceptor {
-                            acceptor
-                                .accept(stream)
-                                .and_then(|client| match network.as_str() {
-                                    "ws" => server.handle_tls_websocket_client(
-                                        client,
-                                        websocket_path.as_deref(),
-                                    ),
-                                    "httpupgrade" => accept_httpupgrade_tls(
-                                        client,
-                                        websocket_path.as_deref(),
-                                        httpupgrade_host.as_deref(),
-                                    )
-                                    .and_then(|client| server.handle_tls_client(client)),
-                                    _ => server.handle_tls_client(client),
-                                })
-                        } else if network == "ws" {
-                            server.handle_websocket_client(stream, websocket_path.as_deref())
-                        } else if network == "httpupgrade" {
-                            accept_httpupgrade(
-                                stream,
-                                websocket_path.as_deref(),
-                                httpupgrade_host.as_deref(),
-                            )
-                            .and_then(|stream| server.handle_tcp_client(stream))
-                        } else {
-                            server.handle_tcp_client(stream)
-                        };
-                        let _ = result;
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let join = spawn_tcp_accept_loop(
+        listener,
+        stop_for_thread,
+        workers_for_thread,
+        move |stream| {
+            let server = server.clone();
+            let network = network.clone();
+            let websocket_path = websocket_path.clone();
+            let httpupgrade_host = httpupgrade_host.clone();
+            let tls_acceptor = tls_acceptor.clone();
+            let result = if let Some(acceptor) = tls_acceptor {
+                acceptor
+                    .accept(stream)
+                    .and_then(|client| match network.as_str() {
+                        "ws" => {
+                            server.handle_tls_websocket_client(client, websocket_path.as_deref())
+                        }
+                        "httpupgrade" => accept_httpupgrade_tls(
+                            client,
+                            websocket_path.as_deref(),
+                            httpupgrade_host.as_deref(),
+                        )
+                        .and_then(|client| server.handle_tls_client(client)),
+                        _ => server.handle_tls_client(client),
+                    })
+            } else if network == "ws" {
+                server.handle_websocket_client(stream, websocket_path.as_deref())
+            } else if network == "httpupgrade" {
+                accept_httpupgrade(
+                    stream,
+                    websocket_path.as_deref(),
+                    httpupgrade_host.as_deref(),
+                )
+                .and_then(|stream| server.handle_tcp_client(stream))
+            } else {
+                server.handle_tcp_client(stream)
+            };
+            let _ = result;
+        },
+    );
 
     Ok(ListenerHandle {
         status: ListenerStatus {
@@ -705,22 +698,15 @@ fn start_anytls_listener(
     let workers = Arc::new(Mutex::new(Vec::new()));
     let workers_for_thread = workers.clone();
     let runtime_server = server.clone();
-    let join = thread::spawn(move || {
-        while !stop_for_thread.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let server = server.clone();
-                    spawn_connection_worker(&workers_for_thread, move || {
-                        let _ = server.handle_tcp_client(stream);
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let join = spawn_tcp_accept_loop(
+        listener,
+        stop_for_thread,
+        workers_for_thread,
+        move |stream| {
+            let server = server.clone();
+            let _ = server.handle_tcp_client(stream);
+        },
+    );
 
     Ok(ListenerHandle {
         status: ListenerStatus {
@@ -810,22 +796,15 @@ fn start_shadowsocks_listener(
     }
     let workers_for_thread = workers.clone();
     let runtime_server = server.clone();
-    let join = thread::spawn(move || {
-        while !stop_for_thread.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let server = server.clone();
-                    spawn_connection_worker(&workers_for_thread, move || {
-                        let _ = server.handle_tcp_client(stream);
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let join = spawn_tcp_accept_loop(
+        listener,
+        stop_for_thread,
+        workers_for_thread,
+        move |stream| {
+            let server = server.clone();
+            let _ = server.handle_tcp_client(stream);
+        },
+    );
 
     Ok(ListenerHandle {
         status: ListenerStatus {
@@ -912,54 +891,46 @@ fn start_trojan_listener(
     let httpupgrade_host = inbound.transport.host.clone();
     let tls_acceptor = tls_acceptor_for(inbound)?;
     let runtime_server = server.clone();
-    let join = thread::spawn(move || {
-        while !stop_for_thread.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let server = server.clone();
-                    let network = network.clone();
-                    let websocket_path = websocket_path.clone();
-                    let httpupgrade_host = httpupgrade_host.clone();
-                    let tls_acceptor = tls_acceptor.clone();
-                    spawn_connection_worker(&workers_for_thread, move || {
-                        let result = if let Some(acceptor) = tls_acceptor {
-                            acceptor
-                                .accept(stream)
-                                .and_then(|client| match network.as_str() {
-                                    "ws" => server.handle_tls_websocket_client(
-                                        client,
-                                        websocket_path.as_deref(),
-                                    ),
-                                    "httpupgrade" => accept_httpupgrade_tls(
-                                        client,
-                                        websocket_path.as_deref(),
-                                        httpupgrade_host.as_deref(),
-                                    )
-                                    .and_then(|client| server.handle_tls_client(client)),
-                                    _ => server.handle_tls_client(client),
-                                })
-                        } else if network == "ws" {
-                            server.handle_websocket_client(stream, websocket_path.as_deref())
-                        } else if network == "httpupgrade" {
-                            accept_httpupgrade(
-                                stream,
-                                websocket_path.as_deref(),
-                                httpupgrade_host.as_deref(),
-                            )
-                            .and_then(|stream| server.handle_tcp_client(stream))
-                        } else {
-                            server.handle_tcp_client(stream)
-                        };
-                        let _ = result;
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let join = spawn_tcp_accept_loop(
+        listener,
+        stop_for_thread,
+        workers_for_thread,
+        move |stream| {
+            let server = server.clone();
+            let network = network.clone();
+            let websocket_path = websocket_path.clone();
+            let httpupgrade_host = httpupgrade_host.clone();
+            let tls_acceptor = tls_acceptor.clone();
+            let result = if let Some(acceptor) = tls_acceptor {
+                acceptor
+                    .accept(stream)
+                    .and_then(|client| match network.as_str() {
+                        "ws" => {
+                            server.handle_tls_websocket_client(client, websocket_path.as_deref())
+                        }
+                        "httpupgrade" => accept_httpupgrade_tls(
+                            client,
+                            websocket_path.as_deref(),
+                            httpupgrade_host.as_deref(),
+                        )
+                        .and_then(|client| server.handle_tls_client(client)),
+                        _ => server.handle_tls_client(client),
+                    })
+            } else if network == "ws" {
+                server.handle_websocket_client(stream, websocket_path.as_deref())
+            } else if network == "httpupgrade" {
+                accept_httpupgrade(
+                    stream,
+                    websocket_path.as_deref(),
+                    httpupgrade_host.as_deref(),
+                )
+                .and_then(|stream| server.handle_tcp_client(stream))
+            } else {
+                server.handle_tcp_client(stream)
+            };
+            let _ = result;
+        },
+    );
 
     Ok(ListenerHandle {
         status: ListenerStatus {
@@ -1047,54 +1018,46 @@ fn start_vless_listener(
     let httpupgrade_host = inbound.transport.host.clone();
     let tls_acceptor = tls_acceptor_for(inbound)?;
     let runtime_server = server.clone();
-    let join = thread::spawn(move || {
-        while !stop_for_thread.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let server = server.clone();
-                    let network = network.clone();
-                    let websocket_path = websocket_path.clone();
-                    let httpupgrade_host = httpupgrade_host.clone();
-                    let tls_acceptor = tls_acceptor.clone();
-                    spawn_connection_worker(&workers_for_thread, move || {
-                        let result = if let Some(acceptor) = tls_acceptor {
-                            acceptor
-                                .accept(stream)
-                                .and_then(|client| match network.as_str() {
-                                    "ws" => server.handle_tls_websocket_client(
-                                        client,
-                                        websocket_path.as_deref(),
-                                    ),
-                                    "httpupgrade" => accept_httpupgrade_tls(
-                                        client,
-                                        websocket_path.as_deref(),
-                                        httpupgrade_host.as_deref(),
-                                    )
-                                    .and_then(|client| server.handle_tls_client(client)),
-                                    _ => server.handle_tls_client(client),
-                                })
-                        } else if network == "ws" {
-                            server.handle_websocket_client(stream, websocket_path.as_deref())
-                        } else if network == "httpupgrade" {
-                            accept_httpupgrade(
-                                stream,
-                                websocket_path.as_deref(),
-                                httpupgrade_host.as_deref(),
-                            )
-                            .and_then(|stream| server.handle_tcp_client(stream))
-                        } else {
-                            server.handle_tcp_client(stream)
-                        };
-                        let _ = result;
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let join = spawn_tcp_accept_loop(
+        listener,
+        stop_for_thread,
+        workers_for_thread,
+        move |stream| {
+            let server = server.clone();
+            let network = network.clone();
+            let websocket_path = websocket_path.clone();
+            let httpupgrade_host = httpupgrade_host.clone();
+            let tls_acceptor = tls_acceptor.clone();
+            let result = if let Some(acceptor) = tls_acceptor {
+                acceptor
+                    .accept(stream)
+                    .and_then(|client| match network.as_str() {
+                        "ws" => {
+                            server.handle_tls_websocket_client(client, websocket_path.as_deref())
+                        }
+                        "httpupgrade" => accept_httpupgrade_tls(
+                            client,
+                            websocket_path.as_deref(),
+                            httpupgrade_host.as_deref(),
+                        )
+                        .and_then(|client| server.handle_tls_client(client)),
+                        _ => server.handle_tls_client(client),
+                    })
+            } else if network == "ws" {
+                server.handle_websocket_client(stream, websocket_path.as_deref())
+            } else if network == "httpupgrade" {
+                accept_httpupgrade(
+                    stream,
+                    websocket_path.as_deref(),
+                    httpupgrade_host.as_deref(),
+                )
+                .and_then(|stream| server.handle_tcp_client(stream))
+            } else {
+                server.handle_tcp_client(stream)
+            };
+            let _ = result;
+        },
+    );
 
     Ok(ListenerHandle {
         status: ListenerStatus {
@@ -1156,22 +1119,15 @@ fn start_socks_listener(
     let workers = Arc::new(Mutex::new(Vec::new()));
     let workers_for_thread = workers.clone();
     let runtime_server = server.clone();
-    let join = thread::spawn(move || {
-        while !stop_for_thread.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let server = server.clone();
-                    spawn_connection_worker(&workers_for_thread, move || {
-                        let _ = server.handle_tcp_client(stream);
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let join = spawn_tcp_accept_loop(
+        listener,
+        stop_for_thread,
+        workers_for_thread,
+        move |stream| {
+            let server = server.clone();
+            let _ = server.handle_tcp_client(stream);
+        },
+    );
 
     Ok(ListenerHandle {
         status: ListenerStatus {
@@ -1233,22 +1189,15 @@ fn start_mieru_listener(
     let workers = Arc::new(Mutex::new(Vec::new()));
     let workers_for_thread = workers.clone();
     let runtime_server = server.clone();
-    let join = thread::spawn(move || {
-        while !stop_for_thread.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let server = server.clone();
-                    spawn_connection_worker(&workers_for_thread, move || {
-                        let _ = server.handle_tcp_client(stream);
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let join = spawn_tcp_accept_loop(
+        listener,
+        stop_for_thread,
+        workers_for_thread,
+        move |stream| {
+            let server = server.clone();
+            let _ = server.handle_tcp_client(stream);
+        },
+    );
 
     Ok(ListenerHandle {
         status: ListenerStatus {
@@ -1310,22 +1259,15 @@ fn start_http_listener(
     let workers = Arc::new(Mutex::new(Vec::new()));
     let workers_for_thread = workers.clone();
     let runtime_server = server.clone();
-    let join = thread::spawn(move || {
-        while !stop_for_thread.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let server = server.clone();
-                    spawn_connection_worker(&workers_for_thread, move || {
-                        let _ = server.handle_tcp_client(stream);
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let join = spawn_tcp_accept_loop(
+        listener,
+        stop_for_thread,
+        workers_for_thread,
+        move |stream| {
+            let server = server.clone();
+            let _ = server.handle_tcp_client(stream);
+        },
+    );
 
     Ok(ListenerHandle {
         status: ListenerStatus {
@@ -1368,34 +1310,27 @@ fn start_vless_reality_listener(
     let workers = Arc::new(Mutex::new(Vec::new()));
     let workers_for_thread = workers.clone();
     let runtime_server = server.clone();
-    let join = thread::spawn(move || {
-        while !stop_for_thread.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let gateway = gateway.clone();
-                    let server = server.clone();
-                    spawn_connection_worker(&workers_for_thread, move || {
-                        let result = handle_reality_preface(stream, &gateway);
-                        if let Ok(RealityGatewayResult::Authenticated(mut authenticated)) = result {
-                            let _ = authenticated.read_dest_handshake(8, Duration::from_secs(5));
-                            if let Ok(acceptor) = reality_tls_acceptor(
-                                &authenticated.auth.auth_key,
-                                &authenticated.auth.server_name,
-                            ) {
-                                if let Ok(client) = acceptor.accept_stream(authenticated.stream) {
-                                    let _ = server.handle_tls_client(client);
-                                }
-                            }
-                        }
-                    });
+    let join = spawn_tcp_accept_loop(
+        listener,
+        stop_for_thread,
+        workers_for_thread,
+        move |stream| {
+            let gateway = gateway.clone();
+            let server = server.clone();
+            let result = handle_reality_preface(stream, &gateway);
+            if let Ok(RealityGatewayResult::Authenticated(mut authenticated)) = result {
+                let _ = authenticated.read_dest_handshake(8, Duration::from_secs(5));
+                if let Ok(acceptor) = reality_tls_acceptor(
+                    &authenticated.auth.auth_key,
+                    &authenticated.auth.server_name,
+                ) {
+                    if let Ok(client) = acceptor.accept_stream(authenticated.stream) {
+                        let _ = server.handle_tls_client(client);
+                    }
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
             }
-        }
-    });
+        },
+    );
 
     Ok(ListenerHandle {
         status: ListenerStatus {
@@ -1531,6 +1466,72 @@ fn prune_finished_workers(workers: &mut Vec<JoinHandle<()>>) {
         }
     }
     *workers = active;
+}
+
+fn spawn_tcp_accept_loop<F>(
+    listener: TcpListener,
+    stop: Arc<AtomicBool>,
+    workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    handler: F,
+) -> JoinHandle<()>
+where
+    F: Fn(TcpStream) + Send + Sync + 'static,
+{
+    let handler = Arc::new(handler);
+    thread::Builder::new()
+        .name("keli-core-tcp-accept".to_string())
+        .spawn(move || {
+            let Ok(runtime) = tcp_accept_runtime() else {
+                return;
+            };
+            let _ = runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener)?;
+                while !stop.load(Ordering::SeqCst) {
+                    match tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
+                    {
+                        Ok(Ok((stream, _))) => {
+                            if let Ok(stream) = stream.into_std() {
+                                let _ = stream.set_nonblocking(false);
+                                let handler = Arc::clone(&handler);
+                                spawn_connection_worker(&workers, move || handler(stream));
+                            }
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_) => {}
+                    }
+                }
+                Ok::<(), io::Error>(())
+            });
+        })
+        .expect("failed to spawn tcp accept thread")
+}
+
+fn tcp_accept_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
+    if let Some(runtime) = TCP_ACCEPT_RUNTIME.get() {
+        return Ok(runtime);
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(tcp_accept_worker_threads())
+        .thread_name("keli-core-tcp-accept")
+        .enable_io()
+        .enable_time()
+        .build()?;
+    match TCP_ACCEPT_RUNTIME.set(runtime) {
+        Ok(()) => Ok(TCP_ACCEPT_RUNTIME
+            .get()
+            .expect("tcp accept runtime initialized")),
+        Err(_) => Ok(TCP_ACCEPT_RUNTIME
+            .get()
+            .expect("tcp accept runtime initialized by another thread")),
+    }
+}
+
+fn tcp_accept_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .clamp(2, 8)
 }
 
 fn tls_acceptor_for(inbound: &InboundConfig) -> Result<Option<TlsAcceptor>, CoreServiceError> {
