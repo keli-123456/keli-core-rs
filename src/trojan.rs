@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+﻿use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
@@ -14,7 +14,7 @@ use rustls::{
 };
 use sha2::{Digest, Sha224};
 
-use crate::config::{OutboundConfig, OutboundTlsConfig};
+use crate::config::{outbound_transport_network, OutboundConfig, OutboundTlsConfig};
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
@@ -24,7 +24,10 @@ use crate::stream::{copy_count_best_effort_limited, relay_tcp_streams_limited};
 use crate::tls::{relay_tls_stream, TlsConnection};
 use crate::traffic::TrafficRegistry;
 use crate::user::{CoreUser, UserStore};
-use crate::websocket::{accept_websocket, accept_websocket_tls, relay_websocket_tls_stream};
+use crate::websocket::{
+    accept_websocket, accept_websocket_tls, connect_websocket_client, relay_websocket_tls_stream,
+    WebSocketClientStream,
+};
 use crate::{
     connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
 };
@@ -678,6 +681,16 @@ pub(crate) fn connect_trojan_tcp_outbound(
                 "outbound password is required for trojan",
             )
         })?;
+    let network = outbound_transport_network(outbound).to_ascii_lowercase();
+    if network == "ws" {
+        return connect_trojan_websocket_tcp_outbound(outbound, &server, password, target, timeout);
+    }
+    if network != "tcp" {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("trojan outbound transport {network} is not supported yet"),
+        ));
+    }
     if outbound.tls.is_some() {
         return connect_trojan_tls_tcp_outbound(outbound, &server, password, target, timeout);
     }
@@ -688,6 +701,35 @@ pub(crate) fn connect_trojan_tcp_outbound(
     Ok(stream)
 }
 
+fn connect_trojan_websocket_tcp_outbound(
+    outbound: &OutboundConfig,
+    server: &SocksTarget,
+    password: &str,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    if outbound.tls.is_some() {
+        let tls_stream = connect_trojan_tls_stream(outbound, server, timeout)?;
+        let host = outbound_websocket_host(outbound, server);
+        let mut websocket =
+            connect_websocket_client(tls_stream, outbound_websocket_path(outbound), &host)?;
+        write_trojan_tcp_request(&mut websocket, password, target)?;
+        websocket.flush()?;
+        websocket.get_mut().sock.set_nonblocking(true)?;
+        return local_bridge_for_websocket(websocket);
+    }
+
+    let remote = connect_target(server, timeout)?;
+    remote.set_read_timeout(Some(timeout))?;
+    remote.set_write_timeout(Some(timeout))?;
+    let host = outbound_websocket_host(outbound, server);
+    let mut websocket = connect_websocket_client(remote, outbound_websocket_path(outbound), &host)?;
+    write_trojan_tcp_request(&mut websocket, password, target)?;
+    websocket.flush()?;
+    websocket.get_mut().set_nonblocking(true)?;
+    local_bridge_for_websocket(websocket)
+}
+
 fn connect_trojan_tls_tcp_outbound(
     outbound: &OutboundConfig,
     server: &SocksTarget,
@@ -695,6 +737,27 @@ fn connect_trojan_tls_tcp_outbound(
     target: &SocksTarget,
     timeout: Duration,
 ) -> io::Result<TcpStream> {
+    let mut tls_stream = connect_trojan_tls_stream(outbound, server, timeout)?;
+    write_trojan_tcp_request(&mut tls_stream, password, target)?;
+    tls_stream.flush()?;
+
+    let local_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let local_addr = local_listener.local_addr()?;
+    let local_client = TcpStream::connect(local_addr)?;
+    let (local_plain, _) = local_listener.accept()?;
+
+    thread::spawn(move || {
+        let _ = relay_plain_to_tls(local_plain, tls_stream);
+    });
+
+    Ok(local_client)
+}
+
+fn connect_trojan_tls_stream(
+    outbound: &OutboundConfig,
+    server: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<StreamOwned<ClientConnection, TcpStream>> {
     let remote = connect_target(server, timeout)?;
     remote.set_read_timeout(Some(timeout))?;
     remote.set_write_timeout(Some(timeout))?;
@@ -712,19 +775,7 @@ fn connect_trojan_tls_tcp_outbound(
             .complete_io(&mut tls_stream.sock)
             .map_err(tls_error)?;
     }
-    write_trojan_tcp_request(&mut tls_stream, password, target)?;
-    tls_stream.flush()?;
-
-    let local_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-    let local_addr = local_listener.local_addr()?;
-    let local_client = TcpStream::connect(local_addr)?;
-    let (local_plain, _) = local_listener.accept()?;
-
-    thread::spawn(move || {
-        let _ = relay_plain_to_tls(local_plain, tls_stream);
-    });
-
-    Ok(local_client)
+    Ok(tls_stream)
 }
 
 fn trojan_tls_client_config(tls: &OutboundTlsConfig) -> Arc<ClientConfig> {
@@ -777,6 +828,29 @@ fn trojan_outbound_server(outbound: &OutboundConfig) -> io::Result<SocksTarget> 
         .port
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "outbound port is required"))?;
     Ok(SocksTarget { host, port })
+}
+
+fn outbound_websocket_path(outbound: &OutboundConfig) -> Option<&str> {
+    outbound
+        .transport
+        .as_ref()
+        .and_then(|transport| transport.path.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn outbound_websocket_host(outbound: &OutboundConfig, server: &SocksTarget) -> String {
+    outbound
+        .transport
+        .as_ref()
+        .and_then(|transport| transport.host.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| outbound.tls.as_ref().map(|tls| tls.server_name.trim()))
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&server.host)
+        .trim_matches(['[', ']'])
+        .to_string()
 }
 
 fn write_trojan_tcp_request<W: Write>(
@@ -876,6 +950,88 @@ fn relay_plain_to_tls(
 
     let _ = plain.shutdown(Shutdown::Both);
     let _ = tls_stream.sock.shutdown(Shutdown::Both);
+    Ok(())
+}
+
+fn local_bridge_for_websocket<S>(websocket: WebSocketClientStream<S>) -> io::Result<TcpStream>
+where
+    S: Read + Write + Send + 'static,
+{
+    let local_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let local_addr = local_listener.local_addr()?;
+    let local_client = TcpStream::connect(local_addr)?;
+    let (local_plain, _) = local_listener.accept()?;
+
+    thread::spawn(move || {
+        let _ = relay_plain_to_websocket(local_plain, websocket);
+    });
+
+    Ok(local_client)
+}
+
+fn relay_plain_to_websocket<S>(
+    mut plain: TcpStream,
+    mut websocket: WebSocketClientStream<S>,
+) -> io::Result<()>
+where
+    S: Read + Write,
+{
+    plain.set_nonblocking(true)?;
+
+    let mut upload_done = false;
+    let mut download_done = false;
+    let mut upload_buffer = [0u8; 16 * 1024];
+    let mut download_buffer = [0u8; 16 * 1024];
+
+    while !upload_done || !download_done {
+        let mut progressed = false;
+
+        if !upload_done {
+            match plain.read(&mut upload_buffer) {
+                Ok(0) => {
+                    upload_done = true;
+                    let _ = websocket.flush();
+                    progressed = true;
+                }
+                Ok(read) => {
+                    write_all_wait(&mut websocket, &upload_buffer[..read])?;
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    upload_done = true;
+                    let _ = websocket.flush();
+                    progressed = true;
+                }
+            }
+        }
+
+        if !download_done {
+            match websocket.read(&mut download_buffer) {
+                Ok(0) => {
+                    download_done = true;
+                    let _ = plain.shutdown(Shutdown::Write);
+                    progressed = true;
+                }
+                Ok(read) => {
+                    write_all_wait(&mut plain, &download_buffer[..read])?;
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    download_done = true;
+                    let _ = plain.shutdown(Shutdown::Write);
+                    progressed = true;
+                }
+            }
+        }
+
+        if !progressed {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    let _ = plain.shutdown(Shutdown::Both);
     Ok(())
 }
 
@@ -1090,13 +1246,14 @@ mod tests {
     use rustls::pki_types::{CertificateDer, ServerName};
     use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
-    use crate::config::{OutboundConfig, OutboundTlsConfig};
+    use crate::config::{OutboundConfig, OutboundTlsConfig, OutboundTransportConfig};
     use crate::socks5::SocksTarget;
     use crate::tls::TlsAcceptor;
     use crate::trojan::{
         connect_trojan_tcp_outbound, trojan_password_hash, TrojanServer, TrojanServerConfig,
     };
     use crate::user::CoreUser;
+    use crate::websocket::accept_websocket;
 
     struct MemoryStream {
         input: Cursor<Vec<u8>>,
@@ -1415,6 +1572,7 @@ mod tests {
             username: None,
             password: Some("trojan-password".to_string()),
             tls: None,
+            transport: None,
         };
         let target = SocksTarget {
             host: "example.com".to_string(),
@@ -1465,6 +1623,58 @@ mod tests {
                 server_name: "localhost".to_string(),
                 allow_insecure: true,
                 alpn: Vec::new(),
+            }),
+            transport: None,
+        };
+        let target = SocksTarget {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+        let mut stream = connect_trojan_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+            .expect("connect outbound");
+        stream.write_all(b"ping").expect("write payload");
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).expect("read response");
+        assert_eq!(&response, b"pong");
+        proxy_thread.join().expect("proxy thread");
+    }
+
+    #[test]
+    fn trojan_websocket_outbound_writes_request_and_relays_stream() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let proxy_thread = thread::spawn(move || {
+            let (stream, _) = proxy.accept().expect("proxy accept");
+            let (mut reader, mut writer) =
+                accept_websocket(stream, Some("/trojan")).expect("websocket accept");
+            let server = server();
+            let request = server.read_request(&mut reader).expect("trojan request");
+            assert_eq!(
+                request.password_hash,
+                trojan_password_hash("trojan-password")
+            );
+            assert_eq!(request.target.host, "example.com");
+            assert_eq!(request.target.port, 443);
+            let mut payload = [0u8; 4];
+            reader.read_exact(&mut payload).expect("payload");
+            assert_eq!(&payload, b"ping");
+            writer.write_all(b"pong").expect("response");
+        });
+
+        let outbound = OutboundConfig {
+            tag: "trojan-out".to_string(),
+            protocol: "trojan".to_string(),
+            method: None,
+            address: Some(proxy_addr.ip().to_string()),
+            port: Some(proxy_addr.port()),
+            username: None,
+            password: Some("trojan-password".to_string()),
+            tls: None,
+            transport: Some(OutboundTransportConfig {
+                network: "ws".to_string(),
+                path: Some("/trojan".to_string()),
+                host: Some("example.test".to_string()),
+                service_name: None,
             }),
         };
         let target = SocksTarget {

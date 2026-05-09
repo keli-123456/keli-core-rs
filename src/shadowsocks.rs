@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+﻿use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
@@ -1155,6 +1155,7 @@ mod tests {
             username: None,
             password: Some("outbound-secret".to_string()),
             tls: None,
+            transport: None,
         };
         let target = SocksTarget {
             host: "example.com".to_string(),
@@ -1218,6 +1219,7 @@ mod tests {
             username: None,
             password: Some("outbound-secret".to_string()),
             tls: None,
+            transport: None,
         };
         let target = SocksTarget {
             host: "example.com".to_string(),

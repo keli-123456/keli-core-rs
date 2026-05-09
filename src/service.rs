@@ -1,4 +1,4 @@
-use std::fmt;
+﻿use std::fmt;
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1642,6 +1642,7 @@ mod tests {
                 username: None,
                 password: None,
                 tls: None,
+                transport: None,
             }],
             routes: Vec::new(),
             stats: StatsConfig::default(),
@@ -1697,6 +1698,7 @@ mod tests {
                 username: None,
                 password: None,
                 tls: None,
+                transport: None,
             }],
             routes: Vec::new(),
             stats: StatsConfig::default(),

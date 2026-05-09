@@ -1,4 +1,4 @@
-use std::fs;
+﻿use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -116,6 +116,7 @@ fn config(port: u16, user_uuid: &str) -> CoreConfig {
             username: None,
             password: None,
             tls: None,
+            transport: None,
         }],
         routes: Vec::new(),
         stats: StatsConfig {

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+﻿use std::collections::HashSet;
 use std::fmt;
 use std::net::IpAddr;
 
@@ -71,6 +71,8 @@ pub struct OutboundConfig {
     pub password: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<OutboundTlsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<OutboundTransportConfig>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +83,18 @@ pub struct OutboundTlsConfig {
     pub allow_insecure: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alpn: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboundTransportConfig {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub network: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,8 +309,18 @@ fn validate_outbound(outbound: &OutboundConfig) -> Result<(), ValidationError> {
     validate_outbound_endpoint(outbound)
 }
 
+pub(crate) fn outbound_transport_network(outbound: &OutboundConfig) -> &str {
+    outbound
+        .transport
+        .as_ref()
+        .map(|transport| transport.network.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("tcp")
+}
+
 fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), ValidationError> {
     let protocol = outbound.protocol.trim().to_ascii_lowercase();
+    validate_outbound_transport(outbound, &protocol)?;
     if outbound
         .address
         .as_deref()
@@ -401,6 +425,48 @@ fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), Validatio
     if outbound.tls.is_some() && !matches!(protocol.as_str(), "trojan" | "vless") {
         return Err(ValidationError::new(format!(
             "outbound {} tls is supported only for trojan and vless today",
+            outbound.tag
+        )));
+    }
+    Ok(())
+}
+
+fn validate_outbound_transport(
+    outbound: &OutboundConfig,
+    protocol: &str,
+) -> Result<(), ValidationError> {
+    let Some(transport) = outbound.transport.as_ref() else {
+        return Ok(());
+    };
+    let network = outbound_transport_network(outbound).to_ascii_lowercase();
+    if !matches!(protocol, "vless" | "trojan") {
+        return Err(ValidationError::new(format!(
+            "outbound {} transport is supported only for vless and trojan today",
+            outbound.tag
+        )));
+    }
+    if !matches!(network.as_str(), "tcp" | "ws") {
+        return Err(ValidationError::new(format!(
+            "outbound {} {} transport {} is not supported yet",
+            outbound.tag, outbound.protocol, network
+        )));
+    }
+    let path = transport.path.as_deref().map(str::trim).unwrap_or_default();
+    let host = transport.host.as_deref().map(str::trim).unwrap_or_default();
+    let service_name = transport
+        .service_name
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    if !matches!(network.as_str(), "ws") && (!path.is_empty() || !host.is_empty()) {
+        return Err(ValidationError::new(format!(
+            "outbound {} transport path/host is supported only for ws today",
+            outbound.tag
+        )));
+    }
+    if !service_name.is_empty() {
+        return Err(ValidationError::new(format!(
+            "outbound {} grpc service_name is not supported yet",
             outbound.tag
         )));
     }
@@ -1150,8 +1216,9 @@ mod tests {
     use crate::user::CoreUser;
 
     use super::{
-        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, OutboundTlsConfig, RealityConfig,
-        SniffingConfig, StatsConfig, TlsConfig, TransportConfig,
+        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, OutboundTlsConfig,
+        OutboundTransportConfig, RealityConfig, SniffingConfig, StatsConfig, TlsConfig,
+        TransportConfig,
     };
 
     fn user() -> CoreUser {
@@ -1193,6 +1260,7 @@ mod tests {
                 username: None,
                 password: None,
                 tls: None,
+                transport: None,
             }],
             routes: Vec::new(),
             stats: StatsConfig::default(),
@@ -1230,6 +1298,7 @@ mod tests {
                     username: None,
                     password: None,
                     tls: None,
+                    transport: None,
                 },
                 OutboundConfig {
                     tag: "warp".to_string(),
@@ -1240,6 +1309,7 @@ mod tests {
                     username: None,
                     password: None,
                     tls: None,
+                    transport: None,
                 },
             ],
             routes: Vec::new(),
@@ -1296,6 +1366,7 @@ mod tests {
                 username: Some("alice".to_string()),
                 password: Some("secret".to_string()),
                 tls: None,
+                transport: None,
             }],
             routes: vec![crate::config::RouteRule {
                 targets: vec!["domain:example.com".to_string()],
@@ -1342,6 +1413,7 @@ mod tests {
                 username: None,
                 password: Some("secret".to_string()),
                 tls: None,
+                transport: None,
             }],
             routes: vec![crate::config::RouteRule {
                 targets: vec!["domain:example.com".to_string()],
@@ -1397,6 +1469,7 @@ mod tests {
                 username: None,
                 password: Some("secret".to_string()),
                 tls: None,
+                transport: None,
             }],
             routes: vec![crate::config::RouteRule {
                 targets: vec!["domain:example.com".to_string()],
@@ -1410,6 +1483,17 @@ mod tests {
             .validate()
             .expect("plain trojan outbound should validate");
 
+        config.outbounds[0].transport = Some(OutboundTransportConfig {
+            network: "ws".to_string(),
+            path: Some("/trojan".to_string()),
+            host: Some("example.com".to_string()),
+            service_name: None,
+        });
+        config
+            .validate()
+            .expect("trojan websocket outbound should validate");
+
+        config.outbounds[0].transport = None;
         config.outbounds[0].password = None;
         let error = config
             .validate()
@@ -1445,6 +1529,7 @@ mod tests {
                 username: Some("11111111-1111-1111-1111-111111111111".to_string()),
                 password: None,
                 tls: None,
+                transport: None,
             }],
             routes: vec![crate::config::RouteRule {
                 targets: vec!["domain:example.com".to_string()],
@@ -1467,6 +1552,28 @@ mod tests {
             .validate()
             .expect("vless tls outbound should validate");
 
+        config.outbounds[0].transport = Some(OutboundTransportConfig {
+            network: "ws".to_string(),
+            path: Some("/vless".to_string()),
+            host: Some("example.com".to_string()),
+            service_name: None,
+        });
+        config
+            .validate()
+            .expect("vless websocket outbound should validate");
+
+        config.outbounds[0].transport = Some(OutboundTransportConfig {
+            network: "grpc".to_string(),
+            path: None,
+            host: None,
+            service_name: Some("GunService".to_string()),
+        });
+        let error = config
+            .validate()
+            .expect_err("unsupported outbound grpc transport should fail");
+        assert!(error.to_string().contains("not supported yet"));
+
+        config.outbounds[0].transport = None;
         config.outbounds[0].tls = None;
         config.outbounds[0].username = Some("not-a-uuid".to_string());
         let error = config
@@ -1514,6 +1621,7 @@ mod tests {
                     username: None,
                     password: None,
                     tls: None,
+                    transport: None,
                 }),
             }],
             stats: StatsConfig::default(),
@@ -1553,6 +1661,7 @@ mod tests {
                 username: None,
                 password: None,
                 tls: None,
+                transport: None,
             }],
             routes: vec![crate::config::RouteRule {
                 targets: vec![

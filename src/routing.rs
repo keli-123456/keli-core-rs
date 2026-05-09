@@ -1,4 +1,4 @@
-use std::env;
+﻿use std::env;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::PathBuf;
@@ -652,6 +652,7 @@ mod tests {
                 username: None,
                 password: None,
                 tls: None,
+                transport: None,
             }),
         }]);
 
@@ -666,6 +667,7 @@ mod tests {
                 username: None,
                 password: None,
                 tls: None,
+                transport: None,
             })
         );
     }
@@ -681,6 +683,7 @@ mod tests {
             username: None,
             password: None,
             tls: None,
+            transport: None,
         });
 
         let target = decision.apply_to_target("example.com", 443);

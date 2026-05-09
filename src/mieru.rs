@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+﻿use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
@@ -2077,6 +2077,7 @@ mod tests {
                     username: None,
                     password: None,
                     tls: None,
+                    transport: None,
                 }),
             }],
             connect_timeout: Duration::from_secs(5),
@@ -2152,6 +2153,7 @@ mod tests {
                     username: None,
                     password: None,
                     tls: None,
+                    transport: None,
                 }),
             }],
             connect_timeout: Duration::from_secs(5),
@@ -2262,6 +2264,7 @@ mod tests {
                     username: None,
                     password: None,
                     tls: None,
+                    transport: None,
                 }),
             }],
             connect_timeout: Duration::from_secs(5),
@@ -2350,6 +2353,7 @@ mod tests {
                     username: Some("user".to_string()),
                     password: Some("pass".to_string()),
                     tls: None,
+                    transport: None,
                 }),
             }],
             connect_timeout: Duration::from_secs(5),

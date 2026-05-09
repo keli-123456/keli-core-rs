@@ -34,6 +34,42 @@ pub struct WebSocketTlsStream {
     buffer: Vec<u8>,
 }
 
+pub struct WebSocketClientStream<S> {
+    stream: S,
+    buffer: Vec<u8>,
+}
+
+pub fn connect_websocket_client<S: Read + Write>(
+    mut stream: S,
+    path: Option<&str>,
+    host: &str,
+) -> io::Result<WebSocketClientStream<S>> {
+    let path = path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("/");
+    let host = host.trim();
+    if host.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "websocket outbound host is required",
+        ));
+    }
+    let key = "dGhlIHNhbXBsZSBub25jZQ==";
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes())?;
+    stream.flush()?;
+
+    let response = read_http_upgrade(&mut stream)?;
+    validate_client_upgrade_response(&response, key)?;
+    Ok(WebSocketClientStream {
+        stream,
+        buffer: Vec::new(),
+    })
+}
+
 pub fn accept_websocket(
     mut stream: TcpStream,
     expected_path: Option<&str>,
@@ -255,6 +291,52 @@ impl Write for WebSocketTlsStream {
     }
 }
 
+impl<S> WebSocketClientStream<S> {
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.stream
+    }
+}
+
+impl<S: Read + Write> Read for WebSocketClientStream<S> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        while self.buffer.is_empty() {
+            match read_server_frame(&mut self.stream)? {
+                WebSocketFrame::Data(data) => self.buffer = data,
+                WebSocketFrame::Ping(data) => {
+                    self.stream
+                        .write_all(&client_frame_bytes(OPCODE_PONG, &data))?;
+                    self.stream.flush()?;
+                }
+                WebSocketFrame::Pong => {}
+                WebSocketFrame::Close => return Ok(0),
+            }
+        }
+
+        let len = output.len().min(self.buffer.len());
+        output[..len].copy_from_slice(&self.buffer[..len]);
+        self.buffer.drain(..len);
+        Ok(len)
+    }
+}
+
+impl<S: Write> Write for WebSocketClientStream<S> {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if input.is_empty() {
+            return Ok(0);
+        }
+        self.stream
+            .write_all(&client_frame_bytes(OPCODE_BINARY, input))?;
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 enum WebSocketFrame {
     Data(Vec<u8>),
     Ping(Vec<u8>),
@@ -341,11 +423,96 @@ fn parse_upgrade_request(request: &str) -> io::Result<(&str, &str)> {
     }
 }
 
+fn validate_client_upgrade_response(response: &str, key: &str) -> io::Result<()> {
+    let mut lines = response.split("\r\n");
+    let status = lines.next().unwrap_or_default();
+    if !status.contains(" 101 ") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "websocket outbound upgrade failed",
+        ));
+    }
+    let expected_accept = websocket_accept_key(key);
+    let mut upgrade = false;
+    let mut connection_upgrade = false;
+    let mut accept_matches = false;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case("websocket") {
+            upgrade = true;
+        } else if name.eq_ignore_ascii_case("connection")
+            && value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+        {
+            connection_upgrade = true;
+        } else if name.eq_ignore_ascii_case("sec-websocket-accept") && value == expected_accept {
+            accept_matches = true;
+        }
+    }
+    if upgrade && connection_upgrade && accept_matches {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "websocket outbound upgrade response is invalid",
+    ))
+}
+
 fn websocket_accept_key(key: &str) -> String {
     let mut hasher = Sha1::new();
     hasher.update(key.as_bytes());
     hasher.update(WEBSOCKET_GUID.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+}
+
+fn read_server_frame<R: Read>(reader: &mut R) -> io::Result<WebSocketFrame> {
+    let mut header = [0u8; 2];
+    reader.read_exact(&mut header)?;
+    let fin = header[0] & 0x80 != 0;
+    let opcode = header[0] & 0x0f;
+    let masked = header[1] & 0x80 != 0;
+    if masked {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "server websocket frame must not be masked",
+        ));
+    }
+
+    let mut len = u64::from(header[1] & 0x7f);
+    if len == 126 {
+        let mut extended = [0u8; 2];
+        reader.read_exact(&mut extended)?;
+        len = u64::from(u16::from_be_bytes(extended));
+    } else if len == 127 {
+        let mut extended = [0u8; 8];
+        reader.read_exact(&mut extended)?;
+        len = u64::from_be_bytes(extended);
+    }
+    if len > MAX_HTTP_HEADER as u64 * 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "websocket frame too large",
+        ));
+    }
+
+    let mut payload = vec![0u8; len as usize];
+    reader.read_exact(&mut payload)?;
+
+    match opcode {
+        OPCODE_BINARY | OPCODE_CONTINUATION if fin => Ok(WebSocketFrame::Data(payload)),
+        OPCODE_PING => Ok(WebSocketFrame::Ping(payload)),
+        OPCODE_PONG => Ok(WebSocketFrame::Pong),
+        OPCODE_CLOSE => Ok(WebSocketFrame::Close),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported websocket frame",
+        )),
+    }
 }
 
 fn read_frame(reader: &mut TcpStream) -> io::Result<WebSocketFrame> {
@@ -490,6 +657,25 @@ fn frame_bytes(opcode: u8, payload: &[u8]) -> Vec<u8> {
     }
     header.extend_from_slice(payload);
     header
+}
+
+fn client_frame_bytes(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mask = [1u8, 2, 3, 4];
+    let mut frame = vec![0x80 | opcode];
+    if payload.len() < 126 {
+        frame.push(0x80 | payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(&mask);
+    for (index, byte) in payload.iter().enumerate() {
+        frame.push(*byte ^ mask[index % 4]);
+    }
+    frame
 }
 
 fn write_all_wait(writer: &mut TcpStream, mut input: &[u8]) -> io::Result<()> {

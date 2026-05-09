@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+﻿use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::time::Duration;
 
@@ -657,6 +657,7 @@ mod tests {
             username: Some("user".to_string()),
             password: Some("pass1".to_string()),
             tls: None,
+            transport: None,
         };
         let target = SocksTarget {
             host: "example.com".to_string(),
@@ -699,6 +700,7 @@ mod tests {
             username: Some("user".to_string()),
             password: Some("pass".to_string()),
             tls: None,
+            transport: None,
         };
         let target = SocksTarget {
             host: "example.com".to_string(),
@@ -758,6 +760,7 @@ mod tests {
             username: None,
             password: None,
             tls: None,
+            transport: None,
         };
         let target = SocksTarget {
             host: "example.com".to_string(),

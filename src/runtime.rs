@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+﻿use serde::{Deserialize, Serialize};
 
 use crate::config::{CoreConfig, ValidationError};
 use crate::traffic::{TrafficDelta, TrafficRegistry};
@@ -164,6 +164,7 @@ mod tests {
                 username: None,
                 password: None,
                 tls: None,
+                transport: None,
             }],
             routes: Vec::new(),
             stats: StatsConfig::default(),

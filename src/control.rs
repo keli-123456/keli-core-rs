@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+﻿use serde::{Deserialize, Serialize};
 
 use crate::config::CoreConfig;
 use crate::runtime::{CoreStatus, ReloadDecision, RuntimeState};
@@ -204,6 +204,7 @@ mod tests {
                 username: None,
                 password: None,
                 tls: None,
+                transport: None,
             }],
             routes: Vec::new(),
             stats: StatsConfig::default(),
