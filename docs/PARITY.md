@@ -60,7 +60,7 @@ keliboard -> kelinode-rs -> keli-core-rs
 | QUIC/Hysteria2 | Hysteria2 | Partial | TCP and UDP relay paths exist. |
 | QUIC/TUIC | TUIC | Partial | TCP and UDP relay paths exist. |
 | H2 custom outbound transport | Native route outbounds | Partial | VLESS, VMess, and Trojan route outbounds can carry TCP streams over HTTP/2 `httpSettings`; TLS, h2c, custom method, and request headers are supported. `kelinode-rs` may map XHTTP/splithttp `stream-one` route outbounds onto this H2 path with the required XHTTP-compatible headers. |
-| Old QUIC custom outbound transport | Native route outbounds | Partial | VLESS, VMess, and Trojan route outbounds can carry TCP streams over V2Ray-style QUIC when `quicSettings.security` is `none` and `header.type` is `none`; VMess UDP over the QUIC stream path is also wired. QUIC packet auth/header wrapping is still rejected. |
+| Old QUIC custom outbound transport | Native route outbounds | Partial | VLESS, VMess, and Trojan route outbounds can carry TCP streams over V2Ray-style QUIC when `header.type` is `none`; `quicSettings.security` supports `none`, `aes-128-gcm`, and `chacha20-poly1305`. VMess UDP over the QUIC stream path is also wired. QUIC packet header obfuscation is still rejected. |
 | KCP/XHTTP packet-up/stream-up/H3 | Xray production path only | Rejected | Do not render into `keli-core-rs` until native data paths exist. |
 
 ## Runtime Capability Matrix

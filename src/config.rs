@@ -576,13 +576,17 @@ fn validate_outbound_transport(
         )));
     }
     if network == "quic" {
-        if !quic_security.eq_ignore_ascii_case("none") {
+        let quic_security_lc = quic_security.to_ascii_lowercase();
+        if !matches!(
+            quic_security_lc.as_str(),
+            "none" | "aes-128-gcm" | "aes128-gcm" | "chacha20-poly1305" | "chacha20-ietf-poly1305"
+        ) {
             return Err(ValidationError::new(format!(
-                "outbound {} quic security {} is not supported yet",
+                "outbound {} quic security {} is not supported",
                 outbound.tag, quic_security
             )));
         }
-        if !quic_key.is_empty() {
+        if quic_security_lc == "none" && !quic_key.is_empty() {
             return Err(ValidationError::new(format!(
                 "outbound {} quic key is supported only with encrypted quic security",
                 outbound.tag
@@ -1810,10 +1814,21 @@ mod tests {
             quic_header_type: Some("none".to_string()),
             ..OutboundTransportConfig::default()
         });
+        config
+            .validate()
+            .expect("encrypted quic outbound should validate when header is none");
+
+        config.outbounds[0].transport = Some(OutboundTransportConfig {
+            network: "quic".to_string(),
+            quic_security: Some("aes-128-gcm".to_string()),
+            quic_key: Some("secret".to_string()),
+            quic_header_type: Some("srtp".to_string()),
+            ..OutboundTransportConfig::default()
+        });
         let error = config
             .validate()
-            .expect_err("encrypted quic outbound should be rejected until packet wrapping exists");
-        assert!(error.to_string().contains("quic security"));
+            .expect_err("quic packet header obfuscation is still rejected");
+        assert!(error.to_string().contains("quic header"));
 
         config.outbounds[0].transport = None;
         config.outbounds[0].tls = None;

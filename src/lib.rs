@@ -14,6 +14,7 @@ pub mod mieru;
 pub mod outbound;
 pub mod protocol;
 pub mod quic;
+mod quic_packet;
 pub mod reality;
 pub mod routing;
 pub mod runtime;
