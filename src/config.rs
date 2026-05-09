@@ -285,7 +285,7 @@ fn validate_outbound(outbound: &OutboundConfig) -> Result<(), ValidationError> {
     }
     if !matches!(
         outbound.protocol.trim().to_ascii_lowercase().as_str(),
-        "freedom" | "socks" | "socks5" | "http" | "shadowsocks" | "trojan"
+        "freedom" | "socks" | "socks5" | "http" | "shadowsocks" | "trojan" | "vless"
     ) {
         return Err(ValidationError::new(format!(
             "outbound {} protocol {} is not implemented in keli-core-rs yet",
@@ -309,7 +309,7 @@ fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), Validatio
     }
     if matches!(
         protocol.as_str(),
-        "socks" | "socks5" | "http" | "shadowsocks" | "trojan"
+        "socks" | "socks5" | "http" | "shadowsocks" | "trojan" | "vless"
     ) {
         if outbound
             .address
@@ -374,13 +374,54 @@ fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), Validatio
             outbound.tag
         )));
     }
-    if outbound.tls.is_some() && protocol != "trojan" {
+    if protocol == "vless" {
+        let user_id = outbound
+            .username
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default();
+        if parse_vless_outbound_uuid(user_id).is_none() {
+            return Err(ValidationError::new(format!(
+                "outbound {} username must be a vless uuid",
+                outbound.tag
+            )));
+        }
+        if outbound
+            .method
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        {
+            return Err(ValidationError::new(format!(
+                "outbound {} vless flow is not supported yet",
+                outbound.tag
+            )));
+        }
+    }
+    if outbound.tls.is_some() && !matches!(protocol.as_str(), "trojan") {
         return Err(ValidationError::new(format!(
             "outbound {} tls is supported only for trojan today",
             outbound.tag
         )));
     }
     Ok(())
+}
+
+fn parse_vless_outbound_uuid(value: &str) -> Option<[u8; 16]> {
+    let value: String = value
+        .chars()
+        .filter(|value| *value != '-')
+        .flat_map(|value| value.to_lowercase())
+        .collect();
+    if value.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let hex = std::str::from_utf8(chunk).ok()?;
+        bytes[index] = u8::from_str_radix(hex, 16).ok()?;
+    }
+    Some(bytes)
 }
 
 fn validate_route_targets(route: &RouteRule) -> Result<(), ValidationError> {
@@ -1377,6 +1418,61 @@ mod tests {
     }
 
     #[test]
+    fn validates_vless_route_outbound_credentials() {
+        let mut config = CoreConfig {
+            instance_id: "node-a".to_string(),
+            log_level: "info".to_string(),
+            dns: DnsConfig::default(),
+            inbounds: vec![InboundConfig {
+                tag: "panel|http|1".to_string(),
+                protocol: Protocol::Http,
+                listen: "0.0.0.0".to_string(),
+                port: 8080,
+                users: vec![user()],
+                cipher: None,
+                flow: String::new(),
+                padding_scheme: Vec::new(),
+                transport: TransportConfig::default(),
+                tls: None,
+                sniffing: SniffingConfig::default(),
+            }],
+            outbounds: vec![OutboundConfig {
+                tag: "vless-out".to_string(),
+                protocol: "vless".to_string(),
+                method: None,
+                address: Some("127.0.0.1".to_string()),
+                port: Some(443),
+                username: Some("11111111-1111-1111-1111-111111111111".to_string()),
+                password: None,
+                tls: None,
+            }],
+            routes: vec![crate::config::RouteRule {
+                targets: vec!["domain:example.com".to_string()],
+                action: crate::config::RouteAction::Outbound("vless-out".to_string()),
+                outbound: None,
+            }],
+            stats: StatsConfig::default(),
+        };
+
+        config
+            .validate()
+            .expect("plain vless outbound should validate");
+
+        config.outbounds[0].username = Some("not-a-uuid".to_string());
+        let error = config
+            .validate()
+            .expect_err("vless outbound without uuid should fail");
+        assert!(error.to_string().contains("username must be a vless uuid"));
+
+        config.outbounds[0].username = Some("11111111-1111-1111-1111-111111111111".to_string());
+        config.outbounds[0].method = Some("xtls-rprx-vision".to_string());
+        let error = config
+            .validate()
+            .expect_err("vless outbound with flow should fail until supported");
+        assert!(error.to_string().contains("vless flow is not supported"));
+    }
+
+    #[test]
     fn validates_embedded_route_outbound_protocols() {
         let config = CoreConfig {
             instance_id: "node-a".to_string(),
@@ -1401,7 +1497,7 @@ mod tests {
                 action: crate::config::RouteAction::Outbound("proxy".to_string()),
                 outbound: Some(OutboundConfig {
                     tag: "proxy".to_string(),
-                    protocol: "vless".to_string(),
+                    protocol: "vmess".to_string(),
                     method: None,
                     address: Some("127.0.0.1".to_string()),
                     port: Some(1080),
@@ -1416,7 +1512,7 @@ mod tests {
         let error = config
             .validate()
             .expect_err("embedded unsupported outbounds should fail before runtime");
-        assert!(error.to_string().contains("protocol vless"));
+        assert!(error.to_string().contains("protocol vmess"));
     }
 
     #[test]
