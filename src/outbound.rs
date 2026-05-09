@@ -7,6 +7,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use crate::config::OutboundConfig;
 use crate::socks5::SocksTarget;
 
+const MAX_UDP_CONNECTION_RESET_RETRIES: usize = 8;
+
 pub fn connect_tcp_outbound(
     outbound: &OutboundConfig,
     target: &SocksTarget,
@@ -102,7 +104,7 @@ fn send_direct_udp(
     udp.set_write_timeout(Some(timeout))?;
     udp.send_to(payload, remote_addr)?;
     let mut response = vec![0u8; 65_535];
-    let (read, source) = udp.recv_from(&mut response)?;
+    let (read, source) = recv_udp_response(&udp, &mut response)?;
     response.truncate(read);
     Ok((source, response))
 }
@@ -246,10 +248,28 @@ fn send_socks5_udp(
     let request = encode_socks5_udp_packet(target, payload)?;
     udp.send_to(&request, relay)?;
     let mut response = vec![0u8; 65_535];
-    let (read, _) = udp.recv_from(&mut response)?;
+    let (read, _) = recv_udp_response(&udp, &mut response)?;
     let (source, payload) = parse_socks5_udp_packet(&response[..read])?;
     let source = resolve_socket_addr(&source, timeout)?;
     Ok((source, payload))
+}
+
+pub(crate) fn recv_udp_response(
+    udp: &UdpSocket,
+    response: &mut [u8],
+) -> io::Result<(usize, SocketAddr)> {
+    let mut resets = 0usize;
+    loop {
+        match udp.recv_from(response) {
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {
+                resets += 1;
+                if resets > MAX_UDP_CONNECTION_RESET_RETRIES {
+                    return Err(error);
+                }
+            }
+            result => return result,
+        }
+    }
 }
 
 fn negotiate_socks5(stream: &mut TcpStream, outbound: &OutboundConfig) -> io::Result<()> {

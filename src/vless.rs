@@ -9,6 +9,7 @@ use std::time::Duration;
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
+use crate::outbound::recv_udp_response;
 use crate::socks5::SocksTarget;
 use crate::stream::{copy_count_best_effort_limited, relay_tcp_streams_limited};
 use crate::tls::{relay_tls_stream, TlsConnection, TlsSocket};
@@ -641,7 +642,7 @@ impl VlessServer {
         let udp = state.socket_for(remote_addr)?;
         udp.send_to(payload, remote_addr)?;
         let mut response = vec![0u8; MAX_UDP_PACKET_SIZE];
-        let download = match udp.recv_from(&mut response) {
+        let download = match recv_udp_response(udp, &mut response) {
             Ok((read, _)) => {
                 write_vless_udp_payload(writer, &response[..read])?;
                 read as u64

@@ -8,6 +8,7 @@ use std::time::Duration;
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
+use crate::outbound::recv_udp_response;
 use crate::stream::relay_tcp_streams_limited;
 use crate::traffic::TrafficRegistry;
 use crate::user::{CoreUser, UserStore};
@@ -353,7 +354,7 @@ impl Socks5Server {
         let mut client_udp_addr = None;
         let mut buffer = vec![0u8; 65_535];
         while control_is_open(&control)? {
-            match udp.recv_from(&mut buffer) {
+            match recv_udp_response(&udp, &mut buffer) {
                 Ok((read, source)) => {
                     if client_udp_addr.is_none() && source.ip() == control.peer_addr()?.ip() {
                         client_udp_addr = Some(source);

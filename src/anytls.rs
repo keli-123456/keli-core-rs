@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
+use crate::outbound::recv_udp_response;
 use crate::socks5::SocksTarget;
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
@@ -501,7 +502,7 @@ impl AnyTlsServer {
         let socket = udp.state.socket_for(remote_addr)?;
         socket.send_to(payload, remote_addr)?;
         let mut response = vec![0u8; MAX_UDP_PACKET_SIZE];
-        let download = match socket.recv_from(&mut response) {
+        let download = match recv_udp_response(socket, &mut response) {
             Ok((read, source)) => {
                 let packet = encode_uot_packet(udp.connect_mode, source, &response[..read]);
                 write_frame(&session.writer, CMD_PSH, stream_id, &packet)?;

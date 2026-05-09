@@ -15,6 +15,7 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::limits::{BandwidthLimiter, UserBandwidthLimiters, UserSessionTracker};
+use crate::outbound::recv_udp_response;
 use crate::socks5::SocksTarget;
 use crate::stream::copy_count_best_effort_limited;
 use crate::traffic::TrafficRegistry;
@@ -289,6 +290,7 @@ impl MieruServer {
                 }
                 Ok(None) => break,
                 Err(error) if is_timeout_error(&error) => continue,
+                Err(error) if is_connection_closed_error(&error) => break,
                 Err(error) => return Err(error),
             }
         }
@@ -512,6 +514,13 @@ fn is_timeout_error(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
+}
+
+fn is_connection_closed_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
     )
 }
 
@@ -1607,7 +1616,7 @@ fn send_direct_mieru_udp(
     udp.set_write_timeout(Some(timeout))?;
     udp.send_to(payload, remote_addr)?;
     let mut response = vec![0u8; 65_535];
-    let (read, source) = udp.recv_from(&mut response)?;
+    let (read, source) = recv_udp_response(&udp, &mut response)?;
     response.truncate(read);
     Ok((source, response))
 }
@@ -2108,6 +2117,77 @@ mod tests {
         assert_eq!(target.port, 443);
         drop(writer);
         proxy_thread.join().expect("proxy thread");
+        let records = server_thread.join().expect("server thread");
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn route_rule_rewrites_mieru_tcp_connect_through_freedom_outbound() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            assert_eq!(&bytes, b"ping");
+            stream.write_all(b"pong").expect("echo write");
+        });
+
+        let server = MieruServer::new(MieruServerConfig {
+            node_tag: "panel|mieru|1".to_string(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            users: vec![user()],
+            routes: vec![RouteRule {
+                targets: vec!["domain:example.com".to_string()],
+                action: RouteAction::Outbound("freedom-out".to_string()),
+                outbound: Some(OutboundConfig {
+                    tag: "freedom-out".to_string(),
+                    protocol: "freedom".to_string(),
+                    address: Some(echo_addr.ip().to_string()),
+                    port: Some(echo_addr.port()),
+                    username: None,
+                    password: None,
+                }),
+            }],
+            connect_timeout: Duration::from_secs(5),
+        });
+        let listener = server.bind().expect("server bind");
+        let listen_addr = listener.local_addr().expect("listen addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            server.handle_tcp_client(stream).expect("handle");
+            server.drain_traffic(1)
+        });
+
+        let client = TcpStream::connect(listen_addr).expect("connect");
+        let mut writer = test_client_writer(client.try_clone().expect("clone"), &user(), 93);
+        writer
+            .write_client_segment(
+                OPEN_SESSION_REQUEST,
+                &socks_connect_domain_request("example.com", 443),
+            )
+            .expect("open");
+        let mut reader = MieruReader::accept(client, &[user()]).expect("client reader");
+        assert_eq!(
+            reader
+                .take_initial_segment()
+                .expect("open response")
+                .metadata
+                .protocol_type,
+            OPEN_SESSION_RESPONSE
+        );
+        assert_socks_connect_success(&mut reader);
+        writer
+            .write_client_segment(DATA_CLIENT_TO_SERVER, b"ping")
+            .expect("data");
+        let mut echoed = [0u8; 4];
+        reader.read_exact(&mut echoed).expect("read echo");
+        assert_eq!(&echoed, b"pong");
+
+        drop(writer);
+        drop(reader);
+        echo_thread.join().expect("echo thread");
         let records = server_thread.join().expect("server thread");
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);

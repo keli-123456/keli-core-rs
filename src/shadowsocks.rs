@@ -18,6 +18,7 @@ use sha1::Sha1;
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
+use crate::outbound::recv_udp_response;
 use crate::socks5::SocksTarget;
 use crate::stream::copy_count_best_effort_limited;
 use crate::traffic::TrafficRegistry;
@@ -213,7 +214,7 @@ impl ShadowsocksServer {
         let mut buffer = vec![0u8; 65_535];
         while !stop.load(Ordering::SeqCst) {
             prune_udp_sessions(&mut client_sessions, &mut remotes);
-            match udp.recv_from(&mut buffer) {
+            match recv_udp_response(&udp, &mut buffer) {
                 Ok((read, source)) => {
                     let packet = &buffer[..read];
                     if let Ok(request) = self.read_udp_request(packet, method) {

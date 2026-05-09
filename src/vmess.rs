@@ -22,6 +22,7 @@ use sha3::Shake128;
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
+use crate::outbound::recv_udp_response;
 use crate::socks5::SocksTarget;
 use crate::stream::copy_count_best_effort_limited;
 use crate::tls::TlsConnection;
@@ -717,7 +718,7 @@ impl VmessServer {
         let udp = state.socket_for(remote_addr)?;
         udp.send_to(payload, remote_addr)?;
         let mut response = vec![0u8; 65_535];
-        match udp.recv_from(&mut response) {
+        match recv_udp_response(udp, &mut response) {
             Ok((read, _)) => {
                 response.truncate(read);
                 Ok((payload.len() as u64, Some(response)))
