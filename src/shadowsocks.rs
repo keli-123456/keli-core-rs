@@ -5,7 +5,6 @@ use std::net::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use aes_gcm::aead::{AeadInPlace, KeyInit};
@@ -21,7 +20,10 @@ use crate::limits::{
 };
 use crate::outbound::recv_udp_response;
 use crate::socks5::SocksTarget;
-use crate::stream::{copy_count_best_effort_limited, join_blocking_relay, spawn_blocking_relay};
+use crate::stream::{
+    copy_count_best_effort_limited, join_blocking_relay, join_native_blocking_relay,
+    spawn_blocking_relay, spawn_native_blocking_relay,
+};
 use crate::traffic::TrafficRegistry;
 use crate::user::CoreUser;
 use crate::{
@@ -860,18 +862,16 @@ fn relay_plain_to_shadowsocks(
 ) -> io::Result<()> {
     let mut plain_read = plain.try_clone()?;
     let mut plain_write = plain;
-    let upload_thread = thread::spawn(move || {
+    let upload_task = spawn_native_blocking_relay(move || {
         let uploaded = copy_count_best_effort_limited(&mut plain_read, &mut remote_writer, None);
         let _ = remote_writer.shutdown();
         uploaded
-    });
+    })?;
 
     let mut remote_reader = LazyShadowsocksReader::new(remote_reader, method, password);
     let _download = copy_count_best_effort_limited(&mut remote_reader, &mut plain_write, None);
     let _ = plain_write.shutdown(Shutdown::Write);
-    let _upload = upload_thread
-        .join()
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "shadowsocks outbound relay panicked"))?;
+    let _upload = join_native_blocking_relay(upload_task, "shadowsocks outbound relay panicked")?;
     Ok(())
 }
 
