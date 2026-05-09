@@ -1236,6 +1236,37 @@ mod tests {
         assert_eq!(udp.as_deref(), Some("true"));
     }
 
+    async fn authenticate_proxy_connection(connection: &quinn::Connection) {
+        let quic = h3_quinn::Connection::new(connection.clone());
+        let (mut h3_connection, mut send_request) = h3::client::new(quic).await.expect("h3 client");
+        let (authenticated, stop_driver) = tokio::sync::oneshot::channel::<()>();
+        let driver = tokio::spawn(async move {
+            tokio::select! {
+                _ = poll_fn(|cx| h3_connection.poll_close(cx)) => {}
+                _ = stop_driver => {
+                    std::mem::forget(h3_connection);
+                }
+            }
+        });
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://hysteria/auth")
+            .header("Hysteria-Auth", "hy2-password")
+            .header("Hysteria-CC-RX", "0")
+            .body(())
+            .expect("auth request");
+        let mut stream = send_request
+            .send_request(request)
+            .await
+            .expect("send auth request");
+        stream.finish().await.expect("finish auth request");
+        let response = stream.recv_response().await.expect("auth response");
+        assert_eq!(response.status().as_u16(), 233);
+        std::mem::forget(send_request);
+        let _ = authenticated.send(());
+        driver.await.expect("h3 driver");
+    }
+
     async fn authenticate_with_rx(
         connection: &quinn::Connection,
         client_rx: &str,
@@ -1272,6 +1303,28 @@ mod tests {
         drop(send_request);
         driver.abort();
         (udp, cc_rx)
+    }
+
+    async fn proxy_tcp_once(
+        connection: quinn::Connection,
+        echo_addr: SocketAddr,
+        payload: &'static [u8],
+    ) -> Vec<u8> {
+        let (mut send, mut recv) = connection.open_bi().await.expect("connect stream");
+        send.write_all(&tcp_request(echo_addr))
+            .await
+            .expect("tcp request");
+        let mut status = [0u8; 1];
+        recv.read_exact(&mut status).await.expect("response status");
+        assert_eq!(status[0], RESPONSE_OK);
+        assert_eq!(read_varint(&mut recv).await.expect("message len"), 0);
+        assert_eq!(read_varint(&mut recv).await.expect("padding len"), 0);
+
+        send.write_all(payload).await.expect("payload");
+        send.finish().expect("finish payload");
+        let mut echoed = vec![0u8; payload.len()];
+        recv.read_exact(&mut echoed).await.expect("echoed payload");
+        echoed
     }
 
     fn tcp_request(addr: SocketAddr) -> Vec<u8> {
@@ -1484,6 +1537,68 @@ mod tests {
             assert_eq!(records[0].user_uuid, "hy2-password");
             assert_eq!(records[0].upload, 4);
             assert_eq!(records[0].download, 4);
+
+            stop.store(true, Ordering::SeqCst);
+            server_task.await.expect("server task");
+        });
+    }
+
+    #[test]
+    fn proxies_multiple_hysteria2_tcp_streams_on_one_connection() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let cert = test_cert("tcp-mux");
+            let echo = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("echo bind");
+            let echo_addr = echo.local_addr().expect("echo addr");
+            let echo_task = tokio::spawn(async move {
+                let mut handlers = Vec::new();
+                for _ in 0..2 {
+                    let (mut stream, _) = echo.accept().await.expect("echo accept");
+                    handlers.push(tokio::spawn(async move {
+                        let mut bytes = [0u8; 4];
+                        stream.read_exact(&mut bytes).await.expect("echo read");
+                        stream.write_all(&bytes).await.expect("echo write");
+                    }));
+                }
+                for handler in handlers {
+                    handler.await.expect("echo handler");
+                }
+            });
+
+            let server = server(&cert, "127.0.0.1:0".parse().unwrap());
+            let endpoint = server.bind().expect("hy2 bind");
+            let server_addr = endpoint.local_addr().expect("server addr");
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_task = tokio::spawn(server.clone().run(endpoint, stop.clone()));
+
+            let client_endpoint = client_endpoint(cert.cert_der.clone());
+            let connection = client_endpoint
+                .connect(server_addr, "localhost")
+                .expect("connect")
+                .await
+                .expect("connection");
+            authenticate_proxy_connection(&connection).await;
+
+            let first = proxy_tcp_once(connection.clone(), echo_addr, b"ping");
+            let second = proxy_tcp_once(connection.clone(), echo_addr, b"pong");
+            let (first, second) = tokio::join!(first, second);
+
+            assert_eq!(&first, b"ping");
+            assert_eq!(&second, b"pong");
+
+            connection.close(0u32.into(), b"done");
+            echo_task.await.expect("echo task");
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let records = server.drain_traffic(1);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].upload, 8);
+            assert_eq!(records[0].download, 8);
 
             stop.store(true, Ordering::SeqCst);
             server_task.await.expect("server task");
