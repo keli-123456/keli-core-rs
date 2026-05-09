@@ -1,8 +1,8 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
@@ -1444,8 +1444,8 @@ struct ConnectionWorkerGroupState {
 }
 
 struct ConnectionWorkerPool {
-    sender: mpsc::Sender<ConnectionWorkerJob>,
-    receiver: Arc<Mutex<mpsc::Receiver<ConnectionWorkerJob>>>,
+    queue: Mutex<VecDeque<ConnectionWorkerJob>>,
+    ready: Condvar,
     worker_count: std::sync::atomic::AtomicUsize,
     idle_count: std::sync::atomic::AtomicUsize,
     pending_count: std::sync::atomic::AtomicUsize,
@@ -1532,10 +1532,9 @@ impl ConnectionWorkerGroupState {
 
 impl ConnectionWorkerPool {
     fn new() -> Self {
-        let (sender, receiver) = mpsc::channel();
         Self {
-            sender,
-            receiver: Arc::new(Mutex::new(receiver)),
+            queue: Mutex::new(VecDeque::new()),
+            ready: Condvar::new(),
             worker_count: std::sync::atomic::AtomicUsize::new(0),
             idle_count: std::sync::atomic::AtomicUsize::new(0),
             pending_count: std::sync::atomic::AtomicUsize::new(0),
@@ -1549,10 +1548,14 @@ impl ConnectionWorkerPool {
         }
 
         self.pending_count.fetch_add(1, Ordering::Relaxed);
-        if self.sender.send(job).is_err() {
-            self.pending_count.fetch_sub(1, Ordering::Relaxed);
-            return false;
+        {
+            let mut queue = self
+                .queue
+                .lock()
+                .expect("connection worker queue lock poisoned");
+            queue.push_back(job);
         }
+        self.ready.notify_one();
         self.spawn_extra_worker_if_needed();
         true
     }
@@ -1600,31 +1603,38 @@ impl ConnectionWorkerPool {
 
     fn run_worker(&'static self) {
         loop {
-            self.idle_count.fetch_add(1, Ordering::Relaxed);
-            let job = {
-                let receiver = self
-                    .receiver
-                    .lock()
-                    .expect("connection worker queue lock poisoned");
-                receiver.recv_timeout(CONNECTION_WORKER_IDLE_TIMEOUT)
+            let Some(job) = self.wait_for_job() else {
+                self.worker_count.fetch_sub(1, Ordering::AcqRel);
+                break;
             };
-            self.idle_count.fetch_sub(1, Ordering::Relaxed);
+            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            job();
+        }
+    }
 
-            match job {
-                Ok(job) => {
-                    self.pending_count.fetch_sub(1, Ordering::Relaxed);
-                    job();
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if self.pending_count.load(Ordering::Acquire) == 0 {
-                        self.worker_count.fetch_sub(1, Ordering::AcqRel);
-                        break;
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    self.worker_count.fetch_sub(1, Ordering::AcqRel);
-                    break;
-                }
+    fn wait_for_job(&'static self) -> Option<ConnectionWorkerJob> {
+        let mut queue = self
+            .queue
+            .lock()
+            .expect("connection worker queue lock poisoned");
+        loop {
+            if let Some(job) = queue.pop_front() {
+                return Some(job);
+            }
+
+            self.idle_count.fetch_add(1, Ordering::Relaxed);
+            let (next_queue, wait_result) = self
+                .ready
+                .wait_timeout(queue, CONNECTION_WORKER_IDLE_TIMEOUT)
+                .expect("connection worker queue lock poisoned");
+            self.idle_count.fetch_sub(1, Ordering::Relaxed);
+            queue = next_queue;
+
+            if wait_result.timed_out()
+                && queue.is_empty()
+                && self.pending_count.load(Ordering::Acquire) == 0
+            {
+                return None;
             }
         }
     }
@@ -1822,6 +1832,26 @@ mod tests {
         }));
         group.join();
         assert!(completed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn connection_worker_group_handles_bursts() {
+        let group = super::ConnectionWorkerGroup::new();
+        let (completed_tx, completed_rx) = mpsc::channel();
+
+        for index in 0..64 {
+            let completed_tx = completed_tx.clone();
+            assert!(group.spawn(move || {
+                completed_tx.send(index).expect("send completion");
+            }));
+        }
+        drop(completed_tx);
+
+        group.join();
+        let mut completed = completed_rx.try_iter().collect::<Vec<_>>();
+        completed.sort_unstable();
+
+        assert_eq!(completed, (0..64).collect::<Vec<_>>());
     }
 
     trait AsyncIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
