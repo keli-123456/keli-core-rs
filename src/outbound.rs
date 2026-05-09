@@ -1,4 +1,4 @@
-﻿use std::io::{self, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::time::Duration;
 
@@ -70,6 +70,10 @@ pub async fn send_udp_outbound_tokio(
     payload: &[u8],
     timeout: Duration,
 ) -> io::Result<(SocketAddr, Vec<u8>)> {
+    if outbound.protocol.trim().eq_ignore_ascii_case("freedom") {
+        return send_direct_udp_tokio(&freedom_target(outbound, target), payload, timeout).await;
+    }
+
     let outbound = outbound.clone();
     let target = target.clone();
     let payload = payload.to_vec();
@@ -112,6 +116,42 @@ async fn connect_direct_tokio(
     timeout: Duration,
 ) -> io::Result<tokio::net::TcpStream> {
     crate::dns::connect_tcp_tokio(&target.host, target.port, timeout).await
+}
+
+async fn send_direct_udp_tokio(
+    target: &SocksTarget,
+    payload: &[u8],
+    timeout: Duration,
+) -> io::Result<(SocketAddr, Vec<u8>)> {
+    let remote_addr =
+        crate::dns::resolve_socket_addr_tokio(&target.host, target.port, timeout).await?;
+    let udp = tokio::net::UdpSocket::bind(udp_bind_addr_for_remote(remote_addr)).await?;
+    udp.send_to(payload, remote_addr).await?;
+
+    let mut response = vec![0u8; 65_535];
+    let mut resets = 0usize;
+    loop {
+        match tokio::time::timeout(timeout, udp.recv_from(&mut response)).await {
+            Ok(Ok((read, source))) => {
+                response.truncate(read);
+                return Ok((source, response));
+            }
+            Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionReset => {
+                resets += 1;
+                if resets <= MAX_UDP_CONNECTION_RESET_RETRIES {
+                    continue;
+                }
+                return Err(error);
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "udp outbound response timed out",
+                ));
+            }
+        }
+    }
 }
 
 fn send_direct_udp(
@@ -633,7 +673,10 @@ mod tests {
     use std::time::Duration;
 
     use crate::config::OutboundConfig;
-    use crate::outbound::{connect_tcp_outbound, connect_tcp_outbound_tokio, send_udp_outbound};
+    use crate::outbound::{
+        connect_tcp_outbound, connect_tcp_outbound_tokio, send_udp_outbound,
+        send_udp_outbound_tokio,
+    };
     use crate::socks5::SocksTarget;
     use tokio::io::AsyncReadExt as _;
 
@@ -668,6 +711,46 @@ mod tests {
         let mut payload = [0u8; 4];
         stream.read_exact(&mut payload).await.expect("payload");
         assert_eq!(&payload, b"pong");
+        server.join().expect("server");
+    }
+
+    #[tokio::test]
+    async fn sends_through_async_freedom_udp_outbound() {
+        let remote = UdpSocket::bind("127.0.0.1:0").expect("bind remote");
+        remote
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("remote timeout");
+        let remote_addr = remote.local_addr().expect("remote addr");
+        let server = thread::spawn(move || {
+            let mut packet = [0u8; 512];
+            let (read, peer) = remote.recv_from(&mut packet).expect("recv request");
+            assert_eq!(&packet[..read], b"ping");
+            remote.send_to(b"pong", peer).expect("send response");
+        });
+
+        let outbound = OutboundConfig {
+            tag: "direct-out".to_string(),
+            protocol: "freedom".to_string(),
+            method: None,
+            alter_id: None,
+            address: Some(remote_addr.ip().to_string()),
+            port: Some(remote_addr.port()),
+            username: None,
+            password: None,
+            tls: None,
+            transport: None,
+        };
+        let target = SocksTarget {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+        let (source, payload) =
+            send_udp_outbound_tokio(&outbound, &target, b"ping", Duration::from_secs(2))
+                .await
+                .expect("udp outbound");
+
+        assert_eq!(source, remote_addr);
+        assert_eq!(payload, b"pong");
         server.join().expect("server");
     }
 
