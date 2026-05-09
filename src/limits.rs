@@ -183,31 +183,44 @@ impl BandwidthLimiter {
             return;
         }
 
-        let requested = bytes as f64;
-        let rate = self.bytes_per_second as f64;
         loop {
-            let sleep_for = {
-                let mut state = self.state.lock().expect("bandwidth limiter lock poisoned");
-                let now = Instant::now();
-                let elapsed = now.duration_since(state.last_refill).as_secs_f64();
-                let capacity = rate.max(requested);
-                state.tokens = (state.tokens + elapsed * rate).min(capacity);
-                state.last_refill = now;
-
-                if state.tokens >= requested {
-                    state.tokens -= requested;
-                    None
-                } else {
-                    let missing = requested - state.tokens;
-                    state.tokens = 0.0;
-                    Some(Duration::from_secs_f64(missing / rate))
-                }
-            };
-
-            let Some(duration) = sleep_for else {
+            let Some(duration) = self.reserve_wait_duration(bytes) else {
                 return;
             };
             thread::sleep(duration);
+        }
+    }
+
+    pub async fn wait_for_async(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+
+        loop {
+            let Some(duration) = self.reserve_wait_duration(bytes) else {
+                return;
+            };
+            tokio::time::sleep(duration).await;
+        }
+    }
+
+    fn reserve_wait_duration(&self, bytes: usize) -> Option<Duration> {
+        let requested = bytes as f64;
+        let rate = self.bytes_per_second as f64;
+        let mut state = self.state.lock().expect("bandwidth limiter lock poisoned");
+        let now = Instant::now();
+        let elapsed = now.duration_since(state.last_refill).as_secs_f64();
+        let capacity = rate.max(requested);
+        state.tokens = (state.tokens + elapsed * rate).min(capacity);
+        state.last_refill = now;
+
+        if state.tokens >= requested {
+            state.tokens -= requested;
+            None
+        } else {
+            let missing = requested - state.tokens;
+            state.tokens = 0.0;
+            Some(Duration::from_secs_f64(missing / rate))
         }
     }
 }
