@@ -2071,6 +2071,7 @@ mod tests {
                 outbound: Some(OutboundConfig {
                     tag: "socks-out".to_string(),
                     protocol: "socks".to_string(),
+                    method: None,
                     address: Some(proxy_addr.ip().to_string()),
                     port: Some(proxy_addr.port()),
                     username: None,
@@ -2144,6 +2145,7 @@ mod tests {
                 outbound: Some(OutboundConfig {
                     tag: "freedom-out".to_string(),
                     protocol: "freedom".to_string(),
+                    method: None,
                     address: Some(echo_addr.ip().to_string()),
                     port: Some(echo_addr.port()),
                     username: None,
@@ -2252,6 +2254,7 @@ mod tests {
                 outbound: Some(OutboundConfig {
                     tag: "socks-out".to_string(),
                     protocol: "socks".to_string(),
+                    method: None,
                     address: Some(proxy_addr.ip().to_string()),
                     port: Some(proxy_addr.port()),
                     username: None,
@@ -2338,6 +2341,7 @@ mod tests {
                 outbound: Some(OutboundConfig {
                     tag: "http-out".to_string(),
                     protocol: "http".to_string(),
+                    method: None,
                     address: Some(proxy_addr.ip().to_string()),
                     port: Some(proxy_addr.port()),
                     username: Some("user".to_string()),

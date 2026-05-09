@@ -60,6 +60,8 @@ pub struct OutboundConfig {
     pub tag: String,
     pub protocol: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
@@ -271,7 +273,7 @@ fn validate_outbound(outbound: &OutboundConfig) -> Result<(), ValidationError> {
     }
     if !matches!(
         outbound.protocol.trim().to_ascii_lowercase().as_str(),
-        "freedom" | "socks" | "socks5" | "http"
+        "freedom" | "socks" | "socks5" | "http" | "shadowsocks"
     ) {
         return Err(ValidationError::new(format!(
             "outbound {} protocol {} is not implemented in keli-core-rs yet",
@@ -293,7 +295,10 @@ fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), Validatio
             outbound.tag
         )));
     }
-    if matches!(protocol.as_str(), "socks" | "socks5" | "http") {
+    if matches!(
+        protocol.as_str(),
+        "socks" | "socks5" | "http" | "shadowsocks"
+    ) {
         if outbound
             .address
             .as_deref()
@@ -310,6 +315,37 @@ fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), Validatio
             return Err(ValidationError::new(format!(
                 "outbound {} port is required for {}",
                 outbound.tag, outbound.protocol
+            )));
+        }
+    }
+    if protocol == "shadowsocks" {
+        let method = outbound
+            .method
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default();
+        if method.is_empty() {
+            return Err(ValidationError::new(format!(
+                "outbound {} method is required for shadowsocks",
+                outbound.tag
+            )));
+        }
+        if !is_supported_shadowsocks_cipher(method) {
+            return Err(ValidationError::new(format!(
+                "outbound {} shadowsocks cipher {} is not supported",
+                outbound.tag, method
+            )));
+        }
+        if outbound
+            .password
+            .as_deref()
+            .map(str::trim)
+            .map(str::is_empty)
+            .unwrap_or(true)
+        {
+            return Err(ValidationError::new(format!(
+                "outbound {} password is required for shadowsocks",
+                outbound.tag
             )));
         }
     }
@@ -1079,6 +1115,7 @@ mod tests {
             outbounds: vec![OutboundConfig {
                 tag: "direct".to_string(),
                 protocol: "freedom".to_string(),
+                method: None,
                 address: None,
                 port: None,
                 username: None,
@@ -1114,6 +1151,7 @@ mod tests {
                 OutboundConfig {
                     tag: "direct".to_string(),
                     protocol: "freedom".to_string(),
+                    method: None,
                     address: None,
                     port: None,
                     username: None,
@@ -1122,6 +1160,7 @@ mod tests {
                 OutboundConfig {
                     tag: "warp".to_string(),
                     protocol: "freedom".to_string(),
+                    method: None,
                     address: Some("127.0.0.1".to_string()),
                     port: Some(40000),
                     username: None,
@@ -1176,6 +1215,7 @@ mod tests {
             outbounds: vec![OutboundConfig {
                 tag: "proxy".to_string(),
                 protocol: "socks".to_string(),
+                method: None,
                 address: Some("127.0.0.1".to_string()),
                 port: Some(1080),
                 username: Some("alice".to_string()),
@@ -1196,6 +1236,60 @@ mod tests {
             .validate()
             .expect_err("proxy outbound without port should fail");
         assert!(error.to_string().contains("port is required"));
+    }
+
+    #[test]
+    fn validates_shadowsocks_route_outbound_credentials() {
+        let mut config = CoreConfig {
+            instance_id: "node-a".to_string(),
+            log_level: "info".to_string(),
+            dns: DnsConfig::default(),
+            inbounds: vec![InboundConfig {
+                tag: "panel|http|1".to_string(),
+                protocol: Protocol::Http,
+                listen: "0.0.0.0".to_string(),
+                port: 8080,
+                users: vec![user()],
+                cipher: None,
+                flow: String::new(),
+                padding_scheme: Vec::new(),
+                transport: TransportConfig::default(),
+                tls: None,
+                sniffing: SniffingConfig::default(),
+            }],
+            outbounds: vec![OutboundConfig {
+                tag: "ss-out".to_string(),
+                protocol: "shadowsocks".to_string(),
+                method: Some("aes-128-gcm".to_string()),
+                address: Some("127.0.0.1".to_string()),
+                port: Some(8388),
+                username: None,
+                password: Some("secret".to_string()),
+            }],
+            routes: vec![crate::config::RouteRule {
+                targets: vec!["domain:example.com".to_string()],
+                action: crate::config::RouteAction::Outbound("ss-out".to_string()),
+                outbound: None,
+            }],
+            stats: StatsConfig::default(),
+        };
+
+        config
+            .validate()
+            .expect("shadowsocks outbound should validate");
+
+        config.outbounds[0].method = None;
+        let error = config
+            .validate()
+            .expect_err("shadowsocks outbound without method should fail");
+        assert!(error.to_string().contains("method is required"));
+
+        config.outbounds[0].method = Some("aes-128-gcm".to_string());
+        config.outbounds[0].password = None;
+        let error = config
+            .validate()
+            .expect_err("shadowsocks outbound without password should fail");
+        assert!(error.to_string().contains("password is required"));
     }
 
     #[test]
@@ -1224,6 +1318,7 @@ mod tests {
                 outbound: Some(OutboundConfig {
                     tag: "proxy".to_string(),
                     protocol: "vless".to_string(),
+                    method: None,
                     address: Some("127.0.0.1".to_string()),
                     port: Some(1080),
                     username: None,
@@ -1261,6 +1356,7 @@ mod tests {
             outbounds: vec![OutboundConfig {
                 tag: "direct".to_string(),
                 protocol: "freedom".to_string(),
+                method: None,
                 address: None,
                 port: None,
                 username: None,

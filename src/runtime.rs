@@ -158,6 +158,7 @@ mod tests {
             outbounds: vec![OutboundConfig {
                 tag: "direct".to_string(),
                 protocol: "freedom".to_string(),
+                method: None,
                 address: None,
                 port: None,
                 username: None,

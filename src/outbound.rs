@@ -18,6 +18,9 @@ pub fn connect_tcp_outbound(
         "freedom" => connect_direct(&freedom_target(outbound, target), timeout),
         "socks" | "socks5" => connect_socks5(outbound, target, timeout),
         "http" => connect_http(outbound, target, timeout),
+        "shadowsocks" => {
+            crate::shadowsocks::connect_shadowsocks_tcp_outbound(outbound, target, timeout)
+        }
         protocol => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("outbound protocol {protocol} is not implemented"),
@@ -47,6 +50,9 @@ pub fn send_udp_outbound(
     match outbound.protocol.trim().to_ascii_lowercase().as_str() {
         "freedom" => send_direct_udp(&freedom_target(outbound, target), payload, timeout),
         "socks" | "socks5" => send_socks5_udp(outbound, target, payload, timeout),
+        "shadowsocks" => {
+            crate::shadowsocks::send_shadowsocks_udp_outbound(outbound, target, payload, timeout)
+        }
         protocol => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("outbound protocol {protocol} does not support udp in keli-core-rs yet"),
@@ -643,6 +649,7 @@ mod tests {
         let outbound = OutboundConfig {
             tag: "socks-out".to_string(),
             protocol: "socks".to_string(),
+            method: None,
             address: Some(proxy_addr.ip().to_string()),
             port: Some(proxy_addr.port()),
             username: Some("user".to_string()),
@@ -683,6 +690,7 @@ mod tests {
         let outbound = OutboundConfig {
             tag: "http-out".to_string(),
             protocol: "http".to_string(),
+            method: None,
             address: Some(proxy_addr.ip().to_string()),
             port: Some(proxy_addr.port()),
             username: Some("user".to_string()),
@@ -740,6 +748,7 @@ mod tests {
         let outbound = OutboundConfig {
             tag: "socks-out".to_string(),
             protocol: "socks".to_string(),
+            method: None,
             address: Some(proxy_addr.ip().to_string()),
             port: Some(proxy_addr.port()),
             username: None,

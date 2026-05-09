@@ -56,7 +56,7 @@ Not implemented yet:
 
 - Real-client interop verification for the VLESS REALITY TLS 1.3 server path.
 - REALITY ML-DSA-65 certificate signing.
-- Advanced DNS/routing execution and custom outbounds.
+- DoH/DoT DNS execution, cache policy, and non-freedom/SOCKS/HTTP/Shadowsocks custom outbounds.
 - Realtime integration.
 - Broader release platform matrix and performance profiles.
 

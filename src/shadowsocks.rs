@@ -15,6 +15,7 @@ use hkdf::Hkdf;
 use md5::{Digest as Md5Digest, Md5};
 use sha1::Sha1;
 
+use crate::config::OutboundConfig;
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
@@ -744,6 +745,173 @@ pub fn is_supported_shadowsocks_cipher(method: &str) -> bool {
     ShadowsocksMethod::parse(method).is_ok()
 }
 
+pub(crate) fn connect_shadowsocks_tcp_outbound(
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let method = ShadowsocksMethod::parse(outbound.method.as_deref().unwrap_or_default())?;
+    let password = shadowsocks_outbound_password(outbound)?.to_string();
+    let server = shadowsocks_outbound_server(outbound)?;
+    let remote = connect_target_with_timeout(&server, timeout)?;
+    remote.set_read_timeout(Some(timeout))?;
+    remote.set_write_timeout(Some(timeout))?;
+
+    let local_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let local_addr = local_listener.local_addr()?;
+    let local_client = TcpStream::connect(local_addr)?;
+    let (local_plain, _) = local_listener.accept()?;
+
+    let remote_reader = remote.try_clone()?;
+    let mut remote_writer = ShadowsocksWriter::new_response(remote, method, &password)?;
+    let request = encode_socks_target(target)?;
+    remote_writer.write_chunk(&request)?;
+    remote_writer.flush()?;
+
+    thread::spawn(move || {
+        let _ =
+            relay_plain_to_shadowsocks(local_plain, remote_reader, remote_writer, method, password);
+    });
+
+    Ok(local_client)
+}
+
+pub(crate) fn send_shadowsocks_udp_outbound(
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    payload: &[u8],
+    timeout: Duration,
+) -> io::Result<(SocketAddr, Vec<u8>)> {
+    let method = ShadowsocksMethod::parse(outbound.method.as_deref().unwrap_or_default())?;
+    let password = shadowsocks_outbound_password(outbound)?;
+    let server = shadowsocks_outbound_server(outbound)?;
+    let remote = resolve_udp_target_with_timeout(&server, timeout)?;
+    let udp = UdpSocket::bind(match remote {
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+    })?;
+    udp.set_read_timeout(Some(timeout))?;
+    udp.set_write_timeout(Some(timeout))?;
+
+    let mut salt = vec![0u8; method.salt_len()];
+    fill_random(&mut salt)?;
+    let mut cipher = ShadowsocksCipher::new(method, password, &salt)?;
+    let mut body = encode_socks_target(target)?;
+    body.extend_from_slice(payload);
+    cipher.encrypt(&mut body)?;
+
+    let mut packet = Vec::with_capacity(salt.len() + body.len());
+    packet.extend_from_slice(&salt);
+    packet.extend_from_slice(&body);
+    udp.send_to(&packet, remote)?;
+
+    let mut response = vec![0u8; 65_535];
+    let (read, _) = recv_udp_response(&udp, &mut response)?;
+    let response = &response[..read];
+    if response.len() <= method.salt_len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short shadowsocks udp response",
+        ));
+    }
+    let (salt, encrypted_body) = response.split_at(method.salt_len());
+    let mut body = encrypted_body.to_vec();
+    let mut cipher = ShadowsocksCipher::new(method, password, salt)?;
+    cipher.decrypt(&mut body)?;
+    let (source, payload) = parse_request_payload(body)?;
+    let source = resolve_udp_target_with_timeout(&source, timeout)?;
+    Ok((source, payload))
+}
+
+fn shadowsocks_outbound_server(outbound: &OutboundConfig) -> io::Result<SocksTarget> {
+    let host = outbound
+        .address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "outbound address is required"))?
+        .to_string();
+    let port = outbound
+        .port
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "outbound port is required"))?;
+    Ok(SocksTarget { host, port })
+}
+
+fn shadowsocks_outbound_password(outbound: &OutboundConfig) -> io::Result<&str> {
+    outbound
+        .password
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "outbound password is required for shadowsocks",
+            )
+        })
+}
+
+fn relay_plain_to_shadowsocks(
+    plain: TcpStream,
+    remote_reader: TcpStream,
+    mut remote_writer: ShadowsocksWriter<TcpStream>,
+    method: ShadowsocksMethod,
+    password: String,
+) -> io::Result<()> {
+    let mut plain_read = plain.try_clone()?;
+    let mut plain_write = plain;
+    let upload_thread = thread::spawn(move || {
+        let uploaded = copy_count_best_effort_limited(&mut plain_read, &mut remote_writer, None);
+        let _ = remote_writer.shutdown();
+        uploaded
+    });
+
+    let mut remote_reader = LazyShadowsocksReader::new(remote_reader, method, password);
+    let _download = copy_count_best_effort_limited(&mut remote_reader, &mut plain_write, None);
+    let _ = plain_write.shutdown(Shutdown::Write);
+    let _upload = upload_thread
+        .join()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "shadowsocks outbound relay panicked"))?;
+    Ok(())
+}
+
+struct LazyShadowsocksReader<R> {
+    reader: Option<R>,
+    inner: Option<ShadowsocksReader<R>>,
+    method: ShadowsocksMethod,
+    password: String,
+}
+
+impl<R: Read> LazyShadowsocksReader<R> {
+    fn new(reader: R, method: ShadowsocksMethod, password: String) -> Self {
+        Self {
+            reader: Some(reader),
+            inner: None,
+            method,
+            password,
+        }
+    }
+
+    fn inner(&mut self) -> io::Result<&mut ShadowsocksReader<R>> {
+        if self.inner.is_none() {
+            let mut reader = self.reader.take().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "shadowsocks reader missing")
+            })?;
+            let mut salt = vec![0u8; self.method.salt_len()];
+            reader.read_exact(&mut salt)?;
+            let cipher = ShadowsocksCipher::new(self.method, &self.password, &salt)?;
+            self.inner = Some(ShadowsocksReader::with_cipher(reader, cipher));
+        }
+        Ok(self.inner.as_mut().expect("lazy reader initialized"))
+    }
+}
+
+impl<R: Read> Read for LazyShadowsocksReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        self.inner()?.read(output)
+    }
+}
+
 fn parse_request_payload(payload: Vec<u8>) -> io::Result<(SocksTarget, Vec<u8>)> {
     let mut cursor = std::io::Cursor::new(payload);
     let host = match read_u8(&mut cursor)? {
@@ -786,8 +954,43 @@ fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStre
     crate::dns::connect_tcp(&target.host, target.port, timeout)
 }
 
+fn connect_target_with_timeout(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStream> {
+    crate::dns::connect_tcp(&target.host, target.port, timeout)
+}
+
 fn resolve_udp_target(target: &SocksTarget) -> io::Result<SocketAddr> {
     crate::dns::resolve_socket_addr(&target.host, target.port, Duration::from_secs(5))
+}
+
+fn resolve_udp_target_with_timeout(
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<SocketAddr> {
+    crate::dns::resolve_socket_addr(&target.host, target.port, timeout)
+}
+
+fn encode_socks_target(target: &SocksTarget) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    if let Ok(ip) = target.host.parse::<Ipv4Addr>() {
+        output.push(ATYP_IPV4);
+        output.extend_from_slice(&ip.octets());
+    } else if let Ok(ip) = target.host.parse::<Ipv6Addr>() {
+        output.push(ATYP_IPV6);
+        output.extend_from_slice(&ip.octets());
+    } else {
+        let host = target.host.trim().trim_matches(['[', ']']);
+        if host.is_empty() || host.len() > u8::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "shadowsocks target host is invalid",
+            ));
+        }
+        output.push(ATYP_DOMAIN);
+        output.push(host.len() as u8);
+        output.extend_from_slice(host.as_bytes());
+    }
+    output.extend_from_slice(&target.port.to_be_bytes());
+    Ok(output)
 }
 
 fn encode_udp_packet(
@@ -881,11 +1084,14 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use crate::config::OutboundConfig;
     use crate::shadowsocks::{
-        is_supported_shadowsocks_cipher, parse_request_payload, ShadowsocksCipher,
-        ShadowsocksMethod, ShadowsocksReader, ShadowsocksServer, ShadowsocksServerConfig,
-        ShadowsocksWriter, UdpClientContext, UdpClientSession, ATYP_IPV4,
+        connect_shadowsocks_tcp_outbound, encode_socks_target, fill_random,
+        is_supported_shadowsocks_cipher, parse_request_payload, send_shadowsocks_udp_outbound,
+        ShadowsocksCipher, ShadowsocksMethod, ShadowsocksReader, ShadowsocksServer,
+        ShadowsocksServerConfig, ShadowsocksWriter, UdpClientContext, UdpClientSession, ATYP_IPV4,
     };
+    use crate::socks5::SocksTarget;
     use crate::user::CoreUser;
 
     fn user() -> CoreUser {
@@ -908,6 +1114,121 @@ mod tests {
             speed_limit: 0,
             device_limit: 0,
         }
+    }
+
+    #[test]
+    fn shadowsocks_tcp_outbound_bridges_plain_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind shadowsocks outbound");
+        let server_addr = listener.local_addr().expect("server addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept shadowsocks outbound");
+            let writer_stream = stream.try_clone().expect("clone writer");
+            let mut reader =
+                ShadowsocksReader::new(stream, ShadowsocksMethod::Aes128Gcm, "outbound-secret")
+                    .expect("reader");
+            let first = reader.read_chunk().expect("first chunk");
+            let (target, initial_payload) = parse_request_payload(first).expect("parse target");
+            assert_eq!(target.host, "example.com");
+            assert_eq!(target.port, 443);
+            assert!(initial_payload.is_empty());
+
+            let mut request = [0u8; 4];
+            reader.read_exact(&mut request).expect("plain payload");
+            assert_eq!(&request, b"ping");
+
+            let mut writer = ShadowsocksWriter::new_response(
+                writer_stream,
+                ShadowsocksMethod::Aes128Gcm,
+                "outbound-secret",
+            )
+            .expect("writer");
+            writer.write_all(b"pong").expect("response");
+            writer.flush().expect("flush");
+        });
+
+        let outbound = OutboundConfig {
+            tag: "ss-out".to_string(),
+            protocol: "shadowsocks".to_string(),
+            method: Some("aes-128-gcm".to_string()),
+            address: Some(server_addr.ip().to_string()),
+            port: Some(server_addr.port()),
+            username: None,
+            password: Some("outbound-secret".to_string()),
+        };
+        let target = SocksTarget {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+        let mut stream =
+            connect_shadowsocks_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+                .expect("connect outbound");
+        stream.write_all(b"ping").expect("write plain");
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).expect("read plain");
+        assert_eq!(&response, b"pong");
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn shadowsocks_udp_outbound_encrypts_packet_and_decodes_response() {
+        let server = UdpSocket::bind("127.0.0.1:0").expect("bind shadowsocks udp");
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let server_addr = server.local_addr().expect("server addr");
+        let worker = thread::spawn(move || {
+            let method = ShadowsocksMethod::Aes128Gcm;
+            let mut packet = [0u8; 1500];
+            let (read, client_addr) = server.recv_from(&mut packet).expect("receive request");
+            let (salt, encrypted_body) = packet[..read].split_at(method.salt_len());
+            let mut body = encrypted_body.to_vec();
+            let mut cipher =
+                ShadowsocksCipher::new(method, "outbound-secret", salt).expect("cipher");
+            cipher.decrypt(&mut body).expect("decrypt request");
+            let (target, payload) = parse_request_payload(body).expect("parse request");
+            assert_eq!(target.host, "example.com");
+            assert_eq!(target.port, 53);
+            assert_eq!(payload, b"ping");
+
+            let mut salt = vec![0u8; method.salt_len()];
+            fill_random(&mut salt).expect("salt");
+            let mut cipher =
+                ShadowsocksCipher::new(method, "outbound-secret", &salt).expect("response cipher");
+            let response_source = SocksTarget {
+                host: "1.1.1.1".to_string(),
+                port: 53,
+            };
+            let mut body = encode_socks_target(&response_source).expect("response target");
+            body.extend_from_slice(b"pong");
+            cipher.encrypt(&mut body).expect("encrypt response");
+            let mut response = salt;
+            response.extend_from_slice(&body);
+            server
+                .send_to(&response, client_addr)
+                .expect("send response");
+        });
+
+        let outbound = OutboundConfig {
+            tag: "ss-out".to_string(),
+            protocol: "shadowsocks".to_string(),
+            method: Some("aes-128-gcm".to_string()),
+            address: Some(server_addr.ip().to_string()),
+            port: Some(server_addr.port()),
+            username: None,
+            password: Some("outbound-secret".to_string()),
+        };
+        let target = SocksTarget {
+            host: "example.com".to_string(),
+            port: 53,
+        };
+        let (source, payload) =
+            send_shadowsocks_udp_outbound(&outbound, &target, b"ping", Duration::from_secs(2))
+                .expect("udp outbound");
+
+        assert_eq!(source.ip().to_string(), "1.1.1.1");
+        assert_eq!(source.port(), 53);
+        assert_eq!(payload, b"pong");
+        worker.join().expect("udp worker");
     }
 
     fn server() -> ShadowsocksServer {

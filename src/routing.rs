@@ -646,6 +646,7 @@ mod tests {
             outbound: Some(OutboundConfig {
                 tag: "warp".to_string(),
                 protocol: "freedom".to_string(),
+                method: None,
                 address: None,
                 port: None,
                 username: None,
@@ -658,6 +659,7 @@ mod tests {
             RouteDecision::Outbound(OutboundConfig {
                 tag: "warp".to_string(),
                 protocol: "freedom".to_string(),
+                method: None,
                 address: None,
                 port: None,
                 username: None,
@@ -671,6 +673,7 @@ mod tests {
         let decision = RouteDecision::Outbound(OutboundConfig {
             tag: "redirect".to_string(),
             protocol: "freedom".to_string(),
+            method: None,
             address: Some("127.0.0.1".to_string()),
             port: Some(8443),
             username: None,
