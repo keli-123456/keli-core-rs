@@ -655,6 +655,7 @@ mod tests {
             port: Some(proxy_addr.port()),
             username: Some("user".to_string()),
             password: Some("pass1".to_string()),
+            tls: None,
         };
         let target = SocksTarget {
             host: "example.com".to_string(),
@@ -696,6 +697,7 @@ mod tests {
             port: Some(proxy_addr.port()),
             username: Some("user".to_string()),
             password: Some("pass".to_string()),
+            tls: None,
         };
         let target = SocksTarget {
             host: "example.com".to_string(),
@@ -754,6 +756,7 @@ mod tests {
             port: Some(proxy_addr.port()),
             username: None,
             password: None,
+            tls: None,
         };
         let target = SocksTarget {
             host: "example.com".to_string(),

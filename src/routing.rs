@@ -651,6 +651,7 @@ mod tests {
                 port: None,
                 username: None,
                 password: None,
+                tls: None,
             }),
         }]);
 
@@ -664,6 +665,7 @@ mod tests {
                 port: None,
                 username: None,
                 password: None,
+                tls: None,
             })
         );
     }
@@ -678,6 +680,7 @@ mod tests {
             port: Some(8443),
             username: None,
             password: None,
+            tls: None,
         });
 
         let target = decision.apply_to_target("example.com", 443);

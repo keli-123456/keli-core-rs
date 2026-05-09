@@ -1,12 +1,20 @@
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
+};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    StreamOwned,
+};
 use sha2::{Digest, Sha224};
 
-use crate::config::OutboundConfig;
+use crate::config::{OutboundConfig, OutboundTlsConfig};
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
@@ -659,9 +667,6 @@ pub(crate) fn connect_trojan_tcp_outbound(
     timeout: Duration,
 ) -> io::Result<TcpStream> {
     let server = trojan_outbound_server(outbound)?;
-    let mut stream = connect_target(&server, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
     let password = outbound
         .password
         .as_deref()
@@ -673,8 +678,91 @@ pub(crate) fn connect_trojan_tcp_outbound(
                 "outbound password is required for trojan",
             )
         })?;
+    if outbound.tls.is_some() {
+        return connect_trojan_tls_tcp_outbound(outbound, &server, password, target, timeout);
+    }
+    let mut stream = connect_target(&server, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     write_trojan_tcp_request(&mut stream, password, target)?;
     Ok(stream)
+}
+
+fn connect_trojan_tls_tcp_outbound(
+    outbound: &OutboundConfig,
+    server: &SocksTarget,
+    password: &str,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let remote = connect_target(server, timeout)?;
+    remote.set_read_timeout(Some(timeout))?;
+    remote.set_write_timeout(Some(timeout))?;
+    let tls_config = outbound
+        .tls
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "outbound tls is required"))?;
+    let server_name = trojan_tls_server_name(tls_config, server)?;
+    let connection = ClientConnection::new(trojan_tls_client_config(tls_config), server_name)
+        .map_err(tls_error)?;
+    let mut tls_stream = StreamOwned::new(connection, remote);
+    while tls_stream.conn.is_handshaking() {
+        tls_stream
+            .conn
+            .complete_io(&mut tls_stream.sock)
+            .map_err(tls_error)?;
+    }
+    write_trojan_tcp_request(&mut tls_stream, password, target)?;
+    tls_stream.flush()?;
+
+    let local_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let local_addr = local_listener.local_addr()?;
+    let local_client = TcpStream::connect(local_addr)?;
+    let (local_plain, _) = local_listener.accept()?;
+
+    thread::spawn(move || {
+        let _ = relay_plain_to_tls(local_plain, tls_stream);
+    });
+
+    Ok(local_client)
+}
+
+fn trojan_tls_client_config(tls: &OutboundTlsConfig) -> Arc<ClientConfig> {
+    let mut config = if tls.allow_insecure {
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth()
+    } else {
+        let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
+    config.alpn_protocols = tls
+        .alpn
+        .iter()
+        .map(|value| value.as_bytes().to_vec())
+        .collect();
+    Arc::new(config)
+}
+
+fn trojan_tls_server_name(
+    tls: &OutboundTlsConfig,
+    server: &SocksTarget,
+) -> io::Result<ServerName<'static>> {
+    let value = tls.server_name.trim().trim_matches(['[', ']']).to_string();
+    let value = if value.is_empty() {
+        server.host.trim().trim_matches(['[', ']']).to_string()
+    } else {
+        value
+    };
+    ServerName::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "trojan tls server_name is invalid",
+        )
+    })
 }
 
 fn trojan_outbound_server(outbound: &OutboundConfig) -> io::Result<SocksTarget> {
@@ -722,6 +810,144 @@ fn write_trojan_target<W: Write>(writer: &mut W, target: &SocksTarget) -> io::Re
         writer.write_all(host.as_bytes())?;
     }
     writer.write_all(&target.port.to_be_bytes())
+}
+
+fn relay_plain_to_tls(
+    mut plain: TcpStream,
+    mut tls_stream: StreamOwned<ClientConnection, TcpStream>,
+) -> io::Result<()> {
+    plain.set_nonblocking(true)?;
+    tls_stream.sock.set_nonblocking(true)?;
+
+    let mut upload_done = false;
+    let mut download_done = false;
+    let mut upload_buffer = [0u8; 16 * 1024];
+    let mut download_buffer = [0u8; 16 * 1024];
+
+    while !upload_done || !download_done {
+        let mut progressed = false;
+
+        if !upload_done {
+            match plain.read(&mut upload_buffer) {
+                Ok(0) => {
+                    upload_done = true;
+                    tls_stream.conn.send_close_notify();
+                    let _ = tls_stream.flush();
+                    progressed = true;
+                }
+                Ok(read) => {
+                    write_all_wait(&mut tls_stream, &upload_buffer[..read])?;
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    upload_done = true;
+                    tls_stream.conn.send_close_notify();
+                    let _ = tls_stream.flush();
+                    progressed = true;
+                }
+            }
+        }
+
+        if !download_done {
+            match tls_stream.read(&mut download_buffer) {
+                Ok(0) => {
+                    download_done = true;
+                    let _ = plain.shutdown(Shutdown::Write);
+                    progressed = true;
+                }
+                Ok(read) => {
+                    write_all_wait(&mut plain, &download_buffer[..read])?;
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    download_done = true;
+                    let _ = plain.shutdown(Shutdown::Write);
+                    progressed = true;
+                }
+            }
+        }
+
+        if !progressed {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    let _ = plain.shutdown(Shutdown::Both);
+    let _ = tls_stream.sock.shutdown(Shutdown::Both);
+    Ok(())
+}
+
+fn write_all_wait<W: Write>(writer: &mut W, mut input: &[u8]) -> io::Result<()> {
+    while !input.is_empty() {
+        match writer.write(input) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "socket write returned zero",
+                ));
+            }
+            Ok(written) => input = &input[written..],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    writer.flush()
+}
+
+fn tls_error(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+        ]
+    }
 }
 
 fn read_trojan_target<R: Read>(reader: &mut R) -> io::Result<SocksTarget> {
@@ -864,7 +1090,7 @@ mod tests {
     use rustls::pki_types::{CertificateDer, ServerName};
     use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
-    use crate::config::OutboundConfig;
+    use crate::config::{OutboundConfig, OutboundTlsConfig};
     use crate::socks5::SocksTarget;
     use crate::tls::TlsAcceptor;
     use crate::trojan::{
@@ -1188,6 +1414,58 @@ mod tests {
             port: Some(proxy_addr.port()),
             username: None,
             password: Some("trojan-password".to_string()),
+            tls: None,
+        };
+        let target = SocksTarget {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+        let mut stream = connect_trojan_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+            .expect("connect outbound");
+        stream.write_all(b"ping").expect("write payload");
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).expect("read response");
+        assert_eq!(&response, b"pong");
+        proxy_thread.join().expect("proxy thread");
+    }
+
+    #[test]
+    fn trojan_tls_tcp_outbound_writes_request_and_relays_stream() {
+        let cert = test_cert("trojan-out-tls");
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let proxy_thread = thread::spawn(move || {
+            let (stream, _) = proxy.accept().expect("proxy accept");
+            let mut stream = acceptor.accept(stream).expect("tls accept");
+            let server = server();
+            let request = server.read_request(&mut stream).expect("trojan request");
+            assert_eq!(
+                request.password_hash,
+                trojan_password_hash("trojan-password")
+            );
+            assert_eq!(request.target.host, "example.com");
+            assert_eq!(request.target.port, 443);
+            let mut payload = [0u8; 4];
+            stream.read_exact(&mut payload).expect("payload");
+            assert_eq!(&payload, b"ping");
+            stream.write_all(b"pong").expect("response");
+        });
+
+        let outbound = OutboundConfig {
+            tag: "trojan-out".to_string(),
+            protocol: "trojan".to_string(),
+            method: None,
+            address: Some(proxy_addr.ip().to_string()),
+            port: Some(proxy_addr.port()),
+            username: None,
+            password: Some("trojan-password".to_string()),
+            tls: Some(OutboundTlsConfig {
+                server_name: "localhost".to_string(),
+                allow_insecure: true,
+                alpn: Vec::new(),
+            }),
         };
         let target = SocksTarget {
             host: "example.com".to_string(),

@@ -1154,6 +1154,7 @@ mod tests {
             port: Some(server_addr.port()),
             username: None,
             password: Some("outbound-secret".to_string()),
+            tls: None,
         };
         let target = SocksTarget {
             host: "example.com".to_string(),
@@ -1216,6 +1217,7 @@ mod tests {
             port: Some(server_addr.port()),
             username: None,
             password: Some("outbound-secret".to_string()),
+            tls: None,
         };
         let target = SocksTarget {
             host: "example.com".to_string(),

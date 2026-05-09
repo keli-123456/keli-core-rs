@@ -214,6 +214,7 @@ mod tests {
                 port: None,
                 username: None,
                 password: None,
+                tls: None,
             }],
             routes: Vec::new(),
             stats: StatsConfig::default(),

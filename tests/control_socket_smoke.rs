@@ -115,6 +115,7 @@ fn config(port: u16, user_uuid: &str) -> CoreConfig {
             port: None,
             username: None,
             password: None,
+            tls: None,
         }],
         routes: Vec::new(),
         stats: StatsConfig {

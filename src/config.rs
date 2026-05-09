@@ -69,6 +69,18 @@ pub struct OutboundConfig {
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<OutboundTlsConfig>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboundTlsConfig {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub server_name: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_insecure: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alpn: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +371,12 @@ fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), Validatio
     {
         return Err(ValidationError::new(format!(
             "outbound {} password is required for trojan",
+            outbound.tag
+        )));
+    }
+    if outbound.tls.is_some() && protocol != "trojan" {
+        return Err(ValidationError::new(format!(
+            "outbound {} tls is supported only for trojan today",
             outbound.tag
         )));
     }
@@ -1133,6 +1151,7 @@ mod tests {
                 port: None,
                 username: None,
                 password: None,
+                tls: None,
             }],
             routes: Vec::new(),
             stats: StatsConfig::default(),
@@ -1169,6 +1188,7 @@ mod tests {
                     port: None,
                     username: None,
                     password: None,
+                    tls: None,
                 },
                 OutboundConfig {
                     tag: "warp".to_string(),
@@ -1178,6 +1198,7 @@ mod tests {
                     port: Some(40000),
                     username: None,
                     password: None,
+                    tls: None,
                 },
             ],
             routes: Vec::new(),
@@ -1233,6 +1254,7 @@ mod tests {
                 port: Some(1080),
                 username: Some("alice".to_string()),
                 password: Some("secret".to_string()),
+                tls: None,
             }],
             routes: vec![crate::config::RouteRule {
                 targets: vec!["domain:example.com".to_string()],
@@ -1278,6 +1300,7 @@ mod tests {
                 port: Some(8388),
                 username: None,
                 password: Some("secret".to_string()),
+                tls: None,
             }],
             routes: vec![crate::config::RouteRule {
                 targets: vec!["domain:example.com".to_string()],
@@ -1332,6 +1355,7 @@ mod tests {
                 port: Some(443),
                 username: None,
                 password: Some("secret".to_string()),
+                tls: None,
             }],
             routes: vec![crate::config::RouteRule {
                 targets: vec!["domain:example.com".to_string()],
@@ -1383,6 +1407,7 @@ mod tests {
                     port: Some(1080),
                     username: None,
                     password: None,
+                    tls: None,
                 }),
             }],
             stats: StatsConfig::default(),
@@ -1421,6 +1446,7 @@ mod tests {
                 port: None,
                 username: None,
                 password: None,
+                tls: None,
             }],
             routes: vec![crate::config::RouteRule {
                 targets: vec![
