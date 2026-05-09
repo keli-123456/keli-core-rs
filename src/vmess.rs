@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aes::cipher::{BlockDecrypt, KeyInit as BlockKeyInit};
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit as BlockKeyInit};
 use aes::Aes128;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, Nonce as AesGcmNonce};
@@ -19,6 +19,16 @@ use sha2::Sha256;
 use sha3::digest::{ExtendableOutput, Update};
 use sha3::Shake128;
 
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    StreamOwned,
+};
+
+use crate::config::{outbound_transport_network, OutboundConfig, OutboundTlsConfig};
+use crate::grpc::connect_grpc_client;
+use crate::httpupgrade::connect_httpupgrade_client;
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
@@ -28,7 +38,7 @@ use crate::stream::copy_count_best_effort_limited;
 use crate::tls::TlsConnection;
 use crate::traffic::TrafficRegistry;
 use crate::user::{CoreUser, UserStore};
-use crate::websocket::{accept_websocket, accept_websocket_tls};
+use crate::websocket::{accept_websocket, accept_websocket_tls, connect_websocket_client};
 use crate::{
     connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
 };
@@ -1649,6 +1659,159 @@ fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStre
     crate::dns::connect_tcp(&target.host, target.port, timeout)
 }
 
+pub(crate) fn connect_vmess_tcp_outbound(
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let server = vmess_outbound_server(outbound)?;
+    let network = outbound_transport_network(outbound).to_ascii_lowercase();
+    if network == "ws" {
+        return connect_vmess_websocket_tcp_outbound(outbound, &server, target, timeout);
+    }
+    if network == "httpupgrade" {
+        return connect_vmess_httpupgrade_tcp_outbound(outbound, &server, target, timeout);
+    }
+    if network == "grpc" {
+        return connect_vmess_grpc_tcp_outbound(outbound, &server, target, timeout);
+    }
+    if network != "tcp" {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("vmess outbound transport {network} is not supported yet"),
+        ));
+    }
+    if outbound.tls.is_some() {
+        return connect_vmess_tls_tcp_outbound(outbound, &server, target, timeout);
+    }
+    let mut stream = connect_target(&server, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let request = write_vmess_tcp_request(&mut stream, outbound, target)?;
+    read_vmess_response_header(&mut stream, &request)?;
+    stream.set_nonblocking(true)?;
+    local_bridge_for_vmess(stream, request)
+}
+
+fn connect_vmess_grpc_tcp_outbound(
+    outbound: &OutboundConfig,
+    server: &SocksTarget,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let host = outbound_transport_host(outbound, server);
+    let mut grpc = connect_grpc_client(
+        server,
+        timeout,
+        outbound.tls.as_ref(),
+        outbound_transport_service_name(outbound),
+        &host,
+    )?;
+    let request = write_vmess_tcp_request(&mut grpc, outbound, target)?;
+    grpc.flush()?;
+    read_vmess_response_header(&mut grpc, &request)?;
+    grpc.set_nonblocking(true);
+    local_bridge_for_vmess(grpc, request)
+}
+
+fn connect_vmess_httpupgrade_tcp_outbound(
+    outbound: &OutboundConfig,
+    server: &SocksTarget,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    if outbound.tls.is_some() {
+        let tls_stream = connect_vmess_tls_stream(outbound, server, timeout)?;
+        let host = outbound_transport_host(outbound, server);
+        let mut tls_stream =
+            connect_httpupgrade_client(tls_stream, outbound_transport_path(outbound), &host)?;
+        let request = write_vmess_tcp_request(&mut tls_stream, outbound, target)?;
+        tls_stream.flush()?;
+        read_vmess_response_header(&mut tls_stream, &request)?;
+        tls_stream.sock.set_nonblocking(true)?;
+        return local_bridge_for_vmess(tls_stream, request);
+    }
+
+    let remote = connect_target(server, timeout)?;
+    remote.set_read_timeout(Some(timeout))?;
+    remote.set_write_timeout(Some(timeout))?;
+    let host = outbound_transport_host(outbound, server);
+    let mut stream = connect_httpupgrade_client(remote, outbound_transport_path(outbound), &host)?;
+    let request = write_vmess_tcp_request(&mut stream, outbound, target)?;
+    read_vmess_response_header(&mut stream, &request)?;
+    stream.set_nonblocking(true)?;
+    local_bridge_for_vmess(stream, request)
+}
+
+fn connect_vmess_websocket_tcp_outbound(
+    outbound: &OutboundConfig,
+    server: &SocksTarget,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    if outbound.tls.is_some() {
+        let tls_stream = connect_vmess_tls_stream(outbound, server, timeout)?;
+        let host = outbound_transport_host(outbound, server);
+        let mut websocket =
+            connect_websocket_client(tls_stream, outbound_transport_path(outbound), &host)?;
+        let request = write_vmess_tcp_request(&mut websocket, outbound, target)?;
+        websocket.flush()?;
+        read_vmess_response_header(&mut websocket, &request)?;
+        websocket.get_mut().sock.set_nonblocking(true)?;
+        return local_bridge_for_vmess(websocket, request);
+    }
+
+    let remote = connect_target(server, timeout)?;
+    remote.set_read_timeout(Some(timeout))?;
+    remote.set_write_timeout(Some(timeout))?;
+    let host = outbound_transport_host(outbound, server);
+    let mut websocket = connect_websocket_client(remote, outbound_transport_path(outbound), &host)?;
+    let request = write_vmess_tcp_request(&mut websocket, outbound, target)?;
+    websocket.flush()?;
+    read_vmess_response_header(&mut websocket, &request)?;
+    websocket.get_mut().set_nonblocking(true)?;
+    local_bridge_for_vmess(websocket, request)
+}
+
+fn connect_vmess_tls_tcp_outbound(
+    outbound: &OutboundConfig,
+    server: &SocksTarget,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let mut tls_stream = connect_vmess_tls_stream(outbound, server, timeout)?;
+    let request = write_vmess_tcp_request(&mut tls_stream, outbound, target)?;
+    tls_stream.flush()?;
+    read_vmess_response_header(&mut tls_stream, &request)?;
+    tls_stream.sock.set_nonblocking(true)?;
+    local_bridge_for_vmess(tls_stream, request)
+}
+
+fn connect_vmess_tls_stream(
+    outbound: &OutboundConfig,
+    server: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<StreamOwned<ClientConnection, TcpStream>> {
+    let remote = connect_target(server, timeout)?;
+    remote.set_read_timeout(Some(timeout))?;
+    remote.set_write_timeout(Some(timeout))?;
+    let tls_config = outbound
+        .tls
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "outbound tls is required"))?;
+    let server_name = vmess_tls_server_name(tls_config, server)?;
+    let connection = ClientConnection::new(vmess_tls_client_config(tls_config), server_name)
+        .map_err(tls_error)?;
+    let mut tls_stream = StreamOwned::new(connection, remote);
+    while tls_stream.conn.is_handshaking() {
+        tls_stream
+            .conn
+            .complete_io(&mut tls_stream.sock)
+            .map_err(tls_error)?;
+    }
+    Ok(tls_stream)
+}
+
 fn resolve_udp_target(target: &SocksTarget) -> io::Result<SocketAddr> {
     crate::dns::resolve_socket_addr(&target.host, target.port, Duration::from_secs(5))
 }
@@ -1658,6 +1821,380 @@ fn udp_bind_addr_for_remote(remote: SocketAddr) -> SocketAddr {
         SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     }
+}
+
+fn vmess_tls_client_config(tls: &OutboundTlsConfig) -> Arc<ClientConfig> {
+    let mut config = if tls.allow_insecure {
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth()
+    } else {
+        let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
+    config.alpn_protocols = tls
+        .alpn
+        .iter()
+        .map(|value| value.as_bytes().to_vec())
+        .collect();
+    Arc::new(config)
+}
+
+fn vmess_tls_server_name(
+    tls: &OutboundTlsConfig,
+    server: &SocksTarget,
+) -> io::Result<ServerName<'static>> {
+    let value = tls.server_name.trim().trim_matches(['[', ']']).to_string();
+    let value = if value.is_empty() {
+        server.host.trim().trim_matches(['[', ']']).to_string()
+    } else {
+        value
+    };
+    ServerName::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "vmess tls server_name is invalid",
+        )
+    })
+}
+
+fn vmess_outbound_server(outbound: &OutboundConfig) -> io::Result<SocksTarget> {
+    let host = outbound
+        .address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "outbound address is required"))?
+        .to_string();
+    let port = outbound
+        .port
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "outbound port is required"))?;
+    Ok(SocksTarget { host, port })
+}
+
+fn vmess_outbound_user_id(outbound: &OutboundConfig) -> io::Result<[u8; 16]> {
+    let value = outbound
+        .username
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "outbound username must be a vmess uuid",
+            )
+        })?;
+    parse_uuid_bytes(value)
+}
+
+fn vmess_outbound_security(outbound: &OutboundConfig) -> io::Result<VmessSecurity> {
+    let value = outbound
+        .method
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("auto")
+        .to_ascii_lowercase();
+    match value.as_str() {
+        "auto" | "aes-128-gcm" | "aes128-gcm" => Ok(VmessSecurity::Aes128Gcm),
+        "chacha20-poly1305" | "chacha20-ietf-poly1305" => Ok(VmessSecurity::ChaCha20Poly1305),
+        "none" => Ok(VmessSecurity::None),
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("unsupported vmess outbound security {value}"),
+        )),
+    }
+}
+
+fn outbound_transport_path(outbound: &OutboundConfig) -> Option<&str> {
+    outbound
+        .transport
+        .as_ref()
+        .and_then(|transport| transport.path.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn outbound_transport_host(outbound: &OutboundConfig, server: &SocksTarget) -> String {
+    outbound
+        .transport
+        .as_ref()
+        .and_then(|transport| transport.host.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| outbound.tls.as_ref().map(|tls| tls.server_name.trim()))
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&server.host)
+        .trim_matches(['[', ']'])
+        .to_string()
+}
+
+fn outbound_transport_service_name(outbound: &OutboundConfig) -> Option<&str> {
+    outbound
+        .transport
+        .as_ref()
+        .and_then(|transport| transport.service_name.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn write_vmess_tcp_request<W: Write>(
+    writer: &mut W,
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+) -> io::Result<VmessRequest> {
+    let uuid = vmess_outbound_user_id(outbound)?;
+    let cmd_key = vmess_cmd_key(&uuid);
+    let request_body_key = random_array::<16>()?;
+    let request_body_iv = random_array::<16>()?;
+    let response_header = random_array::<1>()?[0];
+    let options = OPTION_CHUNK_STREAM | OPTION_CHUNK_MASKING | OPTION_GLOBAL_PADDING;
+    let security = vmess_outbound_security(outbound)?;
+    let mut header = Vec::new();
+    header.push(VERSION);
+    header.extend_from_slice(&request_body_iv);
+    header.extend_from_slice(&request_body_key);
+    header.push(response_header);
+    header.push(options);
+    header.push(vmess_security_byte(security));
+    header.push(0);
+    header.push(COMMAND_TCP);
+    write_vmess_target_header(&mut header, target)?;
+    let checksum = fnv1a(&header);
+    header.extend_from_slice(&checksum.to_be_bytes());
+
+    let auth_id = create_auth_id(&cmd_key, unix_timestamp(), random_array::<4>()?);
+    let nonce = random_array::<8>()?;
+    writer.write_all(&seal_request_header(&cmd_key, &auth_id, &nonce, &header)?)?;
+
+    let response_body_key = first_16_sha256(&request_body_key);
+    let response_body_iv = first_16_sha256(&request_body_iv);
+    Ok(VmessRequest {
+        command: VmessCommand::Tcp,
+        user_key: format_uuid_compact(&uuid),
+        user_uuid: outbound
+            .username
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string(),
+        target: target.clone(),
+        client_ip: None,
+        request_body_key,
+        request_body_iv,
+        response_body_key,
+        response_body_iv,
+        response_header,
+        options,
+        security,
+    })
+}
+
+fn write_vmess_target_header(output: &mut Vec<u8>, target: &SocksTarget) -> io::Result<()> {
+    output.extend_from_slice(&target.port.to_be_bytes());
+    if let Ok(ip) = target.host.parse::<Ipv4Addr>() {
+        output.push(ATYP_IPV4);
+        output.extend_from_slice(&ip.octets());
+    } else if let Ok(ip) = target.host.parse::<Ipv6Addr>() {
+        output.push(ATYP_IPV6);
+        output.extend_from_slice(&ip.octets());
+    } else {
+        let host = target.host.trim().trim_matches(['[', ']']);
+        if host.is_empty() || host.len() > u8::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "vmess target host is invalid",
+            ));
+        }
+        output.push(ATYP_DOMAIN);
+        output.push(host.len() as u8);
+        output.extend_from_slice(host.as_bytes());
+    }
+    Ok(())
+}
+
+fn vmess_security_byte(security: VmessSecurity) -> u8 {
+    match security {
+        VmessSecurity::Aes128Gcm => SECURITY_AES128_GCM,
+        VmessSecurity::ChaCha20Poly1305 => SECURITY_CHACHA20_POLY1305,
+        VmessSecurity::None => SECURITY_NONE,
+    }
+}
+
+fn seal_request_header(
+    cmd_key: &[u8; 16],
+    auth_id: &[u8; 16],
+    nonce: &[u8; 8],
+    header: &[u8],
+) -> io::Result<Vec<u8>> {
+    let len_key = kdf16(cmd_key, &[HEADER_LENGTH_KEY, auth_id, nonce.as_slice()]);
+    let len_nonce = first_12(&kdf(
+        cmd_key,
+        &[HEADER_LENGTH_NONCE, auth_id, nonce.as_slice()],
+    ));
+    let payload_key = kdf16(cmd_key, &[HEADER_PAYLOAD_KEY, auth_id, nonce.as_slice()]);
+    let payload_nonce = first_12(&kdf(
+        cmd_key,
+        &[HEADER_PAYLOAD_NONCE, auth_id, nonce.as_slice()],
+    ));
+    let mut output = Vec::with_capacity(42 + header.len());
+    output.extend_from_slice(auth_id);
+    output.extend_from_slice(&aes_gcm_seal(
+        &len_key,
+        &len_nonce,
+        &(header.len() as u16).to_be_bytes(),
+        auth_id,
+    )?);
+    output.extend_from_slice(nonce);
+    output.extend_from_slice(&aes_gcm_seal(
+        &payload_key,
+        &payload_nonce,
+        header,
+        auth_id,
+    )?);
+    Ok(output)
+}
+
+fn read_vmess_response_header<R: Read>(reader: &mut R, request: &VmessRequest) -> io::Result<()> {
+    let mut len_cipher = [0u8; 18];
+    reader.read_exact(&mut len_cipher)?;
+    let len_key = kdf16(&request.response_body_key, &[RESPONSE_HEADER_LENGTH_KEY]);
+    let len_nonce = first_12(&kdf(
+        &request.response_body_iv,
+        &[RESPONSE_HEADER_LENGTH_IV],
+    ));
+    let len = aes_gcm_open(&len_key, &len_nonce, &len_cipher, &[])?;
+    if len.len() != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid vmess response header length",
+        ));
+    }
+    let len = u16::from_be_bytes([len[0], len[1]]) as usize;
+    let mut payload_cipher = vec![0u8; len + 16];
+    reader.read_exact(&mut payload_cipher)?;
+    let payload_key = kdf16(&request.response_body_key, &[RESPONSE_HEADER_PAYLOAD_KEY]);
+    let payload_nonce = first_12(&kdf(
+        &request.response_body_iv,
+        &[RESPONSE_HEADER_PAYLOAD_IV],
+    ));
+    let payload = aes_gcm_open(&payload_key, &payload_nonce, &payload_cipher, &[])?;
+    if payload.len() < 4 || payload[0] != request.response_header {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid vmess response header",
+        ));
+    }
+    Ok(())
+}
+
+fn local_bridge_for_vmess<S>(remote: S, request: VmessRequest) -> io::Result<TcpStream>
+where
+    S: Read + Write + Send + 'static,
+{
+    let local_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let local_addr = local_listener.local_addr()?;
+    let local_client = TcpStream::connect(local_addr)?;
+    let (local_plain, _) = local_listener.accept()?;
+
+    thread::spawn(move || {
+        let _ = relay_plain_to_vmess(local_plain, remote, request);
+    });
+
+    Ok(local_client)
+}
+
+fn relay_plain_to_vmess<S>(
+    mut plain: TcpStream,
+    mut remote: S,
+    request: VmessRequest,
+) -> io::Result<()>
+where
+    S: Read + Write,
+{
+    plain.set_nonblocking(true)?;
+    let mut request_body = VmessBodyEncoder::new_with_length_seed(
+        request.request_body_key,
+        request.request_body_iv,
+        request.request_body_key,
+        request.request_body_iv,
+        request.options,
+        request.security,
+    );
+    let mut response_body = VmessBodyDecoder::new_with_length_seed(
+        request.response_body_key,
+        request.response_body_iv,
+        request.request_body_key,
+        request.request_body_iv,
+        request.options,
+        request.security,
+    );
+    let mut upload_done = false;
+    let mut download_done = false;
+    let mut upload_buffer = [0u8; 16 * 1024];
+    let mut download_buffer = [0u8; 16 * 1024];
+
+    while !upload_done || !download_done {
+        let mut progressed = false;
+
+        if !upload_done {
+            match plain.read(&mut upload_buffer) {
+                Ok(0) => {
+                    upload_done = true;
+                    let _ = request_body.finish(&mut remote);
+                    progressed = true;
+                }
+                Ok(read) => {
+                    request_body.write_plain(&mut remote, &upload_buffer[..read])?;
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    upload_done = true;
+                    let _ = request_body.finish(&mut remote);
+                    progressed = true;
+                }
+            }
+        }
+
+        if !download_done {
+            match response_body.read_plain(&mut remote, &mut download_buffer) {
+                Ok(0) => {
+                    download_done = true;
+                    let _ = plain.shutdown(Shutdown::Write);
+                    progressed = true;
+                }
+                Ok(read) => {
+                    write_all_wait(&mut plain, &download_buffer[..read])?;
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    download_done = true;
+                    let _ = plain.shutdown(Shutdown::Write);
+                    progressed = true;
+                }
+            }
+        }
+
+        if !progressed {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    let _ = request_body.finish(&mut remote);
+    let _ = plain.shutdown(Shutdown::Both);
+    Ok(())
+}
+
+fn random_array<const N: usize>() -> io::Result<[u8; N]> {
+    let mut output = [0u8; N];
+    getrandom::getrandom(&mut output)
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+    Ok(output)
 }
 
 fn write_all_wait<W: Write>(writer: &mut W, mut input: &[u8]) -> io::Result<()> {
@@ -1870,10 +2407,59 @@ fn unix_timestamp() -> i64 {
         .as_secs() as i64
 }
 
-#[cfg(test)]
-fn create_auth_id(cmd_key: &[u8; 16], timestamp: i64, random: [u8; 4]) -> [u8; 16] {
-    use aes::cipher::BlockEncrypt;
+fn tls_error(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
 
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+        ]
+    }
+}
+
+fn create_auth_id(cmd_key: &[u8; 16], timestamp: i64, random: [u8; 4]) -> [u8; 16] {
     let mut plain = [0u8; 16];
     plain[..8].copy_from_slice(&timestamp.to_be_bytes());
     plain[8..12].copy_from_slice(&random);
@@ -1890,9 +2476,12 @@ fn create_auth_id(cmd_key: &[u8; 16], timestamp: i64, random: [u8; 4]) -> [u8; 1
 mod tests {
     use std::fs;
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream, UdpSocket};
+    use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1900,12 +2489,15 @@ mod tests {
     use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
     use super::{
-        create_auth_id, fnv1a, kdf, parse_uuid_bytes, vmess_cmd_key, write_response_header,
-        VmessBodyReader, VmessBodyWriter, VmessCommand, VmessRequest, VmessSecurity, VmessServer,
-        VmessServerConfig, ATYP_IPV4, COMMAND_TCP, COMMAND_UDP, OPTION_AUTHENTICATED_LENGTH,
-        OPTION_CHUNK_MASKING, OPTION_CHUNK_STREAM, OPTION_GLOBAL_PADDING, SECURITY_AES128_GCM,
-        VERSION,
+        connect_vmess_tcp_outbound, create_auth_id, fnv1a, kdf, parse_uuid_bytes, vmess_cmd_key,
+        write_response_header, VmessBodyReader, VmessBodyWriter, VmessCommand, VmessRequest,
+        VmessSecurity, VmessServer, VmessServerConfig, ATYP_IPV4, COMMAND_TCP, COMMAND_UDP,
+        OPTION_AUTHENTICATED_LENGTH, OPTION_CHUNK_MASKING, OPTION_CHUNK_STREAM,
+        OPTION_GLOBAL_PADDING, SECURITY_AES128_GCM, VERSION,
     };
+    use crate::config::{OutboundConfig, OutboundTransportConfig};
+    use crate::grpc::{run_grpc_listener, GrpcStreamHandler};
+    use crate::httpupgrade::accept_httpupgrade;
     use crate::socks5::SocksTarget;
     use crate::tls::TlsAcceptor;
     use crate::user::CoreUser;
@@ -1940,6 +2532,45 @@ mod tests {
             routes: Vec::new(),
             connect_timeout: Duration::from_secs(3),
         })
+    }
+
+    fn echo_server() -> (SocketAddr, thread::JoinHandle<()>) {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            assert_eq!(&bytes, b"ping");
+            stream.write_all(b"pong").expect("echo write");
+        });
+        (echo_addr, echo_thread)
+    }
+
+    fn vmess_outbound(
+        proxy_addr: SocketAddr,
+        transport: Option<OutboundTransportConfig>,
+    ) -> OutboundConfig {
+        OutboundConfig {
+            tag: "vmess-out".to_string(),
+            protocol: "vmess".to_string(),
+            method: Some("aes-128-gcm".to_string()),
+            address: Some(proxy_addr.ip().to_string()),
+            port: Some(proxy_addr.port()),
+            username: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            password: None,
+            tls: None,
+            transport,
+        }
+    }
+
+    fn assert_outbound_reaches_echo(mut stream: TcpStream, echo_thread: thread::JoinHandle<()>) {
+        stream.write_all(b"ping").expect("write payload");
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).expect("read response");
+        assert_eq!(&response, b"pong");
+        drop(stream);
+        echo_thread.join().expect("echo thread");
     }
 
     fn vmess_request(target: std::net::SocketAddr, payload: &[u8]) -> (Vec<u8>, VmessRequest) {
@@ -2295,6 +2926,151 @@ mod tests {
             .expect("new user should authenticate");
         assert_eq!(request.user_uuid, next_user.uuid);
         assert_eq!(request.user_key, "22222222222222222222222222222222");
+    }
+
+    #[test]
+    fn vmess_tcp_outbound_writes_request_and_relays_stream() {
+        let (echo_addr, echo_thread) = echo_server();
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let proxy_thread = thread::spawn(move || {
+            let (stream, _) = proxy.accept().expect("proxy accept");
+            server().handle_tcp_client(stream).expect("vmess proxy");
+        });
+        let target = SocksTarget {
+            host: echo_addr.ip().to_string(),
+            port: echo_addr.port(),
+        };
+        let outbound = vmess_outbound(proxy_addr, None);
+
+        let stream = connect_vmess_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+            .expect("connect outbound");
+
+        assert_outbound_reaches_echo(stream, echo_thread);
+        proxy_thread.join().expect("proxy thread");
+    }
+
+    #[test]
+    fn vmess_websocket_outbound_writes_request_and_relays_stream() {
+        let (echo_addr, echo_thread) = echo_server();
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let proxy_thread = thread::spawn(move || {
+            let (stream, _) = proxy.accept().expect("proxy accept");
+            server()
+                .handle_websocket_client(stream, Some("/vmess"))
+                .expect("vmess websocket proxy");
+        });
+        let target = SocksTarget {
+            host: echo_addr.ip().to_string(),
+            port: echo_addr.port(),
+        };
+        let outbound = vmess_outbound(
+            proxy_addr,
+            Some(OutboundTransportConfig {
+                network: "ws".to_string(),
+                path: Some("/vmess".to_string()),
+                host: Some("example.test".to_string()),
+                service_name: None,
+            }),
+        );
+
+        let stream = connect_vmess_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+            .expect("connect outbound");
+
+        assert_outbound_reaches_echo(stream, echo_thread);
+        proxy_thread.join().expect("proxy thread");
+    }
+
+    #[test]
+    fn vmess_httpupgrade_outbound_writes_request_and_relays_stream() {
+        let (echo_addr, echo_thread) = echo_server();
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let proxy_thread = thread::spawn(move || {
+            let (stream, _) = proxy.accept().expect("proxy accept");
+            let stream = accept_httpupgrade(stream, Some("/vmess"), Some("example.test"))
+                .expect("httpupgrade accept");
+            let reader = stream.try_clone().expect("httpupgrade clone");
+            server()
+                .handle_split_client(reader, stream)
+                .expect("vmess httpupgrade proxy");
+        });
+        let target = SocksTarget {
+            host: echo_addr.ip().to_string(),
+            port: echo_addr.port(),
+        };
+        let outbound = vmess_outbound(
+            proxy_addr,
+            Some(OutboundTransportConfig {
+                network: "httpupgrade".to_string(),
+                path: Some("/vmess".to_string()),
+                host: Some("example.test".to_string()),
+                service_name: None,
+            }),
+        );
+
+        let stream = connect_vmess_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+            .expect("connect outbound");
+
+        assert_outbound_reaches_echo(stream, echo_thread);
+        proxy_thread.join().expect("proxy thread");
+    }
+
+    #[test]
+    fn vmess_grpc_outbound_writes_request_and_relays_stream() {
+        let (echo_addr, echo_thread) = echo_server();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        listener
+            .set_nonblocking(true)
+            .expect("proxy listener nonblocking");
+        let proxy_addr = listener.local_addr().expect("proxy addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let handler_stop = stop.clone();
+        let proxy_thread = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let _guard = runtime.enter();
+            let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+            drop(_guard);
+            let handler: GrpcStreamHandler = Arc::new(move |reader, writer| {
+                server()
+                    .handle_split_client(reader, writer)
+                    .expect("vmess grpc proxy");
+                handler_stop.store(true, Ordering::SeqCst);
+            });
+            runtime
+                .block_on(run_grpc_listener(
+                    listener,
+                    server_stop,
+                    "GunService".to_string(),
+                    None,
+                    handler,
+                ))
+                .expect("grpc listener");
+        });
+        let target = SocksTarget {
+            host: echo_addr.ip().to_string(),
+            port: echo_addr.port(),
+        };
+        let outbound = vmess_outbound(
+            proxy_addr,
+            Some(OutboundTransportConfig {
+                network: "grpc".to_string(),
+                path: None,
+                host: Some("example.test".to_string()),
+                service_name: Some("GunService".to_string()),
+            }),
+        );
+
+        let stream = connect_vmess_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+            .expect("connect outbound");
+
+        assert_outbound_reaches_echo(stream, echo_thread);
+        proxy_thread.join().expect("proxy thread");
     }
 
     #[test]

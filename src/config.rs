@@ -299,7 +299,7 @@ fn validate_outbound(outbound: &OutboundConfig) -> Result<(), ValidationError> {
     }
     if !matches!(
         outbound.protocol.trim().to_ascii_lowercase().as_str(),
-        "freedom" | "socks" | "socks5" | "http" | "shadowsocks" | "trojan" | "vless"
+        "freedom" | "socks" | "socks5" | "http" | "shadowsocks" | "trojan" | "vless" | "vmess"
     ) {
         return Err(ValidationError::new(format!(
             "outbound {} protocol {} is not implemented in keli-core-rs yet",
@@ -333,7 +333,7 @@ fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), Validatio
     }
     if matches!(
         protocol.as_str(),
-        "socks" | "socks5" | "http" | "shadowsocks" | "trojan" | "vless"
+        "socks" | "socks5" | "http" | "shadowsocks" | "trojan" | "vless" | "vmess"
     ) {
         if outbound
             .address
@@ -422,9 +422,43 @@ fn validate_outbound_endpoint(outbound: &OutboundConfig) -> Result<(), Validatio
             )));
         }
     }
-    if outbound.tls.is_some() && !matches!(protocol.as_str(), "trojan" | "vless") {
+    if protocol == "vmess" {
+        let user_id = outbound
+            .username
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default();
+        if parse_vless_outbound_uuid(user_id).is_none() {
+            return Err(ValidationError::new(format!(
+                "outbound {} username must be a vmess uuid",
+                outbound.tag
+            )));
+        }
+        let security = outbound
+            .method
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("auto")
+            .to_ascii_lowercase();
+        if !matches!(
+            security.as_str(),
+            "auto"
+                | "aes-128-gcm"
+                | "aes128-gcm"
+                | "chacha20-poly1305"
+                | "chacha20-ietf-poly1305"
+                | "none"
+        ) {
+            return Err(ValidationError::new(format!(
+                "outbound {} vmess security {} is not supported",
+                outbound.tag, security
+            )));
+        }
+    }
+    if outbound.tls.is_some() && !matches!(protocol.as_str(), "trojan" | "vless" | "vmess") {
         return Err(ValidationError::new(format!(
-            "outbound {} tls is supported only for trojan and vless today",
+            "outbound {} tls is supported only for trojan, vless, and vmess today",
             outbound.tag
         )));
     }
@@ -439,9 +473,9 @@ fn validate_outbound_transport(
         return Ok(());
     };
     let network = outbound_transport_network(outbound).to_ascii_lowercase();
-    if !matches!(protocol, "vless" | "trojan") {
+    if !matches!(protocol, "vless" | "trojan" | "vmess") {
         return Err(ValidationError::new(format!(
-            "outbound {} transport is supported only for vless and trojan today",
+            "outbound {} transport is supported only for vless, trojan, and vmess today",
             outbound.tag
         )));
     }
@@ -1647,7 +1681,7 @@ mod tests {
                     method: None,
                     address: Some("127.0.0.1".to_string()),
                     port: Some(1080),
-                    username: None,
+                    username: Some("11111111-1111-1111-1111-111111111111".to_string()),
                     password: None,
                     tls: None,
                     transport: None,
@@ -1656,10 +1690,16 @@ mod tests {
             stats: StatsConfig::default(),
         };
 
+        config
+            .validate()
+            .expect("embedded vmess route outbound should validate");
+
+        let mut config = config;
+        config.routes[0].outbound.as_mut().unwrap().protocol = "naive".to_string();
         let error = config
             .validate()
             .expect_err("embedded unsupported outbounds should fail before runtime");
-        assert!(error.to_string().contains("protocol vmess"));
+        assert!(error.to_string().contains("protocol naive"));
     }
 
     #[test]

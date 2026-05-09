@@ -23,6 +23,7 @@ pub fn connect_tcp_outbound(
         }
         "trojan" => crate::trojan::connect_trojan_tcp_outbound(outbound, target, timeout),
         "vless" => crate::vless::connect_vless_tcp_outbound(outbound, target, timeout),
+        "vmess" => crate::vmess::connect_vmess_tcp_outbound(outbound, target, timeout),
         protocol => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("outbound protocol {protocol} is not implemented"),
