@@ -1,4 +1,4 @@
-﻿use std::collections::HashSet;
+use std::collections::HashSet;
 use std::fmt;
 use std::net::IpAddr;
 
@@ -445,7 +445,7 @@ fn validate_outbound_transport(
             outbound.tag
         )));
     }
-    if !matches!(network.as_str(), "tcp" | "ws") {
+    if !matches!(network.as_str(), "tcp" | "ws" | "httpupgrade") {
         return Err(ValidationError::new(format!(
             "outbound {} {} transport {} is not supported yet",
             outbound.tag, outbound.protocol, network
@@ -458,9 +458,9 @@ fn validate_outbound_transport(
         .as_deref()
         .map(str::trim)
         .unwrap_or_default();
-    if !matches!(network.as_str(), "ws") && (!path.is_empty() || !host.is_empty()) {
+    if !matches!(network.as_str(), "ws" | "httpupgrade") && (!path.is_empty() || !host.is_empty()) {
         return Err(ValidationError::new(format!(
-            "outbound {} transport path/host is supported only for ws today",
+            "outbound {} transport path/host is supported only for ws/httpupgrade today",
             outbound.tag
         )));
     }
@@ -1493,6 +1493,16 @@ mod tests {
             .validate()
             .expect("trojan websocket outbound should validate");
 
+        config.outbounds[0].transport = Some(OutboundTransportConfig {
+            network: "httpupgrade".to_string(),
+            path: Some("/trojan".to_string()),
+            host: Some("example.com".to_string()),
+            service_name: None,
+        });
+        config
+            .validate()
+            .expect("trojan httpupgrade outbound should validate");
+
         config.outbounds[0].transport = None;
         config.outbounds[0].password = None;
         let error = config
@@ -1561,6 +1571,16 @@ mod tests {
         config
             .validate()
             .expect("vless websocket outbound should validate");
+
+        config.outbounds[0].transport = Some(OutboundTransportConfig {
+            network: "httpupgrade".to_string(),
+            path: Some("/vless".to_string()),
+            host: Some("example.com".to_string()),
+            service_name: None,
+        });
+        config
+            .validate()
+            .expect("vless httpupgrade outbound should validate");
 
         config.outbounds[0].transport = Some(OutboundTransportConfig {
             network: "grpc".to_string(),

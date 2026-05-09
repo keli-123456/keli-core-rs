@@ -1,4 +1,4 @@
-﻿use std::io::{self, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
@@ -15,6 +15,7 @@ use rustls::{
 use sha2::{Digest, Sha224};
 
 use crate::config::{outbound_transport_network, OutboundConfig, OutboundTlsConfig};
+use crate::httpupgrade::connect_httpupgrade_client;
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
@@ -685,6 +686,11 @@ pub(crate) fn connect_trojan_tcp_outbound(
     if network == "ws" {
         return connect_trojan_websocket_tcp_outbound(outbound, &server, password, target, timeout);
     }
+    if network == "httpupgrade" {
+        return connect_trojan_httpupgrade_tcp_outbound(
+            outbound, &server, password, target, timeout,
+        );
+    }
     if network != "tcp" {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -701,6 +707,42 @@ pub(crate) fn connect_trojan_tcp_outbound(
     Ok(stream)
 }
 
+fn connect_trojan_httpupgrade_tcp_outbound(
+    outbound: &OutboundConfig,
+    server: &SocksTarget,
+    password: &str,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    if outbound.tls.is_some() {
+        let tls_stream = connect_trojan_tls_stream(outbound, server, timeout)?;
+        let host = outbound_transport_host(outbound, server);
+        let mut tls_stream =
+            connect_httpupgrade_client(tls_stream, outbound_transport_path(outbound), &host)?;
+        write_trojan_tcp_request(&mut tls_stream, password, target)?;
+        tls_stream.flush()?;
+
+        let local_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+        let local_addr = local_listener.local_addr()?;
+        let local_client = TcpStream::connect(local_addr)?;
+        let (local_plain, _) = local_listener.accept()?;
+
+        thread::spawn(move || {
+            let _ = relay_plain_to_tls(local_plain, tls_stream);
+        });
+
+        return Ok(local_client);
+    }
+
+    let remote = connect_target(server, timeout)?;
+    remote.set_read_timeout(Some(timeout))?;
+    remote.set_write_timeout(Some(timeout))?;
+    let host = outbound_transport_host(outbound, server);
+    let mut stream = connect_httpupgrade_client(remote, outbound_transport_path(outbound), &host)?;
+    write_trojan_tcp_request(&mut stream, password, target)?;
+    Ok(stream)
+}
+
 fn connect_trojan_websocket_tcp_outbound(
     outbound: &OutboundConfig,
     server: &SocksTarget,
@@ -710,9 +752,9 @@ fn connect_trojan_websocket_tcp_outbound(
 ) -> io::Result<TcpStream> {
     if outbound.tls.is_some() {
         let tls_stream = connect_trojan_tls_stream(outbound, server, timeout)?;
-        let host = outbound_websocket_host(outbound, server);
+        let host = outbound_transport_host(outbound, server);
         let mut websocket =
-            connect_websocket_client(tls_stream, outbound_websocket_path(outbound), &host)?;
+            connect_websocket_client(tls_stream, outbound_transport_path(outbound), &host)?;
         write_trojan_tcp_request(&mut websocket, password, target)?;
         websocket.flush()?;
         websocket.get_mut().sock.set_nonblocking(true)?;
@@ -722,8 +764,8 @@ fn connect_trojan_websocket_tcp_outbound(
     let remote = connect_target(server, timeout)?;
     remote.set_read_timeout(Some(timeout))?;
     remote.set_write_timeout(Some(timeout))?;
-    let host = outbound_websocket_host(outbound, server);
-    let mut websocket = connect_websocket_client(remote, outbound_websocket_path(outbound), &host)?;
+    let host = outbound_transport_host(outbound, server);
+    let mut websocket = connect_websocket_client(remote, outbound_transport_path(outbound), &host)?;
     write_trojan_tcp_request(&mut websocket, password, target)?;
     websocket.flush()?;
     websocket.get_mut().set_nonblocking(true)?;
@@ -830,7 +872,7 @@ fn trojan_outbound_server(outbound: &OutboundConfig) -> io::Result<SocksTarget> 
     Ok(SocksTarget { host, port })
 }
 
-fn outbound_websocket_path(outbound: &OutboundConfig) -> Option<&str> {
+fn outbound_transport_path(outbound: &OutboundConfig) -> Option<&str> {
     outbound
         .transport
         .as_ref()
@@ -839,7 +881,7 @@ fn outbound_websocket_path(outbound: &OutboundConfig) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-fn outbound_websocket_host(outbound: &OutboundConfig, server: &SocksTarget) -> String {
+fn outbound_transport_host(outbound: &OutboundConfig, server: &SocksTarget) -> String {
     outbound
         .transport
         .as_ref()
@@ -1247,6 +1289,7 @@ mod tests {
     use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
     use crate::config::{OutboundConfig, OutboundTlsConfig, OutboundTransportConfig};
+    use crate::httpupgrade::accept_httpupgrade;
     use crate::socks5::SocksTarget;
     use crate::tls::TlsAcceptor;
     use crate::trojan::{
@@ -1672,6 +1715,57 @@ mod tests {
             tls: None,
             transport: Some(OutboundTransportConfig {
                 network: "ws".to_string(),
+                path: Some("/trojan".to_string()),
+                host: Some("example.test".to_string()),
+                service_name: None,
+            }),
+        };
+        let target = SocksTarget {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+        let mut stream = connect_trojan_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+            .expect("connect outbound");
+        stream.write_all(b"ping").expect("write payload");
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).expect("read response");
+        assert_eq!(&response, b"pong");
+        proxy_thread.join().expect("proxy thread");
+    }
+
+    #[test]
+    fn trojan_httpupgrade_outbound_writes_request_and_relays_stream() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let proxy_thread = thread::spawn(move || {
+            let (stream, _) = proxy.accept().expect("proxy accept");
+            let mut stream = accept_httpupgrade(stream, Some("/trojan"), Some("example.test"))
+                .expect("httpupgrade accept");
+            let server = server();
+            let request = server.read_request(&mut stream).expect("trojan request");
+            assert_eq!(
+                request.password_hash,
+                trojan_password_hash("trojan-password")
+            );
+            assert_eq!(request.target.host, "example.com");
+            assert_eq!(request.target.port, 443);
+            let mut payload = [0u8; 4];
+            stream.read_exact(&mut payload).expect("payload");
+            assert_eq!(&payload, b"ping");
+            stream.write_all(b"pong").expect("response");
+        });
+
+        let outbound = OutboundConfig {
+            tag: "trojan-out".to_string(),
+            protocol: "trojan".to_string(),
+            method: None,
+            address: Some(proxy_addr.ip().to_string()),
+            port: Some(proxy_addr.port()),
+            username: None,
+            password: Some("trojan-password".to_string()),
+            tls: None,
+            transport: Some(OutboundTransportConfig {
+                network: "httpupgrade".to_string(),
                 path: Some("/trojan".to_string()),
                 host: Some("example.test".to_string()),
                 service_name: None,

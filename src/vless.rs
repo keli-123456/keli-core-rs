@@ -14,6 +14,7 @@ use rustls::{
 };
 
 use crate::config::{outbound_transport_network, OutboundConfig, OutboundTlsConfig};
+use crate::httpupgrade::connect_httpupgrade_client;
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
@@ -787,6 +788,11 @@ pub(crate) fn connect_vless_tcp_outbound(
             outbound, &server, &user_id, flow, target, timeout,
         );
     }
+    if network == "httpupgrade" {
+        return connect_vless_httpupgrade_tcp_outbound(
+            outbound, &server, &user_id, flow, target, timeout,
+        );
+    }
     if network != "tcp" {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -804,6 +810,45 @@ pub(crate) fn connect_vless_tcp_outbound(
     Ok(stream)
 }
 
+fn connect_vless_httpupgrade_tcp_outbound(
+    outbound: &OutboundConfig,
+    server: &SocksTarget,
+    user_id: &[u8; 16],
+    flow: &str,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    if outbound.tls.is_some() {
+        let tls_stream = connect_vless_tls_stream(outbound, server, timeout)?;
+        let host = outbound_transport_host(outbound, server);
+        let mut tls_stream =
+            connect_httpupgrade_client(tls_stream, outbound_transport_path(outbound), &host)?;
+        write_vless_tcp_request(&mut tls_stream, user_id, flow, target)?;
+        tls_stream.flush()?;
+        read_vless_response_header(&mut tls_stream)?;
+
+        let local_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+        let local_addr = local_listener.local_addr()?;
+        let local_client = TcpStream::connect(local_addr)?;
+        let (local_plain, _) = local_listener.accept()?;
+
+        thread::spawn(move || {
+            let _ = relay_plain_to_tls(local_plain, tls_stream);
+        });
+
+        return Ok(local_client);
+    }
+
+    let remote = connect_target(server, timeout)?;
+    remote.set_read_timeout(Some(timeout))?;
+    remote.set_write_timeout(Some(timeout))?;
+    let host = outbound_transport_host(outbound, server);
+    let mut stream = connect_httpupgrade_client(remote, outbound_transport_path(outbound), &host)?;
+    write_vless_tcp_request(&mut stream, user_id, flow, target)?;
+    read_vless_response_header(&mut stream)?;
+    Ok(stream)
+}
+
 fn connect_vless_websocket_tcp_outbound(
     outbound: &OutboundConfig,
     server: &SocksTarget,
@@ -814,9 +859,9 @@ fn connect_vless_websocket_tcp_outbound(
 ) -> io::Result<TcpStream> {
     if outbound.tls.is_some() {
         let tls_stream = connect_vless_tls_stream(outbound, server, timeout)?;
-        let host = outbound_websocket_host(outbound, server);
+        let host = outbound_transport_host(outbound, server);
         let mut websocket =
-            connect_websocket_client(tls_stream, outbound_websocket_path(outbound), &host)?;
+            connect_websocket_client(tls_stream, outbound_transport_path(outbound), &host)?;
         write_vless_tcp_request(&mut websocket, user_id, flow, target)?;
         websocket.flush()?;
         read_vless_response_header(&mut websocket)?;
@@ -827,8 +872,8 @@ fn connect_vless_websocket_tcp_outbound(
     let remote = connect_target(server, timeout)?;
     remote.set_read_timeout(Some(timeout))?;
     remote.set_write_timeout(Some(timeout))?;
-    let host = outbound_websocket_host(outbound, server);
-    let mut websocket = connect_websocket_client(remote, outbound_websocket_path(outbound), &host)?;
+    let host = outbound_transport_host(outbound, server);
+    let mut websocket = connect_websocket_client(remote, outbound_transport_path(outbound), &host)?;
     write_vless_tcp_request(&mut websocket, user_id, flow, target)?;
     websocket.flush()?;
     read_vless_response_header(&mut websocket)?;
@@ -953,7 +998,7 @@ fn vless_outbound_user_id(outbound: &OutboundConfig) -> io::Result<[u8; 16]> {
     parse_uuid_bytes(value)
 }
 
-fn outbound_websocket_path(outbound: &OutboundConfig) -> Option<&str> {
+fn outbound_transport_path(outbound: &OutboundConfig) -> Option<&str> {
     outbound
         .transport
         .as_ref()
@@ -962,7 +1007,7 @@ fn outbound_websocket_path(outbound: &OutboundConfig) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-fn outbound_websocket_host(outbound: &OutboundConfig, server: &SocksTarget) -> String {
+fn outbound_transport_host(outbound: &OutboundConfig, server: &SocksTarget) -> String {
     outbound
         .transport
         .as_ref()
@@ -1593,6 +1638,7 @@ mod tests {
     use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
     use crate::config::{OutboundConfig, OutboundTlsConfig, OutboundTransportConfig};
+    use crate::httpupgrade::accept_httpupgrade;
     use crate::socks5::SocksTarget;
     use crate::tls::TlsAcceptor;
     use crate::user::CoreUser;
@@ -2116,6 +2162,58 @@ mod tests {
                 network: "ws".to_string(),
                 path: Some("/vless".to_string()),
                 host: Some("localhost".to_string()),
+                service_name: None,
+            }),
+        };
+        let target = SocksTarget {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+
+        let mut stream = connect_vless_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+            .expect("connect outbound");
+        stream.write_all(b"ping").expect("write payload");
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).expect("read response");
+
+        assert_eq!(&response, b"pong");
+        proxy_thread.join().expect("proxy thread");
+    }
+
+    #[test]
+    fn vless_httpupgrade_outbound_writes_request_and_relays_stream() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let proxy_thread = thread::spawn(move || {
+            let (stream, _) = proxy.accept().expect("proxy accept");
+            let mut stream = accept_httpupgrade(stream, Some("/vless"), Some("example.test"))
+                .expect("httpupgrade accept");
+            let request = server().read_request(&mut stream).expect("vless request");
+            assert_eq!(request.user_uuid, "11111111-1111-1111-1111-111111111111");
+            assert_eq!(request.target.host, "example.com");
+            assert_eq!(request.target.port, 443);
+
+            stream
+                .write_all(&[super::VERSION, 0x00])
+                .expect("response header");
+            let mut payload = [0u8; 4];
+            stream.read_exact(&mut payload).expect("payload");
+            assert_eq!(&payload, b"ping");
+            stream.write_all(b"pong").expect("response");
+        });
+        let outbound = OutboundConfig {
+            tag: "vless-out".to_string(),
+            protocol: "vless".to_string(),
+            method: None,
+            address: Some(proxy_addr.ip().to_string()),
+            port: Some(proxy_addr.port()),
+            username: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            password: None,
+            tls: None,
+            transport: Some(OutboundTransportConfig {
+                network: "httpupgrade".to_string(),
+                path: Some("/vless".to_string()),
+                host: Some("example.test".to_string()),
                 service_name: None,
             }),
         };

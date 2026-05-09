@@ -33,6 +33,33 @@ pub fn accept_httpupgrade_tls(
     Ok(stream)
 }
 
+pub fn connect_httpupgrade_client<S: Read + Write>(
+    mut stream: S,
+    path: Option<&str>,
+    host: &str,
+) -> io::Result<S> {
+    let path = path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("/");
+    let host = host.trim();
+    if host.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "httpupgrade outbound host is required",
+        ));
+    }
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes())?;
+    stream.flush()?;
+
+    let response = read_http_upgrade(&mut stream)?;
+    validate_httpupgrade_response(&response)?;
+    Ok(stream)
+}
+
 fn read_http_upgrade<R: Read>(stream: &mut R) -> io::Result<String> {
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
@@ -135,6 +162,42 @@ fn validate_host(host: Option<&str>, expected_host: Option<&str>) -> io::Result<
     Err(io::Error::new(
         io::ErrorKind::PermissionDenied,
         "httpupgrade host does not match inbound transport host",
+    ))
+}
+
+fn validate_httpupgrade_response(response: &str) -> io::Result<()> {
+    let mut lines = response.split("\r\n");
+    let status = lines.next().unwrap_or_default();
+    if !status.contains(" 101 ") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "httpupgrade outbound upgrade failed",
+        ));
+    }
+    let mut upgrade = false;
+    let mut connection_upgrade = false;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case("websocket") {
+            upgrade = true;
+        } else if name.eq_ignore_ascii_case("connection")
+            && value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+        {
+            connection_upgrade = true;
+        }
+    }
+    if upgrade && connection_upgrade {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "httpupgrade outbound upgrade response is invalid",
     ))
 }
 
