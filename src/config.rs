@@ -445,7 +445,7 @@ fn validate_outbound_transport(
             outbound.tag
         )));
     }
-    if !matches!(network.as_str(), "tcp" | "ws" | "httpupgrade") {
+    if !matches!(network.as_str(), "tcp" | "ws" | "httpupgrade" | "grpc") {
         return Err(ValidationError::new(format!(
             "outbound {} {} transport {} is not supported yet",
             outbound.tag, outbound.protocol, network
@@ -464,9 +464,9 @@ fn validate_outbound_transport(
             outbound.tag
         )));
     }
-    if !service_name.is_empty() {
+    if network != "grpc" && !service_name.is_empty() {
         return Err(ValidationError::new(format!(
-            "outbound {} grpc service_name is not supported yet",
+            "outbound {} grpc service_name is supported only for grpc transport",
             outbound.tag
         )));
     }
@@ -1503,6 +1503,16 @@ mod tests {
             .validate()
             .expect("trojan httpupgrade outbound should validate");
 
+        config.outbounds[0].transport = Some(OutboundTransportConfig {
+            network: "grpc".to_string(),
+            path: None,
+            host: None,
+            service_name: Some("GunService".to_string()),
+        });
+        config
+            .validate()
+            .expect("trojan grpc outbound should validate");
+
         config.outbounds[0].transport = None;
         config.outbounds[0].password = None;
         let error = config
@@ -1588,10 +1598,9 @@ mod tests {
             host: None,
             service_name: Some("GunService".to_string()),
         });
-        let error = config
+        config
             .validate()
-            .expect_err("unsupported outbound grpc transport should fail");
-        assert!(error.to_string().contains("not supported yet"));
+            .expect("vless grpc outbound should validate");
 
         config.outbounds[0].transport = None;
         config.outbounds[0].tls = None;

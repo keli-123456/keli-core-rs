@@ -1,4 +1,5 @@
 use std::io::{self, Read, Write};
+use std::net::Ipv6Addr;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
@@ -6,11 +7,16 @@ use std::time::Duration;
 use bytes::Bytes;
 use h2::RecvStream;
 use http::{HeaderMap, Request, Response, StatusCode};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio_rustls::TlsAcceptor as TokioTlsAcceptor;
+use tokio_rustls::{TlsAcceptor as TokioTlsAcceptor, TlsConnector};
 
+use crate::config::OutboundTlsConfig;
+use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
 
 const DEFAULT_SERVICE_NAME: &str = "GunService";
@@ -35,6 +41,13 @@ pub struct GrpcHunkReader {
 #[derive(Clone)]
 pub struct GrpcHunkWriter {
     tx: UnboundedSender<Vec<u8>>,
+}
+
+pub(crate) struct GrpcClientStream {
+    rx: mpsc::Receiver<Vec<u8>>,
+    tx: UnboundedSender<Vec<u8>>,
+    buffer: Vec<u8>,
+    nonblocking: bool,
 }
 
 pub async fn run_grpc_listener(
@@ -80,6 +93,214 @@ pub async fn run_grpc_listener(
     }
 
     Ok(())
+}
+
+pub(crate) fn connect_grpc_client(
+    server: &SocksTarget,
+    timeout: Duration,
+    tls: Option<&OutboundTlsConfig>,
+    service_name: Option<&str>,
+    host: &str,
+) -> io::Result<GrpcClientStream> {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (input_tx, input_rx) = mpsc::channel();
+    let (output_tx, output_rx) = unbounded_channel();
+    let server = server.clone();
+    let tls = tls.cloned();
+    let service_name = service_name.unwrap_or(DEFAULT_SERVICE_NAME).to_string();
+    let host = host.trim().trim_matches(['[', ']']).to_string();
+
+    thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = ready_tx.send(Err(io_other(error)));
+                return;
+            }
+        };
+        let result = runtime.block_on(run_grpc_client(
+            server,
+            timeout,
+            tls,
+            service_name,
+            host,
+            input_tx,
+            output_rx,
+            ready_tx.clone(),
+        ));
+        if let Err(error) = result {
+            let _ = ready_tx.send(Err(error));
+        }
+    });
+
+    match ready_rx.recv_timeout(timeout) {
+        Ok(Ok(())) => Ok(GrpcClientStream::new(input_rx, output_tx)),
+        Ok(Err(error)) => Err(error),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "grpc outbound handshake timed out",
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "grpc outbound worker exited before handshake",
+        )),
+    }
+}
+
+async fn run_grpc_client(
+    server: SocksTarget,
+    timeout: Duration,
+    tls: Option<OutboundTlsConfig>,
+    service_name: String,
+    host: String,
+    input_tx: mpsc::Sender<Vec<u8>>,
+    output_rx: UnboundedReceiver<Vec<u8>>,
+    ready_tx: mpsc::Sender<io::Result<()>>,
+) -> io::Result<()> {
+    let tcp = crate::dns::connect_tcp_tokio(&server.host, server.port, timeout).await?;
+    tcp.set_nodelay(true)?;
+    let request_host = first_non_empty(host.trim(), server.host.trim()).to_string();
+
+    if let Some(tls_config) = tls {
+        let server_name = grpc_tls_server_name(&tls_config, &server)?;
+        let connector = TlsConnector::from(grpc_tls_client_config(&tls_config));
+        let stream = tokio::time::timeout(timeout, connector.connect(server_name, tcp))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "grpc tls handshake timed out"))?
+            .map_err(io_other)?;
+        run_grpc_client_stream(
+            stream,
+            true,
+            request_host,
+            service_name,
+            input_tx,
+            output_rx,
+            ready_tx,
+        )
+        .await
+    } else {
+        run_grpc_client_stream(
+            tcp,
+            false,
+            request_host,
+            service_name,
+            input_tx,
+            output_rx,
+            ready_tx,
+        )
+        .await
+    }
+}
+
+async fn run_grpc_client_stream<S>(
+    stream: S,
+    tls: bool,
+    host: String,
+    service_name: String,
+    input_tx: mpsc::Sender<Vec<u8>>,
+    output_rx: UnboundedReceiver<Vec<u8>>,
+    ready_tx: mpsc::Sender<io::Result<()>>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut client, connection) = h2::client::handshake(stream).await.map_err(io_other)?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let path = grpc_tun_path(&service_name);
+    let uri = grpc_request_uri(tls, &host, &path);
+    let request = Request::builder()
+        .method(http::Method::POST)
+        .uri(uri)
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .map_err(io_other)?;
+    let (response, mut send) = client.send_request(request, false).map_err(io_other)?;
+    let response = response.await.map_err(io_other)?;
+    if response.status() != StatusCode::OK {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("grpc outbound server returned {}", response.status()),
+        ));
+    }
+    let response_task = read_grpc_hunks(response.into_body(), input_tx);
+    let request_task = write_grpc_client_hunks(&mut send, output_rx);
+    let _ = ready_tx.send(Ok(()));
+    let (response_result, request_result) = tokio::join!(response_task, request_task);
+    response_result?;
+    request_result
+}
+
+async fn write_grpc_client_hunks(
+    send: &mut h2::SendStream<Bytes>,
+    mut rx: UnboundedReceiver<Vec<u8>>,
+) -> io::Result<()> {
+    while let Some(payload) = rx.recv().await {
+        send.send_data(Bytes::from(encode_grpc_hunk(&payload)), false)
+            .map_err(io_other)?;
+    }
+    send.send_data(Bytes::new(), true).map_err(io_other)
+}
+
+fn grpc_tls_client_config(tls: &OutboundTlsConfig) -> Arc<ClientConfig> {
+    let mut config = if tls.allow_insecure {
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth()
+    } else {
+        let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
+    let mut alpn = tls.alpn.clone();
+    if alpn.is_empty() {
+        alpn.push("h2".to_string());
+    } else if !alpn.iter().any(|value| value == "h2") {
+        alpn.insert(0, "h2".to_string());
+    }
+    config.alpn_protocols = alpn.iter().map(|value| value.as_bytes().to_vec()).collect();
+    Arc::new(config)
+}
+
+fn grpc_tls_server_name(
+    tls: &OutboundTlsConfig,
+    server: &SocksTarget,
+) -> io::Result<ServerName<'static>> {
+    let value = tls.server_name.trim().trim_matches(['[', ']']).to_string();
+    let value = if value.is_empty() {
+        server.host.trim().trim_matches(['[', ']']).to_string()
+    } else {
+        value
+    };
+    ServerName::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "grpc tls server_name is invalid",
+        )
+    })
+}
+
+fn grpc_request_uri(tls: bool, host: &str, path: &str) -> String {
+    let scheme = if tls { "https" } else { "http" };
+    let authority = grpc_authority(host);
+    format!("{scheme}://{authority}{path}")
+}
+
+fn grpc_authority(host: &str) -> String {
+    let host = host.trim().trim_matches(['[', ']']);
+    if host.parse::<Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
 }
 
 fn tokio_tls_acceptor(config: GrpcTlsConfig) -> io::Result<TokioTlsAcceptor> {
@@ -360,6 +581,68 @@ impl Read for GrpcHunkReader {
     }
 }
 
+impl GrpcClientStream {
+    fn new(rx: mpsc::Receiver<Vec<u8>>, tx: UnboundedSender<Vec<u8>>) -> Self {
+        Self {
+            rx,
+            tx,
+            buffer: Vec::new(),
+            nonblocking: false,
+        }
+    }
+
+    pub(crate) fn set_nonblocking(&mut self, nonblocking: bool) {
+        self.nonblocking = nonblocking;
+    }
+}
+
+impl Read for GrpcClientStream {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        while self.buffer.is_empty() {
+            if self.nonblocking {
+                match self.rx.try_recv() {
+                    Ok(data) => self.buffer = data,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "grpc stream has no data available",
+                        ));
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => return Ok(0),
+                }
+            } else {
+                match self.rx.recv() {
+                    Ok(data) => self.buffer = data,
+                    Err(_) => return Ok(0),
+                }
+            }
+        }
+        let len = output.len().min(self.buffer.len());
+        output[..len].copy_from_slice(&self.buffer[..len]);
+        self.buffer.drain(..len);
+        Ok(len)
+    }
+}
+
+impl Write for GrpcClientStream {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if input.is_empty() {
+            return Ok(0);
+        }
+        self.tx
+            .send(input.to_vec())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "grpc stream closed"))?;
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl GrpcHunkWriter {
     fn new(tx: UnboundedSender<Vec<u8>>) -> Self {
         Self { tx }
@@ -379,6 +662,54 @@ impl Write for GrpcHunkWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+        ]
     }
 }
 

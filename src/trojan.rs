@@ -15,6 +15,7 @@ use rustls::{
 use sha2::{Digest, Sha224};
 
 use crate::config::{outbound_transport_network, OutboundConfig, OutboundTlsConfig};
+use crate::grpc::{connect_grpc_client, GrpcClientStream};
 use crate::httpupgrade::connect_httpupgrade_client;
 use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
@@ -691,6 +692,9 @@ pub(crate) fn connect_trojan_tcp_outbound(
             outbound, &server, password, target, timeout,
         );
     }
+    if network == "grpc" {
+        return connect_trojan_grpc_tcp_outbound(outbound, &server, password, target, timeout);
+    }
     if network != "tcp" {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -705,6 +709,27 @@ pub(crate) fn connect_trojan_tcp_outbound(
     stream.set_write_timeout(Some(timeout))?;
     write_trojan_tcp_request(&mut stream, password, target)?;
     Ok(stream)
+}
+
+fn connect_trojan_grpc_tcp_outbound(
+    outbound: &OutboundConfig,
+    server: &SocksTarget,
+    password: &str,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let host = outbound_transport_host(outbound, server);
+    let mut grpc = connect_grpc_client(
+        server,
+        timeout,
+        outbound.tls.as_ref(),
+        outbound_transport_service_name(outbound),
+        &host,
+    )?;
+    write_trojan_tcp_request(&mut grpc, password, target)?;
+    grpc.flush()?;
+    grpc.set_nonblocking(true);
+    local_bridge_for_grpc(grpc)
 }
 
 fn connect_trojan_httpupgrade_tcp_outbound(
@@ -895,6 +920,15 @@ fn outbound_transport_host(outbound: &OutboundConfig, server: &SocksTarget) -> S
         .to_string()
 }
 
+fn outbound_transport_service_name(outbound: &OutboundConfig) -> Option<&str> {
+    outbound
+        .transport
+        .as_ref()
+        .and_then(|transport| transport.service_name.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 fn write_trojan_tcp_request<W: Write>(
     writer: &mut W,
     password: &str,
@@ -1011,6 +1045,19 @@ where
     Ok(local_client)
 }
 
+fn local_bridge_for_grpc(grpc: GrpcClientStream) -> io::Result<TcpStream> {
+    let local_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let local_addr = local_listener.local_addr()?;
+    let local_client = TcpStream::connect(local_addr)?;
+    let (local_plain, _) = local_listener.accept()?;
+
+    thread::spawn(move || {
+        let _ = relay_plain_to_grpc(local_plain, grpc);
+    });
+
+    Ok(local_client)
+}
+
 fn relay_plain_to_websocket<S>(
     mut plain: TcpStream,
     mut websocket: WebSocketClientStream<S>,
@@ -1050,6 +1097,66 @@ where
 
         if !download_done {
             match websocket.read(&mut download_buffer) {
+                Ok(0) => {
+                    download_done = true;
+                    let _ = plain.shutdown(Shutdown::Write);
+                    progressed = true;
+                }
+                Ok(read) => {
+                    write_all_wait(&mut plain, &download_buffer[..read])?;
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    download_done = true;
+                    let _ = plain.shutdown(Shutdown::Write);
+                    progressed = true;
+                }
+            }
+        }
+
+        if !progressed {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    let _ = plain.shutdown(Shutdown::Both);
+    Ok(())
+}
+
+fn relay_plain_to_grpc(mut plain: TcpStream, mut grpc: GrpcClientStream) -> io::Result<()> {
+    plain.set_nonblocking(true)?;
+
+    let mut upload_done = false;
+    let mut download_done = false;
+    let mut upload_buffer = [0u8; 16 * 1024];
+    let mut download_buffer = [0u8; 16 * 1024];
+
+    while !upload_done || !download_done {
+        let mut progressed = false;
+
+        if !upload_done {
+            match plain.read(&mut upload_buffer) {
+                Ok(0) => {
+                    upload_done = true;
+                    let _ = grpc.flush();
+                    progressed = true;
+                }
+                Ok(read) => {
+                    write_all_wait(&mut grpc, &upload_buffer[..read])?;
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    upload_done = true;
+                    let _ = grpc.flush();
+                    progressed = true;
+                }
+            }
+        }
+
+        if !download_done {
+            match grpc.read(&mut download_buffer) {
                 Ok(0) => {
                     download_done = true;
                     let _ = plain.shutdown(Shutdown::Write);
@@ -1281,7 +1388,10 @@ mod tests {
     use std::io::{Cursor, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1289,6 +1399,7 @@ mod tests {
     use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
     use crate::config::{OutboundConfig, OutboundTlsConfig, OutboundTransportConfig};
+    use crate::grpc::{run_grpc_listener, GrpcStreamHandler};
     use crate::httpupgrade::accept_httpupgrade;
     use crate::socks5::SocksTarget;
     use crate::tls::TlsAcceptor;
@@ -1769,6 +1880,79 @@ mod tests {
                 path: Some("/trojan".to_string()),
                 host: Some("example.test".to_string()),
                 service_name: None,
+            }),
+        };
+        let target = SocksTarget {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+        let mut stream = connect_trojan_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+            .expect("connect outbound");
+        stream.write_all(b"ping").expect("write payload");
+        let mut response = [0u8; 4];
+        stream.read_exact(&mut response).expect("read response");
+        assert_eq!(&response, b"pong");
+        proxy_thread.join().expect("proxy thread");
+    }
+
+    #[test]
+    fn trojan_grpc_outbound_writes_request_and_relays_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        listener
+            .set_nonblocking(true)
+            .expect("proxy listener nonblocking");
+        let proxy_addr = listener.local_addr().expect("proxy addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let handler_stop = stop.clone();
+        let proxy_thread = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let _guard = runtime.enter();
+            let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+            drop(_guard);
+            let handler: GrpcStreamHandler = Arc::new(move |mut reader, mut writer| {
+                let server = server();
+                let request = server.read_request(&mut reader).expect("trojan request");
+                assert_eq!(
+                    request.password_hash,
+                    trojan_password_hash("trojan-password")
+                );
+                assert_eq!(request.target.host, "example.com");
+                assert_eq!(request.target.port, 443);
+                let mut payload = [0u8; 4];
+                reader.read_exact(&mut payload).expect("payload");
+                assert_eq!(&payload, b"ping");
+                writer.write_all(b"pong").expect("response");
+                handler_stop.store(true, Ordering::SeqCst);
+            });
+            runtime
+                .block_on(run_grpc_listener(
+                    listener,
+                    server_stop,
+                    "GunService".to_string(),
+                    None,
+                    handler,
+                ))
+                .expect("grpc listener");
+        });
+
+        let outbound = OutboundConfig {
+            tag: "trojan-out".to_string(),
+            protocol: "trojan".to_string(),
+            method: None,
+            address: Some(proxy_addr.ip().to_string()),
+            port: Some(proxy_addr.port()),
+            username: None,
+            password: Some("trojan-password".to_string()),
+            tls: None,
+            transport: Some(OutboundTransportConfig {
+                network: "grpc".to_string(),
+                path: None,
+                host: Some("example.test".to_string()),
+                service_name: Some("GunService".to_string()),
             }),
         };
         let target = SocksTarget {
