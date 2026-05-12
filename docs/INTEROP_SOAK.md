@@ -24,7 +24,7 @@ Each protocol/configuration must record:
 - 30 minute smoke run result.
 - 6 hour soak result before any live migration.
 - Upload/download traffic deltas compared with client-side bytes.
-- User delete behavior: new connections fail immediately, existing accepted connections may drain naturally.
+- User delete behavior: new connections fail immediately; existing accepted connections stop at the next limiter or relay checkpoint and must report tail traffic with the captured `user_id`.
 - Speed limit result.
 - Device limit result, including same-IP multi-session behavior.
 - Error count, reconnect count, and p95/p99 latency.
@@ -54,8 +54,11 @@ Expected semantics:
 - Added user: new authentication succeeds without listener restart.
 - Updated user: credential, speed limit, and device limit are visible to new sessions.
 - Deleted user: new authentication fails immediately.
-- Existing accepted connection after delete: may continue until normal close and must report tail traffic with the captured `user_id`.
+- Existing accepted connection after delete: forwarding stops at the next shared bandwidth limiter or relay checkpoint; it is not a central socket-registry hard close yet.
+- Deleted user tail traffic: must report with the captured `user_id` even after the user leaves the active table.
 - Full snapshot: may reset the core revision after mismatch.
+- Missing current revision plus an incremental `base_revision`: must be rejected so the agent can request a full snapshot.
+- Empty delta: can advance revision when `revision` is present.
 
 ## Local Benchmarks
 
@@ -72,6 +75,15 @@ cargo run --release -- bench vless-tcp-stream --streams 16 --requests 5000 --pay
 
 Record the JSON output and compare `runtime_workers` where present, `completed_requests`, `errors`, `error_rate`, `roundtrip_mbps`, p95/p99 latency, and `retries` across commits on the same host.
 
+Small local smoke sample from a Windows loopback release build:
+
+| Command | Completed | Errors | Retries | Runtime workers |
+| --- | ---: | ---: | ---: | ---: |
+| `hy2-tcp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 |
+| `hy2-udp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 |
+| `tuic-tcp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 |
+| `tuic-udp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 |
+
 ## Soak Pass Criteria
 
 A soak pass requires:
@@ -81,6 +93,7 @@ A soak pass requires:
 - No unbounded memory growth.
 - No traffic drain loss after report/requeue cycles.
 - Deleted users cannot create new sessions.
+- Existing deleted-user connections stop forwarding on the next limiter or relay checkpoint.
 - Valid users are not falsely rejected.
 - p99 latency does not degrade progressively during the run.
 - Error bursts are attributable to client/network conditions and recover without manual core restart.
