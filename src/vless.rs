@@ -564,6 +564,9 @@ impl VlessServer {
         request: VlessRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
+        let _connection = self
+            .bandwidth
+            .register_tcp_connection(Some(&request.user_uuid), &[&client, &remote])?;
         let (upload, download) = if request.flow == FLOW_XTLS_RPRX_VISION {
             relay_vision_tcp_streams(client, remote, request.user_id, bandwidth)?
         } else {
@@ -642,6 +645,9 @@ impl VlessServer {
         } else {
             let mut remote_write = remote.try_clone()?;
             let mut remote_read = remote;
+            let _connection = self
+                .bandwidth
+                .register_tcp_connection(Some(&request.user_uuid), &[&remote_read])?;
             let upload_limiter = bandwidth.clone();
             let upload_task = spawn_native_blocking_relay(move || {
                 copy_count_best_effort_limited(

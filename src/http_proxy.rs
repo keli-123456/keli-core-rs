@@ -221,6 +221,9 @@ impl HttpProxyServer {
             }
         };
         client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
+        let _connection = self
+            .bandwidth
+            .register_tcp_connection(request.user_uuid.as_deref(), &[&client, &remote])?;
         let (upload, download) = relay_tcp_streams_limited(client, remote, bandwidth)?;
         self.record_traffic(
             request.user_uuid,
@@ -254,6 +257,9 @@ impl HttpProxyServer {
             }
         }
         remote.write_all(&outbound)?;
+        let _connection = self
+            .bandwidth
+            .register_tcp_connection(request.user_uuid.as_deref(), &[&*client, &remote])?;
         let upload = outbound.len() as u64;
         let download = copy_count_best_effort_limited(&mut remote, client, bandwidth.as_deref());
         self.record_traffic(

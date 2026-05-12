@@ -2,9 +2,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::net::IpAddr;
+use std::io;
+use std::net::{IpAddr, Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,7 @@ const USER_LIMIT_SHARDS: usize = 64;
 
 type UserSessionShards = Arc<Vec<Mutex<HashMap<String, UserSessionState>>>>;
 type BandwidthLimiterShards = Arc<Vec<Mutex<HashMap<String, Arc<BandwidthLimiter>>>>>;
+type UserConnectionShards = Arc<Vec<Mutex<HashMap<String, Vec<Weak<UserConnectionHandle>>>>>>;
 
 #[derive(Clone, Debug)]
 pub struct UserSessionTracker {
@@ -23,6 +25,7 @@ pub struct UserSessionTracker {
 #[derive(Clone, Debug)]
 pub struct UserBandwidthLimiters {
     limiters: BandwidthLimiterShards,
+    connections: UserConnectionShards,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +42,13 @@ pub struct UserSessionGuard {
 }
 
 #[derive(Debug)]
+pub struct UserConnectionGuard {
+    user_uuid: String,
+    handle: Arc<UserConnectionHandle>,
+    active: UserConnectionShards,
+}
+
+#[derive(Debug)]
 pub struct BandwidthLimiter {
     bytes_per_second: AtomicU64,
     revoked: AtomicBool,
@@ -49,6 +59,11 @@ pub struct BandwidthLimiter {
 struct BandwidthState {
     tokens: f64,
     last_refill: Instant,
+}
+
+#[derive(Debug)]
+struct UserConnectionHandle {
+    sockets: Vec<TcpStream>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -75,6 +90,7 @@ impl Default for UserBandwidthLimiters {
     fn default() -> Self {
         Self {
             limiters: sharded_hash_maps(),
+            connections: sharded_hash_maps(),
         }
     }
 }
@@ -192,6 +208,37 @@ impl UserSessionState {
 }
 
 impl UserBandwidthLimiters {
+    pub fn register_tcp_connection(
+        &self,
+        user_uuid: Option<&str>,
+        sockets: &[&TcpStream],
+    ) -> io::Result<Option<UserConnectionGuard>> {
+        let Some(user_uuid) = user_uuid.map(str::trim).filter(|uuid| !uuid.is_empty()) else {
+            return Ok(None);
+        };
+        if sockets.is_empty() {
+            return Ok(None);
+        }
+
+        let sockets = sockets
+            .iter()
+            .map(|socket| socket.try_clone())
+            .collect::<io::Result<Vec<_>>>()?;
+        let handle = Arc::new(UserConnectionHandle { sockets });
+        let mut active = user_connection_shard(&self.connections, user_uuid)
+            .lock()
+            .expect("user connection lock poisoned");
+        let handles = active.entry(user_uuid.to_string()).or_default();
+        handles.retain(|handle| handle.upgrade().is_some());
+        handles.push(Arc::downgrade(&handle));
+
+        Ok(Some(UserConnectionGuard {
+            user_uuid: user_uuid.to_string(),
+            handle,
+            active: Arc::clone(&self.connections),
+        }))
+    }
+
     pub fn limiter_for(&self, user: Option<&CoreUser>) -> Option<Arc<BandwidthLimiter>> {
         let user = user?;
         let bytes_per_second = speed_limit_mbps_to_bytes_per_second(user.speed_limit);
@@ -244,10 +291,12 @@ impl UserBandwidthLimiters {
                 }
             }
         }
+        self.close_connections_except(&active_uuids);
         self.sync_users(users);
     }
 
     pub fn revoke_users(&self, user_uuids: &[String]) {
+        self.close_user_connections(user_uuids);
         for user_uuid in user_uuids {
             let limiters = bandwidth_limiter_shard(&self.limiters, user_uuid)
                 .lock()
@@ -256,6 +305,61 @@ impl UserBandwidthLimiters {
                 limiter.revoke();
             }
         }
+    }
+
+    pub fn active_connection_count(&self, user_uuid: &str) -> usize {
+        let mut active = user_connection_shard(&self.connections, user_uuid)
+            .lock()
+            .expect("user connection lock poisoned");
+        let Some(handles) = active.get_mut(user_uuid) else {
+            return 0;
+        };
+        handles.retain(|handle| handle.upgrade().is_some());
+        let count = handles.len();
+        if count == 0 {
+            active.remove(user_uuid);
+        }
+        count
+    }
+
+    fn close_user_connections(&self, user_uuids: &[String]) {
+        for user_uuid in user_uuids {
+            let handles = self.connection_handles(user_uuid);
+            for handle in handles {
+                handle.close();
+            }
+        }
+    }
+
+    fn close_connections_except(&self, active_uuids: &HashSet<&str>) {
+        let removed = self
+            .connections
+            .iter()
+            .flat_map(|shard| {
+                let active = shard.lock().expect("user connection lock poisoned");
+                active
+                    .keys()
+                    .filter(|uuid| !active_uuids.contains(uuid.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        self.close_user_connections(&removed);
+    }
+
+    fn connection_handles(&self, user_uuid: &str) -> Vec<Arc<UserConnectionHandle>> {
+        let mut active = user_connection_shard(&self.connections, user_uuid)
+            .lock()
+            .expect("user connection lock poisoned");
+        let Some(handles) = active.get_mut(user_uuid) else {
+            return Vec::new();
+        };
+        let upgraded = handles.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
+        handles.retain(|handle| handle.upgrade().is_some());
+        if handles.is_empty() {
+            active.remove(user_uuid);
+        }
+        upgraded
     }
 }
 
@@ -400,6 +504,14 @@ impl fmt::Display for DeviceLimitExceeded {
 
 impl std::error::Error for DeviceLimitExceeded {}
 
+impl UserConnectionHandle {
+    fn close(&self) {
+        for socket in &self.sockets {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
+}
+
 impl Drop for UserSessionGuard {
     fn drop(&mut self) {
         let Ok(mut active) = user_session_shard(&self.active, &self.user_uuid).lock() else {
@@ -408,6 +520,24 @@ impl Drop for UserSessionGuard {
         if let Some(state) = active.get_mut(&self.user_uuid) {
             state.release(self.key);
             if state.device_count() == 0 {
+                active.remove(&self.user_uuid);
+            }
+        }
+    }
+}
+
+impl Drop for UserConnectionGuard {
+    fn drop(&mut self) {
+        let Ok(mut active) = user_connection_shard(&self.active, &self.user_uuid).lock() else {
+            return;
+        };
+        if let Some(handles) = active.get_mut(&self.user_uuid) {
+            handles.retain(|weak| {
+                weak.upgrade()
+                    .map(|handle| !Arc::ptr_eq(&handle, &self.handle))
+                    .unwrap_or(false)
+            });
+            if handles.is_empty() {
                 active.remove(&self.user_uuid);
             }
         }
@@ -443,6 +573,13 @@ fn bandwidth_limiter_shard<'a>(
     &shards[user_limit_shard_index(user_uuid)]
 }
 
+fn user_connection_shard<'a>(
+    shards: &'a UserConnectionShards,
+    user_uuid: &str,
+) -> &'a Mutex<HashMap<String, Vec<Weak<UserConnectionHandle>>>> {
+    &shards[user_limit_shard_index(user_uuid)]
+}
+
 fn user_limit_shard_index(user_uuid: &str) -> usize {
     let mut hasher = DefaultHasher::new();
     user_uuid.hash(&mut hasher);
@@ -451,8 +588,11 @@ fn user_limit_shard_index(user_uuid: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
     use std::thread;
+    use std::time::Duration;
 
     use crate::limits::{
         speed_limit_mbps_to_bytes_per_second, UserBandwidthLimiters, UserSessionTracker,
@@ -597,6 +737,36 @@ mod tests {
         assert!(Arc::ptr_eq(&limiter, &revived));
         assert!(!revived.is_revoked());
         assert!(revived.wait_for(16));
+    }
+
+    #[test]
+    fn revoke_user_closes_registered_tcp_connections() {
+        let limiters = UserBandwidthLimiters::default();
+        let user = user(0);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("client");
+        let (server, _) = listener.accept().expect("server");
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("client timeout");
+
+        let guard = limiters
+            .register_tcp_connection(Some(&user.uuid), &[&client, &server])
+            .expect("register")
+            .expect("guard");
+        assert_eq!(limiters.active_connection_count(&user.uuid), 1);
+
+        limiters.revoke_users(std::slice::from_ref(&user.uuid));
+
+        let mut buffer = [0u8; 1];
+        let closed = matches!(client.peek(&mut buffer), Ok(0) | Err(_))
+            || matches!(
+                client.try_clone().unwrap().read(&mut buffer),
+                Ok(0) | Err(_)
+            );
+        assert!(closed, "registered connection should close on revoke");
+        drop(guard);
+        assert_eq!(limiters.active_connection_count(&user.uuid), 0);
     }
 
     #[test]

@@ -460,6 +460,9 @@ impl ShadowsocksServer {
         let password = request.user.credential().to_string();
         let response_stream = request.client_reader.reader.try_clone()?;
         let mut upload = 0u64;
+        let _connection = self
+            .bandwidth
+            .register_tcp_connection(Some(&user_uuid), &[&response_stream, &remote])?;
         if !request.initial_payload.is_empty() {
             if let Some(limiter) = bandwidth.as_deref() {
                 if !limiter.wait_for(request.initial_payload.len()) {

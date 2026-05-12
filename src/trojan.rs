@@ -368,6 +368,9 @@ impl TrojanServer {
         request: TrojanRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
+        let _connection = self
+            .bandwidth
+            .register_tcp_connection(Some(&request.user_uuid), &[&client, &remote])?;
         let (upload, download) = relay_tcp_streams_limited(client, remote, bandwidth)?;
         self.traffic.add_with_user_id(
             self.config.node_tag.clone(),
@@ -394,6 +397,9 @@ impl TrojanServer {
     {
         let mut remote_write = remote.try_clone()?;
         let mut remote_read = remote;
+        let _connection = self
+            .bandwidth
+            .register_tcp_connection(Some(&request.user_uuid), &[&remote_read])?;
         let upload_limiter = bandwidth.clone();
         let upload_task = spawn_native_blocking_relay(move || {
             copy_count_best_effort_limited(

@@ -333,6 +333,9 @@ impl Socks5Server {
         request: SocksRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
+        let _connection = self
+            .bandwidth
+            .register_tcp_connection(request.user_uuid.as_deref(), &[&client, &remote])?;
         let (upload, download) = relay_tcp_streams_limited(client, remote, bandwidth)?;
         if let Some(user_uuid) = request.user_uuid {
             self.traffic.add_with_user_id(
