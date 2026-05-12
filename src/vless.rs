@@ -2464,6 +2464,7 @@ mod tests {
     use std::io::{Cursor, Read, Write};
     use std::net::{TcpListener, TcpStream, UdpSocket};
     use std::path::PathBuf;
+    use std::sync::mpsc;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -2635,6 +2636,71 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         let _ = TcpStream::connect(vless_addr);
         server_thread.join().expect("vless server thread");
+        echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
+    fn deleting_vless_user_stops_existing_tcp_relay_on_next_payload() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (second_payload_tx, second_payload_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .expect("echo timeout");
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).expect("first payload");
+            stream.write_all(&first).expect("first echo");
+            let mut second = [0u8; 1];
+            let received_second = stream.read_exact(&mut second).is_ok();
+            second_payload_tx
+                .send(received_second)
+                .expect("send result");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vless bind");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vless accept");
+            let _ = server_clone.handle_tcp_client(stream);
+        });
+
+        let mut client = TcpStream::connect(vless_addr).expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("client read timeout");
+        client
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .expect("client write timeout");
+        client
+            .write_all(&vless_request(echo_addr))
+            .expect("vless request");
+        let mut header = [0u8; 2];
+        client.read_exact(&mut header).expect("vless response");
+        assert_eq!(header, [super::VERSION, 0x00]);
+        client.write_all(b"x").expect("first write");
+        let mut echoed = [0u8; 1];
+        client.read_exact(&mut echoed).expect("first echo");
+        assert_eq!(echoed, *b"x");
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![user().uuid],
+            ..CoreUserDelta::default()
+        });
+        assert_eq!(result.deleted, 1);
+
+        let _ = client.write_all(b"y");
+        assert!(
+            !second_payload_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("echo result"),
+            "deleted user's existing VLESS relay should stop forwarding new payload"
+        );
+        drop(client);
+        server_thread.join().expect("server thread");
         echo_thread.join().expect("echo thread");
     }
 
