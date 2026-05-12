@@ -219,7 +219,6 @@ pub fn authenticate_reality_client_hello(
     if auth_key.as_bytes().iter().all(|byte| *byte == 0) {
         return Err(RealityAuthError::InvalidPrivateKey);
     }
-    let auth_key_bytes = *auth_key.as_bytes();
     let mut derived = [0u8; 32];
     Hkdf::<Sha256>::new(Some(&hello.random[..20]), auth_key.as_bytes())
         .expand(b"REALITY", &mut derived)
@@ -269,7 +268,7 @@ pub fn authenticate_reality_client_hello(
 
     Ok(RealityClientAuth {
         server_name: hello.server_name,
-        auth_key: auth_key_bytes,
+        auth_key: derived,
         client_version,
         client_time,
         short_id,
@@ -1155,9 +1154,7 @@ mod tests {
         assert_eq!(auth.server_name, "www.example.test");
         assert_eq!(
             auth.auth_key,
-            *server_secret
-                .diffie_hellman(&PublicKey::from(&client_secret))
-                .as_bytes()
+            derived_reality_auth_key(&server_secret, &PublicKey::from(&client_secret))
         );
         assert_eq!(auth.client_version, [1, 8, 23]);
         assert_eq!(auth.short_id, short_id);
@@ -1696,6 +1693,15 @@ mod tests {
         record[absolute_session_id_offset..absolute_session_id_offset + 32]
             .copy_from_slice(&encrypted);
         record
+    }
+
+    fn derived_reality_auth_key(secret: &StaticSecret, public: &PublicKey) -> [u8; 32] {
+        let shared = secret.diffie_hellman(public);
+        let mut derived = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(&[0x31; 20]), shared.as_bytes())
+            .expand(b"REALITY", &mut derived)
+            .expect("hkdf");
+        derived
     }
 
     const TLS_RECORD_HANDSHAKE: u8 = 0x16;
