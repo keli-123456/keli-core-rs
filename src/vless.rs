@@ -2687,7 +2687,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_vless_user_stops_existing_tcp_relay_on_next_payload() {
+    fn deleting_vless_user_stops_existing_tcp_relay_on_next_payload_and_reports_tail() {
         let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
         let echo_addr = echo.local_addr().expect("echo addr");
         let (second_payload_tx, second_payload_rx) = mpsc::channel();
@@ -2712,7 +2712,7 @@ mod tests {
         let server_clone = server.clone();
         let server_thread = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("vless accept");
-            let _ = server_clone.handle_tcp_client(stream);
+            server_clone.handle_tcp_client(stream)
         });
 
         let mut client = TcpStream::connect(vless_addr).expect("client connect");
@@ -2747,8 +2747,19 @@ mod tests {
             "deleted user's existing VLESS relay should stop forwarding new payload"
         );
         drop(client);
-        server_thread.join().expect("server thread");
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
         echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|vless|1");
+        assert_eq!(records[0].user_uuid, user().uuid);
+        assert_eq!(records[0].user_id, Some(1));
+        assert_eq!(records[0].upload, 1);
+        assert_eq!(records[0].download, 1);
     }
 
     fn vless_request(target: std::net::SocketAddr) -> Vec<u8> {
