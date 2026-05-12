@@ -1417,7 +1417,7 @@ fn start_vless_reality_listener(
         stop_for_thread,
         workers_for_thread,
         move |stream| {
-            let gateway = gateway.clone();
+            let gateway = reality_gateway_for_connection(&gateway);
             let server = server.clone();
             let result = handle_reality_preface(stream, &gateway);
             if let Ok(RealityGatewayResult::Authenticated(mut authenticated)) = result {
@@ -1445,6 +1445,12 @@ fn start_vless_reality_listener(
         workers,
         join: Some(join),
     })
+}
+
+fn reality_gateway_for_connection(template: &RealityGatewayConfig) -> RealityGatewayConfig {
+    let mut gateway = template.clone();
+    gateway.auth.now = SystemTime::now();
+    gateway
 }
 
 fn reality_tls_acceptor(auth_key: &[u8; 32], server_name: &str) -> io::Result<TlsAcceptor> {
@@ -2412,6 +2418,25 @@ mod tests {
         let acceptor = reality_tls_acceptor(&[0x42; 32], "www.example.test");
 
         assert!(acceptor.is_ok());
+    }
+
+    #[test]
+    fn vless_reality_refreshes_auth_time_per_connection() {
+        let config = vless_reality_config(free_port());
+        let mut gateway =
+            super::reality_gateway_config(&config.inbounds[0]).expect("reality gateway config");
+        gateway.auth.now = UNIX_EPOCH + Duration::from_secs(1);
+
+        let refreshed = super::reality_gateway_for_connection(&gateway);
+        let now = SystemTime::now();
+        let diff = now
+            .duration_since(refreshed.auth.now)
+            .or_else(|_| refreshed.auth.now.duration_since(now))
+            .expect("time diff");
+
+        assert_eq!(refreshed.auth.private_key, gateway.auth.private_key);
+        assert_eq!(refreshed.auth.short_ids, gateway.auth.short_ids);
+        assert!(diff < Duration::from_secs(5));
     }
 
     #[test]
