@@ -657,6 +657,7 @@ fn sync_delta_bandwidth(bandwidth: &UserBandwidthLimiters, delta: &CoreUserDelta
     if let Some(full) = delta.full.as_ref() {
         bandwidth.sync_users(full);
     } else {
+        bandwidth.revoke_users(&delta.deleted);
         bandwidth.sync_users(&delta.added);
         bandwidth.sync_users(&delta.updated);
     }

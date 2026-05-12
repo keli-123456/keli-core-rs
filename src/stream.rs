@@ -309,7 +309,9 @@ where
             Err(_) => break,
         };
         if let Some(limiter) = limiter {
-            limiter.wait_for_async(read).await;
+            if !limiter.wait_for_async(read).await {
+                break;
+            }
         }
         if writer.write_all(&buffer[..read]).await.is_err() {
             break;
@@ -346,7 +348,9 @@ where
             Err(_) => break,
         };
         if let Some(limiter) = limiter {
-            limiter.wait_for(read);
+            if !limiter.wait_for(read) {
+                break;
+            }
         }
         if writer.write_all(&buffer[..read]).is_err() {
             break;
@@ -376,6 +380,20 @@ mod tests {
 
         assert_eq!(copied, 5);
         assert_eq!(output, b"hello");
+    }
+
+    #[test]
+    fn revoked_limiter_stops_limited_copy_before_forwarding_bytes() {
+        let input = b"blocked".to_vec();
+        let limiter = BandwidthLimiter::unlimited();
+        limiter.revoke();
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+
+        let copied = copy_count_best_effort_limited(&mut reader, &mut output, Some(&limiter));
+
+        assert_eq!(copied, 0);
+        assert!(output.is_empty());
     }
 
     #[test]

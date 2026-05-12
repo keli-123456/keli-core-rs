@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,6 +41,7 @@ pub struct UserSessionGuard {
 #[derive(Debug)]
 pub struct BandwidthLimiter {
     bytes_per_second: AtomicU64,
+    revoked: AtomicBool,
     state: Mutex<BandwidthState>,
 }
 
@@ -176,19 +177,18 @@ impl UserBandwidthLimiters {
             .lock()
             .expect("user bandwidth limiter lock poisoned");
 
-        let Some(bytes_per_second) = bytes_per_second else {
-            if let Some(limiter) = limiters.get(&user.uuid) {
-                limiter.set_unlimited();
-            }
-            return None;
-        };
-
         if let Some(limiter) = limiters.get(&user.uuid) {
-            limiter.set_bytes_per_second(bytes_per_second);
+            match bytes_per_second {
+                Some(bytes_per_second) => limiter.set_bytes_per_second(bytes_per_second),
+                None => limiter.set_unlimited(),
+            }
             return Some(Arc::clone(limiter));
         }
 
-        let limiter = Arc::new(BandwidthLimiter::new(bytes_per_second));
+        let limiter = Arc::new(match bytes_per_second {
+            Some(bytes_per_second) => BandwidthLimiter::new(bytes_per_second),
+            None => BandwidthLimiter::unlimited(),
+        });
         limiters.insert(user.uuid.clone(), Arc::clone(&limiter));
         Some(limiter)
     }
@@ -208,12 +208,35 @@ impl UserBandwidthLimiters {
             }
         }
     }
+
+    pub fn revoke_users(&self, user_uuids: &[String]) {
+        for user_uuid in user_uuids {
+            let limiters = bandwidth_limiter_shard(&self.limiters, user_uuid)
+                .lock()
+                .expect("user bandwidth limiter lock poisoned");
+            if let Some(limiter) = limiters.get(user_uuid) {
+                limiter.revoke();
+            }
+        }
+    }
 }
 
 impl BandwidthLimiter {
     pub fn new(bytes_per_second: u64) -> Self {
         Self {
             bytes_per_second: AtomicU64::new(bytes_per_second.max(1)),
+            revoked: AtomicBool::new(false),
+            state: Mutex::new(BandwidthState {
+                tokens: 0.0,
+                last_refill: Instant::now(),
+            }),
+        }
+    }
+
+    pub fn unlimited() -> Self {
+        Self {
+            bytes_per_second: AtomicU64::new(0),
+            revoked: AtomicBool::new(false),
             state: Mutex::new(BandwidthState {
                 tokens: 0.0,
                 last_refill: Instant::now(),
@@ -226,35 +249,51 @@ impl BandwidthLimiter {
     }
 
     fn set_bytes_per_second(&self, bytes_per_second: u64) {
+        self.revoked.store(false, Ordering::Relaxed);
         self.bytes_per_second
             .store(bytes_per_second.max(1), Ordering::Relaxed);
     }
 
     fn set_unlimited(&self) {
+        self.revoked.store(false, Ordering::Relaxed);
         self.bytes_per_second.store(0, Ordering::Relaxed);
     }
 
-    pub fn wait_for(&self, bytes: usize) {
+    pub fn revoke(&self) {
+        self.revoked.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Relaxed)
+    }
+
+    pub fn wait_for(&self, bytes: usize) -> bool {
         if bytes == 0 {
-            return;
+            return !self.is_revoked();
         }
 
         loop {
+            if self.is_revoked() {
+                return false;
+            }
             let Some(duration) = self.reserve_wait_duration(bytes) else {
-                return;
+                return !self.is_revoked();
             };
             thread::sleep(duration);
         }
     }
 
-    pub async fn wait_for_async(&self, bytes: usize) {
+    pub async fn wait_for_async(&self, bytes: usize) -> bool {
         if bytes == 0 {
-            return;
+            return !self.is_revoked();
         }
 
         loop {
+            if self.is_revoked() {
+                return false;
+            }
             let Some(duration) = self.reserve_wait_duration(bytes) else {
-                return;
+                return !self.is_revoked();
             };
             tokio::time::sleep(duration).await;
         }
@@ -470,8 +509,40 @@ mod tests {
 
         user.speed_limit = 0;
 
-        assert!(limiters.limiter_for(Some(&user)).is_none());
+        let unlimited = limiters.limiter_for(Some(&user)).expect("unlimited");
+        assert!(Arc::ptr_eq(&limiter, &unlimited));
         assert_eq!(limiter.bytes_per_second(), 0);
+    }
+
+    #[test]
+    fn unlimited_users_still_get_revocable_limiters() {
+        let limiters = UserBandwidthLimiters::default();
+        let user = user(0);
+
+        let limiter = limiters
+            .limiter_for(Some(&user))
+            .expect("unlimited limiter");
+
+        assert_eq!(limiter.bytes_per_second(), 0);
+        assert!(!limiter.is_revoked());
+        assert!(limiter.wait_for(16));
+    }
+
+    #[test]
+    fn revoked_limiter_stops_existing_connection_and_can_be_reenabled() {
+        let limiters = UserBandwidthLimiters::default();
+        let user = user(0);
+        let limiter = limiters.limiter_for(Some(&user)).expect("active limiter");
+
+        limiters.revoke_users(std::slice::from_ref(&user.uuid));
+
+        assert!(limiter.is_revoked());
+        assert!(!limiter.wait_for(16));
+
+        let revived = limiters.limiter_for(Some(&user)).expect("revived limiter");
+        assert!(Arc::ptr_eq(&limiter, &revived));
+        assert!(!revived.is_revoked());
+        assert!(revived.wait_for(16));
     }
 
     #[test]
