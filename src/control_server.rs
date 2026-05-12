@@ -1,4 +1,4 @@
-﻿use std::fmt;
+use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,6 +7,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::control::{CoreCommand, CoreController, CoreResponse};
+
+pub const MAX_CONTROL_COMMAND_BYTES: usize = 128 * 1024 * 1024;
+const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub enum ControlServerError {
@@ -124,7 +127,22 @@ pub fn serve_control_stream(
     mut stream: TcpStream,
     controller: Arc<Mutex<CoreController>>,
 ) -> Result<CoreResponse, ControlServerError> {
-    let command = read_control_command(&mut stream)?;
+    stream
+        .set_read_timeout(Some(CONTROL_IO_TIMEOUT))
+        .map_err(ControlServerError::Io)?;
+    stream
+        .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
+        .map_err(ControlServerError::Io)?;
+    let command = match read_control_command(&mut stream) {
+        Ok(command) => command,
+        Err(error) => {
+            let response = CoreResponse::Error {
+                message: error.to_string(),
+            };
+            write_control_response(&mut stream, &response)?;
+            return Ok(response);
+        }
+    };
     let response = controller
         .lock()
         .map_err(|_| ControlServerError::Controller("controller lock poisoned".to_string()))?
@@ -134,17 +152,52 @@ pub fn serve_control_stream(
 }
 
 fn read_control_command(stream: &mut TcpStream) -> Result<CoreCommand, ControlServerError> {
+    read_control_command_with_limit(stream, MAX_CONTROL_COMMAND_BYTES)
+}
+
+fn read_control_command_with_limit(
+    stream: &mut TcpStream,
+    max_bytes: usize,
+) -> Result<CoreCommand, ControlServerError> {
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map_err(ControlServerError::Io)?;
+    let line = read_control_line_with_limit(&mut reader, max_bytes)?;
     if line.trim().is_empty() {
         return Err(ControlServerError::Controller(
             "empty control command".to_string(),
         ));
     }
     serde_json::from_str(line.trim()).map_err(ControlServerError::Json)
+}
+
+fn read_control_line_with_limit<R: BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<String, ControlServerError> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf().map_err(ControlServerError::Io)?;
+        if available.is_empty() {
+            break;
+        }
+        let consume = if let Some(position) = available.iter().position(|byte| *byte == b'\n') {
+            position + 1
+        } else {
+            available.len()
+        };
+        if bytes.len().saturating_add(consume) > max_bytes {
+            return Err(ControlServerError::Controller(format!(
+                "control command exceeds {max_bytes} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&available[..consume]);
+        reader.consume(consume);
+        if bytes.ends_with(b"\n") {
+            break;
+        }
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        ControlServerError::Controller(format!("control command is not utf-8: {error}"))
+    })
 }
 
 fn write_control_response(
@@ -159,10 +212,11 @@ fn write_control_response(
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Cursor, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
 
+    use super::read_control_line_with_limit;
     use crate::config::{
         CoreConfig, DnsConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig,
         TransportConfig,
@@ -292,5 +346,40 @@ mod tests {
         ));
 
         server.stop();
+    }
+
+    #[test]
+    fn control_server_returns_error_for_malformed_command() {
+        let controller = Arc::new(Mutex::new(CoreController::new()));
+        let mut server = start_control_server("127.0.0.1:0", controller).expect("start control");
+        let mut stream = TcpStream::connect(server.local_addr()).expect("connect control");
+        writeln!(stream, "{{not-json").expect("write malformed command");
+
+        let mut line = String::new();
+        BufReader::new(stream)
+            .read_line(&mut line)
+            .expect("read response");
+        match serde_json::from_str::<CoreResponse>(line.trim()).expect("decode response") {
+            CoreResponse::Error { message } => {
+                assert!(message.contains("control server json"));
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
+
+        assert!(matches!(
+            send(server.local_addr(), &CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+        server.stop();
+    }
+
+    #[test]
+    fn control_server_rejects_oversized_command_line() {
+        let mut input = Cursor::new(b"{\"type\":\"status\"}\n".to_vec());
+        let error = read_control_line_with_limit(&mut input, 4).expect_err("limit error");
+
+        assert!(error
+            .to_string()
+            .contains("control command exceeds 4 bytes"));
     }
 }
