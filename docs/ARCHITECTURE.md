@@ -19,17 +19,20 @@ The runtime tracks config fingerprints, starts real listeners for implemented pr
 The control boundary accepts transport-neutral commands:
 
 - Apply config.
+- Apply user delta.
 - Drain traffic.
 - Read status.
 - Stop.
 
 `ApplyConfig` starts the real `CoreService` for implemented protocols. If only inbound users change, it returns `updated` and patches the existing listeners in place; otherwise it reloads the service. This lets `kelinode-rs` later use an in-process adapter, a Unix socket, or another local transport without changing the core model.
 
+`ApplyUserDelta` is the native small-change path. It applies added, updated, deleted, or full-snapshot users to one inbound without rebinding the listener. The core tracks an optional revision per inbound: non-full deltas with a known `base_revision` must match the current revision, while a full snapshot may reset the revision after a mismatch. Deleting a user immediately rejects new authentication for that user. Existing accepted connections are not force-closed in this phase; they run until normal close and keep their captured `user_id` for tail traffic accounting.
+
 The binary also exposes a minimal process boundary:
 
 - `check-config <path>` validates a JSON `CoreConfig` and prints its fingerprint.
 - `run-config <path>` applies a JSON `CoreConfig`, prints the apply response, and keeps the core service alive.
-- `run-config <path> --control <addr>` also opens a local JSON-line TCP control socket for `apply_config`, `status`, `drain_traffic`, and `stop`.
+- `run-config <path> --control <addr>` also opens a local JSON-line TCP control socket for `apply_config`, `apply_user_delta`, `status`, `drain_traffic`, and `stop`.
 
 ## Protocol Placement
 

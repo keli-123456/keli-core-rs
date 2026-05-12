@@ -652,7 +652,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::socks5::{Socks5Server, Socks5ServerConfig};
-    use crate::user::CoreUser;
+    use crate::user::{CoreUser, CoreUserDelta};
     use crate::{RouteAction, RouteRule};
 
     struct MemoryStream {
@@ -913,6 +913,65 @@ mod tests {
         let records = server.drain_traffic(1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|socks|1");
+        assert_eq!(records[0].user_uuid, "user-a");
+        assert_eq!(records[0].user_id, Some(1));
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn delete_user_keeps_existing_socks_connection_until_close_and_reports_tail() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("socks bind");
+        let socks_addr = listener.local_addr().expect("socks addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || server_clone.serve_tcp_once(&listener));
+
+        let mut client = TcpStream::connect(socks_addr).expect("client connect");
+        write_authenticated_ipv4_connect(&mut client, echo_addr);
+        let mut response = [0u8; 14];
+        client.read_exact(&mut response).expect("client response");
+        assert_eq!(&response[2..4], &[0x01, 0x00]);
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec!["user-a".to_string()],
+            ..CoreUserDelta::default()
+        });
+        assert_eq!(result.deleted, 1);
+        let mut new_stream = MemoryStream::new(authenticated_domain_connect(
+            "user-a",
+            "user-a",
+            "example.com",
+            443,
+        ));
+        let error = server
+            .read_request(&mut new_stream)
+            .expect_err("deleted user should fail new authentication");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        client.write_all(b"tail").expect("client write payload");
+        let mut echoed = [0u8; 4];
+        client.read_exact(&mut echoed).expect("client read payload");
+        assert_eq!(&echoed, b"tail");
+        drop(client);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
         assert_eq!(records[0].user_uuid, "user-a");
         assert_eq!(records[0].user_id, Some(1));
         assert_eq!(records[0].upload, 4);
