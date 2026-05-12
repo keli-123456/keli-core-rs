@@ -31,6 +31,8 @@ The control boundary accepts transport-neutral commands:
 
 The control boundary also exposes `metrics`, a JSON snapshot intended for the agent or a future exporter. The current low-cardinality counters cover native user delta attempts, successes/errors, incremental versus full snapshot applies, revision mismatch/current-missing fallback signals, duration histogram buckets, and per-inbound active user counts. It deliberately does not use `user_uuid` as a metric dimension.
 
+Production control sockets must either listen on a loopback address or set `KELI_CORE_CONTROL_TOKEN`. The TCP JSON-line transport remains useful for development and agent sidecars, but the core rejects non-loopback listeners without a token so `stop`, `apply_config`, `apply_user_delta`, `drain_traffic`, and `requeue_traffic` are not accidentally exposed.
+
 The binary also exposes a minimal process boundary:
 
 - `check-config <path>` validates a JSON `CoreConfig` and prints its fingerprint.

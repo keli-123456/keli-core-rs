@@ -83,6 +83,7 @@ fn start_control_server_with_token(
     token: Option<String>,
 ) -> Result<ControlServerHandle, ControlServerError> {
     let listen = resolve_control_addr(addr)?;
+    ensure_secure_control_listen(listen, token.as_deref())?;
     let listener = TcpListener::bind(listen).map_err(ControlServerError::Bind)?;
     listener
         .set_nonblocking(true)
@@ -101,6 +102,18 @@ fn start_control_server_with_token(
         stop,
         join: Some(join),
     })
+}
+
+fn ensure_secure_control_listen(
+    listen: SocketAddr,
+    token: Option<&str>,
+) -> Result<(), ControlServerError> {
+    if token.map(str::trim).is_some_and(|value| !value.is_empty()) || listen.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(ControlServerError::Controller(format!(
+        "control server without token must listen on loopback address, got {listen}"
+    )))
 }
 
 fn control_token_from_env() -> Option<String> {
@@ -469,6 +482,46 @@ mod tests {
             CoreResponse::Stopped
         ));
 
+        server.stop();
+    }
+
+    #[test]
+    fn control_server_requires_token_for_non_loopback_listen() {
+        let controller = Arc::new(Mutex::new(CoreController::new()));
+
+        let error = start_control_server_with_token("0.0.0.0:0", controller, None)
+            .expect_err("non-loopback control should require token");
+
+        assert!(error.to_string().contains("without token"));
+        assert!(error.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn control_server_allows_non_loopback_listen_with_token() {
+        let controller = Arc::new(Mutex::new(CoreController::new()));
+        let mut server = start_control_server_with_token(
+            "0.0.0.0:0",
+            controller,
+            Some("secret-token".to_string()),
+        )
+        .expect("token should allow non-loopback control listen");
+        let connect_addr =
+            SocketAddr::new("127.0.0.1".parse().unwrap(), server.local_addr().port());
+
+        match send_raw(
+            connect_addr,
+            serde_json::json!({"type": "status", "token": "secret-token"}),
+        ) {
+            CoreResponse::Status { status, .. } => assert_eq!(status, CoreStatus::Stopped),
+            response => panic!("unexpected response: {response:?}"),
+        }
+        assert!(matches!(
+            send_raw(
+                connect_addr,
+                serde_json::json!({"type": "stop", "token": "secret-token"})
+            ),
+            CoreResponse::Stopped
+        ));
         server.stop();
     }
 
