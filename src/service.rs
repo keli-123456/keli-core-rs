@@ -296,6 +296,10 @@ impl CoreService {
                             "revision mismatch for inbound {node_tag}: current {current_revision}, base {base_revision}"
                         ));
                     }
+                } else {
+                    return Err(format!(
+                        "revision mismatch for inbound {node_tag}: current <missing>, base {base_revision}; full snapshot required"
+                    ));
                 }
             }
         }

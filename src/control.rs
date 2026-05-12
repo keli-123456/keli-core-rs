@@ -507,6 +507,65 @@ mod tests {
     }
 
     #[test]
+    fn apply_user_delta_rejects_base_revision_when_current_missing() {
+        let config = config(Protocol::Socks);
+        let node_tag = config.inbounds[0].tag.clone();
+        let mut controller = CoreController::new();
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyConfig { config }),
+            CoreResponse::Applied { .. }
+        ));
+
+        match controller.handle(CoreCommand::ApplyUserDelta {
+            node_tag: node_tag.clone(),
+            delta: CoreUserDelta {
+                added: vec![user_with_password("user-b", Some("secret-b"), 4096)],
+                base_revision: Some("1".to_string()),
+                revision: Some("2".to_string()),
+                ..CoreUserDelta::default()
+            },
+        }) {
+            CoreResponse::Error { message } => {
+                assert!(message.contains("revision mismatch"));
+                assert!(message.contains("current <missing>"));
+                assert!(message.contains("full snapshot required"));
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
+
+        match controller.handle(CoreCommand::ApplyUserDelta {
+            node_tag: node_tag.clone(),
+            delta: CoreUserDelta {
+                full: Some(vec![user_with_password("user-b", Some("secret-b"), 4096)]),
+                revision: Some("1".to_string()),
+                ..CoreUserDelta::default()
+            },
+        }) {
+            CoreResponse::UserDeltaApplied { result, .. } => {
+                assert!(result.full_applied);
+                assert_eq!(result.active_users, 1);
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
+
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyUserDelta {
+                node_tag,
+                delta: CoreUserDelta {
+                    base_revision: Some("1".to_string()),
+                    revision: Some("2".to_string()),
+                    ..CoreUserDelta::default()
+                },
+            }),
+            CoreResponse::UserDeltaApplied { .. }
+        ));
+        assert!(matches!(
+            controller.handle(CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+    }
+
+    #[test]
     fn apply_user_delta_full_snapshot_resets_revision() {
         let config = config(Protocol::Socks);
         let node_tag = config.inbounds[0].tag.clone();
