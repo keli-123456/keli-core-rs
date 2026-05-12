@@ -1365,16 +1365,20 @@ mod tests {
         assert!(server.user_for_uuid(&new_uuid).is_some());
     }
 
-    fn auth_command(connection: &quinn::Connection) -> Vec<u8> {
-        let uuid = parse_uuid_bytes(&user().uuid).expect("uuid");
+    fn auth_command_for(connection: &quinn::Connection, uuid: &str, password: &str) -> Vec<u8> {
+        let uuid = parse_uuid_bytes(uuid).expect("uuid");
         let mut token = [0u8; 32];
         connection
-            .export_keying_material(&mut token, &uuid, b"tuic-password")
+            .export_keying_material(&mut token, &uuid, password.as_bytes())
             .expect("token");
         let mut command = vec![VERSION, COMMAND_AUTHENTICATE];
         command.extend_from_slice(&uuid);
         command.extend_from_slice(&token);
         command
+    }
+
+    fn auth_command(connection: &quinn::Connection) -> Vec<u8> {
+        auth_command_for(connection, &user().uuid, "tuic-password")
     }
 
     fn connect_command(addr: SocketAddr) -> Vec<u8> {
@@ -1390,6 +1394,140 @@ mod tests {
             .await
             .expect("auth write");
         auth.finish().expect("auth finish");
+    }
+
+    async fn authenticate_client_with(
+        connection: &quinn::Connection,
+        uuid: &str,
+        password: &str,
+    ) -> bool {
+        let mut auth = match connection.open_uni().await {
+            Ok(auth) => auth,
+            Err(_) => return false,
+        };
+        if auth
+            .write_all(&auth_command_for(connection, uuid, password))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        auth.finish().is_ok()
+    }
+
+    async fn tuic_tcp_probe(
+        server_addr: SocketAddr,
+        cert_der: CertificateDer<'static>,
+        uuid: &str,
+        password: &str,
+        echo_addr: SocketAddr,
+    ) -> bool {
+        let client_endpoint = client_endpoint(cert_der);
+        let connection = match client_endpoint.connect(server_addr, "localhost") {
+            Ok(connecting) => match connecting.await {
+                Ok(connection) => connection,
+                Err(_) => return false,
+            },
+            Err(_) => return false,
+        };
+        if !authenticate_client_with(&connection, uuid, password).await {
+            return false;
+        }
+        let (mut send, mut recv) = match connection.open_bi().await {
+            Ok(streams) => streams,
+            Err(_) => return false,
+        };
+        if send.write_all(&connect_command(echo_addr)).await.is_err() {
+            return false;
+        }
+        if send.write_all(b"x").await.is_err() {
+            return false;
+        }
+        if send.finish().is_err() {
+            return false;
+        }
+        let mut echoed = [0u8; 1];
+        let read_result =
+            tokio::time::timeout(Duration::from_secs(2), recv.read_exact(&mut echoed)).await;
+        connection.close(0u32.into(), b"probe done");
+        matches!(read_result, Ok(Ok(_)) if echoed == *b"x")
+    }
+
+    #[test]
+    fn apply_user_delta_changes_tuic_auth_without_rebinding_listener() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let cert = test_cert("user-delta-auth");
+            let echo = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("echo bind");
+            let echo_addr = echo.local_addr().expect("echo addr");
+            let echo_task = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut stream, _) = echo.accept().await.expect("echo accept");
+                    let mut byte = [0u8; 1];
+                    stream.read_exact(&mut byte).await.expect("echo read");
+                    stream.write_all(&byte).await.expect("echo write");
+                }
+            });
+
+            let server = tuic_server(&cert, "127.0.0.1:0".parse().unwrap());
+            let endpoint = server.bind().expect("tuic bind");
+            let server_addr = endpoint.local_addr().expect("server addr");
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_task = tokio::spawn(server.clone().run(endpoint, stop.clone()));
+
+            assert!(
+                tuic_tcp_probe(
+                    server_addr,
+                    cert.cert_der.clone(),
+                    &user().uuid,
+                    "tuic-password",
+                    echo_addr,
+                )
+                .await,
+                "original tuic user should authenticate before delta"
+            );
+
+            let result = server.apply_user_delta(&CoreUserDelta {
+                added: vec![user_b()],
+                deleted: vec![user().uuid],
+                ..CoreUserDelta::default()
+            });
+
+            assert_eq!(result.added, 1);
+            assert_eq!(result.deleted, 1);
+            assert_eq!(result.active_users, 1);
+            assert!(
+                !tuic_tcp_probe(
+                    server_addr,
+                    cert.cert_der.clone(),
+                    &user().uuid,
+                    "tuic-password",
+                    echo_addr,
+                )
+                .await,
+                "deleted tuic user should fail new authentication after delta"
+            );
+            assert!(
+                tuic_tcp_probe(
+                    server_addr,
+                    cert.cert_der.clone(),
+                    &user_b().uuid,
+                    "secret-b",
+                    echo_addr,
+                )
+                .await,
+                "added tuic user should authenticate on the same listener after delta"
+            );
+
+            stop.store(true, Ordering::SeqCst);
+            server_task.await.expect("server task");
+            echo_task.await.expect("echo task");
+        });
     }
 
     #[test]
