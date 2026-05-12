@@ -68,7 +68,7 @@ cargo run --release -- bench hy2-udp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench vless-tcp-stream --streams 16 --requests 5000 --payload 1024
 ```
 
-Record the JSON output and compare `roundtrip_mbps`, p95/p99 latency, and `retries` across commits on the same host.
+Record the JSON output and compare `runtime_workers` where present, `completed_requests`, `errors`, `error_rate`, `roundtrip_mbps`, p95/p99 latency, and `retries` across commits on the same host.
 
 ## Soak Pass Criteria
 

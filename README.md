@@ -150,9 +150,11 @@ cargo run --release -- bench hy2-udp --streams 16 --requests 5000 --payload 1024
 ```
 
 Use the same host, release build, payload, stream count, and request count when comparing
-against Xray or another core. The JSON `retries` field records retryable local socket
-EOF/reset noise seen while establishing benchmark requests; treat non-zero retries as
-environment noise when comparing results.
+against Xray or another core. The JSON includes `runtime_workers` when applicable, `completed_requests`,
+`errors`, `error_rate`, `retries`, throughput, and latency percentiles. The `retries`
+field records retryable local socket EOF/reset noise seen while establishing benchmark
+requests; treat non-zero retries or errors as environment noise until reproduced on a
+second run.
 
 Real-client interop and soak runs are tracked separately from local loopback benchmarks in
 `docs/INTEROP_SOAK.md`. Do not mark a protocol production-ready from these loopback

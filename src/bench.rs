@@ -51,16 +51,62 @@ struct BenchReport {
     protocol: &'static str,
     mode: &'static str,
     streams: usize,
+    runtime_workers: Option<usize>,
     requests_per_stream: usize,
     payload_bytes: usize,
     total_requests: usize,
+    completed_requests: usize,
     upload_bytes: u64,
     download_bytes: u64,
     retries: usize,
+    errors: usize,
+    error_rate: f64,
     elapsed_ms: u128,
     requests_per_second: f64,
     roundtrip_mbps: f64,
     latency: LatencyReport,
+}
+
+impl BenchReport {
+    fn completed(
+        protocol: &'static str,
+        mode: &'static str,
+        options: &BenchOptions,
+        runtime_workers: Option<usize>,
+        upload_bytes: u64,
+        download_bytes: u64,
+        retries: usize,
+        elapsed: Duration,
+        latencies: &[u128],
+    ) -> Self {
+        let total_requests = options.streams.saturating_mul(options.requests);
+        let completed_requests = latencies.len();
+        let errors = total_requests.saturating_sub(completed_requests);
+        let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+        Self {
+            protocol,
+            mode,
+            streams: options.streams,
+            runtime_workers,
+            requests_per_stream: options.requests,
+            payload_bytes: options.payload_size,
+            total_requests,
+            completed_requests,
+            upload_bytes,
+            download_bytes,
+            retries,
+            errors,
+            error_rate: if total_requests == 0 {
+                0.0
+            } else {
+                errors as f64 / total_requests as f64
+            },
+            elapsed_ms: elapsed.as_millis(),
+            requests_per_second: completed_requests as f64 / seconds,
+            roundtrip_mbps: ((upload_bytes + download_bytes) as f64 * 8.0) / seconds / 1_000_000.0,
+            latency: latency_report(latencies),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -185,6 +231,13 @@ fn validate_bench_options(options: &BenchOptions) -> Result<(), String> {
     Ok(())
 }
 
+fn bench_quic_runtime_workers() -> usize {
+    thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .clamp(2, 16)
+}
+
 fn print_bench_usage() {
     println!(
         "bench commands:\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]"
@@ -228,26 +281,22 @@ fn run_vless_tcp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
-    Ok(BenchReport {
-        protocol: "vless-tcp",
-        mode: "connection-per-request",
-        streams: options.streams,
-        requests_per_stream: options.requests,
-        payload_bytes: options.payload_size,
-        total_requests,
+    Ok(BenchReport::completed(
+        "vless-tcp",
+        "connection-per-request",
+        options,
+        None,
         upload_bytes,
         download_bytes,
         retries,
-        elapsed_ms: elapsed.as_millis(),
-        requests_per_second: total_requests as f64 / seconds,
-        roundtrip_mbps: ((upload_bytes + download_bytes) as f64 * 8.0) / seconds / 1_000_000.0,
-        latency: latency_report(&latencies),
-    })
+        elapsed,
+        &latencies,
+    ))
 }
 
 fn run_hy2_tcp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(bench_quic_runtime_workers())
         .enable_all()
         .build()?
         .block_on(run_hy2_tcp_bench_async(options))
@@ -255,6 +304,7 @@ fn run_hy2_tcp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
 
 fn run_hy2_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(bench_quic_runtime_workers())
         .enable_all()
         .build()?
         .block_on(run_hy2_tcp_stream_bench_async(options))
@@ -262,6 +312,7 @@ fn run_hy2_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
 
 fn run_hy2_udp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(bench_quic_runtime_workers())
         .enable_all()
         .build()?
         .block_on(run_hy2_udp_bench_async(options))
@@ -334,22 +385,17 @@ async fn run_hy2_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
-    Ok(BenchReport {
-        protocol: "hy2-tcp",
-        mode: "single-quic-connection",
-        streams: options.streams,
-        requests_per_stream: options.requests,
-        payload_bytes: options.payload_size,
-        total_requests,
+    Ok(BenchReport::completed(
+        "hy2-tcp",
+        "single-quic-connection",
+        options,
+        Some(bench_quic_runtime_workers()),
         upload_bytes,
         download_bytes,
         retries,
-        elapsed_ms: elapsed.as_millis(),
-        requests_per_second: total_requests as f64 / seconds,
-        roundtrip_mbps: ((upload_bytes + download_bytes) as f64 * 8.0) / seconds / 1_000_000.0,
-        latency: latency_report(&latencies),
-    })
+        elapsed,
+        &latencies,
+    ))
 }
 
 async fn run_hy2_tcp_stream_bench_async(options: &BenchOptions) -> io::Result<BenchReport> {
@@ -419,22 +465,17 @@ async fn run_hy2_tcp_stream_bench_async(options: &BenchOptions) -> io::Result<Be
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
-    Ok(BenchReport {
-        protocol: "hy2-tcp",
-        mode: "hy2-tcp-stream-per-worker",
-        streams: options.streams,
-        requests_per_stream: options.requests,
-        payload_bytes: options.payload_size,
-        total_requests,
+    Ok(BenchReport::completed(
+        "hy2-tcp",
+        "hy2-tcp-stream-per-worker",
+        options,
+        Some(bench_quic_runtime_workers()),
         upload_bytes,
         download_bytes,
         retries,
-        elapsed_ms: elapsed.as_millis(),
-        requests_per_second: total_requests as f64 / seconds,
-        roundtrip_mbps: ((upload_bytes + download_bytes) as f64 * 8.0) / seconds / 1_000_000.0,
-        latency: latency_report(&latencies),
-    })
+        elapsed,
+        &latencies,
+    ))
 }
 
 async fn run_hy2_udp_bench_async(options: &BenchOptions) -> io::Result<BenchReport> {
@@ -517,22 +558,17 @@ async fn run_hy2_udp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
-    Ok(BenchReport {
-        protocol: "hy2-udp",
-        mode: "hy2-udp-datagram-connection-per-worker",
-        streams: options.streams,
-        requests_per_stream: options.requests,
-        payload_bytes: options.payload_size,
-        total_requests,
+    Ok(BenchReport::completed(
+        "hy2-udp",
+        "hy2-udp-datagram-connection-per-worker",
+        options,
+        Some(bench_quic_runtime_workers()),
         upload_bytes,
         download_bytes,
         retries,
-        elapsed_ms: elapsed.as_millis(),
-        requests_per_second: total_requests as f64 / seconds,
-        roundtrip_mbps: ((upload_bytes + download_bytes) as f64 * 8.0) / seconds / 1_000_000.0,
-        latency: latency_report(&latencies),
-    })
+        elapsed,
+        &latencies,
+    ))
 }
 
 fn run_vless_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
@@ -572,22 +608,17 @@ fn run_vless_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport>
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
-    Ok(BenchReport {
-        protocol: "vless-tcp",
-        mode: "connection-per-stream",
-        streams: options.streams,
-        requests_per_stream: options.requests,
-        payload_bytes: options.payload_size,
-        total_requests,
+    Ok(BenchReport::completed(
+        "vless-tcp",
+        "connection-per-stream",
+        options,
+        None,
         upload_bytes,
         download_bytes,
         retries,
-        elapsed_ms: elapsed.as_millis(),
-        requests_per_second: total_requests as f64 / seconds,
-        roundtrip_mbps: ((upload_bytes + download_bytes) as f64 * 8.0) / seconds / 1_000_000.0,
-        latency: latency_report(&latencies),
-    })
+        elapsed,
+        &latencies,
+    ))
 }
 
 fn start_echo_server(
@@ -1363,6 +1394,10 @@ mod tests {
         assert_eq!(report.protocol, "vless-tcp");
         assert_eq!(report.mode, "connection-per-request");
         assert_eq!(report.total_requests, 3);
+        assert_eq!(report.completed_requests, 3);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert_eq!(report.runtime_workers, None);
         assert!(report.download_bytes > 0);
     }
 
@@ -1378,6 +1413,10 @@ mod tests {
         assert_eq!(report.protocol, "vless-tcp");
         assert_eq!(report.mode, "connection-per-stream");
         assert_eq!(report.total_requests, 3);
+        assert_eq!(report.completed_requests, 3);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert_eq!(report.runtime_workers, None);
         assert!(report.download_bytes > 0);
     }
 
@@ -1393,6 +1432,10 @@ mod tests {
         assert_eq!(report.protocol, "hy2-tcp");
         assert_eq!(report.mode, "single-quic-connection");
         assert_eq!(report.total_requests, 2);
+        assert_eq!(report.completed_requests, 2);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert!(report.runtime_workers.unwrap_or_default() >= 2);
         assert!(report.download_bytes > 0);
     }
 
@@ -1408,6 +1451,10 @@ mod tests {
         assert_eq!(report.protocol, "hy2-tcp");
         assert_eq!(report.mode, "hy2-tcp-stream-per-worker");
         assert_eq!(report.total_requests, 3);
+        assert_eq!(report.completed_requests, 3);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert!(report.runtime_workers.unwrap_or_default() >= 2);
         assert!(report.download_bytes > 0);
     }
 
@@ -1423,6 +1470,10 @@ mod tests {
         assert_eq!(report.protocol, "hy2-udp");
         assert_eq!(report.mode, "hy2-udp-datagram-connection-per-worker");
         assert_eq!(report.total_requests, 2);
+        assert_eq!(report.completed_requests, 2);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert!(report.runtime_workers.unwrap_or_default() >= 2);
         assert!(report.download_bytes > 0);
     }
 }
