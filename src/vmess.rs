@@ -3059,6 +3059,24 @@ mod tests {
         options: u8,
         command: u8,
     ) -> (Vec<u8>, VmessRequest) {
+        vmess_request_for_user_with_auth_random(
+            user,
+            target,
+            payload,
+            options,
+            command,
+            [1, 2, 3, 4],
+        )
+    }
+
+    fn vmess_request_for_user_with_auth_random(
+        user: &CoreUser,
+        target: std::net::SocketAddr,
+        payload: &[u8],
+        options: u8,
+        command: u8,
+        auth_random: [u8; 4],
+    ) -> (Vec<u8>, VmessRequest) {
         let uuid = parse_uuid_bytes(&user.uuid).expect("uuid");
         let cmd_key = vmess_cmd_key(&uuid);
         let request_body_key = [0x22u8; 16];
@@ -3087,7 +3105,7 @@ mod tests {
         let checksum = fnv1a(&header);
         header.extend_from_slice(&checksum.to_be_bytes());
 
-        let auth_id = create_auth_id(&cmd_key, super::unix_timestamp(), [1, 2, 3, 4]);
+        let auth_id = create_auth_id(&cmd_key, super::unix_timestamp(), auth_random);
         let nonce = [9u8; 8];
         let encrypted_header = seal_header(&cmd_key, &auth_id, &nonce, &header);
         let mut body = VmessBodyWriter::new(
@@ -3174,8 +3192,14 @@ mod tests {
     }
 
     fn decode_response_header<R: Read>(stream: &mut R, request: &VmessRequest) {
+        assert!(try_decode_response_header(stream, request));
+    }
+
+    fn try_decode_response_header<R: Read>(stream: &mut R, request: &VmessRequest) -> bool {
         let mut len_cipher = [0u8; 18];
-        stream.read_exact(&mut len_cipher).expect("response len");
+        if stream.read_exact(&mut len_cipher).is_err() {
+            return false;
+        }
         let len_key = super::kdf16(
             &request.response_body_key,
             &[super::RESPONSE_HEADER_LENGTH_KEY],
@@ -3184,13 +3208,14 @@ mod tests {
             &request.response_body_iv,
             &[super::RESPONSE_HEADER_LENGTH_IV],
         ));
-        let len =
-            super::aes_gcm_open(&len_key, &len_nonce, &len_cipher, &[]).expect("response len open");
+        let Ok(len) = super::aes_gcm_open(&len_key, &len_nonce, &len_cipher, &[]) else {
+            return false;
+        };
         let len = u16::from_be_bytes([len[0], len[1]]) as usize;
         let mut payload_cipher = vec![0u8; len + 16];
-        stream
-            .read_exact(&mut payload_cipher)
-            .expect("response payload");
+        if stream.read_exact(&mut payload_cipher).is_err() {
+            return false;
+        }
         let payload_key = super::kdf16(
             &request.response_body_key,
             &[super::RESPONSE_HEADER_PAYLOAD_KEY],
@@ -3199,9 +3224,51 @@ mod tests {
             &request.response_body_iv,
             &[super::RESPONSE_HEADER_PAYLOAD_IV],
         ));
-        let payload = super::aes_gcm_open(&payload_key, &payload_nonce, &payload_cipher, &[])
-            .expect("response payload open");
-        assert_eq!(payload, [request.response_header, 0, 0, 0]);
+        let Ok(payload) = super::aes_gcm_open(&payload_key, &payload_nonce, &payload_cipher, &[])
+        else {
+            return false;
+        };
+        payload == [request.response_header, 0, 0, 0]
+    }
+
+    fn vmess_tcp_probe(
+        vmess_addr: SocketAddr,
+        user: &CoreUser,
+        echo_addr: SocketAddr,
+        auth_random: [u8; 4],
+    ) -> bool {
+        let (request_bytes, request) = vmess_request_for_user_with_auth_random(
+            user,
+            echo_addr,
+            b"x",
+            OPTION_CHUNK_STREAM | OPTION_CHUNK_MASKING | OPTION_GLOBAL_PADDING,
+            COMMAND_TCP,
+            auth_random,
+        );
+        let mut client = match TcpStream::connect(vmess_addr) {
+            Ok(client) => client,
+            Err(_) => return false,
+        };
+        let _ = client.set_read_timeout(Some(Duration::from_secs(1)));
+        let _ = client.set_write_timeout(Some(Duration::from_secs(1)));
+        if client.write_all(&request_bytes).is_err() {
+            return false;
+        }
+        if !try_decode_response_header(&mut client, &request) {
+            return false;
+        }
+        let mut body = match VmessBodyReader::new(
+            client,
+            request.response_body_key,
+            request.response_body_iv,
+            request.options,
+            request.security,
+        ) {
+            Ok(body) => body,
+            Err(_) => return false,
+        };
+        let mut echoed = [0u8; 1];
+        body.read_exact(&mut echoed).is_ok() && echoed == *b"x"
     }
 
     fn read_legacy_vmess_request_header<R: Read>(
@@ -3498,6 +3565,59 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn apply_user_delta_changes_vmess_auth_without_rebinding_listener() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = echo.accept().expect("echo accept");
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).expect("echo read");
+                stream.write_all(&byte).expect("echo write");
+            }
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vmess bind");
+        let vmess_addr = listener.local_addr().expect("vmess addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().expect("vmess accept");
+                let _ = server_clone.handle_tcp_client(stream);
+            }
+        });
+
+        let original_user = user();
+        let next_user = user_b();
+        assert!(
+            vmess_tcp_probe(vmess_addr, &original_user, echo_addr, [1, 2, 3, 4]),
+            "original vmess user should authenticate before delta"
+        );
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            added: vec![next_user.clone()],
+            deleted: vec![original_user.uuid.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.active_users, 1);
+        assert!(
+            !vmess_tcp_probe(vmess_addr, &original_user, echo_addr, [5, 6, 7, 8]),
+            "deleted vmess user should fail new authentication after delta"
+        );
+        assert!(
+            vmess_tcp_probe(vmess_addr, &next_user, echo_addr, [9, 10, 11, 12]),
+            "added vmess user should authenticate on the same listener after delta"
+        );
+
+        server_thread.join().expect("server thread");
+        echo_thread.join().expect("echo thread");
     }
 
     #[test]
