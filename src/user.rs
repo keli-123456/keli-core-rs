@@ -54,8 +54,9 @@ impl UserStore {
     where
         F: Fn(&CoreUser) -> String,
     {
+        let next = keyed_user_map(&users, key);
         let mut current = self.users.write().expect("user store lock poisoned");
-        *current = keyed_user_map(&users, key);
+        *current = next;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -78,11 +79,13 @@ fn keyed_user_map<F>(users: &[CoreUser], key: F) -> HashMap<String, CoreUser>
 where
     F: Fn(&CoreUser) -> String,
 {
-    users
-        .iter()
-        .filter(|user| !user.is_empty())
-        .map(|user| (key(user), user.clone()))
-        .collect()
+    let mut map = HashMap::with_capacity(users.len());
+    for user in users {
+        if !user.is_empty() {
+            map.insert(key(user), user.clone());
+        }
+    }
+    map
 }
 
 #[cfg(test)]
@@ -119,5 +122,20 @@ mod tests {
 
         assert!(store.get("user-a").is_none());
         assert!(store.get("user-b").is_some());
+    }
+
+    #[test]
+    fn user_store_replaces_large_user_sets() {
+        let store = UserStore::default();
+        let users = (0..10_000)
+            .map(|index| user(&format!("user-{index:05}")))
+            .collect::<Vec<_>>();
+
+        store.replace_uuid_users(users);
+
+        assert!(store.get("user-00000").is_some());
+        assert!(store.get("user-05000").is_some());
+        assert!(store.get("user-09999").is_some());
+        assert!(store.get("user-10000").is_none());
     }
 }
