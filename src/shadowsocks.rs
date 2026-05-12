@@ -1313,6 +1313,40 @@ mod tests {
         (addr, payload)
     }
 
+    fn shadowsocks_tcp_probe(ss_addr: SocketAddr, password: &str, echo_addr: SocketAddr) -> bool {
+        let mut client = match TcpStream::connect(ss_addr) {
+            Ok(client) => client,
+            Err(_) => return false,
+        };
+        let _ = client.set_read_timeout(Some(Duration::from_secs(1)));
+        let _ = client.set_write_timeout(Some(Duration::from_secs(1)));
+        let method = ShadowsocksMethod::parse("aes-128-gcm").expect("method");
+        let mut writer = match ShadowsocksWriter::new_response(
+            client.try_clone().expect("client clone"),
+            method,
+            password,
+        ) {
+            Ok(writer) => writer,
+            Err(_) => return false,
+        };
+        if writer
+            .write_all(&shadowsocks_request(echo_addr, b"x"))
+            .is_err()
+        {
+            return false;
+        }
+        if writer.flush().is_err() {
+            return false;
+        }
+
+        let mut reader = match ShadowsocksReader::new(&mut client, method, password) {
+            Ok(reader) => reader,
+            Err(_) => return false,
+        };
+        let mut echoed = [0u8; 1];
+        reader.read_exact(&mut echoed).is_ok() && echoed == *b"x"
+    }
+
     #[test]
     fn parses_supported_methods() {
         assert!(is_supported_shadowsocks_cipher("aes-128-gcm"));
@@ -1410,6 +1444,61 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(server.read_udp_request(&added_packet, method).is_ok());
+    }
+
+    #[test]
+    fn apply_user_delta_changes_shadowsocks_tcp_auth_without_rebinding_listener() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = echo.accept().expect("echo accept");
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).expect("echo read");
+                stream.write_all(&byte).expect("echo write");
+            }
+        });
+
+        let server = server();
+        let listener = server.bind().expect("ss bind");
+        let ss_addr = listener.local_addr().expect("ss addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || -> io::Result<()> {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept()?;
+                let _ = server_clone.handle_tcp_client(stream);
+            }
+            Ok(())
+        });
+
+        assert!(
+            shadowsocks_tcp_probe(ss_addr, "ss-password", echo_addr),
+            "original shadowsocks user should authenticate before delta"
+        );
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            added: vec![user_b()],
+            deleted: vec![user().uuid],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.active_users, 1);
+        assert!(
+            !shadowsocks_tcp_probe(ss_addr, "ss-password", echo_addr),
+            "deleted shadowsocks user should fail new authentication after delta"
+        );
+        assert!(
+            shadowsocks_tcp_probe(ss_addr, "secret-b", echo_addr),
+            "added shadowsocks user should authenticate on the same listener after delta"
+        );
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve clients");
+        echo_thread.join().expect("echo thread");
     }
 
     #[test]
