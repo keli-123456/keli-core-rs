@@ -1497,6 +1497,72 @@ mod tests {
         });
     }
 
+    #[test]
+    fn deleting_hysteria2_user_closes_existing_connection_and_reports_tail() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let cert = test_cert("delete-existing-connection");
+            let echo = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("echo bind");
+            let echo_addr = echo.local_addr().expect("echo addr");
+            let echo_task = tokio::spawn(async move {
+                let (mut stream, _) = echo.accept().await.expect("echo accept");
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await.expect("echo read");
+                stream.write_all(&byte).await.expect("echo write");
+            });
+            let server = server(&cert, "127.0.0.1:0".parse().expect("addr"));
+            let endpoint = server.bind().expect("hy2 bind");
+            let local_addr = endpoint.local_addr().expect("local addr");
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_task = tokio::spawn(server.clone().run(endpoint, stop.clone()));
+
+            let client_endpoint = client_endpoint(cert.cert_der.clone());
+            let connection = client_endpoint
+                .connect(local_addr, "localhost")
+                .expect("connect")
+                .await
+                .expect("connection");
+            assert_eq!(
+                authenticate_status(&connection, "hy2-password")
+                    .await
+                    .expect("auth status"),
+                233
+            );
+            assert_eq!(
+                proxy_tcp_once(connection.clone(), echo_addr, b"x").await,
+                b"x"
+            );
+
+            let result = server.apply_user_delta(&CoreUserDelta {
+                deleted: vec![user().uuid],
+                ..CoreUserDelta::default()
+            });
+            assert_eq!(result.deleted, 1);
+            tokio::time::timeout(Duration::from_secs(2), connection.closed())
+                .await
+                .expect("deleted HY2 user connection should be closed");
+
+            let records = server.drain_traffic(1);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].node_tag, "panel|hysteria|1");
+            assert_eq!(records[0].user_uuid, user().uuid);
+            assert_eq!(records[0].user_id, Some(1));
+            assert_eq!(records[0].upload, 1);
+            assert_eq!(records[0].download, 1);
+
+            connection.close(0u32.into(), b"done");
+            client_endpoint.wait_idle().await;
+            stop.store(true, Ordering::SeqCst);
+            server_task.await.expect("server task");
+            echo_task.await.expect("echo task");
+        });
+    }
+
     async fn authenticate(connection: &quinn::Connection) {
         let (udp, _) = authenticate_with_rx(connection, "0").await;
         assert_eq!(udp.as_deref(), Some("true"));
