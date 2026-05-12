@@ -1073,6 +1073,57 @@ mod tests {
         assert!(server.user_for_password_hash(&sha256("secret-b")).is_some());
     }
 
+    #[test]
+    fn apply_user_delta_changes_anytls_auth_without_rebinding_listener() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = echo.accept().expect("echo accept");
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).expect("echo read");
+                stream.write_all(&byte).expect("echo write");
+            }
+        });
+
+        let server = server();
+        let listener = server.bind().expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().expect("accept");
+                let _ = server_clone.handle_tcp_client(stream);
+            }
+        });
+
+        assert!(
+            anytls_tcp_probe(addr, "anytls-password", echo_addr),
+            "original anytls user should authenticate before delta"
+        );
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            added: vec![user_b()],
+            deleted: vec![user().uuid],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.active_users, 1);
+        assert!(
+            !anytls_tcp_probe(addr, "anytls-password", echo_addr),
+            "deleted anytls user should fail new authentication after delta"
+        );
+        assert!(
+            anytls_tcp_probe(addr, "secret-b", echo_addr),
+            "added anytls user should authenticate on the same listener after delta"
+        );
+
+        server_thread.join().expect("thread");
+        echo_thread.join().expect("echo thread");
+    }
+
     fn write_auth(client: &mut TcpStream, password: &str) {
         client
             .write_all(&sha256(password))
@@ -1081,25 +1132,72 @@ mod tests {
     }
 
     fn write_frame(client: &mut TcpStream, command: u8, stream_id: u32, payload: &[u8]) {
-        client
-            .write_all(&[
-                command,
-                (stream_id >> 24) as u8,
-                (stream_id >> 16) as u8,
-                (stream_id >> 8) as u8,
-                stream_id as u8,
-                (payload.len() >> 8) as u8,
-                payload.len() as u8,
-            ])
-            .expect("frame header");
-        client.write_all(payload).expect("frame payload");
+        try_write_frame(client, command, stream_id, payload).expect("frame write");
+    }
+
+    fn try_write_frame(
+        client: &mut TcpStream,
+        command: u8,
+        stream_id: u32,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
+        client.write_all(&[
+            command,
+            (stream_id >> 24) as u8,
+            (stream_id >> 16) as u8,
+            (stream_id >> 8) as u8,
+            stream_id as u8,
+            (payload.len() >> 8) as u8,
+            payload.len() as u8,
+        ])?;
+        client.write_all(payload)
     }
 
     fn read_frame(client: &mut TcpStream) -> (u8, u32, Vec<u8>) {
-        let header = read_frame_header(client).expect("frame header");
+        try_read_frame(client).expect("frame")
+    }
+
+    fn try_read_frame(client: &mut TcpStream) -> Option<(u8, u32, Vec<u8>)> {
+        let header = read_frame_header(client).ok()?;
         let mut body = vec![0u8; header.len];
-        client.read_exact(&mut body).expect("frame body");
-        (header.command, header.stream_id, body)
+        client.read_exact(&mut body).ok()?;
+        Some((header.command, header.stream_id, body))
+    }
+
+    fn anytls_tcp_probe(
+        addr: std::net::SocketAddr,
+        password: &str,
+        echo_addr: std::net::SocketAddr,
+    ) -> bool {
+        let mut client = match TcpStream::connect(addr) {
+            Ok(client) => client,
+            Err(_) => return false,
+        };
+        let _ = client.set_read_timeout(Some(Duration::from_secs(1)));
+        let _ = client.set_write_timeout(Some(Duration::from_secs(1)));
+        if client.write_all(&sha256(password)).is_err() {
+            return false;
+        }
+        if client.write_all(&0u16.to_be_bytes()).is_err() {
+            return false;
+        }
+        if try_write_frame(&mut client, CMD_PSH, 1, &ipv4_target(echo_addr)).is_err() {
+            return false;
+        }
+        let Some((command, stream_id, body)) = try_read_frame(&mut client) else {
+            return false;
+        };
+        if command != CMD_SYNACK || stream_id != 1 || !body.is_empty() {
+            return false;
+        }
+        if try_write_frame(&mut client, CMD_PSH, 1, b"x").is_err() {
+            return false;
+        }
+        let Some((command, stream_id, body)) = try_read_frame(&mut client) else {
+            return false;
+        };
+        let _ = try_write_frame(&mut client, CMD_FIN, 1, &[]);
+        command == CMD_PSH && stream_id == 1 && body == b"x"
     }
 
     fn ipv4_target(target: std::net::SocketAddr) -> Vec<u8> {
