@@ -210,25 +210,32 @@ impl Hysteria2Server {
         });
 
         loop {
-            match connection.accept_bi().await {
-                Ok(stream) => {
-                    let server = self.clone();
-                    let user_uuid = auth.user.uuid.clone();
-                    let user_id = auth.user.id;
-                    let bandwidth = bandwidth.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = server
-                            .handle_tcp_stream(stream, user_uuid, user_id, bandwidth, client_ip)
-                            .await
-                        {
-                            eprintln!("hysteria2 tcp stream error: {error}");
-                        }
-                    });
+            let revoke_watch = bandwidth.clone();
+            tokio::select! {
+                stream = connection.accept_bi() => match stream {
+                    Ok(stream) => {
+                        let server = self.clone();
+                        let user_uuid = auth.user.uuid.clone();
+                        let user_id = auth.user.id;
+                        let bandwidth = bandwidth.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = server
+                                .handle_tcp_stream(stream, user_uuid, user_id, bandwidth, client_ip)
+                                .await
+                            {
+                                eprintln!("hysteria2 tcp stream error: {error}");
+                            }
+                        });
+                    }
+                    Err(quinn::ConnectionError::ApplicationClosed { .. })
+                    | Err(quinn::ConnectionError::LocallyClosed)
+                    | Err(quinn::ConnectionError::ConnectionClosed(_)) => return Ok(()),
+                    Err(error) => return Err(io_other(error)),
+                },
+                _ = revoke_watch.wait_revoked() => {
+                    connection.close(0u32.into(), b"user revoked");
+                    return Ok(());
                 }
-                Err(quinn::ConnectionError::ApplicationClosed { .. })
-                | Err(quinn::ConnectionError::LocallyClosed)
-                | Err(quinn::ConnectionError::ConnectionClosed(_)) => return Ok(()),
-                Err(error) => return Err(io_other(error)),
             }
         }
     }
@@ -413,12 +420,16 @@ impl Hysteria2Server {
     ) -> io::Result<()> {
         let mut fragments = UdpFragmentStore::default();
         loop {
-            let datagram = match connection.read_datagram().await {
-                Ok(datagram) => datagram,
-                Err(quinn::ConnectionError::ApplicationClosed { .. })
-                | Err(quinn::ConnectionError::LocallyClosed)
-                | Err(quinn::ConnectionError::ConnectionClosed(_)) => return Ok(()),
-                Err(error) => return Err(io_other(error)),
+            let revoke_watch = bandwidth.clone();
+            let datagram = tokio::select! {
+                datagram = connection.read_datagram() => match datagram {
+                    Ok(datagram) => datagram,
+                    Err(quinn::ConnectionError::ApplicationClosed { .. })
+                    | Err(quinn::ConnectionError::LocallyClosed)
+                    | Err(quinn::ConnectionError::ConnectionClosed(_)) => return Ok(()),
+                    Err(error) => return Err(io_other(error)),
+                },
+                _ = revoke_watch.wait_revoked() => return Ok(()),
             };
             let Ok(message) = parse_udp_datagram(&datagram) else {
                 continue;
@@ -681,6 +692,27 @@ struct DirectionalLimiters {
 }
 
 impl DirectionalLimiters {
+    fn is_empty(&self) -> bool {
+        self.upload.is_empty() && self.download.is_empty()
+    }
+
+    fn is_revoked(&self) -> bool {
+        self.upload
+            .iter()
+            .chain(self.download.iter())
+            .any(|limiter| limiter.is_revoked())
+    }
+
+    async fn wait_revoked(&self) {
+        if self.is_empty() {
+            std::future::pending::<()>().await;
+        }
+
+        while !self.is_revoked() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     async fn wait_upload(&self, bytes: usize) -> bool {
         for limiter in &self.upload {
             if !limiter.wait_for_async(bytes).await {
@@ -807,7 +839,12 @@ async fn receive_udp_replies(
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; UDP_PACKET_BUFFER_SIZE];
     loop {
-        let (read, peer) = session.socket.recv_from(&mut buffer).await?;
+        let revoke_watch = bandwidth.clone();
+        let (read, peer) = tokio::select! {
+            result = session.socket.recv_from(&mut buffer) => result?,
+            _ = connection.closed() => return Ok(()),
+            _ = revoke_watch.wait_revoked() => return Ok(()),
+        };
         if !bandwidth.wait_download(read).await {
             return Ok(());
         }
@@ -1044,10 +1081,18 @@ async fn relay_streams(
 ) -> io::Result<(u64, u64)> {
     let (mut remote_read, mut remote_write) = remote.into_split();
     let upload = async {
+        let bandwidth = bandwidth.clone();
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
-            let read = recv.read(&mut buffer).await.map_err(io_other)?;
+            let revoke_watch = bandwidth.clone();
+            let read = tokio::select! {
+                read = recv.read(&mut buffer) => read.map_err(io_other)?,
+                _ = revoke_watch.wait_revoked() => {
+                    let _ = remote_write.shutdown().await;
+                    return Ok::<u64, io::Error>(total);
+                }
+            };
             let Some(read) = read else {
                 let _ = remote_write.shutdown().await;
                 return Ok::<u64, io::Error>(total);
@@ -1062,10 +1107,18 @@ async fn relay_streams(
         }
     };
     let download = async {
+        let bandwidth = bandwidth.clone();
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
-            let read = remote_read.read(&mut buffer).await?;
+            let revoke_watch = bandwidth.clone();
+            let read = tokio::select! {
+                read = remote_read.read(&mut buffer) => read?,
+                _ = revoke_watch.wait_revoked() => {
+                    let _ = send.finish();
+                    return Ok::<u64, io::Error>(total);
+                }
+            };
             if read == 0 {
                 let _ = send.finish();
                 return Ok::<u64, io::Error>(total);
@@ -1332,6 +1385,29 @@ mod tests {
         assert_eq!(result.active_users, 1);
         assert!(server.user_for_auth("rotated-hy2").is_none());
         assert!(server.user_for_auth("secret-b").is_some());
+    }
+
+    #[test]
+    fn directional_limiters_observe_user_revocation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let limiter = Arc::new(BandwidthLimiter::unlimited());
+            let limits = DirectionalLimiters {
+                upload: vec![limiter.clone()],
+                download: Vec::new(),
+            };
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                limiter.revoke();
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), limits.wait_revoked())
+                .await
+                .expect("revocation should wake waiter");
+        });
     }
 
     #[test]

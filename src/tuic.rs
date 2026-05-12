@@ -207,7 +207,18 @@ impl TuicServer {
         });
 
         loop {
-            match connection.accept_bi().await {
+            let stream = if let Some(limiter) = bandwidth.as_deref() {
+                tokio::select! {
+                    stream = connection.accept_bi() => stream,
+                    _ = wait_limiter_revoke(limiter) => {
+                        connection.close(0u32.into(), b"user revoked");
+                        return Ok(());
+                    }
+                }
+            } else {
+                connection.accept_bi().await
+            };
+            match stream {
                 Ok(stream) => {
                     let server = self.clone();
                     let user_uuid = user.uuid.clone();
@@ -322,7 +333,15 @@ impl TuicServer {
     ) -> io::Result<()> {
         let mut fragments = UdpFragmentStore::default();
         loop {
-            let datagram = match connection.read_datagram().await {
+            let datagram = if let Some(limiter) = bandwidth.as_deref() {
+                tokio::select! {
+                    datagram = connection.read_datagram() => datagram,
+                    _ = wait_limiter_revoke(limiter) => return Ok(()),
+                }
+            } else {
+                connection.read_datagram().await
+            };
+            let datagram = match datagram {
                 Ok(datagram) => datagram,
                 Err(quinn::ConnectionError::ApplicationClosed { .. })
                 | Err(quinn::ConnectionError::LocallyClosed)
@@ -358,7 +377,15 @@ impl TuicServer {
     ) -> io::Result<()> {
         let mut fragments = UdpFragmentStore::default();
         loop {
-            let mut stream = match connection.accept_uni().await {
+            let stream = if let Some(limiter) = bandwidth.as_deref() {
+                tokio::select! {
+                    stream = connection.accept_uni() => stream,
+                    _ = wait_limiter_revoke(limiter) => return Ok(()),
+                }
+            } else {
+                connection.accept_uni().await
+            };
+            let mut stream = match stream {
                 Ok(stream) => stream,
                 Err(quinn::ConnectionError::ApplicationClosed { .. })
                 | Err(quinn::ConnectionError::LocallyClosed)
@@ -755,6 +782,12 @@ async fn resolve_udp_target(target: &SocksTarget, timeout: Duration) -> io::Resu
     crate::dns::resolve_socket_addr_tokio(&target.host, target.port, timeout).await
 }
 
+async fn wait_limiter_revoke(limiter: &BandwidthLimiter) {
+    while !limiter.is_revoked() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn receive_udp_replies(
     assoc_id: u16,
     session: Arc<UdpRelaySession>,
@@ -774,6 +807,13 @@ async fn receive_udp_replies(
         let result = tokio::select! {
             result = session.socket.recv_from(&mut buffer) => result,
             _ = connection.closed() => return Ok(()),
+            _ = async {
+                if let Some(limiter) = bandwidth.as_deref() {
+                    wait_limiter_revoke(limiter).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => return Ok(()),
             _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
         };
         let (read, peer) = result?;
@@ -826,7 +866,17 @@ async fn relay_streams(
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
-            let read = recv.read(&mut buffer).await.map_err(io_other)?;
+            let read = if let Some(limiter) = bandwidth.as_deref() {
+                tokio::select! {
+                    read = recv.read(&mut buffer) => read.map_err(io_other)?,
+                    _ = wait_limiter_revoke(limiter) => {
+                        let _ = remote_write.shutdown().await;
+                        return Ok::<u64, io::Error>(total);
+                    }
+                }
+            } else {
+                recv.read(&mut buffer).await.map_err(io_other)?
+            };
             let Some(read) = read else {
                 let _ = remote_write.shutdown().await;
                 return Ok::<u64, io::Error>(total);
@@ -845,10 +895,26 @@ async fn relay_streams(
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
-            let read = remote_read.read(&mut buffer).await?;
+            let read = if let Some(limiter) = bandwidth.as_deref() {
+                tokio::select! {
+                    read = remote_read.read(&mut buffer) => read?,
+                    _ = wait_limiter_revoke(limiter) => {
+                        let _ = send.finish();
+                        return Ok::<u64, io::Error>(total);
+                    }
+                }
+            } else {
+                remote_read.read(&mut buffer).await?
+            };
             if read == 0 {
                 let _ = send.finish();
                 return Ok::<u64, io::Error>(total);
+            }
+            if let Some(limiter) = bandwidth.as_deref() {
+                if !limiter.wait_for(read) {
+                    let _ = send.finish();
+                    return Ok::<u64, io::Error>(total);
+                }
             }
             send.write_all(&buffer[..read]).await.map_err(io_other)?;
             total = total.saturating_add(read as u64);
@@ -1380,6 +1446,28 @@ mod tests {
         assert_eq!(result.active_users, 1);
         assert!(server.user_for_uuid(&old_uuid).is_none());
         assert!(server.user_for_uuid(&new_uuid).is_some());
+    }
+
+    #[test]
+    fn tuic_relay_waiter_observes_user_revocation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let limiter = Arc::new(BandwidthLimiter::unlimited());
+            tokio::spawn({
+                let limiter = limiter.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    limiter.revoke();
+                }
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), wait_limiter_revoke(&limiter))
+                .await
+                .expect("revocation should wake waiter");
+        });
     }
 
     fn auth_command_for(connection: &quinn::Connection, uuid: &str, password: &str) -> Vec<u8> {
