@@ -211,6 +211,9 @@ impl VmessServer {
             return self.relay_udp_single(client, request, bandwidth);
         }
         let remote = self.connect_for_request(&request)?;
+        let _connection = self
+            .bandwidth
+            .register_tcp_connection(Some(&request.user_uuid), &[&client, &remote])?;
         write_response_header(&mut client, &request)?;
         self.relay_split(client, remote, request, bandwidth)
     }
@@ -2937,7 +2940,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        mpsc, Arc,
     };
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -3083,6 +3086,34 @@ mod tests {
         command: u8,
         auth_random: [u8; 4],
     ) -> (Vec<u8>, VmessRequest) {
+        let (mut output, request) = vmess_request_header_for_user_with_auth_random(
+            user,
+            target,
+            options,
+            command,
+            auth_random,
+        );
+        let mut body = VmessBodyWriter::new(
+            Vec::new(),
+            request.request_body_key,
+            request.request_body_iv,
+            options,
+            request.security,
+        )
+        .expect("body writer");
+        body.write_all(payload).expect("body payload");
+        body.finish().expect("body finish");
+        output.extend_from_slice(&body.into_inner());
+        (output, request)
+    }
+
+    fn vmess_request_header_for_user_with_auth_random(
+        user: &CoreUser,
+        target: std::net::SocketAddr,
+        options: u8,
+        command: u8,
+        auth_random: [u8; 4],
+    ) -> (Vec<u8>, VmessRequest) {
         let uuid = parse_uuid_bytes(&user.uuid).expect("uuid");
         let cmd_key = vmess_cmd_key(&uuid);
         let request_body_key = [0x22u8; 16];
@@ -3114,16 +3145,6 @@ mod tests {
         let auth_id = create_auth_id(&cmd_key, super::unix_timestamp(), auth_random);
         let nonce = [9u8; 8];
         let encrypted_header = seal_header(&cmd_key, &auth_id, &nonce, &header);
-        let mut body = VmessBodyWriter::new(
-            Vec::new(),
-            request_body_key,
-            request_body_iv,
-            options,
-            security,
-        )
-        .expect("body writer");
-        body.write_all(payload).expect("body payload");
-        body.finish().expect("body finish");
 
         let response_body_key = super::first_16_sha256(&request_body_key);
         let response_body_iv = super::first_16_sha256(&request_body_iv);
@@ -3151,9 +3172,7 @@ mod tests {
             header_mode: VmessHeaderMode::Aead,
         };
 
-        let mut output = encrypted_header;
-        output.extend_from_slice(&body.into_inner());
-        (output, request)
+        (encrypted_header, request)
     }
 
     fn seal_header(
@@ -3624,6 +3643,106 @@ mod tests {
 
         server_thread.join().expect("server thread");
         echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
+    fn deleting_vmess_user_stops_existing_tcp_relay_on_next_payload_and_reports_tail() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (second_payload_tx, second_payload_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .expect("echo timeout");
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).expect("first payload");
+            stream.write_all(&first).expect("first echo");
+            let mut second = [0u8; 1];
+            let received_second = stream.read_exact(&mut second).is_ok();
+            second_payload_tx
+                .send(received_second)
+                .expect("send result");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vmess bind");
+        let vmess_addr = listener.local_addr().expect("vmess addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vmess accept");
+            server_clone.handle_tcp_client(stream)
+        });
+
+        let (header, request) = vmess_request_header_for_user_with_auth_random(
+            &user(),
+            echo_addr,
+            OPTION_CHUNK_STREAM | OPTION_CHUNK_MASKING | OPTION_GLOBAL_PADDING,
+            COMMAND_TCP,
+            [7, 7, 7, 7],
+        );
+        let mut client = TcpStream::connect(vmess_addr).expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("client read timeout");
+        client
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .expect("client write timeout");
+        client.write_all(&header).expect("client request header");
+        let mut request_body = VmessBodyWriter::new(
+            client.try_clone().expect("client clone"),
+            request.request_body_key,
+            request.request_body_iv,
+            request.options,
+            request.security,
+        )
+        .expect("request body writer");
+        request_body.write_all(b"x").expect("first payload");
+        request_body.flush().expect("first flush");
+
+        decode_response_header(&mut client, &request);
+        let mut response_body = VmessBodyReader::new(
+            client.try_clone().expect("client clone"),
+            request.response_body_key,
+            request.response_body_iv,
+            request.options,
+            request.security,
+        )
+        .expect("response body");
+        let mut echoed = [0u8; 1];
+        response_body.read_exact(&mut echoed).expect("first echo");
+        assert_eq!(echoed, *b"x");
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![user().uuid],
+            ..CoreUserDelta::default()
+        });
+        assert_eq!(result.deleted, 1);
+
+        let _ = request_body.write_all(b"y");
+        let _ = request_body.flush();
+        assert!(
+            !second_payload_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("echo result"),
+            "deleted user's existing VMess relay should stop forwarding new payload"
+        );
+        drop(request_body);
+        drop(response_body);
+        drop(client);
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|vmess|1");
+        assert_eq!(records[0].user_uuid, user().uuid);
+        assert_eq!(records[0].user_id, Some(1));
+        assert_eq!(records[0].upload, 1);
+        assert_eq!(records[0].download, 1);
     }
 
     #[test]
