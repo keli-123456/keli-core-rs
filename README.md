@@ -126,6 +126,7 @@ cargo run -- bench vless-tcp --streams 8 --requests 1000 --payload 1024
 cargo run -- bench vless-tcp-stream --streams 8 --requests 1000 --payload 1024
 cargo run -- bench hy2-tcp --streams 8 --requests 1000 --payload 1024
 cargo run -- bench hy2-tcp-stream --streams 8 --requests 1000 --payload 1024
+cargo run -- bench hy2-udp --streams 8 --requests 1000 --payload 1024
 ```
 
 ## Local Benchmarks
@@ -145,12 +146,17 @@ cargo run --release -- bench vless-tcp --streams 16 --requests 5000 --payload 10
 cargo run --release -- bench vless-tcp-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-tcp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-tcp-stream --streams 16 --requests 5000 --payload 1024
+cargo run --release -- bench hy2-udp --streams 16 --requests 5000 --payload 1024
 ```
 
 Use the same host, release build, payload, stream count, and request count when comparing
 against Xray or another core. The JSON `retries` field records retryable local socket
 EOF/reset noise seen while establishing benchmark requests; treat non-zero retries as
 environment noise when comparing results.
+
+Real-client interop and soak runs are tracked separately from local loopback benchmarks in
+`docs/INTEROP_SOAK.md`. Do not mark a protocol production-ready from these loopback
+benchmarks alone.
 
 ## Release Artifacts
 
