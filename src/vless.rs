@@ -868,7 +868,9 @@ impl VlessServer {
         };
 
         if let Some(limiter) = bandwidth {
-            limiter.wait_for(payload.len());
+            if !limiter.wait_for(payload.len()) {
+                return Ok((0, 0));
+            }
         }
 
         if let Some(outbound) = outbound {
@@ -940,7 +942,9 @@ impl VlessServer {
         };
 
         if let Some(limiter) = bandwidth {
-            limiter.wait_for_async(payload.len()).await;
+            if !limiter.wait_for_async(payload.len()).await {
+                return Ok((0, 0));
+            }
         }
 
         if let Some(outbound) = outbound {
@@ -2124,7 +2128,10 @@ async fn relay_tcp_streams_async(
                 return Ok::<u64, io::Error>(total);
             }
             if let Some(limiter) = upload_limiter.as_deref() {
-                limiter.wait_for_async(read).await;
+                if !limiter.wait_for_async(read).await {
+                    let _ = remote_write.shutdown().await;
+                    return Ok::<u64, io::Error>(total);
+                }
             }
             remote_write.write_all(&buffer[..read]).await?;
             on_upload(read as u64);
@@ -2141,7 +2148,10 @@ async fn relay_tcp_streams_async(
                 return Ok::<u64, io::Error>(total);
             }
             if let Some(limiter) = limiter.as_deref() {
-                limiter.wait_for_async(read).await;
+                if !limiter.wait_for_async(read).await {
+                    let _ = client_write.shutdown().await;
+                    return Ok::<u64, io::Error>(total);
+                }
             }
             client_write.write_all(&buffer[..read]).await?;
             on_download(read as u64);
@@ -2222,7 +2232,11 @@ where
             let decoded = vision_decoder.read_decoded(&mut client_buffer)?;
             if decoded > 0 {
                 if let Some(limiter) = limiter.as_deref() {
-                    limiter.wait_for(decoded);
+                    if !limiter.wait_for(decoded) {
+                        upload_done = true;
+                        let _ = remote.shutdown(Shutdown::Write);
+                        continue;
+                    }
                 }
                 write_all_wait(&mut remote, &client_buffer[..decoded])?;
                 upload = upload.saturating_add(decoded as u64);

@@ -568,7 +568,9 @@ impl TrojanServer {
         };
 
         if let Some(limiter) = bandwidth {
-            limiter.wait_for(payload.len());
+            if !limiter.wait_for(payload.len()) {
+                return Ok((0, 0));
+            }
         }
 
         if let Some(outbound) = outbound {

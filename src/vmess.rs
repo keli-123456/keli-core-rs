@@ -556,7 +556,11 @@ impl VmessServer {
                     }
                     Ok(read) => {
                         if let Some(limiter) = bandwidth.as_deref() {
-                            limiter.wait_for(read);
+                            if !limiter.wait_for(read) {
+                                upload_done = true;
+                                let _ = remote.shutdown(Shutdown::Write);
+                                continue;
+                            }
                         }
                         write_all_wait(&mut remote, &client_buffer[..read])?;
                         upload = upload.saturating_add(read as u64);
@@ -758,7 +762,9 @@ impl VmessServer {
         };
 
         if let Some(limiter) = bandwidth {
-            limiter.wait_for(payload.len());
+            if !limiter.wait_for(payload.len()) {
+                return Ok((0, None));
+            }
         }
 
         if let Some(outbound) = outbound {

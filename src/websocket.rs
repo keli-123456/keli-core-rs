@@ -145,7 +145,11 @@ pub fn relay_websocket_tls_stream(
                 }
                 Ok(read) => {
                     if let Some(limiter) = limiter.as_deref() {
-                        limiter.wait_for(read);
+                        if !limiter.wait_for(read) {
+                            upload_done = true;
+                            let _ = remote.shutdown(Shutdown::Write);
+                            continue;
+                        }
                     }
                     write_all_wait(&mut remote, &client_buffer[..read])?;
                     upload = upload.saturating_add(read as u64);

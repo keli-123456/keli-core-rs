@@ -374,7 +374,9 @@ impl Socks5Server {
                         match &decision {
                             RouteDecision::Direct => {
                                 if let Some(limiter) = bandwidth.as_deref() {
-                                    limiter.wait_for(payload.len());
+                                    if !limiter.wait_for(payload.len()) {
+                                        break;
+                                    }
                                 }
                                 let remote_addr = resolve_udp_target(&target)?;
                                 udp.send_to(payload, remote_addr)?;
@@ -382,7 +384,9 @@ impl Socks5Server {
                             }
                             RouteDecision::Outbound(outbound) => {
                                 if let Some(limiter) = bandwidth.as_deref() {
-                                    limiter.wait_for(payload.len());
+                                    if !limiter.wait_for(payload.len()) {
+                                        break;
+                                    }
                                 }
                                 match send_udp_outbound(
                                     outbound,

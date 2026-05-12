@@ -497,7 +497,9 @@ fn handle_mieru_session(
         let mut upload = 0u64;
         if !initial_payload.is_empty() {
             if let Some(limiter) = bandwidth.as_deref() {
-                limiter.wait_for(initial_payload.len());
+                if !limiter.wait_for(initial_payload.len()) {
+                    return Ok(());
+                }
             }
             remote.write_all(&initial_payload)?;
             upload = initial_payload.len() as u64;
@@ -1420,7 +1422,9 @@ where
     while let Some(packet) = read_mieru_udp_frame(&mut reader, &mut pending)? {
         let (target, payload) = parse_socks_udp_packet(&packet)?;
         if let Some(limiter) = limiter.as_deref() {
-            limiter.wait_for(payload.len());
+            if !limiter.wait_for(payload.len()) {
+                break;
+            }
         }
         let protocol_labels = route_protocol_labels("udp", &payload);
         let response = match router.decide_target(&target.host, target.port, &protocol_labels) {

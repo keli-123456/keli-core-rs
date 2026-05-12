@@ -359,7 +359,9 @@ impl ShadowsocksServer {
             return Err(error);
         }
         if let Some(limiter) = self.bandwidth.limiter_for(Some(&request.user)).as_deref() {
-            limiter.wait_for(request.payload.len());
+            if !limiter.wait_for(request.payload.len()) {
+                return Ok(());
+            }
         }
         if let Some(outbound) = outbound {
             match send_udp_outbound(
@@ -459,7 +461,9 @@ impl ShadowsocksServer {
         let mut upload = 0u64;
         if !request.initial_payload.is_empty() {
             if let Some(limiter) = bandwidth.as_deref() {
-                limiter.wait_for(request.initial_payload.len());
+                if !limiter.wait_for(request.initial_payload.len()) {
+                    return Ok(());
+                }
             }
             remote.write_all(&request.initial_payload)?;
             upload = request.initial_payload.len() as u64;

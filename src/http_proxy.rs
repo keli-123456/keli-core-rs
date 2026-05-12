@@ -245,7 +245,9 @@ impl HttpProxyServer {
         };
         let outbound = render_plain_http_request(&request, &target)?;
         if let Some(limiter) = bandwidth.as_deref() {
-            limiter.wait_for(outbound.len());
+            if !limiter.wait_for(outbound.len()) {
+                return Ok(());
+            }
         }
         remote.write_all(&outbound)?;
         let upload = outbound.len() as u64;

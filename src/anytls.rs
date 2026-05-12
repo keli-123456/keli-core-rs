@@ -303,7 +303,9 @@ impl AnyTlsServer {
             match remote {
                 AnyTlsRemote::Tcp(mut remote) => {
                     if let Some(limiter) = session.bandwidth.as_deref() {
-                        limiter.wait_for(body.len());
+                        if !limiter.wait_for(body.len()) {
+                            return Ok(());
+                        }
                     }
                     remote.write_all(&body)?;
                     session.traffic.lock().expect("traffic lock poisoned").0 += body.len() as u64;
@@ -405,7 +407,9 @@ impl AnyTlsServer {
 
         if !initial_payload.is_empty() {
             if let Some(limiter) = session.bandwidth.as_deref() {
-                limiter.wait_for(initial_payload.len());
+                if !limiter.wait_for(initial_payload.len()) {
+                    return Ok(());
+                }
             }
             if let Some(AnyTlsRemote::Tcp(remote)) = session.remotes.get_mut(&stream_id) {
                 remote.write_all(initial_payload)?;
@@ -478,7 +482,9 @@ impl AnyTlsServer {
         };
 
         if let Some(limiter) = session.bandwidth.as_deref() {
-            limiter.wait_for(payload.len());
+            if !limiter.wait_for(payload.len()) {
+                return Ok((0, 0));
+            }
         }
 
         if let Some(outbound) = outbound {
