@@ -881,6 +881,78 @@ mod tests {
     }
 
     #[test]
+    fn apply_user_delta_updates_socks_users() {
+        let server = server();
+        let mut updated = user();
+        updated.password = Some("rotated-socks".to_string());
+        updated.speed_limit = 64;
+        updated.device_limit = 2;
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            added: vec![user_b()],
+            updated: vec![updated.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.active_users, 2);
+        let mut old_stream = MemoryStream::new(authenticated_domain_connect(
+            "user-a",
+            "user-a",
+            "example.com",
+            443,
+        ));
+        assert_eq!(
+            server
+                .read_request(&mut old_stream)
+                .expect_err("old credential should fail after update")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let mut updated_stream = MemoryStream::new(authenticated_domain_connect(
+            "user-a",
+            "rotated-socks",
+            "example.com",
+            443,
+        ));
+        let request = server
+            .read_request(&mut updated_stream)
+            .expect("updated credential should authenticate");
+        let user = server.request_user(&request).expect("updated user");
+        assert_eq!(user.speed_limit, 64);
+        assert_eq!(user.device_limit, 2);
+        let mut added_stream = MemoryStream::new(authenticated_domain_connect(
+            "user-b",
+            "secret-b",
+            "example.com",
+            443,
+        ));
+        assert!(server.read_request(&mut added_stream).is_ok());
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![updated.uuid],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.active_users, 1);
+        let mut deleted_stream = MemoryStream::new(authenticated_domain_connect(
+            "user-a",
+            "rotated-socks",
+            "example.com",
+            443,
+        ));
+        assert_eq!(
+            server
+                .read_request(&mut deleted_stream)
+                .expect_err("deleted user should fail after delta delete")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
     fn proxies_tcp_and_records_user_traffic() {
         let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
         let echo_addr = echo.local_addr().expect("echo addr");

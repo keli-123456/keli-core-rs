@@ -805,6 +805,66 @@ mod tests {
     }
 
     #[test]
+    fn apply_user_delta_updates_http_users() {
+        let server = server();
+        let mut updated = user();
+        updated.password = Some("rotated-http".to_string());
+        updated.speed_limit = 64;
+        updated.device_limit = 2;
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            added: vec![user_b()],
+            updated: vec![updated.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.active_users, 2);
+        let old_headers = vec![(
+            "Proxy-Authorization".to_string(),
+            basic_auth_value("user-a", "user-a"),
+        )];
+        assert_eq!(
+            server
+                .authenticate(&old_headers)
+                .expect_err("old credential should fail after update")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let updated_headers = vec![(
+            "Proxy-Authorization".to_string(),
+            basic_auth_value("user-a", "rotated-http"),
+        )];
+        let user = server
+            .authenticate(&updated_headers)
+            .expect("updated credential should authenticate")
+            .expect("updated user");
+        assert_eq!(user.speed_limit, 64);
+        assert_eq!(user.device_limit, 2);
+        let added_headers = vec![(
+            "Proxy-Authorization".to_string(),
+            basic_auth_value("user-b", "secret-b"),
+        )];
+        assert!(server.authenticate(&added_headers).is_ok());
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![updated.uuid],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.active_users, 1);
+        assert_eq!(
+            server
+                .authenticate(&updated_headers)
+                .expect_err("deleted user should fail after delta delete")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
     fn writes_407_for_missing_auth_on_tcp_connection() {
         let server = server();
         let listener = server.bind().expect("proxy bind");
