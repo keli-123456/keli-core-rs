@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -85,6 +85,7 @@ pub struct CoreService {
     config: CoreConfig,
     listeners: Vec<ListenerHandle>,
     traffic: SharedTrafficRegistry,
+    user_revisions: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -240,6 +241,7 @@ impl CoreService {
             config: active_config,
             listeners,
             traffic,
+            user_revisions: HashMap::new(),
         })
     }
 
@@ -272,6 +274,7 @@ impl CoreService {
                 handle.runtime.replace_users(inbound.users.clone());
             }
         }
+        self.user_revisions.clear();
         self.config = config;
     }
 
@@ -285,6 +288,17 @@ impl CoreService {
             .iter()
             .find(|handle| handle.status.tag == node_tag)
             .ok_or_else(|| format!("unknown inbound node_tag {node_tag}"))?;
+        if delta.full.is_none() {
+            if let Some(base_revision) = delta.base_revision.as_deref() {
+                if let Some(current_revision) = self.user_revisions.get(node_tag) {
+                    if current_revision != base_revision {
+                        return Err(format!(
+                            "revision mismatch for inbound {node_tag}: current {current_revision}, base {base_revision}"
+                        ));
+                    }
+                }
+            }
+        }
         let result = handle.runtime.apply_user_delta(delta);
         if let Some(inbound) = self
             .config
@@ -293,6 +307,12 @@ impl CoreService {
             .find(|inbound| inbound.tag == node_tag)
         {
             apply_user_delta_to_vec(&mut inbound.users, delta);
+        }
+        if let Some(revision) = delta.revision.as_ref() {
+            self.user_revisions
+                .insert(node_tag.to_string(), revision.clone());
+        } else if delta.full.is_some() {
+            self.user_revisions.remove(node_tag);
         }
         Ok(result)
     }
