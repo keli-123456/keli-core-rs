@@ -242,6 +242,13 @@ impl CoreService {
             .drain_minimum(minimum_bytes)
     }
 
+    pub fn requeue_traffic(&self, records: Vec<TrafficDelta>) {
+        self.traffic
+            .lock()
+            .expect("traffic registry lock poisoned")
+            .add_deltas(records);
+    }
+
     pub fn can_update_users(&self, config: &CoreConfig) -> bool {
         config_without_users(&self.config) == config_without_users(config)
     }

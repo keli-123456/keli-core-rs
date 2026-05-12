@@ -10,6 +10,7 @@ use crate::traffic::TrafficDelta;
 pub enum CoreCommand {
     ApplyConfig { config: CoreConfig },
     DrainTraffic { minimum_bytes: u64 },
+    RequeueTraffic { records: Vec<TrafficDelta> },
     Status,
     Stop,
 }
@@ -24,6 +25,9 @@ pub enum CoreResponse {
     },
     Traffic {
         records: Vec<TrafficDelta>,
+    },
+    TrafficRequeued {
+        count: usize,
     },
     Status {
         status: CoreStatus,
@@ -55,6 +59,11 @@ impl CoreController {
             CoreCommand::DrainTraffic { minimum_bytes } => CoreResponse::Traffic {
                 records: self.drain_traffic(minimum_bytes),
             },
+            CoreCommand::RequeueTraffic { records } => {
+                let count = records.len();
+                self.requeue_traffic(records);
+                CoreResponse::TrafficRequeued { count }
+            }
             CoreCommand::Status => CoreResponse::Status {
                 status: self.runtime.status().clone(),
                 listeners: self.listeners(),
@@ -133,6 +142,13 @@ impl CoreController {
         }
     }
 
+    fn requeue_traffic(&mut self, records: Vec<TrafficDelta>) {
+        match &mut self.service {
+            Some(service) => service.requeue_traffic(records),
+            None => self.runtime.requeue_traffic(records),
+        }
+    }
+
     fn listeners(&self) -> Vec<ListenerStatus> {
         self.service
             .as_ref()
@@ -160,6 +176,7 @@ mod tests {
     use crate::control::{CoreCommand, CoreController, CoreResponse};
     use crate::protocol::Protocol;
     use crate::runtime::CoreStatus;
+    use crate::traffic::TrafficDelta;
     use crate::user::CoreUser;
 
     fn free_port() -> u16 {
@@ -304,6 +321,36 @@ mod tests {
 
         match response {
             CoreResponse::Error { message } => assert!(message.contains("external sidecar")),
+            response => panic!("unexpected response: {response:?}"),
+        }
+    }
+
+    #[test]
+    fn requeues_drained_traffic_records() {
+        let mut controller = CoreController::new();
+        let record = TrafficDelta {
+            node_tag: "node-a".to_string(),
+            user_uuid: "user-a".to_string(),
+            user_id: Some(7),
+            upload: 10,
+            download: 20,
+            online_ips: vec!["198.51.100.7".to_string()],
+        };
+
+        assert!(matches!(
+            controller.handle(CoreCommand::RequeueTraffic {
+                records: vec![record]
+            }),
+            CoreResponse::TrafficRequeued { count: 1 }
+        ));
+
+        match controller.handle(CoreCommand::DrainTraffic { minimum_bytes: 1 }) {
+            CoreResponse::Traffic { records } => {
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].user_id, Some(7));
+                assert_eq!(records[0].upload, 10);
+                assert_eq!(records[0].online_ips, vec!["198.51.100.7"]);
+            }
             response => panic!("unexpected response: {response:?}"),
         }
     }

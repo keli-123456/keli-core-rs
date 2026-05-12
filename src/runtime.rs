@@ -98,6 +98,10 @@ impl RuntimeState {
     pub fn drain_traffic(&mut self, minimum_bytes: u64) -> Vec<TrafficDelta> {
         self.traffic.drain_minimum(minimum_bytes)
     }
+
+    pub fn requeue_traffic(&mut self, records: Vec<TrafficDelta>) {
+        self.traffic.add_deltas(records);
+    }
 }
 
 impl Default for RuntimeState {

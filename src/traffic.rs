@@ -91,6 +91,45 @@ impl TrafficRegistry {
         }
     }
 
+    pub fn add_delta(&mut self, delta: TrafficDelta) {
+        let key = TrafficKey {
+            node_tag: delta.node_tag,
+            user_uuid: delta.user_uuid,
+        };
+        let entry = match self.counters.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let node_tag = entry.key().node_tag.clone();
+                let user_uuid = entry.key().user_uuid.clone();
+                entry.insert(TrafficDelta {
+                    node_tag,
+                    user_uuid,
+                    user_id: delta.user_id,
+                    upload: 0,
+                    download: 0,
+                    online_ips: Vec::new(),
+                })
+            }
+        };
+        if entry.user_id.is_none() {
+            entry.user_id = delta.user_id;
+        }
+        entry.upload = entry.upload.saturating_add(delta.upload);
+        entry.download = entry.download.saturating_add(delta.download);
+        for ip in delta.online_ips {
+            if !entry.online_ips.iter().any(|value| value == &ip) {
+                entry.online_ips.push(ip);
+            }
+        }
+        entry.online_ips.sort();
+    }
+
+    pub fn add_deltas(&mut self, records: impl IntoIterator<Item = TrafficDelta>) {
+        for record in records {
+            self.add_delta(record);
+        }
+    }
+
     pub fn drain_all(&mut self) -> Vec<TrafficDelta> {
         let mut records = self
             .counters
@@ -195,5 +234,37 @@ mod tests {
         assert_eq!(records[0].user_id, Some(42));
         assert_eq!(records[0].upload, 11);
         assert_eq!(records[0].download, 22);
+    }
+
+    #[test]
+    fn requeues_drained_traffic_deltas() {
+        let mut registry = TrafficRegistry::default();
+
+        registry.add_with_user_id(
+            "node-a",
+            "user-a",
+            Some(42),
+            10,
+            20,
+            Some("198.51.100.7".parse().unwrap()),
+        );
+        let records = registry.drain_all();
+        assert!(registry.is_empty());
+
+        registry.add_deltas(records);
+        registry.add_with_user_id(
+            "node-a",
+            "user-a",
+            None,
+            1,
+            2,
+            Some("198.51.100.8".parse().unwrap()),
+        );
+        let records = registry.drain_all();
+
+        assert_eq!(records[0].user_id, Some(42));
+        assert_eq!(records[0].upload, 11);
+        assert_eq!(records[0].download, 22);
+        assert_eq!(records[0].online_ips, vec!["198.51.100.7", "198.51.100.8"]);
     }
 }
