@@ -1096,7 +1096,7 @@ mod tests {
     use std::io::{self, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::Duration;
 
@@ -1509,6 +1509,88 @@ mod tests {
             .expect("server thread")
             .expect("serve clients");
         echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
+    fn deleting_shadowsocks_user_stops_existing_tcp_relay_on_next_payload_and_reports_tail() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (second_payload_tx, second_payload_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .expect("echo timeout");
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).expect("first payload");
+            stream.write_all(&first).expect("first echo");
+            let mut second = [0u8; 1];
+            let received_second = stream.read_exact(&mut second).is_ok();
+            second_payload_tx
+                .send(received_second)
+                .expect("send result");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("ss bind");
+        let ss_addr = listener.local_addr().expect("ss addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("ss accept");
+            let _ = server_clone.handle_tcp_client(stream);
+        });
+
+        let mut client = TcpStream::connect(ss_addr).expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("client read timeout");
+        client
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .expect("client write timeout");
+        let method = ShadowsocksMethod::parse("aes-128-gcm").expect("method");
+        let mut writer = ShadowsocksWriter::new_response(
+            client.try_clone().expect("client clone"),
+            method,
+            "ss-password",
+        )
+        .expect("ss writer");
+        writer
+            .write_all(&shadowsocks_request(echo_addr, b"x"))
+            .expect("initial request");
+        writer.flush().expect("initial flush");
+        let mut reader =
+            ShadowsocksReader::new(&mut client, method, "ss-password").expect("ss reader");
+        let mut echoed = [0u8; 1];
+        reader.read_exact(&mut echoed).expect("first echo");
+        assert_eq!(echoed, *b"x");
+        drop(reader);
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![user().uuid],
+            ..CoreUserDelta::default()
+        });
+        assert_eq!(result.deleted, 1);
+
+        let _ = writer.write_all(b"y");
+        let _ = writer.flush();
+        assert!(
+            !second_payload_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("echo result"),
+            "deleted user's existing Shadowsocks relay should stop forwarding new payload"
+        );
+        drop(writer);
+        drop(client);
+        server_thread.join().expect("server thread");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|shadowsocks|1");
+        assert_eq!(records[0].user_uuid, "ss-password");
+        assert_eq!(records[0].user_id, Some(1));
+        assert_eq!(records[0].upload, 1);
+        assert_eq!(records[0].download, 1);
     }
 
     #[test]
