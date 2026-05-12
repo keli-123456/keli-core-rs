@@ -142,6 +142,9 @@ impl AnyTlsServer {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let user = self.read_auth(&mut client)?;
         let _session = self.acquire_user_session(&user, client_ip)?;
+        let _connection = self
+            .bandwidth
+            .register_tcp_connection(Some(&user.uuid), &[&client])?;
         let writer = Arc::new(Mutex::new(client.try_clone()?));
         let mut session = AnyTlsSession {
             bandwidth: self.bandwidth.limiter_for(Some(&user)),
@@ -225,9 +228,16 @@ impl AnyTlsServer {
                 Ok(header) => header,
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::ConnectionReset => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::ConnectionAborted => return Ok(()),
                 Err(error) => return Err(error),
             };
-            let body = read_frame_body(client, header.len)?;
+            let body = match read_frame_body(client, header.len) {
+                Ok(body) => body,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::ConnectionReset => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::ConnectionAborted => return Ok(()),
+                Err(error) => return Err(error),
+            };
             match header.command {
                 CMD_WASTE => {}
                 CMD_SETTINGS => {
@@ -970,6 +980,7 @@ fn anytls_user_map(users: &[CoreUser]) -> HashMap<[u8; 32], CoreUser> {
 mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream, UdpSocket};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
@@ -1128,6 +1139,80 @@ mod tests {
 
         server_thread.join().expect("thread");
         echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
+    fn deleting_anytls_user_stops_existing_tcp_relay_on_next_payload_and_reports_tail() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (second_payload_tx, second_payload_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .expect("echo timeout");
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).expect("first payload");
+            stream.write_all(&first).expect("first echo");
+            let mut second = [0u8; 1];
+            let received_second = stream.read_exact(&mut second).is_ok();
+            second_payload_tx
+                .send(received_second)
+                .expect("send result");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            server_clone.handle_tcp_client(stream)
+        });
+
+        let mut client = TcpStream::connect(addr).expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("client read timeout");
+        client
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .expect("client write timeout");
+        write_auth(&mut client, "anytls-password");
+        write_frame(&mut client, CMD_PSH, 1, &ipv4_target(echo_addr));
+        let (command, stream_id, body) = read_frame(&mut client);
+        assert_eq!(command, CMD_SYNACK);
+        assert_eq!(stream_id, 1);
+        assert!(body.is_empty());
+        write_frame(&mut client, CMD_PSH, 1, b"x");
+        let (command, stream_id, body) = read_frame(&mut client);
+        assert_eq!(command, CMD_PSH);
+        assert_eq!(stream_id, 1);
+        assert_eq!(body, b"x");
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![user().uuid],
+            ..CoreUserDelta::default()
+        });
+        assert_eq!(result.deleted, 1);
+
+        let _ = try_write_frame(&mut client, CMD_PSH, 1, b"y");
+        assert!(
+            !second_payload_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("echo result"),
+            "deleted user's existing AnyTLS relay should stop forwarding new payload"
+        );
+        drop(client);
+        server_thread.join().expect("thread").expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|anytls|1");
+        assert_eq!(records[0].user_uuid, user().uuid);
+        assert_eq!(records[0].user_id, Some(1));
+        assert_eq!(records[0].upload, 1);
+        assert_eq!(records[0].download, 1);
     }
 
     fn write_auth(client: &mut TcpStream, password: &str) {
