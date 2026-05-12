@@ -1418,6 +1418,16 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             let cert = test_cert("user-delta-auth");
+            let echo = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("echo bind");
+            let echo_addr = echo.local_addr().expect("echo addr");
+            let echo_task = tokio::spawn(async move {
+                let (mut stream, _) = echo.accept().await.expect("echo accept");
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await.expect("echo read");
+                stream.write_all(&byte).await.expect("echo write");
+            });
             let server = server(&cert, "127.0.0.1:0".parse().expect("addr"));
             let endpoint = server.bind().expect("hy2 bind");
             let local_addr = endpoint.local_addr().expect("local addr");
@@ -1474,11 +1484,16 @@ mod tests {
                     .expect("new auth status"),
                 233
             );
+            assert_eq!(
+                proxy_tcp_once(accepted.clone(), echo_addr, b"z").await,
+                b"z"
+            );
             accepted.close(0u32.into(), b"done");
             accepted_endpoint.wait_idle().await;
 
             stop.store(true, Ordering::SeqCst);
             server_task.await.expect("server task");
+            echo_task.await.expect("echo task");
         });
     }
 
