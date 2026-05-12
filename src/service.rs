@@ -564,7 +564,9 @@ fn start_hysteria2_listener(
         sessions,
         bandwidth,
     );
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(quic_runtime_worker_threads())
+        .thread_name("keli-core-hysteria2")
         .enable_all()
         .build()
         .map_err(|source| CoreServiceError::Bind {
@@ -653,7 +655,9 @@ fn start_tuic_listener(
         sessions,
         bandwidth,
     );
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(quic_runtime_worker_threads())
+        .thread_name("keli-core-tuic")
         .enable_all()
         .build()
         .map_err(|source| CoreServiceError::Bind {

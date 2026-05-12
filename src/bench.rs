@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::CertificateDer;
 use serde::Serialize;
@@ -116,6 +117,15 @@ pub fn run_bench(args: impl Iterator<Item = String>) -> Result<(), String> {
             );
             Ok(())
         }
+        Some("hy2-udp") | Some("hysteria2-udp") => {
+            let options = parse_bench_options(args)?;
+            let report = run_hy2_udp_bench(&options).map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+            );
+            Ok(())
+        }
         Some("--help") | Some("help") | None => {
             print_bench_usage();
             Ok(())
@@ -177,7 +187,7 @@ fn validate_bench_options(options: &BenchOptions) -> Result<(), String> {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]"
+        "bench commands:\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]"
     );
 }
 
@@ -248,6 +258,13 @@ fn run_hy2_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
         .enable_all()
         .build()?
         .block_on(run_hy2_tcp_stream_bench_async(options))
+}
+
+fn run_hy2_udp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_hy2_udp_bench_async(options))
 }
 
 async fn run_hy2_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchReport> {
@@ -406,6 +423,104 @@ async fn run_hy2_tcp_stream_bench_async(options: &BenchOptions) -> io::Result<Be
     Ok(BenchReport {
         protocol: "hy2-tcp",
         mode: "hy2-tcp-stream-per-worker",
+        streams: options.streams,
+        requests_per_stream: options.requests,
+        payload_bytes: options.payload_size,
+        total_requests,
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed_ms: elapsed.as_millis(),
+        requests_per_second: total_requests as f64 / seconds,
+        roundtrip_mbps: ((upload_bytes + download_bytes) as f64 * 8.0) / seconds / 1_000_000.0,
+        latency: latency_report(&latencies),
+    })
+}
+
+async fn run_hy2_udp_bench_async(options: &BenchOptions) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let echo = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await?);
+    let echo_addr = echo.local_addr()?;
+    let echo_task = {
+        let echo = echo.clone();
+        let echo_stop = echo_stop.clone();
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; 65_535];
+            while !echo_stop.load(Ordering::SeqCst) {
+                match tokio::time::timeout(Duration::from_millis(20), echo.recv_from(&mut buffer))
+                    .await
+                {
+                    Ok(Ok((read, peer))) => {
+                        echo.send_to(&buffer[..read], peer).await?;
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {}
+                }
+            }
+            Ok::<(), io::Error>(())
+        })
+    };
+
+    let cert = BenchCert::new("hy2-udp-bench")?;
+    let server = Hysteria2Server::new(Hysteria2ServerConfig {
+        node_tag: "bench|hy2|udp".to_string(),
+        listen: "127.0.0.1:0".parse().expect("valid listen addr"),
+        users: vec![hy2_user()],
+        routes: Vec::new(),
+        cert_file: cert.cert_path.to_string_lossy().to_string(),
+        key_file: cert.key_path.to_string_lossy().to_string(),
+        server_name: "localhost".to_string(),
+        alpn: vec!["h3".to_string()],
+        reject_unknown_sni: false,
+        connect_timeout: Duration::from_secs(3),
+        up_mbps: 0,
+        down_mbps: 0,
+        ignore_client_bandwidth: false,
+        obfs: None,
+    });
+    let endpoint = server.bind()?;
+    let server_addr = endpoint.local_addr()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_task = tokio::spawn(server.run(endpoint, stop.clone()));
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        let cert_der = cert.cert_der.clone();
+        workers.push(tokio::spawn(async move {
+            run_hy2_udp_client(server_addr, cert_der, echo_addr, stream_id, &options).await
+        }));
+    }
+
+    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "hy2 udp worker panicked"))??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+    }
+    let elapsed = started.elapsed();
+
+    stop.store(true, Ordering::SeqCst);
+    server_task
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "hy2 udp server task panicked"))?;
+    echo_stop.store(true, Ordering::SeqCst);
+    echo_task
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "hy2 udp echo task panicked"))??;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+    Ok(BenchReport {
+        protocol: "hy2-udp",
+        mode: "hy2-udp-datagram-connection-per-worker",
         streams: options.streams,
         requests_per_stream: options.requests,
         payload_bytes: options.payload_size,
@@ -876,6 +991,60 @@ async fn run_hy2_tcp_stream_client(
     })
 }
 
+async fn run_hy2_udp_client(
+    server_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    echo_addr: SocketAddr,
+    stream_id: usize,
+    options: &BenchOptions,
+) -> io::Result<ClientStats> {
+    let client_endpoint = hy2_client_endpoint(cert_der)?;
+    let connection = client_endpoint
+        .connect(server_addr, "localhost")
+        .map_err(io_other)?
+        .await
+        .map_err(io_other)?;
+    authenticate_hy2(&connection).await?;
+    let payload = bench_payload(stream_id, options.payload_size);
+    let session_id = stream_id.saturating_add(1) as u32;
+    let mut latencies = Vec::with_capacity(options.requests);
+
+    for request_index in 0..options.requests {
+        let packet_id = ((request_index % usize::from(u16::MAX)) + 1) as u16;
+        let started = Instant::now();
+        let datagram = hy2_udp_datagram(session_id, packet_id, echo_addr, &payload)?;
+        connection
+            .send_datagram_wait(Bytes::from(datagram))
+            .await
+            .map_err(io_other)?;
+        let response = tokio::time::timeout(Duration::from_secs(10), connection.read_datagram())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "hy2 udp response timeout"))?
+            .map_err(io_other)?;
+        let response = parse_hy2_udp_datagram(&response)?;
+        if response.session_id != session_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "hy2 udp response id mismatch",
+            ));
+        }
+        if response.data != payload {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "hy2 udp bench echo payload mismatch",
+            ));
+        }
+        latencies.push(started.elapsed().as_micros());
+    }
+
+    connection.close(0u32.into(), b"bench done");
+    client_endpoint.wait_idle().await;
+    Ok(ClientStats {
+        latencies,
+        retries: 0,
+    })
+}
+
 fn hy2_client_endpoint(cert_der: CertificateDer<'static>) -> io::Result<quinn::Endpoint> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert_der).map_err(io_other)?;
@@ -942,6 +1111,65 @@ fn hy2_tcp_request(target: SocketAddr) -> Vec<u8> {
     request
 }
 
+struct Hy2UdpBenchDatagram {
+    session_id: u32,
+    data: Vec<u8>,
+}
+
+fn hy2_udp_datagram(
+    session_id: u32,
+    packet_id: u16,
+    target: SocketAddr,
+    data: &[u8],
+) -> io::Result<Vec<u8>> {
+    let address = format_socket_addr(&target);
+    let mut output = Vec::with_capacity(8 + address.len() + data.len() + 8);
+    output.extend_from_slice(&session_id.to_be_bytes());
+    output.extend_from_slice(&packet_id.to_be_bytes());
+    output.push(0);
+    output.push(1);
+    output.extend_from_slice(&encode_hy2_varint(address.len() as u64)?);
+    output.extend_from_slice(address.as_bytes());
+    output.extend_from_slice(data);
+    Ok(output)
+}
+
+fn parse_hy2_udp_datagram(input: &[u8]) -> io::Result<Hy2UdpBenchDatagram> {
+    if input.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hy2 udp datagram is too short",
+        ));
+    }
+    let session_id = u32::from_be_bytes(input[0..4].try_into().expect("fixed slice"));
+    let _packet_id = u16::from_be_bytes(input[4..6].try_into().expect("fixed slice"));
+    if input[6] != 0 || input[7] != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hy2 udp bench expects unfragmented datagram",
+        ));
+    }
+    let mut offset = 8usize;
+    let address_len = read_hy2_varint_from(input, &mut offset)?;
+    let address_len = usize::try_from(address_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hy2 udp address length overflows usize",
+        )
+    })?;
+    if address_len == 0 || input.len().saturating_sub(offset) < address_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hy2 udp datagram address is invalid",
+        ));
+    }
+    offset += address_len;
+    Ok(Hy2UdpBenchDatagram {
+        session_id,
+        data: input[offset..].to_vec(),
+    })
+}
+
 async fn read_hy2_tcp_response_header(recv: &mut quinn::RecvStream) -> io::Result<()> {
     let mut status = [0u8; 1];
     recv.read_exact(&mut status).await.map_err(io_other)?;
@@ -999,6 +1227,36 @@ async fn read_hy2_varint(recv: &mut quinn::RecvStream) -> io::Result<u64> {
     };
     for _ in 0..extra {
         value = (value << 8) | u64::from(recv.read_u8().await.map_err(io_other)?);
+    }
+    Ok(value)
+}
+
+fn read_hy2_varint_from(input: &[u8], offset: &mut usize) -> io::Result<u64> {
+    let Some(first) = input.get(*offset).copied() else {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated hy2 varint",
+        ));
+    };
+    *offset += 1;
+    let tag = first >> 6;
+    let mut value = u64::from(first & 0x3f);
+    let extra = match tag {
+        0 => 0,
+        1 => 1,
+        2 => 3,
+        3 => 7,
+        _ => unreachable!(),
+    };
+    if input.len().saturating_sub(*offset) < extra {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated hy2 varint",
+        ));
+    }
+    for _ in 0..extra {
+        value = (value << 8) | u64::from(input[*offset]);
+        *offset += 1;
     }
     Ok(value)
 }
@@ -1075,7 +1333,8 @@ fn join_server(handle: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_bench_options, run_vless_tcp_bench, run_vless_tcp_stream_bench, BenchOptions,
+        parse_bench_options, run_hy2_udp_bench, run_vless_tcp_bench, run_vless_tcp_stream_bench,
+        BenchOptions,
     };
 
     #[test]
@@ -1149,6 +1408,21 @@ mod tests {
         assert_eq!(report.protocol, "hy2-tcp");
         assert_eq!(report.mode, "hy2-tcp-stream-per-worker");
         assert_eq!(report.total_requests, 3);
+        assert!(report.download_bytes > 0);
+    }
+
+    #[test]
+    fn runs_hy2_udp_bench_smoke() {
+        let report = run_hy2_udp_bench(&BenchOptions {
+            streams: 1,
+            requests: 2,
+            payload_size: 16,
+        })
+        .expect("bench");
+
+        assert_eq!(report.protocol, "hy2-udp");
+        assert_eq!(report.mode, "hy2-udp-datagram-connection-per-worker");
+        assert_eq!(report.total_requests, 2);
         assert!(report.download_bytes > 0);
     }
 }
