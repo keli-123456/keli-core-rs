@@ -1610,6 +1610,77 @@ mod tests {
             .is_some());
     }
 
+    #[test]
+    fn apply_user_delta_changes_trojan_auth_without_rebinding_listener() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = echo.accept().expect("echo accept");
+                let mut buffer = [0u8; 1];
+                stream.read_exact(&mut buffer).expect("echo read");
+                stream.write_all(&buffer).expect("echo write");
+            }
+        });
+
+        let server = server();
+        let listener = server.bind().expect("trojan bind");
+        listener
+            .set_nonblocking(true)
+            .expect("trojan listener nonblocking");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let mut workers = Vec::new();
+            while !server_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let server = server_clone.clone();
+                        workers.push(thread::spawn(move || {
+                            let _ = server.handle_tcp_client(stream);
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("trojan accept: {error}"),
+                }
+            }
+            for worker in workers {
+                worker.join().expect("trojan worker");
+            }
+        });
+
+        assert!(trojan_auth_succeeds(
+            trojan_addr,
+            "trojan-password",
+            echo_addr
+        ));
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            added: vec![user_b()],
+            deleted: vec![user().uuid],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.active_users, 1);
+        assert!(!trojan_auth_succeeds(
+            trojan_addr,
+            "trojan-password",
+            echo_addr
+        ));
+        assert!(trojan_auth_succeeds(trojan_addr, "secret-b", echo_addr));
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(trojan_addr);
+        server_thread.join().expect("trojan server thread");
+        echo_thread.join().expect("echo thread");
+    }
+
     fn trojan_request(target: std::net::SocketAddr) -> Vec<u8> {
         trojan_request_with_command(target, 0x01)
     }
@@ -1620,6 +1691,31 @@ mod tests {
 
     fn trojan_request_with_command(target: std::net::SocketAddr, command: u8) -> Vec<u8> {
         trojan_request_with_password_and_command(target, "trojan-password", command)
+    }
+
+    fn trojan_auth_succeeds(
+        server_addr: std::net::SocketAddr,
+        password: &str,
+        target: std::net::SocketAddr,
+    ) -> bool {
+        let Ok(mut stream) = TcpStream::connect(server_addr) else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        if stream
+            .write_all(&trojan_request_with_password_and_command(
+                target, password, 0x01,
+            ))
+            .is_err()
+        {
+            return false;
+        }
+        if stream.write_all(b"x").is_err() {
+            return false;
+        }
+        let mut response = [0u8; 1];
+        stream.read_exact(&mut response).is_ok() && response == *b"x"
     }
 
     fn trojan_request_with_password_and_command(
