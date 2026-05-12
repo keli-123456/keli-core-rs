@@ -29,6 +29,9 @@ Each protocol/configuration must record:
 - Device limit result, including same-IP multi-session behavior.
 - Error count, reconnect count, and p95/p99 latency.
 
+Copy `docs/interop_runs/TEMPLATE.md` for every real-client run. Keep the protocol marked as
+`Partial` until the completed run record is attached to the release candidate.
+
 ## Core Startup
 
 Generate the native config through `kelinode-rs`, then run the core directly while testing:
@@ -54,7 +57,7 @@ Expected semantics:
 - Added user: new authentication succeeds without listener restart.
 - Updated user: credential, speed limit, and device limit are visible to new sessions.
 - Deleted user: new authentication fails immediately.
-- Existing accepted connection after delete: forwarding stops at the next shared bandwidth limiter or relay checkpoint; it is not a central socket-registry hard close yet.
+- Existing accepted connection after delete: main TCP relay paths close registered sockets, and HY2/TUIC authenticated QUIC connections close through limiter revocation. Other protocol wrappers must at least stop forwarding at the next shared bandwidth limiter or relay checkpoint.
 - Deleted user tail traffic: must report with the captured `user_id` even after the user leaves the active table.
 - Full snapshot: may reset the core revision after mismatch.
 - Missing current revision plus an incremental `base_revision`: must be rejected so the agent can request a full snapshot.
