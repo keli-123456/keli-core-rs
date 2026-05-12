@@ -1500,6 +1500,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
+        mpsc,
         Arc,
     };
     use std::thread;
@@ -1688,6 +1689,79 @@ mod tests {
         let _ = TcpStream::connect(trojan_addr);
         server_thread.join().expect("trojan server thread");
         echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
+    fn deleting_trojan_user_stops_existing_tcp_relay_on_next_payload_and_reports_tail() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (second_payload_tx, second_payload_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .expect("echo timeout");
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).expect("first payload");
+            stream.write_all(&first).expect("first echo");
+            let mut second = [0u8; 1];
+            let received_second = stream.read_exact(&mut second).is_ok();
+            second_payload_tx
+                .send(received_second)
+                .expect("send result");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            server_clone.handle_tcp_client(stream)
+        });
+
+        let mut client = TcpStream::connect(trojan_addr).expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("client read timeout");
+        client
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .expect("client write timeout");
+        client
+            .write_all(&trojan_request(echo_addr))
+            .expect("trojan request");
+        client.write_all(b"x").expect("first write");
+        let mut echoed = [0u8; 1];
+        client.read_exact(&mut echoed).expect("first echo");
+        assert_eq!(echoed, *b"x");
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![user().uuid],
+            ..CoreUserDelta::default()
+        });
+        assert_eq!(result.deleted, 1);
+
+        let _ = client.write_all(b"y");
+        assert!(
+            !second_payload_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("echo result"),
+            "deleted user's existing Trojan relay should stop forwarding new payload"
+        );
+        drop(client);
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|trojan|1");
+        assert_eq!(records[0].user_uuid, "trojan-password");
+        assert_eq!(records[0].user_id, Some(1));
+        assert_eq!(records[0].upload, 1);
+        assert_eq!(records[0].download, 1);
     }
 
     fn trojan_request(target: std::net::SocketAddr) -> Vec<u8> {
