@@ -1,5 +1,6 @@
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
+use std::thread;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -330,6 +331,7 @@ pub(crate) fn recv_udp_response(
                 if resets > MAX_UDP_CONNECTION_RESET_RETRIES {
                     return Err(error);
                 }
+                thread::sleep(Duration::from_millis(1));
             }
             result => return result,
         }
