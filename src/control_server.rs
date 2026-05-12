@@ -6,9 +6,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use serde_json::Value;
+
 use crate::control::{CoreCommand, CoreController, CoreResponse};
 
 pub const MAX_CONTROL_COMMAND_BYTES: usize = 128 * 1024 * 1024;
+pub const CONTROL_TOKEN_ENV: &str = "KELI_CORE_CONTROL_TOKEN";
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
@@ -71,6 +74,14 @@ pub fn start_control_server(
     addr: &str,
     controller: Arc<Mutex<CoreController>>,
 ) -> Result<ControlServerHandle, ControlServerError> {
+    start_control_server_with_token(addr, controller, control_token_from_env())
+}
+
+fn start_control_server_with_token(
+    addr: &str,
+    controller: Arc<Mutex<CoreController>>,
+    token: Option<String>,
+) -> Result<ControlServerHandle, ControlServerError> {
     let listen = resolve_control_addr(addr)?;
     let listener = TcpListener::bind(listen).map_err(ControlServerError::Bind)?;
     listener
@@ -82,7 +93,7 @@ pub fn start_control_server(
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let join = thread::spawn(move || {
-        serve_control_listener(listener, controller, thread_stop);
+        serve_control_listener(listener, controller, thread_stop, token);
     });
 
     Ok(ControlServerHandle {
@@ -90,6 +101,13 @@ pub fn start_control_server(
         stop,
         join: Some(join),
     })
+}
+
+fn control_token_from_env() -> Option<String> {
+    std::env::var(CONTROL_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn resolve_control_addr(addr: &str) -> Result<SocketAddr, ControlServerError> {
@@ -103,14 +121,18 @@ fn serve_control_listener(
     listener: TcpListener,
     controller: Arc<Mutex<CoreController>>,
     stop: Arc<AtomicBool>,
+    token: Option<String>,
 ) {
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
                 let controller = controller.clone();
                 let stop = stop.clone();
+                let token = token.clone();
                 thread::spawn(move || {
-                    if let Ok(CoreResponse::Stopped) = serve_control_stream(stream, controller) {
+                    if let Ok(CoreResponse::Stopped) =
+                        serve_control_stream_with_token(stream, controller, token.as_deref())
+                    {
                         stop.store(true, Ordering::SeqCst);
                     }
                 });
@@ -124,8 +146,16 @@ fn serve_control_listener(
 }
 
 pub fn serve_control_stream(
+    stream: TcpStream,
+    controller: Arc<Mutex<CoreController>>,
+) -> Result<CoreResponse, ControlServerError> {
+    serve_control_stream_with_token(stream, controller, control_token_from_env().as_deref())
+}
+
+fn serve_control_stream_with_token(
     mut stream: TcpStream,
     controller: Arc<Mutex<CoreController>>,
+    required_token: Option<&str>,
 ) -> Result<CoreResponse, ControlServerError> {
     stream
         .set_read_timeout(Some(CONTROL_IO_TIMEOUT))
@@ -133,7 +163,7 @@ pub fn serve_control_stream(
     stream
         .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
         .map_err(ControlServerError::Io)?;
-    let command = match read_control_command(&mut stream) {
+    let command = match read_control_command(&mut stream, required_token) {
         Ok(command) => command,
         Err(error) => {
             let response = CoreResponse::Error {
@@ -151,13 +181,17 @@ pub fn serve_control_stream(
     Ok(response)
 }
 
-fn read_control_command(stream: &mut TcpStream) -> Result<CoreCommand, ControlServerError> {
-    read_control_command_with_limit(stream, MAX_CONTROL_COMMAND_BYTES)
+fn read_control_command(
+    stream: &mut TcpStream,
+    required_token: Option<&str>,
+) -> Result<CoreCommand, ControlServerError> {
+    read_control_command_with_limit(stream, MAX_CONTROL_COMMAND_BYTES, required_token)
 }
 
 fn read_control_command_with_limit(
     stream: &mut TcpStream,
     max_bytes: usize,
+    required_token: Option<&str>,
 ) -> Result<CoreCommand, ControlServerError> {
     let mut reader = BufReader::new(stream);
     let line = read_control_line_with_limit(&mut reader, max_bytes)?;
@@ -166,7 +200,28 @@ fn read_control_command_with_limit(
             "empty control command".to_string(),
         ));
     }
-    serde_json::from_str(line.trim()).map_err(ControlServerError::Json)
+    let value = serde_json::from_str::<Value>(line.trim()).map_err(ControlServerError::Json)?;
+    authenticate_control_command(&value, required_token)?;
+    serde_json::from_value(value).map_err(ControlServerError::Json)
+}
+
+fn authenticate_control_command(
+    value: &Value,
+    required_token: Option<&str>,
+) -> Result<(), ControlServerError> {
+    let Some(required_token) = required_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let provided = value.get("token").and_then(Value::as_str).unwrap_or("");
+    if provided == required_token {
+        return Ok(());
+    }
+    Err(ControlServerError::Controller(
+        "unauthorized control command".to_string(),
+    ))
 }
 
 fn read_control_line_with_limit<R: BufRead>(
@@ -222,7 +277,7 @@ mod tests {
         TransportConfig,
     };
     use crate::control::{CoreCommand, CoreController, CoreResponse};
-    use crate::control_server::start_control_server;
+    use crate::control_server::{start_control_server, start_control_server_with_token};
     use crate::protocol::Protocol;
     use crate::runtime::CoreStatus;
     use crate::user::CoreUser;
@@ -281,6 +336,16 @@ mod tests {
         let mut stream = TcpStream::connect(addr).expect("connect control");
         let body = serde_json::to_string(command).expect("encode command");
         writeln!(stream, "{body}").expect("write command");
+        let mut line = String::new();
+        BufReader::new(stream)
+            .read_line(&mut line)
+            .expect("read response");
+        serde_json::from_str(line.trim()).expect("decode response")
+    }
+
+    fn send_raw(addr: SocketAddr, command: serde_json::Value) -> CoreResponse {
+        let mut stream = TcpStream::connect(addr).expect("connect control");
+        writeln!(stream, "{command}").expect("write command");
         let mut line = String::new();
         BufReader::new(stream)
             .read_line(&mut line)
@@ -370,6 +435,40 @@ mod tests {
             send(server.local_addr(), &CoreCommand::Stop),
             CoreResponse::Stopped
         ));
+        server.stop();
+    }
+
+    #[test]
+    fn control_server_rejects_missing_token_when_required() {
+        let controller = Arc::new(Mutex::new(CoreController::new()));
+        let mut server = start_control_server_with_token(
+            "127.0.0.1:0",
+            controller,
+            Some("secret-token".to_string()),
+        )
+        .expect("start control");
+
+        match send_raw(server.local_addr(), serde_json::json!({"type": "status"})) {
+            CoreResponse::Error { message } => {
+                assert!(message.contains("unauthorized control command"));
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
+        match send_raw(
+            server.local_addr(),
+            serde_json::json!({"type": "status", "token": "secret-token"}),
+        ) {
+            CoreResponse::Status { status, .. } => assert_eq!(status, CoreStatus::Stopped),
+            response => panic!("unexpected response: {response:?}"),
+        }
+        assert!(matches!(
+            send_raw(
+                server.local_addr(),
+                serde_json::json!({"type": "stop", "token": "secret-token"})
+            ),
+            CoreResponse::Stopped
+        ));
+
         server.stop();
     }
 
