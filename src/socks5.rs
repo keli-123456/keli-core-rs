@@ -2,7 +2,7 @@ use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::limits::{
@@ -10,7 +10,7 @@ use crate::limits::{
 };
 use crate::outbound::recv_udp_response;
 use crate::stream::relay_tcp_streams_limited;
-use crate::traffic::TrafficRegistry;
+use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, UserStore};
 use crate::{
     connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
@@ -50,7 +50,7 @@ pub struct Socks5Server {
     config: Socks5ServerConfig,
     users: UserStore,
     router: RouteMatcher,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 }
@@ -72,10 +72,10 @@ enum SocksCommand {
 
 impl Socks5Server {
     pub fn new(config: Socks5ServerConfig) -> Self {
-        Self::with_traffic(config, Arc::new(Mutex::new(TrafficRegistry::default())))
+        Self::with_traffic(config, TrafficRegistry::shared())
     }
 
-    pub fn with_traffic(config: Socks5ServerConfig, traffic: Arc<Mutex<TrafficRegistry>>) -> Self {
+    pub fn with_traffic(config: Socks5ServerConfig, traffic: SharedTrafficRegistry) -> Self {
         Self::with_shared_limits(
             config,
             traffic,
@@ -86,7 +86,7 @@ impl Socks5Server {
 
     pub fn with_shared_limits(
         config: Socks5ServerConfig,
-        traffic: Arc<Mutex<TrafficRegistry>>,
+        traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
@@ -153,10 +153,7 @@ impl Socks5Server {
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .drain_minimum(minimum_bytes)
+        self.traffic.drain_minimum(minimum_bytes)
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
@@ -328,17 +325,14 @@ impl Socks5Server {
     ) -> io::Result<()> {
         let (upload, download) = relay_tcp_streams_limited(client, remote, bandwidth)?;
         if let Some(user_uuid) = request.user_uuid {
-            self.traffic
-                .lock()
-                .expect("traffic registry lock poisoned")
-                .add_with_user_id(
-                    self.config.node_tag.clone(),
-                    user_uuid,
-                    request.user_id,
-                    upload,
-                    download,
-                    request.client_ip,
-                );
+            self.traffic.add_with_user_id(
+                self.config.node_tag.clone(),
+                user_uuid,
+                request.user_id,
+                upload,
+                download,
+                request.client_ip,
+            );
         }
         Ok(())
     }
@@ -432,17 +426,14 @@ impl Socks5Server {
         }
 
         if let Some(user_uuid) = request.user_uuid {
-            self.traffic
-                .lock()
-                .expect("traffic registry lock poisoned")
-                .add_with_user_id(
-                    self.config.node_tag.clone(),
-                    user_uuid,
-                    request.user_id,
-                    upload,
-                    download,
-                    request.client_ip,
-                );
+            self.traffic.add_with_user_id(
+                self.config.node_tag.clone(),
+                user_uuid,
+                request.user_id,
+                upload,
+                download,
+                request.client_ip,
+            );
         }
         Ok(())
     }

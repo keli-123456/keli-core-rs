@@ -4,7 +4,7 @@ use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use aes_gcm::aead::{AeadInPlace, KeyInit};
@@ -23,7 +23,7 @@ use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort_limited, join_native_blocking_relay, spawn_native_blocking_relay,
 };
-use crate::traffic::TrafficRegistry;
+use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::CoreUser;
 use crate::{
     connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
@@ -53,7 +53,7 @@ pub struct ShadowsocksServer {
     config: ShadowsocksServerConfig,
     users: Arc<RwLock<Vec<CoreUser>>>,
     router: RouteMatcher,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 }
@@ -116,13 +116,10 @@ struct ShadowsocksWriter<W> {
 
 impl ShadowsocksServer {
     pub fn new(config: ShadowsocksServerConfig) -> Self {
-        Self::with_traffic(config, Arc::new(Mutex::new(TrafficRegistry::default())))
+        Self::with_traffic(config, TrafficRegistry::shared())
     }
 
-    pub fn with_traffic(
-        config: ShadowsocksServerConfig,
-        traffic: Arc<Mutex<TrafficRegistry>>,
-    ) -> Self {
+    pub fn with_traffic(config: ShadowsocksServerConfig, traffic: SharedTrafficRegistry) -> Self {
         Self::with_shared_limits(
             config,
             traffic,
@@ -133,7 +130,7 @@ impl ShadowsocksServer {
 
     pub fn with_shared_limits(
         config: ShadowsocksServerConfig,
-        traffic: Arc<Mutex<TrafficRegistry>>,
+        traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
@@ -190,10 +187,7 @@ impl ShadowsocksServer {
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .drain_minimum(minimum_bytes)
+        self.traffic.drain_minimum(minimum_bytes)
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
@@ -488,17 +482,14 @@ impl ShadowsocksServer {
             "upload relay task panicked",
         )?);
 
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                user_uuid,
-                Some(user_id),
-                upload,
-                download,
-                request.client_ip,
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            user_uuid,
+            Some(user_id),
+            upload,
+            download,
+            request.client_ip,
+        );
         Ok(())
     }
 
@@ -510,17 +501,14 @@ impl ShadowsocksServer {
         client_ip: Option<IpAddr>,
     ) {
         if upload > 0 || download > 0 {
-            self.traffic
-                .lock()
-                .expect("traffic registry lock poisoned")
-                .add_with_user_id(
-                    self.config.node_tag.clone(),
-                    user.uuid.clone(),
-                    Some(user.id),
-                    upload,
-                    download,
-                    client_ip,
-                );
+            self.traffic.add_with_user_id(
+                self.config.node_tag.clone(),
+                user.uuid.clone(),
+                Some(user.id),
+                upload,
+                download,
+                client_ip,
+            );
         }
     }
 

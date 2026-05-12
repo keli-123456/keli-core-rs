@@ -16,7 +16,7 @@ use crate::limits::{
 use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
-use crate::traffic::TrafficRegistry;
+use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::CoreUser;
 use crate::{connect_tcp_outbound_tokio, send_udp_outbound_tokio};
 
@@ -53,7 +53,7 @@ pub struct TuicServer {
     config: TuicServerConfig,
     users: Arc<RwLock<HashMap<[u8; 16], CoreUser>>>,
     router: RouteMatcher,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 }
@@ -62,7 +62,7 @@ impl TuicServer {
     pub fn new(config: TuicServerConfig) -> Self {
         Self::with_shared_limits(
             config,
-            Arc::new(Mutex::new(TrafficRegistry::default())),
+            TrafficRegistry::shared(),
             UserSessionTracker::default(),
             UserBandwidthLimiters::default(),
         )
@@ -70,7 +70,7 @@ impl TuicServer {
 
     pub fn with_shared_limits(
         config: TuicServerConfig,
-        traffic: Arc<Mutex<TrafficRegistry>>,
+        traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
@@ -133,10 +133,7 @@ impl TuicServer {
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .drain_minimum(minimum_bytes)
+        self.traffic.drain_minimum(minimum_bytes)
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
@@ -293,17 +290,14 @@ impl TuicServer {
         };
 
         let (upload, download) = relay_streams(&mut recv, &mut send, remote, bandwidth).await?;
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                user_uuid,
-                Some(user_id),
-                upload,
-                download,
-                Some(client_ip),
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            user_uuid,
+            Some(user_id),
+            upload,
+            download,
+            Some(client_ip),
+        );
         Ok(())
     }
 
@@ -492,17 +486,14 @@ impl TuicServer {
                             let _ = send.finish();
                         }
                     }
-                    self.traffic
-                        .lock()
-                        .expect("traffic registry lock poisoned")
-                        .add_with_user_id(
-                            self.config.node_tag.clone(),
-                            user_uuid.to_string(),
-                            Some(user_id),
-                            packet.payload.len() as u64,
-                            response.len() as u64,
-                            Some(client_ip),
-                        );
+                    self.traffic.add_with_user_id(
+                        self.config.node_tag.clone(),
+                        user_uuid.to_string(),
+                        Some(user_id),
+                        packet.payload.len() as u64,
+                        response.len() as u64,
+                        Some(client_ip),
+                    );
                 }
                 Err(error)
                     if matches!(
@@ -510,17 +501,14 @@ impl TuicServer {
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) =>
                 {
-                    self.traffic
-                        .lock()
-                        .expect("traffic registry lock poisoned")
-                        .add_with_user_id(
-                            self.config.node_tag.clone(),
-                            user_uuid.to_string(),
-                            Some(user_id),
-                            packet.payload.len() as u64,
-                            0,
-                            Some(client_ip),
-                        );
+                    self.traffic.add_with_user_id(
+                        self.config.node_tag.clone(),
+                        user_uuid.to_string(),
+                        Some(user_id),
+                        packet.payload.len() as u64,
+                        0,
+                        Some(client_ip),
+                    );
                 }
                 Err(error) => return Err(error),
             }
@@ -547,17 +535,14 @@ impl TuicServer {
             limiter.wait_for(packet.payload.len());
         }
         session.socket.send_to(&packet.payload, target_addr).await?;
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                user_uuid.to_string(),
-                Some(user_id),
-                packet.payload.len() as u64,
-                0,
-                Some(client_ip),
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            user_uuid.to_string(),
+            Some(user_id),
+            packet.payload.len() as u64,
+            0,
+            Some(client_ip),
+        );
         Ok(())
     }
 
@@ -751,7 +736,7 @@ async fn receive_udp_replies(
     node_tag: String,
     user_uuid: String,
     user_id: u64,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     client_ip: IpAddr,
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; UDP_PACKET_BUFFER_SIZE];
@@ -787,17 +772,14 @@ async fn receive_udp_replies(
                 let _ = send.finish();
             }
         }
-        traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                node_tag.clone(),
-                user_uuid.clone(),
-                Some(user_id),
-                0,
-                read as u64,
-                Some(client_ip),
-            );
+        traffic.add_with_user_id(
+            node_tag.clone(),
+            user_uuid.clone(),
+            Some(user_id),
+            0,
+            read as u64,
+            Some(client_ip),
+        );
     }
 }
 

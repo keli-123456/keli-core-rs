@@ -29,7 +29,7 @@ use crate::reality::{
 use crate::shadowsocks::{ShadowsocksServer, ShadowsocksServerConfig};
 use crate::socks5::{Socks5Server, Socks5ServerConfig};
 use crate::tls::TlsAcceptor;
-use crate::traffic::{TrafficDelta, TrafficRegistry};
+use crate::traffic::{SharedTrafficRegistry, TrafficDelta, TrafficRegistry};
 use crate::trojan::{TrojanServer, TrojanServerConfig};
 use crate::tuic::{TuicServer, TuicServerConfig};
 use crate::user::CoreUser;
@@ -84,7 +84,7 @@ impl std::error::Error for CoreServiceError {}
 pub struct CoreService {
     config: CoreConfig,
     listeners: Vec<ListenerHandle>,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
 }
 
 #[derive(Debug)]
@@ -133,7 +133,7 @@ impl CoreService {
         crate::dns::configure(config.dns.clone());
         let active_config = config.clone();
 
-        let traffic = Arc::new(Mutex::new(TrafficRegistry::default()));
+        let traffic = TrafficRegistry::shared();
         let sessions = UserSessionTracker::default();
         let bandwidth = UserBandwidthLimiters::default();
         let mut listeners = Vec::new();
@@ -236,17 +236,11 @@ impl CoreService {
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<TrafficDelta> {
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .drain_minimum(minimum_bytes)
+        self.traffic.drain_minimum(minimum_bytes)
     }
 
     pub fn requeue_traffic(&self, records: Vec<TrafficDelta>) {
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_deltas(records);
+        self.traffic.add_deltas(records);
     }
 
     pub fn can_update_users(&self, config: &CoreConfig) -> bool {
@@ -381,7 +375,7 @@ fn start_grpc_transport_listener(
 fn start_vmess_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 ) -> Result<ListenerHandle, CoreServiceError> {
@@ -498,7 +492,7 @@ fn start_vmess_listener(
 fn start_hysteria2_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 ) -> Result<ListenerHandle, CoreServiceError> {
@@ -590,7 +584,7 @@ fn hysteria2_obfs_config(transport: &TransportConfig) -> Option<Hysteria2ObfsCon
 fn start_tuic_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 ) -> Result<ListenerHandle, CoreServiceError> {
@@ -667,7 +661,7 @@ fn start_tuic_listener(
 fn start_anytls_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 ) -> Result<ListenerHandle, CoreServiceError> {
@@ -737,7 +731,7 @@ fn start_anytls_listener(
 fn start_shadowsocks_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 ) -> Result<ListenerHandle, CoreServiceError> {
@@ -847,7 +841,7 @@ fn shadowsocks_udp_enabled(transport: &TransportConfig) -> bool {
 fn start_trojan_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 ) -> Result<ListenerHandle, CoreServiceError> {
@@ -965,7 +959,7 @@ fn start_trojan_listener(
 fn start_vless_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 ) -> Result<ListenerHandle, CoreServiceError> {
@@ -1118,7 +1112,7 @@ fn start_vless_listener(
 fn start_socks_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 ) -> Result<ListenerHandle, CoreServiceError> {
@@ -1188,7 +1182,7 @@ fn start_socks_listener(
 fn start_mieru_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 ) -> Result<ListenerHandle, CoreServiceError> {
@@ -1258,7 +1252,7 @@ fn start_mieru_listener(
 fn start_http_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 ) -> Result<ListenerHandle, CoreServiceError> {

@@ -18,7 +18,7 @@ use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 use crate::salamander::SalamanderUdpSocket;
 use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
-use crate::traffic::TrafficRegistry;
+use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, UserStore};
 use crate::{connect_tcp_outbound_tokio, send_udp_outbound_tokio};
 
@@ -57,7 +57,7 @@ pub struct Hysteria2Server {
     config: Hysteria2ServerConfig,
     users: UserStore,
     router: RouteMatcher,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 }
@@ -66,7 +66,7 @@ impl Hysteria2Server {
     pub fn new(config: Hysteria2ServerConfig) -> Self {
         Self::with_shared_limits(
             config,
-            Arc::new(Mutex::new(TrafficRegistry::default())),
+            TrafficRegistry::shared(),
             UserSessionTracker::default(),
             UserBandwidthLimiters::default(),
         )
@@ -74,7 +74,7 @@ impl Hysteria2Server {
 
     pub fn with_shared_limits(
         config: Hysteria2ServerConfig,
-        traffic: Arc<Mutex<TrafficRegistry>>,
+        traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
@@ -161,10 +161,7 @@ impl Hysteria2Server {
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .drain_minimum(minimum_bytes)
+        self.traffic.drain_minimum(minimum_bytes)
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
@@ -361,17 +358,14 @@ impl Hysteria2Server {
 
         write_tcp_response(&mut send, RESPONSE_OK, "").await?;
         let (upload, download) = relay_streams(&mut recv, &mut send, remote, bandwidth).await?;
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                user_uuid,
-                Some(user_id),
-                upload,
-                download,
-                Some(client_ip),
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            user_uuid,
+            Some(user_id),
+            upload,
+            download,
+            Some(client_ip),
+        );
         Ok(())
     }
 
@@ -468,17 +462,14 @@ impl Hysteria2Server {
                                 .map_err(io_other)?;
                         }
                     }
-                    self.traffic
-                        .lock()
-                        .expect("traffic registry lock poisoned")
-                        .add_with_user_id(
-                            self.config.node_tag.clone(),
-                            user_uuid.to_string(),
-                            Some(user_id),
-                            message.data.len() as u64,
-                            response.len() as u64,
-                            Some(client_ip),
-                        );
+                    self.traffic.add_with_user_id(
+                        self.config.node_tag.clone(),
+                        user_uuid.to_string(),
+                        Some(user_id),
+                        message.data.len() as u64,
+                        response.len() as u64,
+                        Some(client_ip),
+                    );
                 }
                 Err(error)
                     if matches!(
@@ -486,17 +477,14 @@ impl Hysteria2Server {
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) =>
                 {
-                    self.traffic
-                        .lock()
-                        .expect("traffic registry lock poisoned")
-                        .add_with_user_id(
-                            self.config.node_tag.clone(),
-                            user_uuid.to_string(),
-                            Some(user_id),
-                            message.data.len() as u64,
-                            0,
-                            Some(client_ip),
-                        );
+                    self.traffic.add_with_user_id(
+                        self.config.node_tag.clone(),
+                        user_uuid.to_string(),
+                        Some(user_id),
+                        message.data.len() as u64,
+                        0,
+                        Some(client_ip),
+                    );
                 }
                 Err(error) => return Err(error),
             }
@@ -517,17 +505,14 @@ impl Hysteria2Server {
             .await?;
         bandwidth.wait_upload(message.data.len()).await;
         session.socket.send_to(&message.data, target_addr).await?;
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                user_uuid.to_string(),
-                Some(user_id),
-                message.data.len() as u64,
-                0,
-                Some(client_ip),
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            user_uuid.to_string(),
+            Some(user_id),
+            message.data.len() as u64,
+            0,
+            Some(client_ip),
+        );
         Ok(())
     }
 
@@ -763,7 +748,7 @@ async fn receive_udp_replies(
     node_tag: String,
     user_uuid: String,
     user_id: u64,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     bandwidth: DirectionalLimiters,
     client_ip: IpAddr,
 ) -> io::Result<()> {
@@ -784,17 +769,14 @@ async fn receive_udp_replies(
             .send_datagram_wait(Bytes::from(datagram))
             .await
             .map_err(io_other)?;
-        traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                node_tag.clone(),
-                user_uuid.clone(),
-                Some(user_id),
-                0,
-                read as u64,
-                Some(client_ip),
-            );
+        traffic.add_with_user_id(
+            node_tag.clone(),
+            user_uuid.clone(),
+            Some(user_id),
+            0,
+            read as u64,
+            Some(client_ip),
+        );
     }
 }
 

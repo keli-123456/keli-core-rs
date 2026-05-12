@@ -63,7 +63,7 @@ pub use shadowsocks::{
 };
 pub use socks5::{Socks5Server, Socks5ServerConfig, SocksTarget};
 pub use tls::{relay_tls_stream, TlsAcceptor, TlsConnection};
-pub use traffic::{TrafficDelta, TrafficKey, TrafficRegistry};
+pub use traffic::{SharedTrafficRegistry, TrafficDelta, TrafficKey, TrafficRegistry};
 pub use trojan::{trojan_password_hash, TrojanServer, TrojanServerConfig};
 pub use tuic::{TuicServer, TuicServerConfig};
 pub use user::{CoreUser, UserStore};

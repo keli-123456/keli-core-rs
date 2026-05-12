@@ -38,7 +38,7 @@ use crate::quic::connect_quic_client_stream;
 use crate::socks5::SocksTarget;
 use crate::stream::{copy_count_best_effort_limited, spawn_native_blocking_relay};
 use crate::tls::TlsConnection;
-use crate::traffic::TrafficRegistry;
+use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, UserStore};
 use crate::websocket::{accept_websocket, accept_websocket_tls, connect_websocket_client};
 use crate::{
@@ -93,7 +93,7 @@ pub struct VmessServer {
     auth_users: Arc<RwLock<Vec<VmessAuthUser>>>,
     replay: Arc<Mutex<HashMap<[u8; 16], Instant>>>,
     router: RouteMatcher,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 }
@@ -159,10 +159,10 @@ struct VmessUdpRelayState {
 
 impl VmessServer {
     pub fn new(config: VmessServerConfig) -> Self {
-        Self::with_traffic(config, Arc::new(Mutex::new(TrafficRegistry::default())))
+        Self::with_traffic(config, TrafficRegistry::shared())
     }
 
-    pub fn with_traffic(config: VmessServerConfig, traffic: Arc<Mutex<TrafficRegistry>>) -> Self {
+    pub fn with_traffic(config: VmessServerConfig, traffic: SharedTrafficRegistry) -> Self {
         Self::with_shared_limits(
             config,
             traffic,
@@ -173,7 +173,7 @@ impl VmessServer {
 
     pub fn with_shared_limits(
         config: VmessServerConfig,
-        traffic: Arc<Mutex<TrafficRegistry>>,
+        traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
@@ -292,10 +292,7 @@ impl VmessServer {
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .drain_minimum(minimum_bytes)
+        self.traffic.drain_minimum(minimum_bytes)
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
@@ -480,17 +477,14 @@ impl VmessServer {
         let upload = upload_thread
             .join()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "upload relay thread panicked"))?;
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                request.user_uuid,
-                request.user_id,
-                upload,
-                download,
-                request.client_ip,
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            request.user_uuid,
+            request.user_id,
+            upload,
+            download,
+            request.client_ip,
+        );
         Ok(())
     }
 
@@ -581,17 +575,14 @@ impl VmessServer {
 
         let _ = response_body.finish(&mut client);
         let _ = remote.shutdown(Shutdown::Both);
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                request.user_uuid,
-                request.user_id,
-                upload,
-                download,
-                request.client_ip,
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            request.user_uuid,
+            request.user_id,
+            upload,
+            download,
+            request.client_ip,
+        );
         Ok(())
     }
 
@@ -790,17 +781,14 @@ impl VmessServer {
         download: u64,
         client_ip: Option<IpAddr>,
     ) {
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                user_uuid,
-                user_id,
-                upload,
-                download,
-                client_ip,
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            user_uuid,
+            user_id,
+            upload,
+            download,
+            client_ip,
+        );
     }
 
     fn request_user(&self, request: &VmessRequest) -> Option<CoreUser> {

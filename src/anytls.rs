@@ -15,7 +15,7 @@ use crate::limits::{
 use crate::outbound::recv_udp_response;
 use crate::socks5::SocksTarget;
 use crate::stream::{join_native_blocking_relay, spawn_native_blocking_relay, NativeRelayHandle};
-use crate::traffic::TrafficRegistry;
+use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::CoreUser;
 use crate::{
     connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
@@ -57,7 +57,7 @@ pub struct AnyTlsServer {
     config: AnyTlsServerConfig,
     users: Arc<RwLock<HashMap<[u8; 32], CoreUser>>>,
     router: RouteMatcher,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 }
@@ -104,10 +104,10 @@ struct AnyTlsUdpRelayState {
 
 impl AnyTlsServer {
     pub fn new(config: AnyTlsServerConfig) -> Self {
-        Self::with_traffic(config, Arc::new(Mutex::new(TrafficRegistry::default())))
+        Self::with_traffic(config, TrafficRegistry::shared())
     }
 
-    pub fn with_traffic(config: AnyTlsServerConfig, traffic: Arc<Mutex<TrafficRegistry>>) -> Self {
+    pub fn with_traffic(config: AnyTlsServerConfig, traffic: SharedTrafficRegistry) -> Self {
         Self::with_shared_limits(
             config,
             traffic,
@@ -118,7 +118,7 @@ impl AnyTlsServer {
 
     pub fn with_shared_limits(
         config: AnyTlsServerConfig,
-        traffic: Arc<Mutex<TrafficRegistry>>,
+        traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
@@ -164,26 +164,20 @@ impl AnyTlsServer {
         }
         let (upload, download) = *session.traffic.lock().expect("traffic lock poisoned");
         if upload > 0 || download > 0 {
-            self.traffic
-                .lock()
-                .expect("traffic registry lock poisoned")
-                .add_with_user_id(
-                    self.config.node_tag.clone(),
-                    session.user.uuid,
-                    Some(session.user.id),
-                    upload,
-                    download,
-                    session.client_ip,
-                );
+            self.traffic.add_with_user_id(
+                self.config.node_tag.clone(),
+                session.user.uuid,
+                Some(session.user.id),
+                upload,
+                download,
+                session.client_ip,
+            );
         }
         result
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .drain_minimum(minimum_bytes)
+        self.traffic.drain_minimum(minimum_bytes)
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {

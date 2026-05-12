@@ -1,6 +1,6 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
@@ -10,7 +10,7 @@ use crate::limits::{
     BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
 use crate::stream::{copy_count_best_effort_limited, relay_tcp_streams_limited};
-use crate::traffic::{TrafficDelta, TrafficRegistry};
+use crate::traffic::{SharedTrafficRegistry, TrafficDelta, TrafficRegistry};
 use crate::user::{CoreUser, UserStore};
 use crate::{connect_tcp_outbound, RouteDecision, RouteMatcher, SocksTarget};
 
@@ -28,7 +28,7 @@ pub struct HttpProxyServer {
     config: HttpProxyServerConfig,
     users: UserStore,
     router: RouteMatcher,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 }
@@ -52,13 +52,10 @@ struct HttpTarget {
 
 impl HttpProxyServer {
     pub fn new(config: HttpProxyServerConfig) -> Self {
-        Self::with_traffic(config, Arc::new(Mutex::new(TrafficRegistry::default())))
+        Self::with_traffic(config, TrafficRegistry::shared())
     }
 
-    pub fn with_traffic(
-        config: HttpProxyServerConfig,
-        traffic: Arc<Mutex<TrafficRegistry>>,
-    ) -> Self {
+    pub fn with_traffic(config: HttpProxyServerConfig, traffic: SharedTrafficRegistry) -> Self {
         Self::with_shared_limits(
             config,
             traffic,
@@ -69,7 +66,7 @@ impl HttpProxyServer {
 
     pub fn with_shared_limits(
         config: HttpProxyServerConfig,
-        traffic: Arc<Mutex<TrafficRegistry>>,
+        traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
@@ -115,10 +112,7 @@ impl HttpProxyServer {
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<TrafficDelta> {
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .drain_minimum(minimum_bytes)
+        self.traffic.drain_minimum(minimum_bytes)
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
@@ -298,17 +292,14 @@ impl HttpProxyServer {
         client_ip: Option<std::net::IpAddr>,
     ) {
         if let Some(user_uuid) = user_uuid {
-            self.traffic
-                .lock()
-                .expect("traffic registry lock poisoned")
-                .add_with_user_id(
-                    self.config.node_tag.clone(),
-                    user_uuid,
-                    user_id,
-                    upload,
-                    download,
-                    client_ip,
-                );
+            self.traffic.add_with_user_id(
+                self.config.node_tag.clone(),
+                user_uuid,
+                user_id,
+                upload,
+                download,
+                client_ip,
+            );
         }
     }
 

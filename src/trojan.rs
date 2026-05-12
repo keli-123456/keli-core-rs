@@ -2,7 +2,7 @@ use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -29,7 +29,7 @@ use crate::stream::{
     spawn_native_blocking_relay,
 };
 use crate::tls::{relay_tls_stream, TlsConnection};
-use crate::traffic::TrafficRegistry;
+use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, UserStore};
 use crate::websocket::{
     accept_websocket, accept_websocket_tls, connect_websocket_client, relay_websocket_tls_stream,
@@ -61,7 +61,7 @@ pub struct TrojanServer {
     config: TrojanServerConfig,
     users: UserStore,
     router: RouteMatcher,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 }
@@ -92,10 +92,10 @@ struct TrojanUdpRelayState {
 
 impl TrojanServer {
     pub fn new(config: TrojanServerConfig) -> Self {
-        Self::with_traffic(config, Arc::new(Mutex::new(TrafficRegistry::default())))
+        Self::with_traffic(config, TrafficRegistry::shared())
     }
 
-    pub fn with_traffic(config: TrojanServerConfig, traffic: Arc<Mutex<TrafficRegistry>>) -> Self {
+    pub fn with_traffic(config: TrojanServerConfig, traffic: SharedTrafficRegistry) -> Self {
         Self::with_shared_limits(
             config,
             traffic,
@@ -106,7 +106,7 @@ impl TrojanServer {
 
     pub fn with_shared_limits(
         config: TrojanServerConfig,
-        traffic: Arc<Mutex<TrafficRegistry>>,
+        traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
@@ -303,10 +303,7 @@ impl TrojanServer {
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .drain_minimum(minimum_bytes)
+        self.traffic.drain_minimum(minimum_bytes)
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
@@ -364,17 +361,14 @@ impl TrojanServer {
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
         let (upload, download) = relay_tcp_streams_limited(client, remote, bandwidth)?;
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                request.user_uuid,
-                Some(request.user_id),
-                upload,
-                download,
-                request.client_ip,
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            request.user_uuid,
+            Some(request.user_id),
+            upload,
+            download,
+            request.client_ip,
+        );
         Ok(())
     }
 
@@ -402,17 +396,14 @@ impl TrojanServer {
         })?;
         let download = copy_count_best_effort_limited(&mut remote_read, &mut writer, None);
         let upload = join_native_blocking_relay(upload_task, "upload relay task panicked")?;
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                request.user_uuid,
-                Some(request.user_id),
-                upload,
-                download,
-                request.client_ip,
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            request.user_uuid,
+            Some(request.user_id),
+            upload,
+            download,
+            request.client_ip,
+        );
         Ok(())
     }
 
@@ -424,17 +415,14 @@ impl TrojanServer {
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
         let (upload, download) = relay_tls_stream(client, remote, bandwidth)?;
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                request.user_uuid,
-                Some(request.user_id),
-                upload,
-                download,
-                request.client_ip,
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            request.user_uuid,
+            Some(request.user_id),
+            upload,
+            download,
+            request.client_ip,
+        );
         Ok(())
     }
 
@@ -446,17 +434,14 @@ impl TrojanServer {
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
         let (upload, download) = relay_websocket_tls_stream(client, remote, bandwidth)?;
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                request.user_uuid,
-                Some(request.user_id),
-                upload,
-                download,
-                request.client_ip,
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            request.user_uuid,
+            Some(request.user_id),
+            upload,
+            download,
+            request.client_ip,
+        );
         Ok(())
     }
 
@@ -630,17 +615,14 @@ impl TrojanServer {
         download: u64,
         client_ip: Option<IpAddr>,
     ) {
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                user_uuid,
-                Some(user_id),
-                upload,
-                download,
-                client_ip,
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            user_uuid,
+            Some(user_id),
+            upload,
+            download,
+            client_ip,
+        );
     }
 
     fn request_user(&self, request: &TrojanRequest) -> Option<CoreUser> {

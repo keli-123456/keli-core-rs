@@ -1,4 +1,4 @@
-﻿use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::config::{CoreConfig, ValidationError};
 use crate::traffic::{TrafficDelta, TrafficRegistry};
@@ -25,7 +25,7 @@ pub enum ReloadDecision {
     Updated,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RuntimeState {
     active_fingerprint: Option<String>,
     status: CoreStatus,

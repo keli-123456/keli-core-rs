@@ -1,6 +1,8 @@
-use std::collections::hash_map::Entry;
+use std::collections::hash_map::{DefaultHasher, Entry};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -22,14 +24,32 @@ pub struct TrafficDelta {
     pub online_ips: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+const TRAFFIC_REGISTRY_SHARDS: usize = 64;
+
+pub type SharedTrafficRegistry = Arc<TrafficRegistry>;
+
+#[derive(Debug)]
 pub struct TrafficRegistry {
-    counters: HashMap<TrafficKey, TrafficDelta>,
+    shards: Vec<Mutex<HashMap<TrafficKey, TrafficDelta>>>,
+}
+
+impl Default for TrafficRegistry {
+    fn default() -> Self {
+        Self {
+            shards: (0..TRAFFIC_REGISTRY_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+        }
+    }
 }
 
 impl TrafficRegistry {
+    pub fn shared() -> SharedTrafficRegistry {
+        Arc::new(Self::default())
+    }
+
     pub fn add(
-        &mut self,
+        &self,
         node_tag: impl Into<String>,
         user_uuid: impl Into<String>,
         upload: u64,
@@ -39,7 +59,7 @@ impl TrafficRegistry {
     }
 
     pub fn add_with_ip(
-        &mut self,
+        &self,
         node_tag: impl Into<String>,
         user_uuid: impl Into<String>,
         upload: u64,
@@ -50,7 +70,7 @@ impl TrafficRegistry {
     }
 
     pub fn add_with_user_id(
-        &mut self,
+        &self,
         node_tag: impl Into<String>,
         user_uuid: impl Into<String>,
         user_id: Option<u64>,
@@ -62,7 +82,11 @@ impl TrafficRegistry {
             node_tag: node_tag.into(),
             user_uuid: user_uuid.into(),
         };
-        let entry = match self.counters.entry(key) {
+        let mut shard = self
+            .shard_for(&key)
+            .lock()
+            .expect("traffic shard lock poisoned");
+        let entry = match shard.entry(key) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
                 let key = entry.key();
@@ -91,12 +115,16 @@ impl TrafficRegistry {
         }
     }
 
-    pub fn add_delta(&mut self, delta: TrafficDelta) {
+    pub fn add_delta(&self, delta: TrafficDelta) {
         let key = TrafficKey {
             node_tag: delta.node_tag,
             user_uuid: delta.user_uuid,
         };
-        let entry = match self.counters.entry(key) {
+        let mut shard = self
+            .shard_for(&key)
+            .lock()
+            .expect("traffic shard lock poisoned");
+        let entry = match shard.entry(key) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
                 let node_tag = entry.key().node_tag.clone();
@@ -124,18 +152,23 @@ impl TrafficRegistry {
         entry.online_ips.sort();
     }
 
-    pub fn add_deltas(&mut self, records: impl IntoIterator<Item = TrafficDelta>) {
+    pub fn add_deltas(&self, records: impl IntoIterator<Item = TrafficDelta>) {
         for record in records {
             self.add_delta(record);
         }
     }
 
-    pub fn drain_all(&mut self) -> Vec<TrafficDelta> {
-        let mut records = self
-            .counters
-            .drain()
-            .map(|(_, value)| value)
-            .collect::<Vec<_>>();
+    pub fn drain_all(&self) -> Vec<TrafficDelta> {
+        let mut records = Vec::new();
+        for shard in &self.shards {
+            records.extend(
+                shard
+                    .lock()
+                    .expect("traffic shard lock poisoned")
+                    .drain()
+                    .map(|(_, value)| value),
+            );
+        }
         records.sort_by(|left, right| {
             left.node_tag
                 .cmp(&right.node_tag)
@@ -144,20 +177,22 @@ impl TrafficRegistry {
         records
     }
 
-    pub fn drain_minimum(&mut self, minimum_bytes: u64) -> Vec<TrafficDelta> {
-        let keys = self
-            .counters
-            .iter()
-            .filter_map(|(key, value)| {
-                let total = value.upload.saturating_add(value.download);
-                (total >= minimum_bytes).then(|| key.clone())
-            })
-            .collect::<Vec<_>>();
+    pub fn drain_minimum(&self, minimum_bytes: u64) -> Vec<TrafficDelta> {
+        let mut records = Vec::new();
+        for shard in &self.shards {
+            let mut shard = shard.lock().expect("traffic shard lock poisoned");
+            let keys = shard
+                .iter()
+                .filter_map(|(key, value)| {
+                    let total = value.upload.saturating_add(value.download);
+                    (total >= minimum_bytes).then(|| key.clone())
+                })
+                .collect::<Vec<_>>();
 
-        let mut records = Vec::with_capacity(keys.len());
-        for key in keys {
-            if let Some(value) = self.counters.remove(&key) {
-                records.push(value);
+            for key in keys {
+                if let Some(value) = shard.remove(&key) {
+                    records.push(value);
+                }
             }
         }
         records.sort_by(|left, right| {
@@ -169,21 +204,37 @@ impl TrafficRegistry {
     }
 
     pub fn len(&self) -> usize {
-        self.counters.len()
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().expect("traffic shard lock poisoned").len())
+            .sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.counters.is_empty()
+        self.shards.iter().all(|shard| {
+            shard
+                .lock()
+                .expect("traffic shard lock poisoned")
+                .is_empty()
+        })
+    }
+
+    fn shard_for(&self, key: &TrafficKey) -> &Mutex<HashMap<TrafficKey, TrafficDelta>> {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        &self.shards[(hasher.finish() as usize) % self.shards.len()]
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::TrafficRegistry;
 
     #[test]
     fn accumulates_and_drains_traffic() {
-        let mut registry = TrafficRegistry::default();
+        let registry = TrafficRegistry::default();
 
         registry.add("node-a", "user-a", 10, 20);
         registry.add("node-a", "user-a", 1, 2);
@@ -199,7 +250,7 @@ mod tests {
 
     #[test]
     fn records_online_ips_without_duplicates() {
-        let mut registry = TrafficRegistry::default();
+        let registry = TrafficRegistry::default();
 
         registry.add_with_ip(
             "node-a",
@@ -223,7 +274,7 @@ mod tests {
 
     #[test]
     fn preserves_user_id_for_deleted_user_reporting() {
-        let mut registry = TrafficRegistry::default();
+        let registry = TrafficRegistry::default();
 
         registry.add_with_user_id("node-a", "user-a", Some(42), 10, 20, None);
         registry.add_with_user_id("node-a", "user-a", None, 1, 2, None);
@@ -238,7 +289,7 @@ mod tests {
 
     #[test]
     fn requeues_drained_traffic_deltas() {
-        let mut registry = TrafficRegistry::default();
+        let registry = TrafficRegistry::default();
 
         registry.add_with_user_id(
             "node-a",
@@ -266,5 +317,42 @@ mod tests {
         assert_eq!(records[0].upload, 11);
         assert_eq!(records[0].download, 22);
         assert_eq!(records[0].online_ips, vec!["198.51.100.7", "198.51.100.8"]);
+    }
+
+    #[test]
+    fn shared_registry_accepts_concurrent_writers() {
+        let registry = TrafficRegistry::shared();
+        let mut workers = Vec::new();
+
+        for worker in 0..16 {
+            let registry = registry.clone();
+            workers.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    registry.add_with_user_id(
+                        "node-a",
+                        format!("user-{worker}"),
+                        Some(worker),
+                        1,
+                        2,
+                        None,
+                    );
+                }
+            }));
+        }
+
+        for worker in workers {
+            worker.join().expect("traffic worker should not panic");
+        }
+
+        let records = registry.drain_all();
+        assert_eq!(records.len(), 16);
+        assert_eq!(
+            records.iter().map(|record| record.upload).sum::<u64>(),
+            1600
+        );
+        assert_eq!(
+            records.iter().map(|record| record.download).sum::<u64>(),
+            3200
+        );
     }
 }

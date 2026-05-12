@@ -1,4 +1,4 @@
-﻿use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
@@ -20,7 +20,7 @@ use crate::stream::{
     copy_count_best_effort_limited, join_native_blocking_relay, spawn_native_blocking_relay,
     NativeRelayHandle,
 };
-use crate::traffic::TrafficRegistry;
+use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::CoreUser;
 use crate::{
     connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
@@ -69,7 +69,7 @@ pub struct MieruServer {
     config: MieruServerConfig,
     users: Arc<RwLock<Vec<CoreUser>>>,
     router: RouteMatcher,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 }
@@ -182,10 +182,10 @@ struct MieruSocksRequest {
 
 impl MieruServer {
     pub fn new(config: MieruServerConfig) -> Self {
-        Self::with_traffic(config, Arc::new(Mutex::new(TrafficRegistry::default())))
+        Self::with_traffic(config, TrafficRegistry::shared())
     }
 
-    pub fn with_traffic(config: MieruServerConfig, traffic: Arc<Mutex<TrafficRegistry>>) -> Self {
+    pub fn with_traffic(config: MieruServerConfig, traffic: SharedTrafficRegistry) -> Self {
         Self::with_shared_limits(
             config,
             traffic,
@@ -196,7 +196,7 @@ impl MieruServer {
 
     pub fn with_shared_limits(
         config: MieruServerConfig,
-        traffic: Arc<Mutex<TrafficRegistry>>,
+        traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
@@ -313,10 +313,7 @@ impl MieruServer {
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .drain_minimum(minimum_bytes)
+        self.traffic.drain_minimum(minimum_bytes)
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
@@ -336,7 +333,7 @@ impl MieruServer {
 struct MieruSessionRuntime {
     node_tag: String,
     router: RouteMatcher,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
     timeout: Duration,
@@ -492,18 +489,14 @@ fn handle_mieru_session(
         (upload.saturating_add(relayed_upload), download)
     };
 
-    runtime
-        .traffic
-        .lock()
-        .expect("traffic registry lock poisoned")
-        .add_with_user_id(
-            runtime.node_tag,
-            user.uuid,
-            Some(user.id),
-            upload,
-            download,
-            client_ip,
-        );
+    runtime.traffic.add_with_user_id(
+        runtime.node_tag,
+        user.uuid,
+        Some(user.id),
+        upload,
+        download,
+        client_ip,
+    );
     Ok(())
 }
 

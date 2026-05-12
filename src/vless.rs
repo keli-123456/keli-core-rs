@@ -2,7 +2,7 @@ use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -29,7 +29,7 @@ use crate::stream::{
     spawn_native_blocking_relay,
 };
 use crate::tls::{relay_tls_stream, TlsConnection, TlsSocket};
-use crate::traffic::TrafficRegistry;
+use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, UserStore};
 use crate::vision::{VisionDecoder, VisionEncoder, VisionReader, VisionWriter};
 use crate::websocket::{
@@ -65,7 +65,7 @@ pub struct VlessServer {
     config: VlessServerConfig,
     users: UserStore,
     router: RouteMatcher,
-    traffic: Arc<Mutex<TrafficRegistry>>,
+    traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
 }
@@ -106,10 +106,10 @@ struct AsyncVlessUdpRelayState {
 
 impl VlessServer {
     pub fn new(config: VlessServerConfig) -> Self {
-        Self::with_traffic(config, Arc::new(Mutex::new(TrafficRegistry::default())))
+        Self::with_traffic(config, TrafficRegistry::shared())
     }
 
-    pub fn with_traffic(config: VlessServerConfig, traffic: Arc<Mutex<TrafficRegistry>>) -> Self {
+    pub fn with_traffic(config: VlessServerConfig, traffic: SharedTrafficRegistry) -> Self {
         Self::with_shared_limits(
             config,
             traffic,
@@ -120,7 +120,7 @@ impl VlessServer {
 
     pub fn with_shared_limits(
         config: VlessServerConfig,
-        traffic: Arc<Mutex<TrafficRegistry>>,
+        traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
@@ -381,10 +381,7 @@ impl VlessServer {
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .drain_minimum(minimum_bytes)
+        self.traffic.drain_minimum(minimum_bytes)
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
@@ -564,17 +561,14 @@ impl VlessServer {
         } else {
             relay_tcp_streams_limited(client, remote, bandwidth)?
         };
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                request.user_uuid,
-                Some(request.user_numeric_id),
-                upload,
-                download,
-                request.client_ip,
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            request.user_uuid,
+            Some(request.user_numeric_id),
+            upload,
+            download,
+            request.client_ip,
+        );
         Ok(())
     }
 
@@ -586,17 +580,14 @@ impl VlessServer {
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
         let (upload, download) = relay_tcp_streams_async(client, remote, bandwidth).await?;
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                request.user_uuid,
-                Some(request.user_numeric_id),
-                upload,
-                download,
-                request.client_ip,
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            request.user_uuid,
+            Some(request.user_numeric_id),
+            upload,
+            download,
+            request.client_ip,
+        );
         Ok(())
     }
 
@@ -629,17 +620,14 @@ impl VlessServer {
             let upload = join_native_blocking_relay(upload_task, "upload relay task panicked")?;
             (upload, download)
         };
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                request.user_uuid,
-                Some(request.user_numeric_id),
-                upload,
-                download,
-                request.client_ip,
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            request.user_uuid,
+            Some(request.user_numeric_id),
+            upload,
+            download,
+            request.client_ip,
+        );
         Ok(())
     }
 
@@ -658,17 +646,14 @@ impl VlessServer {
         } else {
             relay_tls_stream(client, remote, bandwidth)?
         };
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                request.user_uuid,
-                Some(request.user_numeric_id),
-                upload,
-                download,
-                request.client_ip,
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            request.user_uuid,
+            Some(request.user_numeric_id),
+            upload,
+            download,
+            request.client_ip,
+        );
         Ok(())
     }
 
@@ -680,17 +665,14 @@ impl VlessServer {
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
         let (upload, download) = relay_websocket_tls_stream(client, remote, bandwidth)?;
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                request.user_uuid,
-                Some(request.user_numeric_id),
-                upload,
-                download,
-                request.client_ip,
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            request.user_uuid,
+            Some(request.user_numeric_id),
+            upload,
+            download,
+            request.client_ip,
+        );
         Ok(())
     }
 
@@ -985,17 +967,14 @@ impl VlessServer {
         download: u64,
         client_ip: Option<IpAddr>,
     ) {
-        self.traffic
-            .lock()
-            .expect("traffic registry lock poisoned")
-            .add_with_user_id(
-                self.config.node_tag.clone(),
-                user_uuid,
-                Some(user_id),
-                upload,
-                download,
-                client_ip,
-            );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            user_uuid,
+            Some(user_id),
+            upload,
+            download,
+            client_ip,
+        );
     }
 
     fn request_user(&self, request: &VlessRequest) -> Option<CoreUser> {
