@@ -75,6 +75,7 @@ struct VlessRequest {
     command: VlessCommand,
     user_key: String,
     user_uuid: String,
+    user_numeric_id: u64,
     user_id: [u8; 16],
     flow: String,
     target: SocksTarget,
@@ -440,6 +441,7 @@ impl VlessServer {
             command,
             user_key,
             user_uuid: user.uuid.clone(),
+            user_numeric_id: user.id,
             user_id: uuid,
             flow,
             target,
@@ -496,6 +498,7 @@ impl VlessServer {
             command,
             user_key,
             user_uuid: user.uuid.clone(),
+            user_numeric_id: user.id,
             user_id: uuid,
             flow,
             target,
@@ -564,9 +567,10 @@ impl VlessServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 request.user_uuid,
+                Some(request.user_numeric_id),
                 upload,
                 download,
                 request.client_ip,
@@ -585,9 +589,10 @@ impl VlessServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 request.user_uuid,
+                Some(request.user_numeric_id),
                 upload,
                 download,
                 request.client_ip,
@@ -627,9 +632,10 @@ impl VlessServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 request.user_uuid,
+                Some(request.user_numeric_id),
                 upload,
                 download,
                 request.client_ip,
@@ -655,9 +661,10 @@ impl VlessServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 request.user_uuid,
+                Some(request.user_numeric_id),
                 upload,
                 download,
                 request.client_ip,
@@ -676,9 +683,10 @@ impl VlessServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 request.user_uuid,
+                Some(request.user_numeric_id),
                 upload,
                 download,
                 request.client_ip,
@@ -719,7 +727,13 @@ impl VlessServer {
                 Err(error) => break Err(error),
             }
         };
-        self.record_traffic(request.user_uuid, upload, download, request.client_ip);
+        self.record_traffic(
+            request.user_uuid,
+            request.user_numeric_id,
+            upload,
+            download,
+            request.client_ip,
+        );
         result
     }
 
@@ -756,7 +770,13 @@ impl VlessServer {
                 Err(error) => break Err(error),
             }
         };
-        self.record_traffic(request.user_uuid, upload, download, request.client_ip);
+        self.record_traffic(
+            request.user_uuid,
+            request.user_numeric_id,
+            upload,
+            download,
+            request.client_ip,
+        );
         result
     }
 
@@ -795,7 +815,13 @@ impl VlessServer {
                 Err(error) => break Err(error),
             }
         };
-        self.record_traffic(request.user_uuid, upload, download, request.client_ip);
+        self.record_traffic(
+            request.user_uuid,
+            request.user_numeric_id,
+            upload,
+            download,
+            request.client_ip,
+        );
         result
     }
 
@@ -954,6 +980,7 @@ impl VlessServer {
     fn record_traffic(
         &self,
         user_uuid: String,
+        user_id: u64,
         upload: u64,
         download: u64,
         client_ip: Option<IpAddr>,
@@ -961,9 +988,10 @@ impl VlessServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 user_uuid,
+                Some(user_id),
                 upload,
                 download,
                 client_ip,
@@ -3285,6 +3313,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|vless|1");
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(records[0].user_id, Some(1));
         assert_eq!(records[0].upload, 8);
         assert_eq!(records[0].download, 8);
     }

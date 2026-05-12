@@ -189,12 +189,14 @@ impl Hysteria2Server {
         let udp_server = self.clone();
         let udp_connection = connection.clone();
         let udp_user_uuid = auth.user.uuid.clone();
+        let udp_user_id = auth.user.id;
         let udp_bandwidth = bandwidth.clone();
         tokio::spawn(async move {
             let _ = udp_server
                 .handle_udp_datagrams(
                     udp_connection,
                     udp_user_uuid,
+                    udp_user_id,
                     udp_bandwidth,
                     udp_sessions,
                     client_ip,
@@ -207,10 +209,11 @@ impl Hysteria2Server {
                 Ok(stream) => {
                     let server = self.clone();
                     let user_uuid = auth.user.uuid.clone();
+                    let user_id = auth.user.id;
                     let bandwidth = bandwidth.clone();
                     tokio::spawn(async move {
                         if let Err(error) = server
-                            .handle_tcp_stream(stream, user_uuid, bandwidth, client_ip)
+                            .handle_tcp_stream(stream, user_uuid, user_id, bandwidth, client_ip)
                             .await
                         {
                             eprintln!("hysteria2 tcp stream error: {error}");
@@ -290,6 +293,7 @@ impl Hysteria2Server {
         &self,
         (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
         user_uuid: String,
+        user_id: u64,
         bandwidth: DirectionalLimiters,
         client_ip: IpAddr,
     ) -> io::Result<()> {
@@ -360,9 +364,10 @@ impl Hysteria2Server {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 user_uuid,
+                Some(user_id),
                 upload,
                 download,
                 Some(client_ip),
@@ -374,6 +379,7 @@ impl Hysteria2Server {
         &self,
         connection: quinn::Connection,
         user_uuid: String,
+        user_id: u64,
         bandwidth: DirectionalLimiters,
         sessions: Arc<Mutex<HashMap<u32, Arc<UdpRelaySession>>>>,
         client_ip: IpAddr,
@@ -397,6 +403,7 @@ impl Hysteria2Server {
                 .handle_udp_message(
                     &connection,
                     &user_uuid,
+                    user_id,
                     bandwidth.clone(),
                     &sessions,
                     client_ip,
@@ -410,6 +417,7 @@ impl Hysteria2Server {
         &self,
         connection: &quinn::Connection,
         user_uuid: &str,
+        user_id: u64,
         bandwidth: DirectionalLimiters,
         sessions: &Arc<Mutex<HashMap<u32, Arc<UdpRelaySession>>>>,
         client_ip: IpAddr,
@@ -463,9 +471,10 @@ impl Hysteria2Server {
                     self.traffic
                         .lock()
                         .expect("traffic registry lock poisoned")
-                        .add_with_ip(
+                        .add_with_user_id(
                             self.config.node_tag.clone(),
                             user_uuid.to_string(),
+                            Some(user_id),
                             message.data.len() as u64,
                             response.len() as u64,
                             Some(client_ip),
@@ -480,9 +489,10 @@ impl Hysteria2Server {
                     self.traffic
                         .lock()
                         .expect("traffic registry lock poisoned")
-                        .add_with_ip(
+                        .add_with_user_id(
                             self.config.node_tag.clone(),
                             user_uuid.to_string(),
+                            Some(user_id),
                             message.data.len() as u64,
                             0,
                             Some(client_ip),
@@ -497,6 +507,7 @@ impl Hysteria2Server {
             .get_udp_session(
                 connection,
                 user_uuid,
+                user_id,
                 sessions,
                 message.session_id,
                 &message.target,
@@ -509,9 +520,10 @@ impl Hysteria2Server {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 user_uuid.to_string(),
+                Some(user_id),
                 message.data.len() as u64,
                 0,
                 Some(client_ip),
@@ -523,6 +535,7 @@ impl Hysteria2Server {
         &self,
         connection: &quinn::Connection,
         user_uuid: &str,
+        user_id: u64,
         sessions: &Arc<Mutex<HashMap<u32, Arc<UdpRelaySession>>>>,
         session_id: u32,
         target: &SocksTarget,
@@ -572,7 +585,7 @@ impl Hysteria2Server {
         let traffic = self.traffic.clone();
         tokio::spawn(async move {
             let _ = receive_udp_replies(
-                session_id, receiver, connection, node_tag, user_uuid, traffic, bandwidth,
+                session_id, receiver, connection, node_tag, user_uuid, user_id, traffic, bandwidth,
                 client_ip,
             )
             .await;
@@ -749,6 +762,7 @@ async fn receive_udp_replies(
     connection: quinn::Connection,
     node_tag: String,
     user_uuid: String,
+    user_id: u64,
     traffic: Arc<Mutex<TrafficRegistry>>,
     bandwidth: DirectionalLimiters,
     client_ip: IpAddr,
@@ -773,9 +787,10 @@ async fn receive_udp_replies(
         traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 node_tag.clone(),
                 user_uuid.clone(),
+                Some(user_id),
                 0,
                 read as u64,
                 Some(client_ip),
@@ -1539,6 +1554,7 @@ mod tests {
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].node_tag, "panel|hysteria|1");
             assert_eq!(records[0].user_uuid, "hy2-password");
+            assert_eq!(records[0].user_id, Some(1));
             assert_eq!(records[0].upload, 4);
             assert_eq!(records[0].download, 4);
 
@@ -1668,6 +1684,7 @@ mod tests {
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].node_tag, "panel|hysteria|1");
             assert_eq!(records[0].user_uuid, "hy2-password");
+            assert_eq!(records[0].user_id, Some(1));
             assert_eq!(records[0].upload, 4);
             assert_eq!(records[0].download, 4);
 
