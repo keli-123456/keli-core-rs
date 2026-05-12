@@ -2257,6 +2257,7 @@ where
     let mut remote_buffer = [0u8; 16 * 1024];
     let mut vision_decoder = VisionDecoder::new(user_id);
     let mut vision_encoder = VisionEncoder::new(user_id);
+    let mut encode_download = true;
 
     while !upload_done || !download_done {
         if limiter
@@ -2270,6 +2271,9 @@ where
 
         if !upload_done {
             let decoded = vision_decoder.read_decoded(&mut client_buffer)?;
+            if vision_decoder.prefix_checked() {
+                encode_download = vision_decoder.saw_vision_prefix();
+            }
             if decoded > 0 {
                 if let Some(limiter) = limiter.as_deref() {
                     if !limiter.wait_for(decoded) {
@@ -2318,8 +2322,12 @@ where
                             continue;
                         }
                     }
-                    let encoded = vision_encoder.encode(&remote_buffer[..read]);
-                    client.write_plain_all_wait(&encoded)?;
+                    if encode_download {
+                        let encoded = vision_encoder.encode(&remote_buffer[..read]);
+                        client.write_plain_all_wait(&encoded)?;
+                    } else {
+                        client.write_plain_all_wait(&remote_buffer[..read])?;
+                    }
                     download = download.saturating_add(read as u64);
                     progressed = true;
                 }
@@ -3906,6 +3914,55 @@ mod tests {
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn proxies_tls_vision_plain_payload_without_padding_prefix() {
+        let cert = test_cert("vless-vision-plain");
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let payload = b"plain-http-like-payload".to_vec();
+        let expected = payload.clone();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = vec![0u8; expected.len()];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+        });
+
+        let server = server_with_flow("xtls-rprx-vision");
+        let listener = server.bind().expect("vless bind");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vless accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            server_clone.handle_tls_client(client)
+        });
+
+        let mut client = tls_client(vless_addr, cert.cert_der.clone());
+        client
+            .write_all(&vless_request_with_flow(echo_addr, "xtls-rprx-vision"))
+            .expect("client request");
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).expect("client response");
+        assert_eq!(response, [0x00, 0x00]);
+
+        client.write_all(&payload).expect("plain payload");
+        let mut echoed = vec![0u8; payload.len()];
+        client
+            .read_exact(&mut echoed)
+            .expect("plain echoed payload");
+        assert_eq!(echoed, payload);
+        drop(client);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
     }
 
     #[test]

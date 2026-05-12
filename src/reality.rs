@@ -28,6 +28,9 @@ const EXT_SERVER_NAME: u16 = 0x0000;
 const EXT_KEY_SHARE: u16 = 0x0033;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const GROUP_X25519: u16 = 0x001d;
+const GROUP_X25519_MLKEM768: u16 = 0x11ec;
+const GROUP_X25519_KYBER768_DRAFT00: u16 = 0x6399;
+const GROUP_FAKE_X25519_KYBER768_DRAFT00_OLD: u16 = 0xfe31;
 const MAX_TLS_RECORD_LEN: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,6 +102,7 @@ pub struct RealityGatewayConfig {
     pub auth: RealityAuthConfig,
     pub dest: String,
     pub connect_timeout: Duration,
+    pub probe_dest_on_auth: bool,
 }
 
 #[derive(Debug)]
@@ -115,7 +119,7 @@ pub enum RealityGatewayResult {
 pub struct RealityAuthenticatedStream {
     pub auth: RealityClientAuth,
     pub stream: PrefixedTcpStream,
-    pub dest: TcpStream,
+    pub dest: Option<TcpStream>,
 }
 
 #[derive(Debug)]
@@ -181,17 +185,26 @@ pub fn handle_reality_preface(
     config: &RealityGatewayConfig,
 ) -> io::Result<RealityGatewayResult> {
     let first_record = read_first_tls_record(&mut client)?;
-    let mut dest = connect_dest(&config.dest, config.connect_timeout)?;
-    dest.write_all(&first_record)?;
     match authenticate_reality_client_hello(&first_record, &config.auth) {
-        Ok(auth) => Ok(RealityGatewayResult::Authenticated(
-            RealityAuthenticatedStream {
-                auth,
-                stream: PrefixedTcpStream::new(client, first_record),
-                dest,
-            },
-        )),
+        Ok(auth) => {
+            let dest = if config.probe_dest_on_auth {
+                let mut dest = connect_dest(&config.dest, config.connect_timeout)?;
+                dest.write_all(&first_record)?;
+                Some(dest)
+            } else {
+                None
+            };
+            Ok(RealityGatewayResult::Authenticated(
+                RealityAuthenticatedStream {
+                    auth,
+                    stream: PrefixedTcpStream::new(client, first_record),
+                    dest,
+                },
+            ))
+        }
         Err(reason) => {
+            let mut dest = connect_dest(&config.dest, config.connect_timeout)?;
+            dest.write_all(&first_record)?;
             let (upload, download) = fallback_to_dest(client, first_record, dest)?;
             Ok(RealityGatewayResult::Fallback {
                 reason,
@@ -534,9 +547,15 @@ impl RealityAuthenticatedStream {
                 "max_records must be greater than zero",
             ));
         }
-        self.dest.set_read_timeout(Some(timeout))?;
-        let result = read_reality_dest_handshake(&mut self.dest, max_records);
-        let restore_result = self.dest.set_read_timeout(None);
+        let dest = self.dest.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "reality dest probe is disabled for authenticated clients",
+            )
+        })?;
+        dest.set_read_timeout(Some(timeout))?;
+        let result = read_reality_dest_handshake(dest, max_records);
+        let restore_result = dest.set_read_timeout(None);
         match (result, restore_result) {
             (Ok(handshake), Ok(())) => Ok(handshake),
             (Err(error), _) => Err(error),
@@ -552,9 +571,15 @@ impl RealityAuthenticatedStream {
         if max_records == 0 {
             return Ok(Vec::new());
         }
-        self.dest.set_read_timeout(Some(timeout))?;
-        let result = read_tls_records(&mut self.dest, max_records);
-        let restore_result = self.dest.set_read_timeout(None);
+        let dest = self.dest.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "reality dest probe is disabled for authenticated clients",
+            )
+        })?;
+        dest.set_read_timeout(Some(timeout))?;
+        let result = read_tls_records(dest, max_records);
+        let restore_result = dest.set_read_timeout(None);
         match (result, restore_result) {
             (Ok(records), Ok(())) => Ok(records),
             (Err(error), _) => Err(error),
@@ -806,6 +831,19 @@ fn parse_key_share_extension(input: &[u8]) -> Result<Option<[u8; 32]>, RealityAu
         if group == GROUP_X25519 && value.len() == 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(value);
+            return Ok(Some(key));
+        }
+        if group == GROUP_X25519_MLKEM768 && value.len() >= 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&value[value.len() - 32..]);
+            return Ok(Some(key));
+        }
+        if (group == GROUP_X25519_KYBER768_DRAFT00
+            || group == GROUP_FAKE_X25519_KYBER768_DRAFT00_OLD)
+            && value.len() >= 32
+        {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&value[..32]);
             return Ok(Some(key));
         }
     }
@@ -1099,7 +1137,7 @@ fn hex_digit(value: u8) -> char {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::io::{Read, Write};
+    use std::io::{self, Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::thread;
@@ -1163,6 +1201,76 @@ mod tests {
             derived_reality_auth_key(&server_secret, &PublicKey::from(&client_secret))
         );
         assert_eq!(auth.client_version, [1, 8, 23]);
+        assert_eq!(auth.short_id, short_id);
+    }
+
+    #[test]
+    fn authenticates_reality_client_hello_with_x25519_mlkem768_share() {
+        let server_secret = StaticSecret::from([7u8; 32]);
+        let client_secret = StaticSecret::from([9u8; 32]);
+        let client_public = PublicKey::from(&client_secret);
+        let short_id = [0xec, 0x88, 0x38, 0x81, 0, 0, 0, 0];
+        let mut hybrid_share = vec![0xa5; 1184];
+        hybrid_share.extend_from_slice(client_public.as_bytes());
+        let record = build_reality_client_hello_with_key_share(
+            &client_secret,
+            &PublicKey::from(&server_secret),
+            "www.example.test",
+            [1, 8, 23],
+            1_777_650_625,
+            short_id,
+            GROUP_X25519_MLKEM768,
+            &hybrid_share,
+        );
+        let config = RealityAuthConfig {
+            private_key: server_secret.to_bytes(),
+            server_names: HashSet::from(["www.example.test".to_string()]),
+            short_ids: HashSet::from([short_id]),
+            max_time_diff: None,
+            now: UNIX_EPOCH + Duration::from_secs(1_777_650_625),
+        };
+
+        let auth = authenticate_reality_client_hello(&record, &config).expect("hybrid auth");
+
+        assert_eq!(
+            auth.auth_key,
+            derived_reality_auth_key(&server_secret, &client_public)
+        );
+        assert_eq!(auth.short_id, short_id);
+    }
+
+    #[test]
+    fn authenticates_reality_client_hello_with_x25519_kyber_draft_share() {
+        let server_secret = StaticSecret::from([7u8; 32]);
+        let client_secret = StaticSecret::from([9u8; 32]);
+        let client_public = PublicKey::from(&client_secret);
+        let short_id = [0xec, 0x88, 0x38, 0x81, 0, 0, 0, 0];
+        let mut hybrid_share = client_public.as_bytes().to_vec();
+        hybrid_share.extend_from_slice(&[0xa5; 1184]);
+        let record = build_reality_client_hello_with_key_share(
+            &client_secret,
+            &PublicKey::from(&server_secret),
+            "www.example.test",
+            [1, 8, 23],
+            1_777_650_625,
+            short_id,
+            GROUP_X25519_KYBER768_DRAFT00,
+            &hybrid_share,
+        );
+        let config = RealityAuthConfig {
+            private_key: server_secret.to_bytes(),
+            server_names: HashSet::from(["www.example.test".to_string()]),
+            short_ids: HashSet::from([short_id]),
+            max_time_diff: None,
+            now: UNIX_EPOCH + Duration::from_secs(1_777_650_625),
+        };
+
+        let auth = authenticate_reality_client_hello(&record, &config).expect("draft auth");
+
+        assert_eq!(
+            auth.auth_key,
+            derived_reality_auth_key(&server_secret, &client_public)
+        );
         assert_eq!(auth.short_id, short_id);
     }
 
@@ -1556,6 +1664,41 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_preface_does_not_connect_dest_when_probe_disabled() {
+        let server_secret = StaticSecret::from([7u8; 32]);
+        let client_secret = StaticSecret::from([9u8; 32]);
+        let short_id = [0x6b, 0xa8, 0x51, 0x79, 0xe3, 0x0d, 0x4f, 0xc2];
+        let record = build_reality_client_hello(
+            &client_secret,
+            &PublicKey::from(&server_secret),
+            "www.example.test",
+            [1, 8, 23],
+            1_777_650_625,
+            short_id,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind reality");
+        let addr = listener.local_addr().expect("reality addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept reality");
+            let mut config = gateway_config(server_secret, short_id, "203.0.113.1:443".to_string());
+            config.probe_dest_on_auth = false;
+            let result = handle_reality_preface(stream, &config).expect("reality preface");
+            let RealityGatewayResult::Authenticated(mut authenticated) = result else {
+                panic!("expected authenticated reality stream");
+            };
+            assert!(authenticated.dest.is_none());
+            let error = authenticated
+                .read_dest_handshake(1, Duration::from_millis(1))
+                .expect_err("dest probe disabled");
+            assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        });
+
+        let mut client = TcpStream::connect(addr).expect("client connect");
+        client.write_all(&record).expect("client write");
+        server_thread.join().expect("server thread");
+    }
+
+    #[test]
     fn gateway_falls_back_to_dest_for_invalid_reality_auth() {
         let fallback = TcpListener::bind("127.0.0.1:0").expect("bind fallback");
         let fallback_addr = fallback.local_addr().expect("fallback addr");
@@ -1631,6 +1774,7 @@ mod tests {
             },
             dest,
             connect_timeout: Duration::from_secs(3),
+            probe_dest_on_auth: true,
         }
     }
 
@@ -1641,6 +1785,29 @@ mod tests {
         version: [u8; 3],
         unix_time: u32,
         short_id: [u8; 8],
+    ) -> Vec<u8> {
+        let client_public = PublicKey::from(client_secret);
+        build_reality_client_hello_with_key_share(
+            client_secret,
+            server_public,
+            server_name,
+            version,
+            unix_time,
+            short_id,
+            GROUP_X25519,
+            client_public.as_bytes(),
+        )
+    }
+
+    fn build_reality_client_hello_with_key_share(
+        client_secret: &StaticSecret,
+        server_public: &PublicKey,
+        server_name: &str,
+        version: [u8; 3],
+        unix_time: u32,
+        short_id: [u8; 8],
+        group: u16,
+        key_share: &[u8],
     ) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&TLS_VERSION_1_2.to_be_bytes());
@@ -1658,7 +1825,7 @@ mod tests {
         body.push(0);
 
         let sni_ext = sni_extension(server_name);
-        let key_share_ext = key_share_extension(&PublicKey::from(client_secret));
+        let key_share_ext = key_share_extension(group, key_share);
         let mut extensions = Vec::new();
         extension(&mut extensions, EXT_SERVER_NAME, &sni_ext);
         extension(&mut extensions, EXT_KEY_SHARE, &key_share_ext);
@@ -1721,6 +1888,8 @@ mod tests {
     const EXT_KEY_SHARE: u16 = 0x0033;
     const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
     const GROUP_X25519: u16 = 0x001d;
+    const GROUP_X25519_MLKEM768: u16 = 0x11ec;
+    const GROUP_X25519_KYBER768_DRAFT00: u16 = 0x6399;
 
     fn sni_extension(server_name: &str) -> Vec<u8> {
         let mut name = Vec::new();
@@ -1733,11 +1902,11 @@ mod tests {
         output
     }
 
-    fn key_share_extension(public_key: &PublicKey) -> Vec<u8> {
+    fn key_share_extension(group: u16, key_share: &[u8]) -> Vec<u8> {
         let mut share = Vec::new();
-        share.extend_from_slice(&GROUP_X25519.to_be_bytes());
-        share.extend_from_slice(&32u16.to_be_bytes());
-        share.extend_from_slice(public_key.as_bytes());
+        share.extend_from_slice(&group.to_be_bytes());
+        share.extend_from_slice(&(key_share.len() as u16).to_be_bytes());
+        share.extend_from_slice(key_share);
         let mut output = Vec::new();
         output.extend_from_slice(&(share.len() as u16).to_be_bytes());
         output.extend_from_slice(&share);

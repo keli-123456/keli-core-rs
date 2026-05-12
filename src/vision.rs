@@ -10,6 +10,7 @@ const MAX_PADDING: usize = 255;
 pub struct VisionState {
     user_id: [u8; 16],
     checked_prefix: bool,
+    saw_vision_prefix: bool,
     plain: bool,
     remaining_command: i32,
     remaining_content: i32,
@@ -22,6 +23,7 @@ impl VisionState {
         Self {
             user_id,
             checked_prefix: false,
+            saw_vision_prefix: false,
             plain: false,
             remaining_command: -1,
             remaining_content: -1,
@@ -92,6 +94,14 @@ impl VisionDecoder {
     pub fn read_decoded(&mut self, output: &mut [u8]) -> io::Result<usize> {
         self.process_buffer()?;
         Ok(drain_output(&mut self.output, output).unwrap_or(0))
+    }
+
+    pub fn prefix_checked(&self) -> bool {
+        self.state.checked_prefix
+    }
+
+    pub fn saw_vision_prefix(&self) -> bool {
+        self.state.saw_vision_prefix
     }
 }
 
@@ -173,6 +183,7 @@ impl VisionDecoder {
             let has_prefix = self.input.iter().take(16).copied().eq(self.state.user_id);
             self.state.checked_prefix = true;
             if has_prefix {
+                self.state.saw_vision_prefix = true;
                 self.input.drain(..16);
                 self.state.remaining_command = 5;
             } else {

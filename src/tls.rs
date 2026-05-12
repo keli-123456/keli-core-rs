@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
-use rustls::sign::CertifiedKey;
-use rustls::{ServerConfig, ServerConnection};
+use rustls::sign::{CertifiedKey, Signer, SigningKey, SingleCertAndKey};
+use rustls::{ServerConfig, ServerConnection, SignatureAlgorithm, SignatureScheme};
 
 use crate::limits::BandwidthLimiter;
 
@@ -76,6 +76,21 @@ impl TlsAcceptor {
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(tls_error)?;
+        config.alpn_protocols = alpn.iter().map(|value| value.as_bytes().to_vec()).collect();
+        Ok(Self {
+            config: Arc::new(config),
+        })
+    }
+
+    pub fn from_der_reality_ed25519(
+        certs: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        alpn: &[String],
+    ) -> io::Result<Self> {
+        let builder = ServerConfig::builder().with_no_client_auth();
+        let certified_key = reality_ed25519_certified_key(certs, key, builder.crypto_provider())?;
+        let mut config =
+            builder.with_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key)));
         config.alpn_protocols = alpn.iter().map(|value| value.as_bytes().to_vec()).collect();
         Ok(Self {
             config: Arc::new(config),
@@ -310,6 +325,39 @@ where
     Ok((upload, download))
 }
 
+fn reality_ed25519_certified_key(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    provider: &rustls::crypto::CryptoProvider,
+) -> io::Result<CertifiedKey> {
+    let mut certified_key = CertifiedKey::from_der(certs, key, provider).map_err(tls_error)?;
+    certified_key.key = Arc::new(RealityEd25519SigningKey {
+        inner: certified_key.key.clone(),
+    });
+    Ok(certified_key)
+}
+
+#[derive(Debug)]
+struct RealityEd25519SigningKey {
+    inner: Arc<dyn SigningKey>,
+}
+
+impl SigningKey for RealityEd25519SigningKey {
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+        self.inner
+            .choose_scheme(offered)
+            .or_else(|| self.inner.choose_scheme(&[SignatureScheme::ED25519]))
+    }
+
+    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+        self.inner.public_key()
+    }
+
+    fn algorithm(&self) -> SignatureAlgorithm {
+        self.inner.algorithm()
+    }
+}
+
 fn write_all_wait(writer: &mut TcpStream, mut input: &[u8]) -> io::Result<()> {
     while !input.is_empty() {
         match writer.write(input) {
@@ -416,7 +464,12 @@ fn tls_error(error: impl std::fmt::Display) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::sni_matches;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::SignatureScheme;
+
+    use crate::reality::generate_reality_temporary_certificate;
+
+    use super::{reality_ed25519_certified_key, sni_matches};
 
     #[test]
     fn matches_exact_and_wildcard_sni() {
@@ -425,5 +478,24 @@ mod tests {
         assert!(sni_matches("*.example.test", "node.example.test"));
         assert!(!sni_matches("*.example.test", "example.test"));
         assert!(!sni_matches("node.example.test", "other.example.test"));
+    }
+
+    #[test]
+    fn reality_ed25519_key_falls_back_when_client_omits_ed25519_scheme() {
+        let certificate = generate_reality_temporary_certificate(&[0x42; 32], "www.example.test")
+            .expect("temporary certificate");
+        let certified_key = reality_ed25519_certified_key(
+            vec![CertificateDer::from(certificate.certificate_der)],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certificate.private_key_der)),
+            &rustls::crypto::ring::default_provider(),
+        )
+        .expect("certified key");
+
+        let signer = certified_key
+            .key
+            .choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
+            .expect("fallback signer");
+
+        assert_eq!(signer.scheme(), SignatureScheme::ED25519);
     }
 }

@@ -1419,15 +1419,75 @@ fn start_vless_reality_listener(
         move |stream| {
             let gateway = reality_gateway_for_connection(&gateway);
             let server = server.clone();
+            let trace = reality_trace_enabled();
+            let peer = stream
+                .peer_addr()
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            if trace {
+                eprintln!("keli-core-rs reality trace: accepted peer={peer}");
+            }
             let result = handle_reality_preface(stream, &gateway);
-            if let Ok(RealityGatewayResult::Authenticated(mut authenticated)) = result {
-                let _ = authenticated.read_dest_handshake(8, Duration::from_secs(5));
-                if let Ok(acceptor) = reality_tls_acceptor(
-                    &authenticated.auth.auth_key,
-                    &authenticated.auth.server_name,
-                ) {
-                    if let Ok(client) = acceptor.accept_stream(authenticated.stream) {
-                        let _ = server.handle_tls_client(client);
+            match result {
+                Ok(RealityGatewayResult::Authenticated(authenticated)) => {
+                    if trace {
+                        eprintln!(
+                            "keli-core-rs reality trace: authenticated peer={peer} sni={}",
+                            authenticated.auth.server_name
+                        );
+                    }
+                    let acceptor = match reality_tls_acceptor(
+                        &authenticated.auth.auth_key,
+                        &authenticated.auth.server_name,
+                    ) {
+                        Ok(acceptor) => acceptor,
+                        Err(error) => {
+                            if trace {
+                                eprintln!(
+                                    "keli-core-rs reality trace: certificate error peer={peer} error={error}"
+                                );
+                            }
+                            return;
+                        }
+                    };
+                    let client = match acceptor.accept_stream(authenticated.stream) {
+                        Ok(client) => {
+                            if trace {
+                                eprintln!("keli-core-rs reality trace: tls accepted peer={peer}");
+                            }
+                            client
+                        }
+                        Err(error) => {
+                            if trace {
+                                eprintln!(
+                                    "keli-core-rs reality trace: tls accept error peer={peer} error={error}"
+                                );
+                            }
+                            return;
+                        }
+                    };
+                    if let Err(error) = server.handle_tls_client(client) {
+                        if trace {
+                            eprintln!(
+                                "keli-core-rs reality trace: vless error peer={peer} error={error}"
+                            );
+                        }
+                    } else if trace {
+                        eprintln!("keli-core-rs reality trace: vless finished peer={peer}");
+                    }
+                }
+                Ok(RealityGatewayResult::Fallback { reason, .. }) => {
+                    if trace {
+                        eprintln!(
+                            "keli-core-rs reality trace: fallback peer={peer} reason={reason}"
+                        );
+                    }
+                }
+                Err(error) => {
+                    if trace {
+                        eprintln!(
+                            "keli-core-rs reality trace: preface error peer={peer} error={error}"
+                        );
                     }
                 }
             }
@@ -1453,10 +1513,14 @@ fn reality_gateway_for_connection(template: &RealityGatewayConfig) -> RealityGat
     gateway
 }
 
+fn reality_trace_enabled() -> bool {
+    std::env::var_os("KELI_CORE_REALITY_TRACE").is_some()
+}
+
 fn reality_tls_acceptor(auth_key: &[u8; 32], server_name: &str) -> io::Result<TlsAcceptor> {
     let certificate = generate_reality_temporary_certificate(auth_key, server_name)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    TlsAcceptor::from_der(
+    TlsAcceptor::from_der_reality_ed25519(
         vec![CertificateDer::from(certificate.certificate_der)],
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certificate.private_key_der)),
         &[],
@@ -1500,6 +1564,7 @@ fn reality_gateway_config(
         },
         dest,
         connect_timeout: Duration::from_secs(10),
+        probe_dest_on_auth: false,
     })
 }
 
