@@ -78,16 +78,16 @@ cargo run --release -- bench vless-tcp-stream --streams 16 --requests 5000 --pay
 
 Record the JSON output and compare `runtime_workers` where present, `completed_requests`, `errors`, `error_rate`, `roundtrip_mbps`, p95/p99 latency, and `retries` across commits on the same host.
 
-Small local smoke sample from a Windows loopback release build after the active TCP connection
-registry and QUIC revoke watcher work:
+Small local smoke sample from a Windows loopback release build on `v0.1.24` after the active
+TCP connection registry, QUIC revoke watcher, and VLESS/VMess/AnyTLS tail-traffic coverage:
 
 | Command | Completed | Errors | Retries | Runtime workers | p99 latency | Roundtrip Mbps |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `hy2-tcp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 | 11104 us | 2.46 |
-| `hy2-tcp-stream --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 | 722 us | 35.19 |
-| `hy2-udp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 | 602 us | 1.88 |
-| `tuic-tcp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 | 3660 us | 3.26 |
-| `tuic-udp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 | 904 us | 1.83 |
+| `hy2-tcp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 | 10612 us | 2.77 |
+| `hy2-tcp-stream --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 | 1285 us | 33.32 |
+| `hy2-udp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 | 823 us | 1.77 |
+| `tuic-tcp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 | 11106 us | 2.83 |
+| `tuic-udp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 | 666 us | 1.90 |
 
 ## Soak Pass Criteria
 
