@@ -41,6 +41,7 @@ struct HttpProxyRequest {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     user_uuid: Option<String>,
+    user_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,7 +163,9 @@ impl HttpProxyServer {
             }
         }
 
-        let user_uuid = self.authenticate(&headers)?;
+        let user = self.authenticate(&headers)?;
+        let user_uuid = user.as_ref().map(|user| user.uuid.clone());
+        let user_id = user.as_ref().map(|user| user.id);
         let content_length = header_value(&headers, "content-length")
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(0);
@@ -178,10 +181,11 @@ impl HttpProxyServer {
             headers,
             body,
             user_uuid,
+            user_id,
         })
     }
 
-    fn authenticate(&self, headers: &[(String, String)]) -> io::Result<Option<String>> {
+    fn authenticate(&self, headers: &[(String, String)]) -> io::Result<Option<CoreUser>> {
         if self.users.is_empty() {
             return Ok(None);
         }
@@ -192,7 +196,7 @@ impl HttpProxyServer {
             return Err(auth_required());
         };
         match self.users.get(&username) {
-            Some(user) if user.credential() == password => Ok(Some(user.uuid.clone())),
+            Some(user) if user.credential() == password => Ok(Some(user)),
             _ => Err(auth_required()),
         }
     }
@@ -214,7 +218,13 @@ impl HttpProxyServer {
         };
         client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
         let (upload, download) = relay_tcp_streams_limited(client, remote, bandwidth)?;
-        self.record_traffic(request.user_uuid, upload, download, client_ip);
+        self.record_traffic(
+            request.user_uuid,
+            request.user_id,
+            upload,
+            download,
+            client_ip,
+        );
         Ok(())
     }
 
@@ -240,7 +250,13 @@ impl HttpProxyServer {
         remote.write_all(&outbound)?;
         let upload = outbound.len() as u64;
         let download = copy_count_best_effort_limited(&mut remote, client, bandwidth.as_deref());
-        self.record_traffic(request.user_uuid, upload, download, client_ip);
+        self.record_traffic(
+            request.user_uuid,
+            request.user_id,
+            upload,
+            download,
+            client_ip,
+        );
         Ok(())
     }
 
@@ -276,6 +292,7 @@ impl HttpProxyServer {
     fn record_traffic(
         &self,
         user_uuid: Option<String>,
+        user_id: Option<u64>,
         upload: u64,
         download: u64,
         client_ip: Option<std::net::IpAddr>,
@@ -284,9 +301,10 @@ impl HttpProxyServer {
             self.traffic
                 .lock()
                 .expect("traffic registry lock poisoned")
-                .add_with_ip(
+                .add_with_user_id(
                     self.config.node_tag.clone(),
                     user_uuid,
+                    user_id,
                     upload,
                     download,
                     client_ip,
@@ -588,6 +606,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|http|1");
         assert_eq!(records[0].user_uuid, "user-a");
+        assert_eq!(records[0].user_id, Some(1));
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
     }
@@ -669,10 +688,10 @@ mod tests {
             "Proxy-Authorization".to_string(),
             basic_auth_value("user-b", "secret-b"),
         )];
-        let user_uuid = server
+        let user = server
             .authenticate(&new_headers)
             .expect("new user should authenticate");
-        assert_eq!(user_uuid.as_deref(), Some("user-b"));
+        assert_eq!(user.as_ref().map(|user| user.uuid.as_str()), Some("user-b"));
     }
 
     #[test]

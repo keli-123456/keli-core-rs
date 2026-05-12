@@ -59,6 +59,7 @@ pub struct Socks5Server {
 struct SocksRequest {
     command: SocksCommand,
     user_uuid: Option<String>,
+    user_id: Option<u64>,
     target: SocksTarget,
     client_ip: Option<IpAddr>,
 }
@@ -179,7 +180,7 @@ impl Socks5Server {
         let selected_method = self.select_auth_method(&methods);
         stream.write_all(&[SOCKS5_VERSION, selected_method])?;
 
-        let user_uuid = match selected_method {
+        let user = match selected_method {
             AUTH_NONE => None,
             AUTH_PASSWORD => Some(self.read_password_auth(stream)?),
             AUTH_NO_MATCHING_METHOD => {
@@ -190,8 +191,10 @@ impl Socks5Server {
             }
             _ => unreachable!("selected auth method is controlled internally"),
         };
+        let user_uuid = user.as_ref().map(|user| user.uuid.clone());
+        let user_id = user.as_ref().map(|user| user.id);
 
-        self.read_command_request(stream, user_uuid)
+        self.read_command_request(stream, user_uuid, user_id)
     }
 
     fn select_auth_method(&self, methods: &[u8]) -> u8 {
@@ -207,7 +210,7 @@ impl Socks5Server {
             .unwrap_or(AUTH_NO_MATCHING_METHOD)
     }
 
-    fn read_password_auth<T>(&self, stream: &mut T) -> io::Result<String>
+    fn read_password_auth<T>(&self, stream: &mut T) -> io::Result<CoreUser>
     where
         T: Read + Write,
     {
@@ -229,7 +232,7 @@ impl Socks5Server {
         match self.users.get(&username) {
             Some(user) if user.credential() == password => {
                 stream.write_all(&[0x01, 0x00])?;
-                Ok(user.uuid.clone())
+                Ok(user)
             }
             _ => {
                 stream.write_all(&[0x01, 0xff])?;
@@ -245,6 +248,7 @@ impl Socks5Server {
         &self,
         stream: &mut T,
         user_uuid: Option<String>,
+        user_id: Option<u64>,
     ) -> io::Result<SocksRequest>
     where
         T: Read + Write,
@@ -306,6 +310,7 @@ impl Socks5Server {
         Ok(SocksRequest {
             command,
             user_uuid,
+            user_id,
             target: SocksTarget {
                 host,
                 port: u16::from_be_bytes(port),
@@ -326,9 +331,10 @@ impl Socks5Server {
             self.traffic
                 .lock()
                 .expect("traffic registry lock poisoned")
-                .add_with_ip(
+                .add_with_user_id(
                     self.config.node_tag.clone(),
                     user_uuid,
+                    request.user_id,
                     upload,
                     download,
                     request.client_ip,
@@ -429,9 +435,10 @@ impl Socks5Server {
             self.traffic
                 .lock()
                 .expect("traffic registry lock poisoned")
-                .add_with_ip(
+                .add_with_user_id(
                     self.config.node_tag.clone(),
                     user_uuid,
+                    request.user_id,
                     upload,
                     download,
                     request.client_ip,
@@ -901,6 +908,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|socks|1");
         assert_eq!(records[0].user_uuid, "user-a");
+        assert_eq!(records[0].user_id, Some(1));
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
     }

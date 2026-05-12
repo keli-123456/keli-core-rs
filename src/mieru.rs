@@ -496,7 +496,14 @@ fn handle_mieru_session(
         .traffic
         .lock()
         .expect("traffic registry lock poisoned")
-        .add_with_ip(runtime.node_tag, user.uuid, upload, download, client_ip);
+        .add_with_user_id(
+            runtime.node_tag,
+            user.uuid,
+            Some(user.id),
+            upload,
+            download,
+            client_ip,
+        );
     Ok(())
 }
 
@@ -1830,6 +1837,7 @@ mod tests {
         echo_thread.join().expect("echo thread");
         let records = server_thread.join().expect("server thread");
         assert_eq!(records.len(), 1);
+        assert_eq!(records[0].user_id, Some(1));
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
     }

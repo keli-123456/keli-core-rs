@@ -167,9 +167,10 @@ impl AnyTlsServer {
             self.traffic
                 .lock()
                 .expect("traffic registry lock poisoned")
-                .add_with_ip(
+                .add_with_user_id(
                     self.config.node_tag.clone(),
                     session.user.uuid,
+                    Some(session.user.id),
                     upload,
                     download,
                     session.client_ip,
@@ -1215,6 +1216,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|anytls|1");
         assert_eq!(records[0].user_uuid, "anytls-password");
+        assert_eq!(records[0].user_id, Some(1));
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
     }
