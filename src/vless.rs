@@ -2465,9 +2465,9 @@ mod tests {
     use crate::httpupgrade::accept_httpupgrade;
     use crate::socks5::SocksTarget;
     use crate::tls::TlsAcceptor;
-    use crate::user::CoreUser;
+    use crate::user::{CoreUser, CoreUserDelta};
     use crate::vision::{VisionReader, VisionWriter};
-    use crate::vless::{connect_vless_tcp_outbound, VlessServer, VlessServerConfig};
+    use crate::vless::{compact_uuid, connect_vless_tcp_outbound, VlessServer, VlessServerConfig};
     use crate::websocket::{accept_websocket, accept_websocket_tls};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -2524,6 +2524,41 @@ mod tests {
             flow: flow.to_string(),
             connect_timeout: Duration::from_secs(3),
         })
+    }
+
+    #[test]
+    fn apply_user_delta_updates_vless_users() {
+        let server = server();
+        let mut updated = user();
+        updated.speed_limit = 321;
+        updated.device_limit = 4;
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            added: vec![user_b()],
+            updated: vec![updated.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.active_users, 2);
+        let user = server
+            .users
+            .get(&compact_uuid(&updated.uuid))
+            .expect("updated vless user should remain active");
+        assert_eq!(user.speed_limit, 321);
+        assert_eq!(user.device_limit, 4);
+        assert!(server.users.get(&compact_uuid(&user_b().uuid)).is_some());
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![updated.uuid.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.active_users, 1);
+        assert!(server.users.get(&compact_uuid(&updated.uuid)).is_none());
+        assert!(server.users.get(&compact_uuid(&user_b().uuid)).is_some());
     }
 
     fn vless_request(target: std::net::SocketAddr) -> Vec<u8> {

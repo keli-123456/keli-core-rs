@@ -1326,6 +1326,45 @@ mod tests {
         assert_eq!(user.credential(), "secret-b");
     }
 
+    #[test]
+    fn apply_user_delta_updates_tuic_users() {
+        let cert = test_cert("user-delta");
+        let server = tuic_server(&cert, "127.0.0.1:0".parse().expect("addr"));
+        let mut updated = user();
+        updated.password = Some("rotated-tuic".to_string());
+        updated.speed_limit = 234;
+        updated.device_limit = 6;
+        let old_uuid = parse_uuid_bytes(&updated.uuid).expect("old uuid");
+        let new_uuid = parse_uuid_bytes(&user_b().uuid).expect("new uuid");
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            added: vec![user_b()],
+            updated: vec![updated.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.active_users, 2);
+        let user = server
+            .user_for_uuid(&old_uuid)
+            .expect("updated tuic user should remain active");
+        assert_eq!(user.credential(), "rotated-tuic");
+        assert_eq!(user.speed_limit, 234);
+        assert_eq!(user.device_limit, 6);
+        assert!(server.user_for_uuid(&new_uuid).is_some());
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![updated.uuid.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.active_users, 1);
+        assert!(server.user_for_uuid(&old_uuid).is_none());
+        assert!(server.user_for_uuid(&new_uuid).is_some());
+    }
+
     fn auth_command(connection: &quinn::Connection) -> Vec<u8> {
         let uuid = parse_uuid_bytes(&user().uuid).expect("uuid");
         let mut token = [0u8; 32];

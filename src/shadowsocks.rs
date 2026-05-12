@@ -1098,7 +1098,7 @@ mod tests {
         ShadowsocksServerConfig, ShadowsocksWriter, UdpClientContext, UdpClientSession, ATYP_IPV4,
     };
     use crate::socks5::SocksTarget;
-    use crate::user::CoreUser;
+    use crate::user::{CoreUser, CoreUserDelta};
 
     fn user() -> CoreUser {
         CoreUser {
@@ -1358,6 +1358,58 @@ mod tests {
             .expect("new user should authenticate");
         assert_eq!(request.user.uuid, "ss-user-b");
         assert_eq!(request.payload, b"new");
+    }
+
+    #[test]
+    fn apply_user_delta_updates_shadowsocks_users() {
+        let server = server();
+        let method = ShadowsocksMethod::parse("aes-128-gcm").expect("method");
+        let target = "127.0.0.1:443"
+            .parse::<std::net::SocketAddr>()
+            .expect("target");
+        let mut updated = user();
+        updated.password = Some("rotated-ss".to_string());
+        updated.speed_limit = 567;
+        updated.device_limit = 7;
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            added: vec![user_b()],
+            updated: vec![updated.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.active_users, 2);
+        let old_packet = shadowsocks_udp_packet(method, "ss-password", target, b"old");
+        let error = match server.read_udp_request(&old_packet, method) {
+            Ok(_) => panic!("old credential should fail after delta update"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let updated_packet = shadowsocks_udp_packet(method, "rotated-ss", target, b"new");
+        let request = server
+            .read_udp_request(&updated_packet, method)
+            .expect("updated user should authenticate");
+        assert_eq!(request.user.speed_limit, 567);
+        assert_eq!(request.user.device_limit, 7);
+        let added_packet = shadowsocks_udp_packet(method, "secret-b", target, b"added");
+        assert!(server.read_udp_request(&added_packet, method).is_ok());
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![updated.uuid.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.active_users, 1);
+        let deleted_packet = shadowsocks_udp_packet(method, "rotated-ss", target, b"deleted");
+        let error = match server.read_udp_request(&deleted_packet, method) {
+            Ok(_) => panic!("deleted user should fail after delta delete"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(server.read_udp_request(&added_packet, method).is_ok());
     }
 
     #[test]

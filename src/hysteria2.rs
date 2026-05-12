@@ -1277,6 +1277,43 @@ mod tests {
         assert_eq!(user.uuid, "hy2-user-b");
     }
 
+    #[test]
+    fn apply_user_delta_updates_hysteria2_users() {
+        let cert = test_cert("user-delta");
+        let server = server(&cert, "127.0.0.1:0".parse().expect("addr"));
+        let mut updated = user();
+        updated.password = Some("rotated-hy2".to_string());
+        updated.speed_limit = 123;
+        updated.device_limit = 3;
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            added: vec![user_b()],
+            updated: vec![updated.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.active_users, 2);
+        assert!(server.user_for_auth("hy2-password").is_none());
+        let user = server
+            .user_for_auth("rotated-hy2")
+            .expect("updated user should authenticate");
+        assert_eq!(user.speed_limit, 123);
+        assert_eq!(user.device_limit, 3);
+        assert!(server.user_for_auth("secret-b").is_some());
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![updated.uuid.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.active_users, 1);
+        assert!(server.user_for_auth("rotated-hy2").is_none());
+        assert!(server.user_for_auth("secret-b").is_some());
+    }
+
     async fn authenticate(connection: &quinn::Connection) {
         let (udp, _) = authenticate_with_rx(connection, "0").await;
         assert_eq!(udp.as_deref(), Some("true"));

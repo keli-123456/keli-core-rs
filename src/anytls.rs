@@ -972,7 +972,7 @@ mod tests {
         ATYP_IPV4, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
         CMD_SETTINGS, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, UOT_MAGIC_DOMAIN,
     };
-    use crate::user::CoreUser;
+    use crate::user::{CoreUser, CoreUserDelta};
 
     fn user() -> CoreUser {
         CoreUser {
@@ -1031,6 +1031,46 @@ mod tests {
             .user_for_password_hash(&sha256("secret-b"))
             .expect("new user should authenticate");
         assert_eq!(user.uuid, "anytls-user-b");
+    }
+
+    #[test]
+    fn apply_user_delta_updates_anytls_users() {
+        let server = server();
+        let mut updated = user();
+        updated.password = Some("rotated-anytls".to_string());
+        updated.speed_limit = 789;
+        updated.device_limit = 9;
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            added: vec![user_b()],
+            updated: vec![updated.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.active_users, 2);
+        assert!(server
+            .user_for_password_hash(&sha256("anytls-password"))
+            .is_none());
+        let user = server
+            .user_for_password_hash(&sha256("rotated-anytls"))
+            .expect("updated anytls user should authenticate");
+        assert_eq!(user.speed_limit, 789);
+        assert_eq!(user.device_limit, 9);
+        assert!(server.user_for_password_hash(&sha256("secret-b")).is_some());
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![updated.uuid.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.active_users, 1);
+        assert!(server
+            .user_for_password_hash(&sha256("rotated-anytls"))
+            .is_none());
+        assert!(server.user_for_password_hash(&sha256("secret-b")).is_some());
     }
 
     fn write_auth(client: &mut TcpStream, password: &str) {

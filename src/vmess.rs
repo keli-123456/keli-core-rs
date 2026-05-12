@@ -2941,11 +2941,11 @@ mod tests {
 
     use super::{
         connect_vmess_tcp_outbound, create_auth_id, fnv1a, kdf, parse_uuid_bytes,
-        send_vmess_udp_outbound, vmess_cmd_key, write_response_header, VmessBodyReader,
-        VmessBodyWriter, VmessCommand, VmessHeaderMode, VmessRequest, VmessSecurity, VmessServer,
-        VmessServerConfig, ATYP_IPV4, COMMAND_TCP, COMMAND_UDP, OPTION_AUTHENTICATED_LENGTH,
-        OPTION_CHUNK_MASKING, OPTION_CHUNK_STREAM, OPTION_GLOBAL_PADDING, SECURITY_AES128_GCM,
-        VERSION,
+        send_vmess_udp_outbound, vmess_cmd_key, vmess_user_key, write_response_header,
+        VmessBodyReader, VmessBodyWriter, VmessCommand, VmessHeaderMode, VmessRequest,
+        VmessSecurity, VmessServer, VmessServerConfig, ATYP_IPV4, COMMAND_TCP, COMMAND_UDP,
+        OPTION_AUTHENTICATED_LENGTH, OPTION_CHUNK_MASKING, OPTION_CHUNK_STREAM,
+        OPTION_GLOBAL_PADDING, SECURITY_AES128_GCM, VERSION,
     };
     use crate::config::{OutboundConfig, OutboundTransportConfig};
     use crate::grpc::{run_grpc_listener, GrpcStreamHandler};
@@ -2953,7 +2953,7 @@ mod tests {
     use crate::httpupgrade::accept_httpupgrade;
     use crate::socks5::SocksTarget;
     use crate::tls::TlsAcceptor;
-    use crate::user::CoreUser;
+    use crate::user::{CoreUser, CoreUserDelta};
 
     fn user() -> CoreUser {
         CoreUser {
@@ -3442,6 +3442,62 @@ mod tests {
             .expect("new user should authenticate");
         assert_eq!(request.user_uuid, next_user.uuid);
         assert_eq!(request.user_key, "22222222222222222222222222222222");
+    }
+
+    #[test]
+    fn apply_user_delta_updates_vmess_users() {
+        let server = server();
+        let mut updated = user();
+        updated.speed_limit = 678;
+        updated.device_limit = 8;
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            added: vec![user_b()],
+            updated: vec![updated.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.active_users, 2);
+        let user = server
+            .users
+            .get(&vmess_user_key(&updated).expect("updated key"))
+            .expect("updated vmess user should remain active");
+        assert_eq!(user.speed_limit, 678);
+        assert_eq!(user.device_limit, 8);
+        assert!(server
+            .users
+            .get(&vmess_user_key(&user_b()).expect("new key"))
+            .is_some());
+        assert_eq!(
+            server
+                .auth_users
+                .read()
+                .expect("vmess auth users lock poisoned")
+                .len(),
+            2
+        );
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![updated.uuid.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.active_users, 1);
+        assert!(server
+            .users
+            .get(&vmess_user_key(&updated).expect("deleted key"))
+            .is_none());
+        assert_eq!(
+            server
+                .auth_users
+                .read()
+                .expect("vmess auth users lock poisoned")
+                .len(),
+            1
+        );
     }
 
     #[test]

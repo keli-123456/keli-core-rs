@@ -1508,7 +1508,7 @@ mod tests {
     use crate::trojan::{
         connect_trojan_tcp_outbound, trojan_password_hash, TrojanServer, TrojanServerConfig,
     };
-    use crate::user::CoreUser;
+    use crate::user::{CoreUser, CoreUserDelta};
     use crate::websocket::accept_websocket;
 
     struct MemoryStream {
@@ -1559,6 +1559,55 @@ mod tests {
             routes: Vec::new(),
             connect_timeout: Duration::from_secs(3),
         })
+    }
+
+    #[test]
+    fn apply_user_delta_updates_trojan_users() {
+        let server = server();
+        let mut updated = user();
+        updated.password = Some("rotated-trojan".to_string());
+        updated.speed_limit = 456;
+        updated.device_limit = 5;
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            added: vec![user_b()],
+            updated: vec![updated.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.active_users, 2);
+        assert!(server
+            .users
+            .get(&trojan_password_hash("trojan-password"))
+            .is_none());
+        let user = server
+            .users
+            .get(&trojan_password_hash("rotated-trojan"))
+            .expect("updated trojan user should authenticate");
+        assert_eq!(user.speed_limit, 456);
+        assert_eq!(user.device_limit, 5);
+        assert!(server
+            .users
+            .get(&trojan_password_hash("secret-b"))
+            .is_some());
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![updated.uuid.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.active_users, 1);
+        assert!(server
+            .users
+            .get(&trojan_password_hash("rotated-trojan"))
+            .is_none());
+        assert!(server
+            .users
+            .get(&trojan_password_hash("secret-b"))
+            .is_some());
     }
 
     fn trojan_request(target: std::net::SocketAddr) -> Vec<u8> {
