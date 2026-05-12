@@ -14,6 +14,8 @@ pub struct TrafficKey {
 pub struct TrafficDelta {
     pub node_tag: String,
     pub user_uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<u64>,
     pub upload: u64,
     pub download: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -44,6 +46,18 @@ impl TrafficRegistry {
         download: u64,
         client_ip: Option<IpAddr>,
     ) {
+        self.add_with_user_id(node_tag, user_uuid, None, upload, download, client_ip);
+    }
+
+    pub fn add_with_user_id(
+        &mut self,
+        node_tag: impl Into<String>,
+        user_uuid: impl Into<String>,
+        user_id: Option<u64>,
+        upload: u64,
+        download: u64,
+        client_ip: Option<IpAddr>,
+    ) {
         let key = TrafficKey {
             node_tag: node_tag.into(),
             user_uuid: user_uuid.into(),
@@ -55,6 +69,7 @@ impl TrafficRegistry {
                 let delta = TrafficDelta {
                     node_tag: key.node_tag.clone(),
                     user_uuid: key.user_uuid.clone(),
+                    user_id,
                     upload: 0,
                     download: 0,
                     online_ips: Vec::new(),
@@ -62,6 +77,9 @@ impl TrafficRegistry {
                 entry.insert(delta)
             }
         };
+        if entry.user_id.is_none() {
+            entry.user_id = user_id;
+        }
         entry.upload = entry.upload.saturating_add(upload);
         entry.download = entry.download.saturating_add(download);
         if let Some(client_ip) = client_ip {
@@ -162,5 +180,20 @@ mod tests {
         let records = registry.drain_minimum(1);
 
         assert_eq!(records[0].online_ips, vec!["198.51.100.7"]);
+    }
+
+    #[test]
+    fn preserves_user_id_for_deleted_user_reporting() {
+        let mut registry = TrafficRegistry::default();
+
+        registry.add_with_user_id("node-a", "user-a", Some(42), 10, 20, None);
+        registry.add_with_user_id("node-a", "user-a", None, 1, 2, None);
+
+        let records = registry.drain_all();
+
+        assert_eq!(records[0].user_uuid, "user-a");
+        assert_eq!(records[0].user_id, Some(42));
+        assert_eq!(records[0].upload, 11);
+        assert_eq!(records[0].download, 22);
     }
 }
