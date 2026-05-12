@@ -77,12 +77,13 @@ Record the JSON output and compare `runtime_workers` where present, `completed_r
 
 Small local smoke sample from a Windows loopback release build:
 
-| Command | Completed | Errors | Retries | Runtime workers |
-| --- | ---: | ---: | ---: | ---: |
-| `hy2-tcp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 |
-| `hy2-udp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 |
-| `tuic-tcp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 |
-| `tuic-udp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 |
+| Command | Completed | Errors | Retries | Runtime workers | p99 latency | Roundtrip Mbps |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `hy2-tcp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 | 3773 us | 3.16 |
+| `hy2-tcp-stream --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 | 744 us | 35.07 |
+| `hy2-udp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 | 523 us | 1.86 |
+| `tuic-tcp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 | 3672 us | 3.20 |
+| `tuic-udp --streams 2 --requests 20 --payload 256` | 40 / 40 | 0 | 0 | 8 | 535 us | 1.89 |
 
 ## Soak Pass Criteria
 
