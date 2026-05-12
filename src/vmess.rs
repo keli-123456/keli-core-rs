@@ -117,6 +117,7 @@ struct VmessRequest {
     command: VmessCommand,
     user_key: String,
     user_uuid: String,
+    user_id: Option<u64>,
     target: SocksTarget,
     client_ip: Option<IpAddr>,
     request_body_key: [u8; 16],
@@ -347,6 +348,7 @@ impl VmessServer {
             command: parsed.command,
             user_key: user.user_key.clone(),
             user_uuid: core_user.uuid.clone(),
+            user_id: Some(core_user.id),
             target: parsed.target,
             client_ip: None,
             request_body_key: parsed.request_body_key,
@@ -481,9 +483,10 @@ impl VmessServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 request.user_uuid,
+                request.user_id,
                 upload,
                 download,
                 request.client_ip,
@@ -581,9 +584,10 @@ impl VmessServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 request.user_uuid,
+                request.user_id,
                 upload,
                 download,
                 request.client_ip,
@@ -645,7 +649,13 @@ impl VmessServer {
             }
         };
         let _ = response_body.finish();
-        self.record_traffic(request.user_uuid, upload, download, request.client_ip);
+        self.record_traffic(
+            request.user_uuid,
+            request.user_id,
+            upload,
+            download,
+            request.client_ip,
+        );
         result
     }
 
@@ -699,7 +709,13 @@ impl VmessServer {
             }
         };
         let _ = response_body.finish(&mut client);
-        self.record_traffic(request.user_uuid, upload, download, request.client_ip);
+        self.record_traffic(
+            request.user_uuid,
+            request.user_id,
+            upload,
+            download,
+            request.client_ip,
+        );
         result
     }
 
@@ -769,6 +785,7 @@ impl VmessServer {
     fn record_traffic(
         &self,
         user_uuid: String,
+        user_id: Option<u64>,
         upload: u64,
         download: u64,
         client_ip: Option<IpAddr>,
@@ -776,9 +793,10 @@ impl VmessServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 user_uuid,
+                user_id,
                 upload,
                 download,
                 client_ip,
@@ -2255,6 +2273,7 @@ fn write_vmess_request<W: Write>(
             .map(str::trim)
             .unwrap_or_default()
             .to_string(),
+        user_id: None,
         target: target.clone(),
         client_ip: None,
         request_body_key,
@@ -3071,6 +3090,7 @@ mod tests {
             },
             user_key: super::format_uuid_compact(&uuid),
             user_uuid: user.uuid.clone(),
+            user_id: Some(user.id),
             target: SocksTarget {
                 host: target.ip().to_string(),
                 port: target.port(),
@@ -3201,6 +3221,7 @@ mod tests {
             command: parsed.command,
             user_key: super::format_uuid_compact(&uuid),
             user_uuid: primary_uuid.to_string(),
+            user_id: Some(1),
             target: parsed.target,
             client_ip: None,
             request_body_key: parsed.request_body_key,
@@ -3767,6 +3788,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|vmess|1");
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(records[0].user_id, Some(1));
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
     }
@@ -4087,6 +4109,7 @@ mod tests {
             command: VmessCommand::Tcp,
             user_key: "user".to_string(),
             user_uuid: "user".to_string(),
+            user_id: Some(7),
             target: SocksTarget {
                 host: "127.0.0.1".to_string(),
                 port: 80,

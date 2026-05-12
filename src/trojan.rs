@@ -71,6 +71,7 @@ struct TrojanRequest {
     command: TrojanCommand,
     password_hash: String,
     user_uuid: String,
+    user_id: u64,
     target: SocksTarget,
     client_ip: Option<IpAddr>,
 }
@@ -349,6 +350,7 @@ impl TrojanServer {
             command,
             password_hash,
             user_uuid: user.uuid.clone(),
+            user_id: user.id,
             target,
             client_ip: None,
         })
@@ -365,9 +367,10 @@ impl TrojanServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 request.user_uuid,
+                Some(request.user_id),
                 upload,
                 download,
                 request.client_ip,
@@ -402,9 +405,10 @@ impl TrojanServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 request.user_uuid,
+                Some(request.user_id),
                 upload,
                 download,
                 request.client_ip,
@@ -423,9 +427,10 @@ impl TrojanServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 request.user_uuid,
+                Some(request.user_id),
                 upload,
                 download,
                 request.client_ip,
@@ -444,9 +449,10 @@ impl TrojanServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 request.user_uuid,
+                Some(request.user_id),
                 upload,
                 download,
                 request.client_ip,
@@ -487,7 +493,13 @@ impl TrojanServer {
                 Err(error) => break Err(error),
             }
         };
-        self.record_traffic(request.user_uuid, upload, download, request.client_ip);
+        self.record_traffic(
+            request.user_uuid,
+            request.user_id,
+            upload,
+            download,
+            request.client_ip,
+        );
         result
     }
 
@@ -526,7 +538,13 @@ impl TrojanServer {
                 Err(error) => break Err(error),
             }
         };
-        self.record_traffic(request.user_uuid, upload, download, request.client_ip);
+        self.record_traffic(
+            request.user_uuid,
+            request.user_id,
+            upload,
+            download,
+            request.client_ip,
+        );
         result
     }
 
@@ -607,6 +625,7 @@ impl TrojanServer {
     fn record_traffic(
         &self,
         user_uuid: String,
+        user_id: u64,
         upload: u64,
         download: u64,
         client_ip: Option<IpAddr>,
@@ -614,9 +633,10 @@ impl TrojanServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 user_uuid,
+                Some(user_id),
                 upload,
                 download,
                 client_ip,
@@ -2184,6 +2204,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|trojan|1");
         assert_eq!(records[0].user_uuid, "trojan-password");
+        assert_eq!(records[0].user_id, Some(1));
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
     }
