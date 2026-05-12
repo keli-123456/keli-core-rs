@@ -580,15 +580,41 @@ impl VlessServer {
         request: VlessRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
-        let (upload, download) = relay_tcp_streams_async(client, remote, bandwidth).await?;
-        self.traffic.add_with_user_id(
-            self.config.node_tag.clone(),
-            request.user_uuid,
-            Some(request.user_numeric_id),
-            upload,
-            download,
-            request.client_ip,
-        );
+        let upload_traffic = self.traffic.clone();
+        let upload_node_tag = self.config.node_tag.clone();
+        let upload_user_uuid = request.user_uuid.clone();
+        let upload_user_id = request.user_numeric_id;
+        let mut upload_client_ip = request.client_ip;
+        let download_traffic = self.traffic.clone();
+        let download_node_tag = self.config.node_tag.clone();
+        let download_user_uuid = request.user_uuid;
+        let download_user_id = request.user_numeric_id;
+        relay_tcp_streams_async(
+            client,
+            remote,
+            bandwidth,
+            move |bytes| {
+                upload_traffic.add_with_user_id(
+                    upload_node_tag.clone(),
+                    upload_user_uuid.clone(),
+                    Some(upload_user_id),
+                    bytes,
+                    0,
+                    upload_client_ip.take(),
+                );
+            },
+            move |bytes| {
+                download_traffic.add_with_user_id(
+                    download_node_tag.clone(),
+                    download_user_uuid.clone(),
+                    Some(download_user_id),
+                    0,
+                    bytes,
+                    None,
+                );
+            },
+        )
+        .await?;
         Ok(())
     }
 
@@ -2066,6 +2092,8 @@ async fn relay_tcp_streams_async(
     client: tokio::net::TcpStream,
     remote: tokio::net::TcpStream,
     limiter: Option<Arc<BandwidthLimiter>>,
+    mut on_upload: impl FnMut(u64),
+    mut on_download: impl FnMut(u64),
 ) -> io::Result<(u64, u64)> {
     let (mut client_read, mut client_write) = client.into_split();
     let (mut remote_read, mut remote_write) = remote.into_split();
@@ -2083,6 +2111,7 @@ async fn relay_tcp_streams_async(
                 limiter.wait_for_async(read).await;
             }
             remote_write.write_all(&buffer[..read]).await?;
+            on_upload(read as u64);
             total = total.saturating_add(read as u64);
         }
     };
@@ -2099,6 +2128,7 @@ async fn relay_tcp_streams_async(
                 limiter.wait_for_async(read).await;
             }
             client_write.write_all(&buffer[..read]).await?;
+            on_download(read as u64);
             total = total.saturating_add(read as u64);
         }
     };
@@ -3358,6 +3388,13 @@ mod tests {
         let mut echoed = [0u8; 4];
         client.read_exact(&mut echoed).await.expect("client echo");
         assert_eq!(&echoed, b"ping");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let partial = server.drain_traffic(1);
+        assert_eq!(partial.len(), 1);
+        assert_eq!(partial[0].upload, 4);
+        assert_eq!(partial[0].download, 4);
+
         client.write_all(b"pong").await.expect("client payload");
         let mut echoed = [0u8; 4];
         client.read_exact(&mut echoed).await.expect("client echo");
@@ -3371,8 +3408,8 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|vless|1");
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
-        assert_eq!(records[0].upload, 8);
-        assert_eq!(records[0].download, 8);
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
     }
 
     #[test]
