@@ -486,8 +486,11 @@ impl ShadowsocksServer {
         let mut remote_read = remote;
         let mut encrypted_writer =
             ShadowsocksWriter::new_response(response_stream, method, &password)?;
-        let download =
-            copy_count_best_effort_limited(&mut remote_read, &mut encrypted_writer, None);
+        let download = copy_count_best_effort_limited(
+            &mut remote_read,
+            &mut encrypted_writer,
+            bandwidth.as_deref(),
+        );
         let _ = encrypted_writer.shutdown();
         upload = upload.saturating_add(join_native_blocking_relay(
             upload_task,

@@ -402,7 +402,8 @@ impl TrojanServer {
                 upload_limiter.as_deref(),
             )
         })?;
-        let download = copy_count_best_effort_limited(&mut remote_read, &mut writer, None);
+        let download =
+            copy_count_best_effort_limited(&mut remote_read, &mut writer, bandwidth.as_deref());
         let upload = join_native_blocking_relay(upload_task, "upload relay task panicked")?;
         self.traffic.add_with_user_id(
             self.config.node_tag.clone(),

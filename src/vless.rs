@@ -650,7 +650,8 @@ impl VlessServer {
                     upload_limiter.as_deref(),
                 )
             })?;
-            let download = copy_count_best_effort_limited(&mut remote_read, &mut writer, None);
+            let download =
+                copy_count_best_effort_limited(&mut remote_read, &mut writer, bandwidth.as_deref());
             let upload = join_native_blocking_relay(upload_task, "upload relay task panicked")?;
             (upload, download)
         };
@@ -2121,7 +2122,17 @@ async fn relay_tcp_streams_async(
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
-            let read = client_read.read(&mut buffer).await?;
+            let read = if let Some(limiter) = upload_limiter.as_deref() {
+                tokio::select! {
+                    read = client_read.read(&mut buffer) => read?,
+                    _ = wait_limiter_revoke(limiter) => {
+                        let _ = remote_write.shutdown().await;
+                        return Ok::<u64, io::Error>(total);
+                    }
+                }
+            } else {
+                client_read.read(&mut buffer).await?
+            };
             if read == 0 {
                 let _ = remote_write.shutdown().await;
                 return Ok::<u64, io::Error>(total);
@@ -2141,7 +2152,17 @@ async fn relay_tcp_streams_async(
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
-            let read = remote_read.read(&mut buffer).await?;
+            let read = if let Some(limiter) = limiter.as_deref() {
+                tokio::select! {
+                    read = remote_read.read(&mut buffer) => read?,
+                    _ = wait_limiter_revoke(limiter) => {
+                        let _ = client_write.shutdown().await;
+                        return Ok::<u64, io::Error>(total);
+                    }
+                }
+            } else {
+                remote_read.read(&mut buffer).await?
+            };
             if read == 0 {
                 let _ = client_write.shutdown().await;
                 return Ok::<u64, io::Error>(total);
@@ -2158,6 +2179,12 @@ async fn relay_tcp_streams_async(
         }
     };
     tokio::try_join!(upload, download)
+}
+
+async fn wait_limiter_revoke(limiter: &BandwidthLimiter) {
+    while !limiter.is_revoked() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn relay_vision_tcp_streams(
@@ -2197,7 +2224,8 @@ where
     })?;
 
     let mut vision_writer = VisionWriter::new(writer, user_id);
-    let download = copy_count_best_effort_limited(&mut remote_read, &mut vision_writer, None);
+    let download =
+        copy_count_best_effort_limited(&mut remote_read, &mut vision_writer, limiter.as_deref());
     let upload = join_native_blocking_relay(upload_task, "vision upload relay task panicked")?;
 
     Ok((upload, download))
@@ -2225,6 +2253,13 @@ where
     let mut vision_encoder = VisionEncoder::new(user_id);
 
     while !upload_done || !download_done {
+        if limiter
+            .as_deref()
+            .map(BandwidthLimiter::is_revoked)
+            .unwrap_or(false)
+        {
+            break;
+        }
         let mut progressed = false;
 
         if !upload_done {
@@ -2270,6 +2305,13 @@ where
                     progressed = true;
                 }
                 Ok(read) => {
+                    if let Some(limiter) = limiter.as_deref() {
+                        if !limiter.wait_for(read) {
+                            download_done = true;
+                            let _ = client.close_notify_wait();
+                            continue;
+                        }
+                    }
                     let encoded = vision_encoder.encode(&remote_buffer[..read]);
                     client.write_plain_all_wait(&encoded)?;
                     download = download.saturating_add(read as u64);

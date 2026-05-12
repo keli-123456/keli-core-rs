@@ -235,6 +235,13 @@ where
     let mut remote_buffer = [0u8; 16 * 1024];
 
     while !upload_done || !download_done {
+        if limiter
+            .as_deref()
+            .map(BandwidthLimiter::is_revoked)
+            .unwrap_or(false)
+        {
+            break;
+        }
         let mut progressed = false;
 
         if !upload_done {
@@ -273,6 +280,13 @@ where
                     progressed = true;
                 }
                 Ok(read) => {
+                    if let Some(limiter) = limiter.as_deref() {
+                        if !limiter.wait_for(read) {
+                            download_done = true;
+                            let _ = client.close_notify_wait();
+                            continue;
+                        }
+                    }
                     client.write_plain_all_wait(&remote_buffer[..read])?;
                     download = download.saturating_add(read as u64);
                     progressed = true;
