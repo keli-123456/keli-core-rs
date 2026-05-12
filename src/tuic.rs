@@ -164,6 +164,7 @@ impl TuicServer {
         let datagram_server = self.clone();
         let datagram_connection = connection.clone();
         let datagram_user_uuid = user.uuid.clone();
+        let datagram_user_id = user.id;
         let datagram_bandwidth = bandwidth.clone();
         let datagram_sessions = udp_sessions.clone();
         tokio::spawn(async move {
@@ -171,6 +172,7 @@ impl TuicServer {
                 .handle_udp_datagrams(
                     datagram_connection,
                     datagram_user_uuid,
+                    datagram_user_id,
                     datagram_bandwidth,
                     datagram_sessions,
                     client_ip,
@@ -181,6 +183,7 @@ impl TuicServer {
         let uni_server = self.clone();
         let uni_connection = connection.clone();
         let uni_user_uuid = user.uuid.clone();
+        let uni_user_id = user.id;
         let uni_bandwidth = bandwidth.clone();
         let uni_sessions = udp_sessions.clone();
         tokio::spawn(async move {
@@ -188,6 +191,7 @@ impl TuicServer {
                 .handle_unidirectional_commands(
                     uni_connection,
                     uni_user_uuid,
+                    uni_user_id,
                     uni_bandwidth,
                     uni_sessions,
                     client_ip,
@@ -200,10 +204,11 @@ impl TuicServer {
                 Ok(stream) => {
                     let server = self.clone();
                     let user_uuid = user.uuid.clone();
+                    let user_id = user.id;
                     let bandwidth = bandwidth.clone();
                     tokio::spawn(async move {
                         let _ = server
-                            .handle_connect_stream(stream, user_uuid, bandwidth, client_ip)
+                            .handle_connect_stream(stream, user_uuid, user_id, bandwidth, client_ip)
                             .await;
                     });
                 }
@@ -252,6 +257,7 @@ impl TuicServer {
         &self,
         (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
         user_uuid: String,
+        user_id: u64,
         bandwidth: Option<Arc<BandwidthLimiter>>,
         client_ip: IpAddr,
     ) -> io::Result<()> {
@@ -290,9 +296,10 @@ impl TuicServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 user_uuid,
+                Some(user_id),
                 upload,
                 download,
                 Some(client_ip),
@@ -304,6 +311,7 @@ impl TuicServer {
         &self,
         connection: quinn::Connection,
         user_uuid: String,
+        user_id: u64,
         bandwidth: Option<Arc<BandwidthLimiter>>,
         sessions: Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
         client_ip: IpAddr,
@@ -323,6 +331,7 @@ impl TuicServer {
             self.handle_udp_command(
                 &connection,
                 &user_uuid,
+                user_id,
                 bandwidth.clone(),
                 &sessions,
                 &mut fragments,
@@ -338,6 +347,7 @@ impl TuicServer {
         &self,
         connection: quinn::Connection,
         user_uuid: String,
+        user_id: u64,
         bandwidth: Option<Arc<BandwidthLimiter>>,
         sessions: Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
         client_ip: IpAddr,
@@ -361,6 +371,7 @@ impl TuicServer {
             self.handle_udp_command(
                 &connection,
                 &user_uuid,
+                user_id,
                 bandwidth.clone(),
                 &sessions,
                 &mut fragments,
@@ -376,6 +387,7 @@ impl TuicServer {
         &self,
         connection: &quinn::Connection,
         user_uuid: &str,
+        user_id: u64,
         bandwidth: Option<Arc<BandwidthLimiter>>,
         sessions: &Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
         fragments: &mut UdpFragmentStore,
@@ -387,7 +399,8 @@ impl TuicServer {
             UdpCommand::Packet(packet) => match fragments.push(packet)? {
                 Some(packet) => {
                     self.handle_udp_packet(
-                        connection, user_uuid, bandwidth, sessions, reply_mode, client_ip, packet,
+                        connection, user_uuid, user_id, bandwidth, sessions, reply_mode, client_ip,
+                        packet,
                     )
                     .await
                 }
@@ -411,6 +424,7 @@ impl TuicServer {
         &self,
         connection: &quinn::Connection,
         user_uuid: &str,
+        user_id: u64,
         bandwidth: Option<Arc<BandwidthLimiter>>,
         sessions: &Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
         reply_mode: UdpReplyMode,
@@ -481,9 +495,10 @@ impl TuicServer {
                     self.traffic
                         .lock()
                         .expect("traffic registry lock poisoned")
-                        .add_with_ip(
+                        .add_with_user_id(
                             self.config.node_tag.clone(),
                             user_uuid.to_string(),
+                            Some(user_id),
                             packet.payload.len() as u64,
                             response.len() as u64,
                             Some(client_ip),
@@ -498,9 +513,10 @@ impl TuicServer {
                     self.traffic
                         .lock()
                         .expect("traffic registry lock poisoned")
-                        .add_with_ip(
+                        .add_with_user_id(
                             self.config.node_tag.clone(),
                             user_uuid.to_string(),
+                            Some(user_id),
                             packet.payload.len() as u64,
                             0,
                             Some(client_ip),
@@ -516,6 +532,7 @@ impl TuicServer {
             .get_udp_session(
                 connection,
                 user_uuid,
+                user_id,
                 sessions,
                 packet.assoc_id,
                 target_addr,
@@ -533,9 +550,10 @@ impl TuicServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 user_uuid.to_string(),
+                Some(user_id),
                 packet.payload.len() as u64,
                 0,
                 Some(client_ip),
@@ -547,6 +565,7 @@ impl TuicServer {
         &self,
         connection: &quinn::Connection,
         user_uuid: &str,
+        user_id: u64,
         sessions: &Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
         assoc_id: u16,
         target_addr: SocketAddr,
@@ -588,7 +607,7 @@ impl TuicServer {
         let traffic = self.traffic.clone();
         tokio::spawn(async move {
             let _ = receive_udp_replies(
-                assoc_id, receiver, connection, node_tag, user_uuid, traffic, client_ip,
+                assoc_id, receiver, connection, node_tag, user_uuid, user_id, traffic, client_ip,
             )
             .await;
         });
@@ -731,6 +750,7 @@ async fn receive_udp_replies(
     connection: quinn::Connection,
     node_tag: String,
     user_uuid: String,
+    user_id: u64,
     traffic: Arc<Mutex<TrafficRegistry>>,
     client_ip: IpAddr,
 ) -> io::Result<()> {
@@ -770,9 +790,10 @@ async fn receive_udp_replies(
         traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 node_tag.clone(),
                 user_uuid.clone(),
+                Some(user_id),
                 0,
                 read as u64,
                 Some(client_ip),
@@ -1447,6 +1468,7 @@ mod tests {
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].node_tag, "panel|tuic|1");
             assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
+            assert_eq!(records[0].user_id, Some(1));
             assert_eq!(records[0].upload, 4);
             assert_eq!(records[0].download, 4);
 

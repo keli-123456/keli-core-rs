@@ -235,7 +235,7 @@ impl ShadowsocksServer {
                             session.last_seen = Instant::now();
                         }
                         self.record_udp_traffic(
-                            &context.user.uuid,
+                            &context.user,
                             0,
                             packet.len() as u64,
                             Some(context.client_addr.ip()),
@@ -375,7 +375,7 @@ impl ShadowsocksServer {
                     let response = encode_udp_packet(method, &context, source, &response_payload)?;
                     udp.send_to(&response, client_addr)?;
                     self.record_udp_traffic(
-                        &request.user.uuid,
+                        &request.user,
                         request.payload.len() as u64,
                         response_payload.len() as u64,
                         Some(client_addr.ip()),
@@ -388,7 +388,7 @@ impl ShadowsocksServer {
                     ) =>
                 {
                     self.record_udp_traffic(
-                        &request.user.uuid,
+                        &request.user,
                         request.payload.len() as u64,
                         0,
                         Some(client_addr.ip()),
@@ -410,7 +410,7 @@ impl ShadowsocksServer {
             },
         );
         self.record_udp_traffic(
-            &request.user.uuid,
+            &request.user,
             request.payload.len() as u64,
             0,
             Some(client_addr.ip()),
@@ -452,6 +452,7 @@ impl ShadowsocksServer {
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
         let user_uuid = request.user.uuid.clone();
+        let user_id = request.user.id;
         let password = request.user.credential().to_string();
         let response_stream = request.client_reader.reader.try_clone()?;
         let mut upload = 0u64;
@@ -490,9 +491,10 @@ impl ShadowsocksServer {
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
-            .add_with_ip(
+            .add_with_user_id(
                 self.config.node_tag.clone(),
                 user_uuid,
+                Some(user_id),
                 upload,
                 download,
                 request.client_ip,
@@ -502,7 +504,7 @@ impl ShadowsocksServer {
 
     fn record_udp_traffic(
         &self,
-        user_uuid: &str,
+        user: &CoreUser,
         upload: u64,
         download: u64,
         client_ip: Option<IpAddr>,
@@ -511,9 +513,10 @@ impl ShadowsocksServer {
             self.traffic
                 .lock()
                 .expect("traffic registry lock poisoned")
-                .add_with_ip(
+                .add_with_user_id(
                     self.config.node_tag.clone(),
-                    user_uuid.to_string(),
+                    user.uuid.clone(),
+                    Some(user.id),
                     upload,
                     download,
                     client_ip,
@@ -1405,6 +1408,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|shadowsocks|1");
         assert_eq!(records[0].user_uuid, "ss-password");
+        assert_eq!(records[0].user_id, Some(1));
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
     }
