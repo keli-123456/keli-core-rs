@@ -32,7 +32,7 @@ use crate::tls::TlsAcceptor;
 use crate::traffic::{SharedTrafficRegistry, TrafficDelta, TrafficRegistry};
 use crate::trojan::{TrojanServer, TrojanServerConfig};
 use crate::tuic::{TuicServer, TuicServerConfig};
-use crate::user::CoreUser;
+use crate::user::{apply_user_delta_to_vec, CoreUser, CoreUserDelta, CoreUserDeltaResult};
 use crate::vless::{VlessServer, VlessServerConfig};
 use crate::vmess::{VmessServer, VmessServerConfig};
 
@@ -123,6 +123,21 @@ impl ListenerRuntime {
             ListenerRuntime::Tuic(server) => server.replace_users(users),
             ListenerRuntime::Hysteria2(server) => server.replace_users(users),
             ListenerRuntime::Mieru(server) => server.replace_users(users),
+        }
+    }
+
+    fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
+        match self {
+            ListenerRuntime::Socks(server) => server.apply_user_delta(delta),
+            ListenerRuntime::Http(server) => server.apply_user_delta(delta),
+            ListenerRuntime::Vless(server) => server.apply_user_delta(delta),
+            ListenerRuntime::Vmess(server) => server.apply_user_delta(delta),
+            ListenerRuntime::Trojan(server) => server.apply_user_delta(delta),
+            ListenerRuntime::Shadowsocks(server) => server.apply_user_delta(delta),
+            ListenerRuntime::AnyTls(server) => server.apply_user_delta(delta),
+            ListenerRuntime::Tuic(server) => server.apply_user_delta(delta),
+            ListenerRuntime::Hysteria2(server) => server.apply_user_delta(delta),
+            ListenerRuntime::Mieru(server) => server.apply_user_delta(delta),
         }
     }
 }
@@ -258,6 +273,28 @@ impl CoreService {
             }
         }
         self.config = config;
+    }
+
+    pub fn apply_user_delta(
+        &mut self,
+        node_tag: &str,
+        delta: &CoreUserDelta,
+    ) -> Result<CoreUserDeltaResult, String> {
+        let handle = self
+            .listeners
+            .iter()
+            .find(|handle| handle.status.tag == node_tag)
+            .ok_or_else(|| format!("unknown inbound node_tag {node_tag}"))?;
+        let result = handle.runtime.apply_user_delta(delta);
+        if let Some(inbound) = self
+            .config
+            .inbounds
+            .iter_mut()
+            .find(|inbound| inbound.tag == node_tag)
+        {
+            apply_user_delta_to_vec(&mut inbound.users, delta);
+        }
+        Ok(result)
     }
 
     pub fn stop(&mut self) {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,33 @@ pub struct CoreUser {
     pub email: Option<String>,
     pub speed_limit: u64,
     pub device_limit: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreUserDelta {
+    #[serde(default)]
+    pub added: Vec<CoreUser>,
+    #[serde(default)]
+    pub updated: Vec<CoreUser>,
+    #[serde(default)]
+    pub deleted: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full: Option<Vec<CoreUser>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreUserDeltaResult {
+    pub added: usize,
+    pub updated: usize,
+    pub deleted: usize,
+    pub missing_updated: usize,
+    pub missing_deleted: usize,
+    pub active_users: usize,
+    pub full_applied: bool,
 }
 
 impl CoreUser {
@@ -29,7 +57,13 @@ impl CoreUser {
 
 #[derive(Clone, Debug, Default)]
 pub struct UserStore {
-    users: Arc<RwLock<HashMap<String, CoreUser>>>,
+    users: Arc<RwLock<UserStoreState>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct UserStoreState {
+    users: HashMap<String, CoreUser>,
+    uuid_keys: HashMap<String, String>,
 }
 
 impl UserStore {
@@ -42,7 +76,7 @@ impl UserStore {
         F: Fn(&CoreUser) -> String,
     {
         Self {
-            users: Arc::new(RwLock::new(keyed_user_map(users, key))),
+            users: Arc::new(RwLock::new(keyed_user_state(users, key))),
         }
     }
 
@@ -54,7 +88,7 @@ impl UserStore {
     where
         F: Fn(&CoreUser) -> String,
     {
-        let next = keyed_user_map(&users, key);
+        let next = keyed_user_state(&users, key);
         let mut current = self.users.write().expect("user store lock poisoned");
         *current = next;
     }
@@ -63,34 +97,268 @@ impl UserStore {
         self.users
             .read()
             .expect("user store lock poisoned")
+            .users
             .is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.users
+            .read()
+            .expect("user store lock poisoned")
+            .users
+            .len()
+    }
+
+    pub fn list(&self) -> Vec<CoreUser> {
+        let mut users = self
+            .users
+            .read()
+            .expect("user store lock poisoned")
+            .users
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        users.sort_by(|left, right| left.uuid.cmp(&right.uuid));
+        users
     }
 
     pub fn get(&self, uuid: &str) -> Option<CoreUser> {
         self.users
             .read()
             .expect("user store lock poisoned")
+            .users
             .get(uuid)
             .cloned()
     }
+
+    pub fn apply_uuid_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
+        self.apply_keyed_delta(delta, |user| user.uuid.clone())
+    }
+
+    pub fn apply_keyed_delta<F>(&self, delta: &CoreUserDelta, key: F) -> CoreUserDeltaResult
+    where
+        F: Fn(&CoreUser) -> String,
+    {
+        if let Some(full) = delta.full.as_ref() {
+            let mut current = self.users.write().expect("user store lock poisoned");
+            *current = keyed_user_state(full, key);
+            return CoreUserDeltaResult {
+                active_users: current.users.len(),
+                full_applied: true,
+                ..CoreUserDeltaResult::default()
+            };
+        }
+
+        let mut result = CoreUserDeltaResult::default();
+        let mut current = self.users.write().expect("user store lock poisoned");
+        for user in &delta.added {
+            if user.is_empty() {
+                continue;
+            }
+            let key = key(user);
+            if let Some(old_key) = current.uuid_keys.insert(user.uuid.clone(), key.clone()) {
+                current.users.remove(&old_key);
+                result.updated += 1;
+            } else {
+                result.added += 1;
+            }
+            current.users.insert(key, user.clone());
+        }
+        for user in &delta.updated {
+            if user.is_empty() {
+                continue;
+            }
+            let key = key(user);
+            if let Some(old_key) = current.uuid_keys.insert(user.uuid.clone(), key.clone()) {
+                current.users.remove(&old_key);
+                current.users.insert(key, user.clone());
+                result.updated += 1;
+            } else {
+                current.uuid_keys.remove(&user.uuid);
+                result.missing_updated += 1;
+            }
+        }
+        for uuid in &delta.deleted {
+            if let Some(key) = current.uuid_keys.remove(uuid) {
+                if current.users.remove(&key).is_some() {
+                    result.deleted += 1;
+                } else {
+                    result.missing_deleted += 1;
+                }
+            } else {
+                result.missing_deleted += 1;
+            }
+        }
+        result.active_users = current.users.len();
+        result
+    }
 }
 
-fn keyed_user_map<F>(users: &[CoreUser], key: F) -> HashMap<String, CoreUser>
+pub fn apply_user_delta_to_vec(
+    users: &mut Vec<CoreUser>,
+    delta: &CoreUserDelta,
+) -> CoreUserDeltaResult {
+    if let Some(full) = delta.full.as_ref() {
+        *users = active_user_vec(full);
+        return CoreUserDeltaResult {
+            active_users: users.len(),
+            full_applied: true,
+            ..CoreUserDeltaResult::default()
+        };
+    }
+
+    let mut result = CoreUserDeltaResult::default();
+    let mut by_uuid = users
+        .drain(..)
+        .filter(|user| !user.is_empty())
+        .map(|user| (user.uuid.clone(), user))
+        .collect::<HashMap<_, _>>();
+    for user in &delta.added {
+        if user.is_empty() {
+            continue;
+        }
+        if by_uuid.insert(user.uuid.clone(), user.clone()).is_some() {
+            result.updated += 1;
+        } else {
+            result.added += 1;
+        }
+    }
+    for user in &delta.updated {
+        if user.is_empty() {
+            continue;
+        }
+        if by_uuid.contains_key(&user.uuid) {
+            by_uuid.insert(user.uuid.clone(), user.clone());
+            result.updated += 1;
+        } else {
+            result.missing_updated += 1;
+        }
+    }
+    for uuid in &delta.deleted {
+        if by_uuid.remove(uuid).is_some() {
+            result.deleted += 1;
+        } else {
+            result.missing_deleted += 1;
+        }
+    }
+    *users = by_uuid.into_values().collect();
+    users.sort_by(|left, right| left.uuid.cmp(&right.uuid));
+    result.active_users = users.len();
+    result
+}
+
+pub fn apply_user_delta_to_keyed_map<K, F>(
+    users: &mut HashMap<K, CoreUser>,
+    delta: &CoreUserDelta,
+    key: F,
+) -> CoreUserDeltaResult
+where
+    K: Clone + Eq + Hash,
+    F: Fn(&CoreUser) -> Option<K>,
+{
+    if let Some(full) = delta.full.as_ref() {
+        users.clear();
+        for user in full {
+            if !user.is_empty() {
+                if let Some(key) = key(user) {
+                    users.insert(key, user.clone());
+                }
+            }
+        }
+        return CoreUserDeltaResult {
+            active_users: users.len(),
+            full_applied: true,
+            ..CoreUserDeltaResult::default()
+        };
+    }
+
+    let mut result = CoreUserDeltaResult::default();
+    let mut uuid_keys = users
+        .iter()
+        .map(|(key, user)| (user.uuid.clone(), key.clone()))
+        .collect::<HashMap<_, _>>();
+    for user in &delta.added {
+        if user.is_empty() {
+            continue;
+        }
+        let Some(key) = key(user) else {
+            continue;
+        };
+        if let Some(old_key) = uuid_keys.insert(user.uuid.clone(), key.clone()) {
+            users.remove(&old_key);
+            result.updated += 1;
+        } else {
+            result.added += 1;
+        }
+        users.insert(key, user.clone());
+    }
+    for user in &delta.updated {
+        if user.is_empty() {
+            continue;
+        }
+        let Some(key) = key(user) else {
+            result.missing_updated += 1;
+            continue;
+        };
+        if let Some(old_key) = uuid_keys.insert(user.uuid.clone(), key.clone()) {
+            users.remove(&old_key);
+            users.insert(key, user.clone());
+            result.updated += 1;
+        } else {
+            uuid_keys.remove(&user.uuid);
+            result.missing_updated += 1;
+        }
+    }
+    for uuid in &delta.deleted {
+        if let Some(key) = uuid_keys.remove(uuid) {
+            if users.remove(&key).is_some() {
+                result.deleted += 1;
+            } else {
+                result.missing_deleted += 1;
+            }
+        } else {
+            result.missing_deleted += 1;
+        }
+    }
+    result.active_users = users.len();
+    result
+}
+
+fn active_user_vec(users: &[CoreUser]) -> Vec<CoreUser> {
+    let mut users = users
+        .iter()
+        .filter(|user| !user.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    users.sort_by(|left, right| left.uuid.cmp(&right.uuid));
+    users
+}
+
+fn keyed_user_state<F>(users: &[CoreUser], key: F) -> UserStoreState
 where
     F: Fn(&CoreUser) -> String,
 {
-    let mut map = HashMap::with_capacity(users.len());
+    let mut state = UserStoreState {
+        users: HashMap::with_capacity(users.len()),
+        uuid_keys: HashMap::with_capacity(users.len()),
+    };
     for user in users {
         if !user.is_empty() {
-            map.insert(key(user), user.clone());
+            let key = key(user);
+            state.uuid_keys.insert(user.uuid.clone(), key.clone());
+            state.users.insert(key, user.clone());
         }
     }
-    map
+    state
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CoreUser, UserStore};
+    use std::collections::HashMap;
+
+    use super::{
+        apply_user_delta_to_keyed_map, apply_user_delta_to_vec, CoreUser, CoreUserDelta, UserStore,
+    };
 
     fn user(uuid: &str) -> CoreUser {
         CoreUser {
@@ -100,6 +368,13 @@ mod tests {
             email: None,
             speed_limit: 0,
             device_limit: 0,
+        }
+    }
+
+    fn limited_user(uuid: &str, speed_limit: u64) -> CoreUser {
+        CoreUser {
+            speed_limit,
+            ..user(uuid)
         }
     }
 
@@ -137,5 +412,115 @@ mod tests {
         assert!(store.get("user-05000").is_some());
         assert!(store.get("user-09999").is_some());
         assert!(store.get("user-10000").is_none());
+    }
+
+    #[test]
+    fn user_store_applies_uuid_delta() {
+        let store = UserStore::from_uuid_users(&[user("user-a"), user("user-b")]);
+        let result = store.apply_uuid_delta(&CoreUserDelta {
+            added: vec![user("user-c")],
+            updated: vec![limited_user("user-b", 1024)],
+            deleted: vec!["user-a".to_string()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.active_users, 2);
+        assert!(store.get("user-a").is_none());
+        assert_eq!(store.get("user-b").expect("user b").speed_limit, 1024);
+        assert!(store.get("user-c").is_some());
+    }
+
+    #[test]
+    fn user_store_rekeys_updated_credentials() {
+        let mut initial = user("user-a");
+        initial.password = Some("old".to_string());
+        let store = UserStore::from_keyed_users(&[initial], |user| user.credential().to_string());
+        let mut updated = user("user-a");
+        updated.password = Some("new".to_string());
+
+        let result = store.apply_keyed_delta(
+            &CoreUserDelta {
+                updated: vec![updated],
+                ..CoreUserDelta::default()
+            },
+            |user| user.credential().to_string(),
+        );
+
+        assert_eq!(result.updated, 1);
+        assert!(store.get("old").is_none());
+        assert!(store.get("new").is_some());
+    }
+
+    #[test]
+    fn user_store_counts_duplicate_added_as_update() {
+        let store = UserStore::from_uuid_users(&[]);
+
+        let result = store.apply_uuid_delta(&CoreUserDelta {
+            added: vec![user("user-a"), limited_user("user-a", 2048)],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.active_users, 1);
+        assert_eq!(store.get("user-a").expect("user a").speed_limit, 2048);
+    }
+
+    #[test]
+    fn user_store_reports_missing_update_and_delete() {
+        let store = UserStore::from_uuid_users(&[user("user-a")]);
+
+        let result = store.apply_uuid_delta(&CoreUserDelta {
+            updated: vec![user("missing-update")],
+            deleted: vec!["missing-delete".to_string()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.missing_updated, 1);
+        assert_eq!(result.missing_deleted, 1);
+        assert_eq!(result.active_users, 1);
+        assert!(store.get("user-a").is_some());
+    }
+
+    #[test]
+    fn vec_delta_full_snapshot_replaces_users() {
+        let mut users = vec![user("user-a"), user("user-b")];
+
+        let result = apply_user_delta_to_vec(
+            &mut users,
+            &CoreUserDelta {
+                full: Some(vec![user("user-c")]),
+                ..CoreUserDelta::default()
+            },
+        );
+
+        assert!(result.full_applied);
+        assert_eq!(result.active_users, 1);
+        assert_eq!(users, vec![user("user-c")]);
+    }
+
+    #[test]
+    fn keyed_map_delta_updates_by_uuid_and_key() {
+        let mut old = user("user-a");
+        old.password = Some("old".to_string());
+        let mut users = HashMap::from([(old.credential().to_string(), old)]);
+        let mut updated = user("user-a");
+        updated.password = Some("new".to_string());
+
+        let result = apply_user_delta_to_keyed_map(
+            &mut users,
+            &CoreUserDelta {
+                updated: vec![updated],
+                ..CoreUserDelta::default()
+            },
+            |user| Some(user.credential().to_string()),
+        );
+
+        assert_eq!(result.updated, 1);
+        assert!(!users.contains_key("old"));
+        assert!(users.contains_key("new"));
     }
 }

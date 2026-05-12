@@ -24,7 +24,7 @@ use crate::stream::{
     copy_count_best_effort_limited, join_native_blocking_relay, spawn_native_blocking_relay,
 };
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
-use crate::user::CoreUser;
+use crate::user::{apply_user_delta_to_vec, CoreUser, CoreUserDelta, CoreUserDeltaResult};
 use crate::{
     connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
 };
@@ -194,6 +194,12 @@ impl ShadowsocksServer {
         self.bandwidth.sync_users(&users);
         let mut current = self.users.write().expect("shadowsocks users lock poisoned");
         *current = active_user_list(&users);
+    }
+
+    pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
+        sync_delta_bandwidth(&self.bandwidth, delta);
+        let mut current = self.users.write().expect("shadowsocks users lock poisoned");
+        apply_user_delta_to_vec(&mut current, delta)
     }
 
     fn active_users(&self) -> Vec<CoreUser> {
@@ -525,6 +531,15 @@ impl ShadowsocksServer {
                 error.to_string(),
             )),
         }
+    }
+}
+
+fn sync_delta_bandwidth(bandwidth: &UserBandwidthLimiters, delta: &CoreUserDelta) {
+    if let Some(full) = delta.full.as_ref() {
+        bandwidth.sync_users(full);
+    } else {
+        bandwidth.sync_users(&delta.added);
+        bandwidth.sync_users(&delta.updated);
     }
 }
 

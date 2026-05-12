@@ -72,6 +72,12 @@ impl RuntimeState {
         ReloadDecision::Updated
     }
 
+    pub fn apply_runtime_update(&mut self) -> ReloadDecision {
+        self.active_fingerprint = None;
+        self.status = CoreStatus::Running;
+        ReloadDecision::Updated
+    }
+
     pub fn needs_reload(&self, plan: &CorePlan) -> bool {
         self.active_fingerprint.as_deref() != Some(plan.fingerprint.as_str())
     }

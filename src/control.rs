@@ -1,16 +1,27 @@
-﻿use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::config::CoreConfig;
 use crate::runtime::{CoreStatus, ReloadDecision, RuntimeState};
 use crate::service::{CoreService, ListenerStatus};
 use crate::traffic::TrafficDelta;
+use crate::user::{CoreUserDelta, CoreUserDeltaResult};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CoreCommand {
-    ApplyConfig { config: CoreConfig },
-    DrainTraffic { minimum_bytes: u64 },
-    RequeueTraffic { records: Vec<TrafficDelta> },
+    ApplyConfig {
+        config: CoreConfig,
+    },
+    ApplyUserDelta {
+        node_tag: String,
+        delta: CoreUserDelta,
+    },
+    DrainTraffic {
+        minimum_bytes: u64,
+    },
+    RequeueTraffic {
+        records: Vec<TrafficDelta>,
+    },
     Status,
     Stop,
 }
@@ -20,6 +31,12 @@ pub enum CoreCommand {
 pub enum CoreResponse {
     Applied {
         decision: String,
+        status: CoreStatus,
+        listeners: Vec<ListenerStatus>,
+    },
+    UserDeltaApplied {
+        node_tag: String,
+        result: CoreUserDeltaResult,
         status: CoreStatus,
         listeners: Vec<ListenerStatus>,
     },
@@ -56,6 +73,9 @@ impl CoreController {
     pub fn handle(&mut self, command: CoreCommand) -> CoreResponse {
         match command {
             CoreCommand::ApplyConfig { config } => self.apply_config(config),
+            CoreCommand::ApplyUserDelta { node_tag, delta } => {
+                self.apply_user_delta(node_tag, delta)
+            }
             CoreCommand::DrainTraffic { minimum_bytes } => CoreResponse::Traffic {
                 records: self.drain_traffic(minimum_bytes),
             },
@@ -76,6 +96,27 @@ impl CoreController {
                 self.runtime.stop();
                 CoreResponse::Stopped
             }
+        }
+    }
+
+    fn apply_user_delta(&mut self, node_tag: String, delta: CoreUserDelta) -> CoreResponse {
+        let Some(service) = &mut self.service else {
+            return CoreResponse::Error {
+                message: "cannot apply user delta before config is applied".to_string(),
+            };
+        };
+        let result = match service.apply_user_delta(&node_tag, &delta) {
+            Ok(result) => result,
+            Err(message) => {
+                return CoreResponse::Error { message };
+            }
+        };
+        self.runtime.apply_runtime_update();
+        CoreResponse::UserDeltaApplied {
+            node_tag,
+            result,
+            status: self.runtime.status().clone(),
+            listeners: self.listeners(),
         }
     }
 
@@ -167,7 +208,8 @@ fn decision_name(decision: ReloadDecision) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::net::TcpListener;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
 
     use crate::config::{
         CoreConfig, DnsConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig,
@@ -177,7 +219,7 @@ mod tests {
     use crate::protocol::Protocol;
     use crate::runtime::CoreStatus;
     use crate::traffic::TrafficDelta;
-    use crate::user::CoreUser;
+    use crate::user::{CoreUser, CoreUserDelta};
 
     fn free_port() -> u16 {
         TcpListener::bind("127.0.0.1:0")
@@ -312,6 +354,108 @@ mod tests {
     }
 
     #[test]
+    fn apply_user_delta_updates_users_without_rebinding_listener() {
+        let config = config(Protocol::Socks);
+        let node_tag = config.inbounds[0].tag.clone();
+        let mut controller = CoreController::new();
+
+        let first = controller.handle(CoreCommand::ApplyConfig {
+            config: config.clone(),
+        });
+        let first_addr = match first {
+            CoreResponse::Applied { listeners, .. } => listeners[0].local_addr,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        assert_eq!(socks_auth_status(first_addr, "user-a", "user-a"), 0x00);
+
+        let second = controller.handle(CoreCommand::ApplyUserDelta {
+            node_tag: node_tag.clone(),
+            delta: CoreUserDelta {
+                added: vec![user_with_password("user-b", Some("secret-b"), 4096)],
+                deleted: vec!["user-a".to_string()],
+                ..CoreUserDelta::default()
+            },
+        });
+
+        match second {
+            CoreResponse::UserDeltaApplied {
+                node_tag: applied_tag,
+                result,
+                status,
+                listeners,
+            } => {
+                assert_eq!(applied_tag, node_tag);
+                assert_eq!(result.added, 1);
+                assert_eq!(result.deleted, 1);
+                assert_eq!(result.active_users, 1);
+                assert_eq!(status, CoreStatus::Running);
+                assert_eq!(listeners[0].local_addr, first_addr);
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
+        assert_eq!(socks_auth_status(first_addr, "user-a", "user-a"), 0xff);
+        assert_eq!(socks_auth_status(first_addr, "user-b", "secret-b"), 0x00);
+        assert!(matches!(
+            controller.handle(CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+    }
+
+    #[test]
+    fn apply_user_delta_reports_unknown_node_tag() {
+        let mut controller = CoreController::new();
+        let apply = controller.handle(CoreCommand::ApplyConfig {
+            config: config(Protocol::Socks),
+        });
+        assert!(matches!(apply, CoreResponse::Applied { .. }));
+
+        match controller.handle(CoreCommand::ApplyUserDelta {
+            node_tag: "missing".to_string(),
+            delta: CoreUserDelta::default(),
+        }) {
+            CoreResponse::Error { message } => assert!(message.contains("unknown inbound")),
+            response => panic!("unexpected response: {response:?}"),
+        }
+        assert!(matches!(
+            controller.handle(CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+    }
+
+    #[test]
+    fn apply_user_delta_empty_delta_keeps_listener() {
+        let config = config(Protocol::Socks);
+        let node_tag = config.inbounds[0].tag.clone();
+        let mut controller = CoreController::new();
+
+        let first = controller.handle(CoreCommand::ApplyConfig { config });
+        let first_addr = match first {
+            CoreResponse::Applied { listeners, .. } => listeners[0].local_addr,
+            response => panic!("unexpected response: {response:?}"),
+        };
+
+        match controller.handle(CoreCommand::ApplyUserDelta {
+            node_tag,
+            delta: CoreUserDelta::default(),
+        }) {
+            CoreResponse::UserDeltaApplied {
+                result, listeners, ..
+            } => {
+                assert_eq!(result.added, 0);
+                assert_eq!(result.updated, 0);
+                assert_eq!(result.deleted, 0);
+                assert_eq!(result.active_users, 1);
+                assert_eq!(listeners[0].local_addr, first_addr);
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
+        assert!(matches!(
+            controller.handle(CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+    }
+
+    #[test]
     fn apply_config_reports_sidecar_protocol_errors() {
         let mut controller = CoreController::new();
 
@@ -323,6 +467,36 @@ mod tests {
             CoreResponse::Error { message } => assert!(message.contains("external sidecar")),
             response => panic!("unexpected response: {response:?}"),
         }
+    }
+
+    fn user_with_password(uuid: &str, password: Option<&str>, speed_limit: u64) -> CoreUser {
+        CoreUser {
+            id: 2,
+            uuid: uuid.to_string(),
+            password: password.map(str::to_string),
+            email: None,
+            speed_limit,
+            device_limit: 0,
+        }
+    }
+
+    fn socks_auth_status(addr: SocketAddr, username: &str, password: &str) -> u8 {
+        let mut stream = TcpStream::connect(addr).expect("connect socks listener");
+        stream
+            .write_all(&[0x05, 0x01, 0x02])
+            .expect("write socks methods");
+        let mut method = [0u8; 2];
+        stream.read_exact(&mut method).expect("read socks method");
+        assert_eq!(method, [0x05, 0x02]);
+        let mut auth = vec![0x01, username.len() as u8];
+        auth.extend_from_slice(username.as_bytes());
+        auth.push(password.len() as u8);
+        auth.extend_from_slice(password.as_bytes());
+        stream.write_all(&auth).expect("write auth");
+        let mut status = [0u8; 2];
+        stream.read_exact(&mut status).expect("read auth status");
+        assert_eq!(status[0], 0x01);
+        status[1]
     }
 
     #[test]

@@ -17,7 +17,7 @@ use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
-use crate::user::CoreUser;
+use crate::user::{apply_user_delta_to_keyed_map, CoreUser, CoreUserDelta, CoreUserDeltaResult};
 use crate::{connect_tcp_outbound_tokio, send_udp_outbound_tokio};
 
 const VERSION: u8 = 0x05;
@@ -140,6 +140,14 @@ impl TuicServer {
         self.bandwidth.sync_users(&users);
         let mut current = self.users.write().expect("tuic users lock poisoned");
         *current = tuic_user_map(&users);
+    }
+
+    pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
+        sync_delta_bandwidth(&self.bandwidth, delta);
+        let mut current = self.users.write().expect("tuic users lock poisoned");
+        apply_user_delta_to_keyed_map(&mut current, delta, |user| {
+            parse_uuid_bytes(&user.uuid).ok()
+        })
     }
 
     fn user_for_uuid(&self, uuid: &[u8; 16]) -> Option<CoreUser> {
@@ -608,6 +616,15 @@ impl TuicServer {
         self.sessions
             .try_acquire_for_ip(Some(user), client_ip)
             .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))
+    }
+}
+
+fn sync_delta_bandwidth(bandwidth: &UserBandwidthLimiters, delta: &CoreUserDelta) {
+    if let Some(full) = delta.full.as_ref() {
+        bandwidth.sync_users(full);
+    } else {
+        bandwidth.sync_users(&delta.added);
+        bandwidth.sync_users(&delta.updated);
     }
 }
 

@@ -39,7 +39,7 @@ use crate::socks5::SocksTarget;
 use crate::stream::{copy_count_best_effort_limited, spawn_native_blocking_relay};
 use crate::tls::TlsConnection;
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
-use crate::user::{CoreUser, UserStore};
+use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::websocket::{accept_websocket, accept_websocket_tls, connect_websocket_client};
 use crate::{
     connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
@@ -306,6 +306,29 @@ impl VmessServer {
             .write()
             .expect("vmess auth users lock poisoned");
         *auth_users = vmess_auth_users(&users);
+    }
+
+    pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
+        let delta = CoreUserDelta {
+            added: valid_vmess_users(&delta.added),
+            updated: valid_vmess_users(&delta.updated),
+            deleted: delta.deleted.clone(),
+            full: delta.full.as_ref().map(|users| valid_vmess_users(users)),
+            base_revision: delta.base_revision.clone(),
+            revision: delta.revision.clone(),
+        };
+        sync_delta_bandwidth(&self.bandwidth, &delta);
+        let mut result = self.users.apply_keyed_delta(&delta, |user| {
+            vmess_user_key(user).expect("valid vmess user")
+        });
+        let users = self.users.list();
+        result.active_users = users.len();
+        let mut auth_users = self
+            .auth_users
+            .write()
+            .expect("vmess auth users lock poisoned");
+        *auth_users = vmess_auth_users(&users);
+        result
     }
 
     fn read_request<R: Read>(&self, stream: &mut R) -> io::Result<VmessRequest> {
@@ -855,6 +878,15 @@ fn valid_vmess_users(users: &[CoreUser]) -> Vec<CoreUser> {
         .filter(|user| !user.is_empty() && vmess_user_key(user).is_some())
         .cloned()
         .collect()
+}
+
+fn sync_delta_bandwidth(bandwidth: &UserBandwidthLimiters, delta: &CoreUserDelta) {
+    if let Some(full) = delta.full.as_ref() {
+        bandwidth.sync_users(full);
+    } else {
+        bandwidth.sync_users(&delta.added);
+        bandwidth.sync_users(&delta.updated);
+    }
 }
 
 fn vmess_auth_users(users: &[CoreUser]) -> Vec<VmessAuthUser> {

@@ -19,7 +19,7 @@ use crate::salamander::SalamanderUdpSocket;
 use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
-use crate::user::{CoreUser, UserStore};
+use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::{connect_tcp_outbound_tokio, send_udp_outbound_tokio};
 
 const TCP_REQUEST_ID: u64 = 0x401;
@@ -168,6 +168,12 @@ impl Hysteria2Server {
         self.bandwidth.sync_users(&users);
         self.users
             .replace_keyed_users(users, |user| user.credential().to_string());
+    }
+
+    pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
+        sync_delta_bandwidth(&self.bandwidth, delta);
+        self.users
+            .apply_keyed_delta(delta, |user| user.credential().to_string())
     }
 
     fn user_for_auth(&self, auth: &str) -> Option<CoreUser> {
@@ -644,6 +650,15 @@ impl Hysteria2Server {
         self.sessions
             .try_acquire_for_ip(Some(user), client_ip)
             .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))
+    }
+}
+
+fn sync_delta_bandwidth(bandwidth: &UserBandwidthLimiters, delta: &CoreUserDelta) {
+    if let Some(full) = delta.full.as_ref() {
+        bandwidth.sync_users(full);
+    } else {
+        bandwidth.sync_users(&delta.added);
+        bandwidth.sync_users(&delta.updated);
     }
 }
 

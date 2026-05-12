@@ -30,7 +30,7 @@ use crate::stream::{
 };
 use crate::tls::{relay_tls_stream, TlsConnection, TlsSocket};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
-use crate::user::{CoreUser, UserStore};
+use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::vision::{VisionDecoder, VisionEncoder, VisionReader, VisionWriter};
 use crate::websocket::{
     accept_websocket, accept_websocket_tls, connect_websocket_client, relay_websocket_tls_stream,
@@ -388,6 +388,12 @@ impl VlessServer {
         self.bandwidth.sync_users(&users);
         self.users
             .replace_keyed_users(users, |user| compact_uuid(&user.uuid));
+    }
+
+    pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
+        sync_delta_bandwidth(&self.bandwidth, delta);
+        self.users
+            .apply_keyed_delta(delta, |user| compact_uuid(&user.uuid))
     }
 
     fn read_request<T>(&self, stream: &mut T) -> io::Result<VlessRequest>
@@ -1020,6 +1026,15 @@ impl VlessServer {
                 error.to_string(),
             )),
         }
+    }
+}
+
+fn sync_delta_bandwidth(bandwidth: &UserBandwidthLimiters, delta: &CoreUserDelta) {
+    if let Some(full) = delta.full.as_ref() {
+        bandwidth.sync_users(full);
+    } else {
+        bandwidth.sync_users(&delta.added);
+        bandwidth.sync_users(&delta.updated);
     }
 }
 
