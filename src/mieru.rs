@@ -221,6 +221,9 @@ impl MieruServer {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let mut reader = MieruReader::accept(client.try_clone()?, &self.active_users())?;
         let user = reader.user().clone();
+        let _connection = self
+            .bandwidth
+            .register_tcp_connection(Some(&user.uuid), &[&client])?;
         let mut writer = MieruWriter::server(client, &user, reader.session_id())?;
         let Some(initial) = reader.take_initial_segment() else {
             return Err(io::Error::new(
@@ -1709,7 +1712,7 @@ mod tests {
         DATA_SERVER_TO_CLIENT, OPEN_SESSION_REQUEST, OPEN_SESSION_RESPONSE,
         SOCKS_CMD_UDP_ASSOCIATE, SOCKS_CONNECT_SUCCESS, STATUS_OK,
     };
-    use crate::user::CoreUser;
+    use crate::user::{CoreUser, CoreUserDelta};
 
     fn user() -> CoreUser {
         CoreUser {
@@ -1854,6 +1857,94 @@ mod tests {
         assert_eq!(records[0].user_id, Some(1));
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn deleting_mieru_user_stops_existing_tcp_relay_on_next_payload_and_reports_tail() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (second_payload_tx, second_payload_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .expect("echo timeout");
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).expect("first payload");
+            stream.write_all(&first).expect("first echo");
+            let mut second = [0u8; 1];
+            let received_second = stream.read_exact(&mut second).is_ok();
+            second_payload_tx
+                .send(received_second)
+                .expect("send result");
+        });
+
+        let server = MieruServer::new(MieruServerConfig {
+            node_tag: "panel|mieru|1".to_string(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            users: vec![user()],
+            routes: Vec::new(),
+            connect_timeout: Duration::from_secs(5),
+        });
+        let listener = server.bind().expect("server bind");
+        let listen_addr = listener.local_addr().expect("listen addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            server_clone.handle_tcp_client(stream)?;
+            Ok::<_, std::io::Error>(server_clone.drain_traffic(1))
+        });
+
+        let client = TcpStream::connect(listen_addr).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("client read timeout");
+        client
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .expect("client write timeout");
+        let mut writer = test_client_writer(client.try_clone().expect("clone"), &user(), 9);
+        writer
+            .write_client_segment(OPEN_SESSION_REQUEST, &socks_connect_request(echo_addr))
+            .expect("open");
+        let mut reader = MieruReader::accept(client, &[user()]).expect("client reader");
+        let open_response = reader.take_initial_segment().expect("open");
+        assert_eq!(open_response.metadata.protocol_type, OPEN_SESSION_RESPONSE);
+        assert_socks_connect_success(&mut reader);
+
+        writer
+            .write_client_segment(DATA_CLIENT_TO_SERVER, b"x")
+            .expect("first data");
+        let mut echoed = [0u8; 1];
+        reader.read_exact(&mut echoed).expect("first echo");
+        assert_eq!(echoed, *b"x");
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![user().uuid],
+            ..CoreUserDelta::default()
+        });
+        assert_eq!(result.deleted, 1);
+
+        let _ = writer.write_client_segment(DATA_CLIENT_TO_SERVER, b"y");
+        assert!(
+            !second_payload_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("echo result"),
+            "deleted user's existing Mieru relay should stop forwarding new payload"
+        );
+        drop(writer);
+        drop(reader);
+
+        echo_thread.join().expect("echo thread");
+        let records = server_thread
+            .join()
+            .expect("server thread")
+            .expect("handle");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|mieru|1");
+        assert_eq!(records[0].user_uuid, user().uuid);
+        assert_eq!(records[0].user_id, Some(1));
+        assert_eq!(records[0].upload, 1);
+        assert_eq!(records[0].download, 1);
     }
 
     #[test]
