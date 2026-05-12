@@ -1314,6 +1314,78 @@ mod tests {
         assert!(server.user_for_auth("secret-b").is_some());
     }
 
+    #[test]
+    fn apply_user_delta_changes_hysteria2_auth_without_rebinding_listener() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let cert = test_cert("user-delta-auth");
+            let server = server(&cert, "127.0.0.1:0".parse().expect("addr"));
+            let endpoint = server.bind().expect("hy2 bind");
+            let local_addr = endpoint.local_addr().expect("local addr");
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_task = tokio::spawn(server.clone().run(endpoint, stop.clone()));
+
+            let first_endpoint = client_endpoint(cert.cert_der.clone());
+            let connection = first_endpoint
+                .connect(local_addr, "localhost")
+                .expect("connect old")
+                .await
+                .expect("old connection");
+            assert_eq!(
+                authenticate_status(&connection, "hy2-password")
+                    .await
+                    .expect("old auth status"),
+                233
+            );
+            connection.close(0u32.into(), b"done");
+            first_endpoint.wait_idle().await;
+
+            let result = server.apply_user_delta(&CoreUserDelta {
+                added: vec![user_b()],
+                deleted: vec![user().uuid],
+                ..CoreUserDelta::default()
+            });
+
+            assert_eq!(result.added, 1);
+            assert_eq!(result.deleted, 1);
+            assert_eq!(result.active_users, 1);
+
+            let rejected_endpoint = client_endpoint(cert.cert_der.clone());
+            let rejected = rejected_endpoint
+                .connect(local_addr, "localhost")
+                .expect("connect rejected")
+                .await
+                .expect("rejected connection");
+            assert!(!matches!(
+                authenticate_status(&rejected, "hy2-password").await,
+                Ok(233)
+            ));
+            rejected.close(0u32.into(), b"done");
+            rejected_endpoint.wait_idle().await;
+
+            let accepted_endpoint = client_endpoint(cert.cert_der.clone());
+            let accepted = accepted_endpoint
+                .connect(local_addr, "localhost")
+                .expect("connect accepted")
+                .await
+                .expect("accepted connection");
+            assert_eq!(
+                authenticate_status(&accepted, "secret-b")
+                    .await
+                    .expect("new auth status"),
+                233
+            );
+            accepted.close(0u32.into(), b"done");
+            accepted_endpoint.wait_idle().await;
+
+            stop.store(true, Ordering::SeqCst);
+            server_task.await.expect("server task");
+        });
+    }
+
     async fn authenticate(connection: &quinn::Connection) {
         let (udp, _) = authenticate_with_rx(connection, "0").await;
         assert_eq!(udp.as_deref(), Some("true"));
@@ -1348,6 +1420,32 @@ mod tests {
         std::mem::forget(send_request);
         let _ = authenticated.send(());
         driver.await.expect("h3 driver");
+    }
+
+    async fn authenticate_status(
+        connection: &quinn::Connection,
+        password: &str,
+    ) -> io::Result<u16> {
+        let quic = h3_quinn::Connection::new(connection.clone());
+        let (mut h3_connection, mut send_request) =
+            h3::client::new(quic).await.map_err(io_other)?;
+        let driver = tokio::spawn(async move {
+            let _ = poll_fn(|cx| h3_connection.poll_close(cx)).await;
+        });
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://hysteria/auth")
+            .header("Hysteria-Auth", password)
+            .header("Hysteria-CC-RX", "0")
+            .body(())
+            .expect("auth request");
+        let mut stream = send_request.send_request(request).await.map_err(io_other)?;
+        stream.finish().await.map_err(io_other)?;
+        let response = stream.recv_response().await.map_err(io_other)?;
+        let status = response.status().as_u16();
+        drop(send_request);
+        driver.abort();
+        Ok(status)
     }
 
     async fn authenticate_with_rx(
