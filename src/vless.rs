@@ -2561,12 +2561,96 @@ mod tests {
         assert!(server.users.get(&compact_uuid(&user_b().uuid)).is_some());
     }
 
+    #[test]
+    fn apply_user_delta_changes_vless_auth_without_rebinding_listener() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = echo.accept().expect("echo accept");
+                let mut buffer = [0u8; 1];
+                let _ = stream.read(&mut buffer);
+            }
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vless bind");
+        listener
+            .set_nonblocking(true)
+            .expect("vless listener nonblocking");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let mut workers = Vec::new();
+            while !server_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let server = server_clone.clone();
+                        workers.push(thread::spawn(move || {
+                            let _ = server.handle_tcp_client(stream);
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("vless accept: {error}"),
+                }
+            }
+            for worker in workers {
+                worker.join().expect("vless worker");
+            }
+        });
+
+        assert!(vless_auth_succeeds(vless_addr, [0x11; 16], echo_addr));
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            added: vec![user_b()],
+            deleted: vec![user().uuid],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.active_users, 1);
+        assert!(!vless_auth_succeeds(vless_addr, [0x11; 16], echo_addr));
+        assert!(vless_auth_succeeds(vless_addr, [0x22; 16], echo_addr));
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(vless_addr);
+        server_thread.join().expect("vless server thread");
+        echo_thread.join().expect("echo thread");
+    }
+
     fn vless_request(target: std::net::SocketAddr) -> Vec<u8> {
         vless_request_with_flow(target, "")
     }
 
     fn vless_udp_request(target: std::net::SocketAddr) -> Vec<u8> {
         vless_request_with_flow_and_command(target, "", 0x02)
+    }
+
+    fn vless_auth_succeeds(
+        server_addr: std::net::SocketAddr,
+        user_id: [u8; 16],
+        target: std::net::SocketAddr,
+    ) -> bool {
+        let Ok(mut stream) = TcpStream::connect(server_addr) else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        if stream
+            .write_all(&vless_request_for_user_with_flow_and_command(
+                user_id, target, "", 0x01,
+            ))
+            .is_err()
+        {
+            return false;
+        }
+        let mut header = [0u8; 2];
+        stream.read_exact(&mut header).is_ok() && header == [super::VERSION, 0x00]
     }
 
     fn vless_request_with_flow(target: std::net::SocketAddr, flow: &str) -> Vec<u8> {
