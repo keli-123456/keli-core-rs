@@ -358,15 +358,40 @@ impl Hysteria2Server {
         };
 
         write_tcp_response(&mut send, RESPONSE_OK, "").await?;
-        let (upload, download) = relay_streams(&mut recv, &mut send, remote, bandwidth).await?;
-        self.traffic.add_with_user_id(
-            self.config.node_tag.clone(),
-            user_uuid,
-            Some(user_id),
-            upload,
-            download,
-            Some(client_ip),
-        );
+        let upload_traffic = self.traffic.clone();
+        let upload_node_tag = self.config.node_tag.clone();
+        let upload_user_uuid = user_uuid.clone();
+        let mut upload_client_ip = Some(client_ip);
+        let download_traffic = self.traffic.clone();
+        let download_node_tag = self.config.node_tag.clone();
+        let download_user_uuid = user_uuid;
+        relay_streams(
+            &mut recv,
+            &mut send,
+            remote,
+            bandwidth,
+            move |bytes| {
+                upload_traffic.add_with_user_id(
+                    upload_node_tag.clone(),
+                    upload_user_uuid.clone(),
+                    Some(user_id),
+                    bytes,
+                    0,
+                    upload_client_ip.take(),
+                );
+            },
+            move |bytes| {
+                download_traffic.add_with_user_id(
+                    download_node_tag.clone(),
+                    download_user_uuid.clone(),
+                    Some(user_id),
+                    0,
+                    bytes,
+                    None,
+                );
+            },
+        )
+        .await?;
         Ok(())
     }
 
@@ -985,6 +1010,8 @@ async fn relay_streams(
     send: &mut quinn::SendStream,
     remote: tokio::net::TcpStream,
     bandwidth: DirectionalLimiters,
+    mut on_upload: impl FnMut(u64),
+    mut on_download: impl FnMut(u64),
 ) -> io::Result<(u64, u64)> {
     let (mut remote_read, mut remote_write) = remote.into_split();
     let upload = async {
@@ -998,6 +1025,7 @@ async fn relay_streams(
             };
             bandwidth.wait_upload(read).await;
             remote_write.write_all(&buffer[..read]).await?;
+            on_upload(read as u64);
             total = total.saturating_add(read as u64);
         }
     };
@@ -1012,6 +1040,7 @@ async fn relay_streams(
             }
             bandwidth.wait_download(read).await;
             send.write_all(&buffer[..read]).await.map_err(io_other)?;
+            on_download(read as u64);
             total = total.saturating_add(read as u64);
         }
     };
@@ -1525,12 +1554,9 @@ mod tests {
             assert_eq!(read_varint(&mut recv).await.expect("padding len"), 0);
 
             send.write_all(b"ping").await.expect("payload");
-            send.finish().expect("finish payload");
             let mut echoed = [0u8; 4];
             recv.read_exact(&mut echoed).await.expect("echoed payload");
             assert_eq!(&echoed, b"ping");
-            connection.close(0u32.into(), b"done");
-            echo_task.await.expect("echo task");
 
             tokio::time::sleep(Duration::from_millis(50)).await;
             let records = server.drain_traffic(1);
@@ -1540,6 +1566,14 @@ mod tests {
             assert_eq!(records[0].user_id, Some(1));
             assert_eq!(records[0].upload, 4);
             assert_eq!(records[0].download, 4);
+
+            send.finish().expect("finish payload");
+            connection.close(0u32.into(), b"done");
+            echo_task.await.expect("echo task");
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let records = server.drain_traffic(1);
+            assert!(records.is_empty());
 
             stop.store(true, Ordering::SeqCst);
             server_task.await.expect("server task");
