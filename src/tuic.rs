@@ -1470,6 +1470,73 @@ mod tests {
         });
     }
 
+    #[test]
+    fn deleting_tuic_user_closes_existing_connection_and_reports_tail() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let cert = test_cert("delete-existing-connection");
+            let echo = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("echo bind");
+            let echo_addr = echo.local_addr().expect("echo addr");
+            let echo_task = tokio::spawn(async move {
+                let (mut stream, _) = echo.accept().await.expect("echo accept");
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await.expect("echo read");
+                stream.write_all(&byte).await.expect("echo write");
+            });
+
+            let server = tuic_server(&cert, "127.0.0.1:0".parse().unwrap());
+            let endpoint = server.bind().expect("tuic bind");
+            let server_addr = endpoint.local_addr().expect("server addr");
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_task = tokio::spawn(server.clone().run(endpoint, stop.clone()));
+            let client_endpoint = client_endpoint(cert.cert_der.clone());
+            let connection = client_endpoint
+                .connect(server_addr, "localhost")
+                .expect("connect")
+                .await
+                .expect("connection");
+            authenticate_client(&connection).await;
+
+            let (mut send, mut recv) = connection.open_bi().await.expect("connect stream");
+            send.write_all(&connect_command(echo_addr))
+                .await
+                .expect("connect command");
+            send.write_all(b"x").await.expect("first payload");
+            send.finish().expect("finish payload");
+            let mut echoed = [0u8; 1];
+            recv.read_exact(&mut echoed).await.expect("first echo");
+            assert_eq!(echoed, *b"x");
+
+            let result = server.apply_user_delta(&CoreUserDelta {
+                deleted: vec![user().uuid],
+                ..CoreUserDelta::default()
+            });
+            assert_eq!(result.deleted, 1);
+            tokio::time::timeout(Duration::from_secs(2), connection.closed())
+                .await
+                .expect("deleted TUIC user connection should be closed");
+
+            let records = server.drain_traffic(1);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].node_tag, "panel|tuic|1");
+            assert_eq!(records[0].user_uuid, user().uuid);
+            assert_eq!(records[0].user_id, Some(1));
+            assert_eq!(records[0].upload, 1);
+            assert_eq!(records[0].download, 1);
+
+            connection.close(0u32.into(), b"done");
+            client_endpoint.wait_idle().await;
+            stop.store(true, Ordering::SeqCst);
+            server_task.await.expect("server task");
+            echo_task.await.expect("echo task");
+        });
+    }
+
     fn auth_command_for(connection: &quinn::Connection, uuid: &str, password: &str) -> Vec<u8> {
         let uuid = parse_uuid_bytes(uuid).expect("uuid");
         let mut token = [0u8; 32];
