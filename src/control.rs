@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 use crate::config::CoreConfig;
+use crate::metrics::{CoreMetrics, CoreMetricsSnapshot};
 use crate::runtime::{CoreStatus, ReloadDecision, RuntimeState};
 use crate::service::{CoreService, ListenerStatus};
 use crate::traffic::TrafficDelta;
@@ -23,6 +25,7 @@ pub enum CoreCommand {
         records: Vec<TrafficDelta>,
     },
     Status,
+    Metrics,
     Stop,
 }
 
@@ -50,6 +53,9 @@ pub enum CoreResponse {
         status: CoreStatus,
         listeners: Vec<ListenerStatus>,
     },
+    Metrics {
+        metrics: CoreMetricsSnapshot,
+    },
     Stopped,
     Error {
         message: String,
@@ -60,6 +66,7 @@ pub enum CoreResponse {
 pub struct CoreController {
     runtime: RuntimeState,
     service: Option<CoreService>,
+    metrics: CoreMetrics,
 }
 
 impl CoreController {
@@ -67,6 +74,7 @@ impl CoreController {
         Self {
             runtime: RuntimeState::new(),
             service: None,
+            metrics: CoreMetrics::default(),
         }
     }
 
@@ -88,6 +96,9 @@ impl CoreController {
                 status: self.runtime.status().clone(),
                 listeners: self.listeners(),
             },
+            CoreCommand::Metrics => CoreResponse::Metrics {
+                metrics: self.metrics.snapshot(),
+            },
             CoreCommand::Stop => {
                 if let Some(service) = &mut self.service {
                     service.stop();
@@ -100,7 +111,14 @@ impl CoreController {
     }
 
     fn apply_user_delta(&mut self, node_tag: String, delta: CoreUserDelta) -> CoreResponse {
+        let started = Instant::now();
+        let full_snapshot = delta.full.is_some();
         let Some(service) = &mut self.service else {
+            self.metrics.record_user_delta_error(
+                full_snapshot,
+                elapsed_ms(started),
+                "cannot apply user delta before config is applied",
+            );
             return CoreResponse::Error {
                 message: "cannot apply user delta before config is applied".to_string(),
             };
@@ -108,9 +126,17 @@ impl CoreController {
         let result = match service.apply_user_delta(&node_tag, &delta) {
             Ok(result) => result,
             Err(message) => {
+                self.metrics
+                    .record_user_delta_error(full_snapshot, elapsed_ms(started), &message);
                 return CoreResponse::Error { message };
             }
         };
+        self.metrics.record_user_delta_success(
+            &node_tag,
+            full_snapshot,
+            elapsed_ms(started),
+            result.active_users,
+        );
         self.runtime.apply_runtime_update();
         CoreResponse::UserDeltaApplied {
             node_tag,
@@ -196,6 +222,10 @@ impl CoreController {
             .map(CoreService::listeners)
             .unwrap_or_default()
     }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn decision_name(decision: ReloadDecision) -> &'static str {
@@ -613,6 +643,102 @@ mod tests {
             }),
             CoreResponse::UserDeltaApplied { .. }
         ));
+        assert!(matches!(
+            controller.handle(CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+    }
+
+    #[test]
+    fn metrics_record_incremental_and_full_user_delta_results() {
+        let config = config(Protocol::Socks);
+        let node_tag = config.inbounds[0].tag.clone();
+        let mut controller = CoreController::new();
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyConfig { config }),
+            CoreResponse::Applied { .. }
+        ));
+
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyUserDelta {
+                node_tag: node_tag.clone(),
+                delta: CoreUserDelta {
+                    full: Some(vec![user_with_password("user-b", Some("secret-b"), 4096)]),
+                    revision: Some("1".to_string()),
+                    ..CoreUserDelta::default()
+                },
+            }),
+            CoreResponse::UserDeltaApplied { .. }
+        ));
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyUserDelta {
+                node_tag: node_tag.clone(),
+                delta: CoreUserDelta {
+                    added: vec![user_with_password("user-c", Some("secret-c"), 2048)],
+                    base_revision: Some("1".to_string()),
+                    revision: Some("2".to_string()),
+                    ..CoreUserDelta::default()
+                },
+            }),
+            CoreResponse::UserDeltaApplied { .. }
+        ));
+
+        match controller.handle(CoreCommand::Metrics) {
+            CoreResponse::Metrics { metrics } => {
+                assert_eq!(metrics.keli_core_user_delta_apply_total, 2);
+                assert_eq!(metrics.keli_core_user_delta_full_snapshot_total, 1);
+                assert_eq!(metrics.keli_core_user_delta_incremental_total, 1);
+                assert_eq!(metrics.keli_core_user_delta_apply_error_total, 0);
+                assert_eq!(metrics.keli_core_user_delta_active_users[&node_tag], 2);
+                assert_eq!(metrics.keli_core_user_delta_apply_duration_ms.count, 2);
+                assert_eq!(
+                    metrics.keli_core_user_delta_apply_duration_ms.buckets["le_inf"],
+                    2
+                );
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
+        assert!(matches!(
+            controller.handle(CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+    }
+
+    #[test]
+    fn metrics_record_revision_mismatch_and_missing_current_errors() {
+        let config = config(Protocol::Socks);
+        let node_tag = config.inbounds[0].tag.clone();
+        let mut controller = CoreController::new();
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyConfig { config }),
+            CoreResponse::Applied { .. }
+        ));
+
+        match controller.handle(CoreCommand::ApplyUserDelta {
+            node_tag,
+            delta: CoreUserDelta {
+                base_revision: Some("1".to_string()),
+                revision: Some("2".to_string()),
+                ..CoreUserDelta::default()
+            },
+        }) {
+            CoreResponse::Error { message } => assert!(message.contains("current <missing>")),
+            response => panic!("unexpected response: {response:?}"),
+        }
+
+        match controller.handle(CoreCommand::Metrics) {
+            CoreResponse::Metrics { metrics } => {
+                assert_eq!(metrics.keli_core_user_delta_apply_total, 1);
+                assert_eq!(metrics.keli_core_user_delta_incremental_total, 1);
+                assert_eq!(metrics.keli_core_user_delta_apply_error_total, 1);
+                assert_eq!(metrics.keli_core_user_delta_revision_mismatch_total, 1);
+                assert_eq!(
+                    metrics.keli_core_user_delta_current_revision_missing_total,
+                    1
+                );
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
         assert!(matches!(
             controller.handle(CoreCommand::Stop),
             CoreResponse::Stopped

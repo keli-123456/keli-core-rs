@@ -11,6 +11,7 @@ pub mod http_proxy;
 pub mod httpupgrade;
 pub mod hysteria2;
 pub mod limits;
+pub mod metrics;
 pub mod mieru;
 pub mod mkcp;
 pub mod outbound;
@@ -49,6 +50,7 @@ pub use limits::{
     BandwidthLimiter, DeviceLimitExceeded, UserBandwidthLimiters, UserSessionGuard,
     UserSessionTracker,
 };
+pub use metrics::{CoreDurationMetrics, CoreMetricsSnapshot};
 pub use mieru::{MieruServer, MieruServerConfig};
 pub use outbound::{
     connect_tcp_outbound, connect_tcp_outbound_tokio, outbound_udp_target, send_udp_outbound,
