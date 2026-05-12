@@ -327,6 +327,7 @@ mod tests {
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),
+                routes: Vec::new(),
             }],
             outbounds: vec![OutboundConfig {
                 tag: "direct".to_string(),

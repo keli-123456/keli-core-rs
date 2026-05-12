@@ -54,6 +54,8 @@ pub struct InboundConfig {
     pub transport: TransportConfig,
     pub tls: Option<TlsConfig>,
     pub sniffing: SniffingConfig,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<RouteRule>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,12 +259,20 @@ impl CoreConfig {
     }
 
     fn validate_routes(&self) -> Result<(), ValidationError> {
+        self.validate_route_rules(&self.routes)?;
+        for inbound in &self.inbounds {
+            self.validate_route_rules(&inbound.routes)?;
+        }
+        Ok(())
+    }
+
+    fn validate_route_rules(&self, routes: &[RouteRule]) -> Result<(), ValidationError> {
         let outbound_tags = self
             .outbounds
             .iter()
             .map(|outbound| outbound.tag.as_str())
             .collect::<HashSet<_>>();
-        for route in &self.routes {
+        for route in routes {
             validate_route_targets(route)?;
             match &route.action {
                 Direct | Block => {}
@@ -289,6 +299,26 @@ impl CoreConfig {
     pub fn resolved_routes(&self) -> Vec<RouteRule> {
         self.routes
             .iter()
+            .map(|route| {
+                let mut route = route.clone();
+                if route.outbound.is_none() {
+                    if let Outbound(tag) = &route.action {
+                        route.outbound = self
+                            .outbounds
+                            .iter()
+                            .find(|outbound| outbound.tag == *tag)
+                            .cloned();
+                    }
+                }
+                route
+            })
+            .collect()
+    }
+
+    pub fn resolved_inbound_routes(&self, inbound: &InboundConfig) -> Vec<RouteRule> {
+        self.routes
+            .iter()
+            .chain(inbound.routes.iter())
             .map(|route| {
                 let mut route = route.clone();
                 if route.outbound.is_none() {
@@ -1401,6 +1431,7 @@ mod tests {
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),
+                routes: Vec::new(),
             }],
             outbounds: vec![OutboundConfig {
                 tag: "direct".to_string(),
@@ -1439,6 +1470,7 @@ mod tests {
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),
+                routes: Vec::new(),
             }],
             outbounds: vec![
                 OutboundConfig {
@@ -1493,6 +1525,81 @@ mod tests {
     }
 
     #[test]
+    fn resolves_routes_for_current_inbound_only() {
+        let first = InboundConfig {
+            tag: "panel|hy2|1".to_string(),
+            protocol: Protocol::Hysteria2,
+            listen: "0.0.0.0".to_string(),
+            port: 8443,
+            users: vec![user()],
+            cipher: None,
+            flow: String::new(),
+            padding_scheme: Vec::new(),
+            transport: TransportConfig::default(),
+            tls: None,
+            sniffing: SniffingConfig::default(),
+            routes: vec![crate::config::RouteRule {
+                targets: vec!["geoip:private".to_string()],
+                action: crate::config::RouteAction::Block,
+                outbound: None,
+            }],
+        };
+        let second = InboundConfig {
+            tag: "panel|vless|2".to_string(),
+            protocol: Protocol::Vless,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![user()],
+            cipher: None,
+            flow: String::new(),
+            padding_scheme: Vec::new(),
+            transport: TransportConfig::default(),
+            tls: None,
+            sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
+        };
+        let config = CoreConfig {
+            instance_id: "node-a".to_string(),
+            log_level: "info".to_string(),
+            dns: DnsConfig::default(),
+            inbounds: vec![first, second],
+            outbounds: vec![OutboundConfig {
+                tag: "direct".to_string(),
+                protocol: "freedom".to_string(),
+                method: None,
+                alter_id: None,
+                address: None,
+                port: None,
+                username: None,
+                password: None,
+                tls: None,
+                transport: None,
+            }],
+            routes: vec![crate::config::RouteRule {
+                targets: vec!["domain:global.example".to_string()],
+                action: crate::config::RouteAction::Direct,
+                outbound: None,
+            }],
+            stats: StatsConfig::default(),
+        };
+
+        let first_routes = config.resolved_inbound_routes(&config.inbounds[0]);
+        let second_routes = config.resolved_inbound_routes(&config.inbounds[1]);
+
+        assert_eq!(first_routes.len(), 2);
+        assert_eq!(
+            first_routes[0].targets,
+            vec!["domain:global.example".to_string()]
+        );
+        assert_eq!(first_routes[1].targets, vec!["geoip:private".to_string()]);
+        assert_eq!(second_routes.len(), 1);
+        assert_eq!(
+            second_routes[0].targets,
+            vec!["domain:global.example".to_string()]
+        );
+    }
+
+    #[test]
     fn validates_tcp_proxy_outbound_endpoints() {
         let mut config = CoreConfig {
             instance_id: "node-a".to_string(),
@@ -1510,6 +1617,7 @@ mod tests {
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),
+                routes: Vec::new(),
             }],
             outbounds: vec![OutboundConfig {
                 tag: "proxy".to_string(),
@@ -1558,6 +1666,7 @@ mod tests {
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),
+                routes: Vec::new(),
             }],
             outbounds: vec![OutboundConfig {
                 tag: "ss-out".to_string(),
@@ -1615,6 +1724,7 @@ mod tests {
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),
+                routes: Vec::new(),
             }],
             outbounds: vec![OutboundConfig {
                 tag: "trojan-out".to_string(),
@@ -1705,6 +1815,7 @@ mod tests {
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),
+                routes: Vec::new(),
             }],
             outbounds: vec![OutboundConfig {
                 tag: "vless-out".to_string(),
@@ -1874,6 +1985,7 @@ mod tests {
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),
+                routes: Vec::new(),
             }],
             outbounds: Vec::new(),
             routes: vec![crate::config::RouteRule {
@@ -1925,6 +2037,7 @@ mod tests {
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),
+                routes: Vec::new(),
             }],
             outbounds: vec![OutboundConfig {
                 tag: "direct".to_string(),
@@ -2004,6 +2117,7 @@ mod tests {
                 },
                 tls: None,
                 sniffing: SniffingConfig::default(),
+                routes: Vec::new(),
             };
 
             inbound.validate().expect("http transport inbound");
@@ -2026,6 +2140,7 @@ mod tests {
                 },
                 tls: None,
                 sniffing: SniffingConfig::default(),
+                routes: Vec::new(),
             };
 
             inbound.validate().expect("grpc transport inbound");
@@ -2046,6 +2161,7 @@ mod tests {
             transport: TransportConfig::default(),
             tls: None,
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         let error = inbound
@@ -2100,6 +2216,7 @@ mod tests {
             },
             tls: None,
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         let error = inbound.validate().expect_err("tcp path should be rejected");
@@ -2139,6 +2256,7 @@ mod tests {
             },
             tls: None,
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         let error = inbound.validate().expect_err("socks ws should be rejected");
@@ -2173,6 +2291,7 @@ mod tests {
             transport: TransportConfig::default(),
             tls: None,
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         assert!(inbound.validate().is_err());
@@ -2199,6 +2318,7 @@ mod tests {
                 reality: None,
             }),
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         let error = inbound
@@ -2229,6 +2349,7 @@ mod tests {
                 reality: None,
             }),
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         let error = inbound
@@ -2259,6 +2380,7 @@ mod tests {
                 reality: None,
             }),
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         inbound.validate().expect("vless vision tcp tls");
@@ -2296,6 +2418,7 @@ mod tests {
                 }),
             }),
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         inbound.validate().expect("vless reality config");
@@ -2329,6 +2452,7 @@ mod tests {
                 }),
             }),
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         inbound.validate().expect("vless reality ipv6 dest");
@@ -2365,6 +2489,7 @@ mod tests {
                 }),
             }),
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         let error = inbound
@@ -2402,6 +2527,7 @@ mod tests {
                 }),
             }),
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         let error = inbound
@@ -2439,6 +2565,7 @@ mod tests {
                 }),
             }),
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         let error = inbound
@@ -2464,6 +2591,7 @@ mod tests {
             transport: TransportConfig::default(),
             tls: None,
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         let error = inbound
@@ -2490,6 +2618,7 @@ mod tests {
             },
             tls: None,
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         inbound.validate().expect("shadowsocks tcp,udp");
@@ -2521,6 +2650,7 @@ mod tests {
                     reality: None,
                 }),
                 sniffing: SniffingConfig::default(),
+                routes: Vec::new(),
             };
 
             inbound.validate().expect("tuic congestion should validate");
@@ -2552,6 +2682,7 @@ mod tests {
                 reality: None,
             }),
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         let error = inbound
@@ -2586,6 +2717,7 @@ mod tests {
                 reality: None,
             }),
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         let error = inbound
@@ -2609,6 +2741,7 @@ mod tests {
             transport: TransportConfig::default(),
             tls: None,
             sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         };
 
         let error = inbound

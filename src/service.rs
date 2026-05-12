@@ -153,9 +153,8 @@ impl CoreService {
         let sessions = UserSessionTracker::default();
         let bandwidth = UserBandwidthLimiters::default();
         let mut listeners = Vec::new();
-        let routes = config.resolved_routes();
-
         for inbound in config.inbounds {
+            let routes = active_config.resolved_inbound_routes(&inbound);
             let handle = match inbound.protocol {
                 Protocol::Socks => start_socks_listener(
                     &inbound,
@@ -2144,6 +2143,7 @@ mod tests {
                 transport: TransportConfig::default(),
                 tls: None,
                 sniffing: SniffingConfig::default(),
+                routes: Vec::new(),
             }],
             outbounds: vec![OutboundConfig {
                 tag: "direct".to_string(),
@@ -2201,6 +2201,7 @@ mod tests {
                     }),
                 }),
                 sniffing: SniffingConfig::default(),
+                routes: Vec::new(),
             }],
             outbounds: vec![OutboundConfig {
                 tag: "direct".to_string(),
