@@ -15,13 +15,23 @@ use serde::Serialize;
 use tokio::io::AsyncReadExt;
 
 use crate::hysteria2::{Hysteria2Server, Hysteria2ServerConfig};
+use crate::tuic::{TuicServer, TuicServerConfig};
 use crate::user::CoreUser;
 use crate::vless::{VlessServer, VlessServerConfig};
 
 const BENCH_USER_UUID: &str = "11111111-1111-1111-1111-111111111111";
 const BENCH_USER_BYTES: [u8; 16] = [0x11; 16];
 const HY2_PASSWORD: &str = "hy2-password";
+const TUIC_PASSWORD: &str = "tuic-password";
 const HY2_TCP_REQUEST_ID: u64 = 0x401;
+const TUIC_VERSION: u8 = 0x05;
+const TUIC_COMMAND_AUTHENTICATE: u8 = 0x00;
+const TUIC_COMMAND_CONNECT: u8 = 0x01;
+const TUIC_COMMAND_PACKET: u8 = 0x02;
+const TUIC_ATYP_DOMAIN: u8 = 0x00;
+const TUIC_ATYP_IPV4: u8 = 0x01;
+const TUIC_ATYP_IPV6: u8 = 0x02;
+const TUIC_ATYP_NONE: u8 = 0xff;
 const DEFAULT_STREAMS: usize = 4;
 const DEFAULT_REQUESTS: usize = 200;
 const DEFAULT_PAYLOAD_SIZE: usize = 1_024;
@@ -172,6 +182,24 @@ pub fn run_bench(args: impl Iterator<Item = String>) -> Result<(), String> {
             );
             Ok(())
         }
+        Some("tuic-tcp") => {
+            let options = parse_bench_options(args)?;
+            let report = run_tuic_tcp_bench(&options).map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+            );
+            Ok(())
+        }
+        Some("tuic-udp") => {
+            let options = parse_bench_options(args)?;
+            let report = run_tuic_udp_bench(&options).map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+            );
+            Ok(())
+        }
         Some("--help") | Some("help") | None => {
             print_bench_usage();
             Ok(())
@@ -240,7 +268,7 @@ fn bench_quic_runtime_workers() -> usize {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]"
+        "bench commands:\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]"
     );
 }
 
@@ -316,6 +344,22 @@ fn run_hy2_udp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
         .enable_all()
         .build()?
         .block_on(run_hy2_udp_bench_async(options))
+}
+
+fn run_tuic_tcp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(bench_quic_runtime_workers())
+        .enable_all()
+        .build()?
+        .block_on(run_tuic_tcp_bench_async(options))
+}
+
+fn run_tuic_udp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(bench_quic_runtime_workers())
+        .enable_all()
+        .build()?
+        .block_on(run_tuic_udp_bench_async(options))
 }
 
 async fn run_hy2_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchReport> {
@@ -561,6 +605,173 @@ async fn run_hy2_udp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
     Ok(BenchReport::completed(
         "hy2-udp",
         "hy2-udp-datagram-connection-per-worker",
+        options,
+        Some(bench_quic_runtime_workers()),
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
+}
+
+async fn run_tuic_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let cert = BenchCert::new("tuic-tcp-bench")?;
+    let server = TuicServer::new(TuicServerConfig {
+        node_tag: "bench|tuic|tcp".to_string(),
+        listen: "127.0.0.1:0".parse().expect("valid listen addr"),
+        users: vec![tuic_user()],
+        routes: Vec::new(),
+        cert_file: cert.cert_path.to_string_lossy().to_string(),
+        key_file: cert.key_path.to_string_lossy().to_string(),
+        server_name: "localhost".to_string(),
+        alpn: vec!["h3".to_string()],
+        reject_unknown_sni: false,
+        congestion_control: String::new(),
+        connect_timeout: Duration::from_secs(3),
+    });
+    let endpoint = server.bind()?;
+    let server_addr = endpoint.local_addr()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_task = tokio::spawn(server.run(endpoint, stop.clone()));
+    let client_endpoint = hy2_client_endpoint(cert.cert_der.clone())?;
+    let connection = client_endpoint
+        .connect(server_addr, "localhost")
+        .map_err(io_other)?
+        .await
+        .map_err(io_other)?;
+    authenticate_tuic(&connection).await?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        let connection = connection.clone();
+        workers.push(tokio::spawn(async move {
+            run_tuic_tcp_client(connection, echo_addr, stream_id, &options).await
+        }));
+    }
+
+    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "tuic tcp worker panicked"))??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+    }
+    let elapsed = started.elapsed();
+
+    connection.close(0u32.into(), b"bench done");
+    client_endpoint.wait_idle().await;
+    stop.store(true, Ordering::SeqCst);
+    server_task
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "tuic tcp server task panicked"))?;
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        "tuic-tcp",
+        "single-quic-connection",
+        options,
+        Some(bench_quic_runtime_workers()),
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
+}
+
+async fn run_tuic_udp_bench_async(options: &BenchOptions) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let echo = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await?);
+    let echo_addr = echo.local_addr()?;
+    let echo_task = {
+        let echo = echo.clone();
+        let echo_stop = echo_stop.clone();
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; 65_535];
+            while !echo_stop.load(Ordering::SeqCst) {
+                match tokio::time::timeout(Duration::from_millis(20), echo.recv_from(&mut buffer))
+                    .await
+                {
+                    Ok(Ok((read, peer))) => {
+                        echo.send_to(&buffer[..read], peer).await?;
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {}
+                }
+            }
+            Ok::<(), io::Error>(())
+        })
+    };
+
+    let cert = BenchCert::new("tuic-udp-bench")?;
+    let server = TuicServer::new(TuicServerConfig {
+        node_tag: "bench|tuic|udp".to_string(),
+        listen: "127.0.0.1:0".parse().expect("valid listen addr"),
+        users: vec![tuic_user()],
+        routes: Vec::new(),
+        cert_file: cert.cert_path.to_string_lossy().to_string(),
+        key_file: cert.key_path.to_string_lossy().to_string(),
+        server_name: "localhost".to_string(),
+        alpn: vec!["h3".to_string()],
+        reject_unknown_sni: false,
+        congestion_control: String::new(),
+        connect_timeout: Duration::from_secs(3),
+    });
+    let endpoint = server.bind()?;
+    let server_addr = endpoint.local_addr()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_task = tokio::spawn(server.run(endpoint, stop.clone()));
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        let cert_der = cert.cert_der.clone();
+        workers.push(tokio::spawn(async move {
+            run_tuic_udp_client(server_addr, cert_der, echo_addr, stream_id, &options).await
+        }));
+    }
+
+    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "tuic udp worker panicked"))??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+    }
+    let elapsed = started.elapsed();
+
+    stop.store(true, Ordering::SeqCst);
+    server_task
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "tuic udp server task panicked"))?;
+    echo_stop.store(true, Ordering::SeqCst);
+    echo_task
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "tuic udp echo task panicked"))??;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        "tuic-udp",
+        "tuic-udp-datagram-connection-per-worker",
         options,
         Some(bench_quic_runtime_workers()),
         upload_bytes,
@@ -902,6 +1113,17 @@ fn hy2_user() -> CoreUser {
     }
 }
 
+fn tuic_user() -> CoreUser {
+    CoreUser {
+        id: 1,
+        uuid: BENCH_USER_UUID.to_string(),
+        password: Some(TUIC_PASSWORD.to_string()),
+        email: None,
+        speed_limit: 0,
+        device_limit: 0,
+    }
+}
+
 async fn run_hy2_tcp_client(
     connection: quinn::Connection,
     echo_addr: SocketAddr,
@@ -1074,6 +1296,287 @@ async fn run_hy2_udp_client(
         latencies,
         retries: 0,
     })
+}
+
+async fn run_tuic_tcp_client(
+    connection: quinn::Connection,
+    echo_addr: SocketAddr,
+    stream_id: usize,
+    options: &BenchOptions,
+) -> io::Result<ClientStats> {
+    let payload = bench_payload(stream_id, options.payload_size);
+    let mut latencies = Vec::with_capacity(options.requests);
+    let mut retries = 0usize;
+    for request_index in 0..options.requests {
+        let mut attempts = 0usize;
+        loop {
+            match run_one_tuic_tcp_request(&connection, echo_addr, &payload).await {
+                Ok(latency) => {
+                    latencies.push(latency);
+                    break;
+                }
+                Err(error)
+                    if attempts < MAX_REQUEST_RETRIES && is_retryable_bench_error(&error) =>
+                {
+                    attempts = attempts.saturating_add(1);
+                    retries = retries.saturating_add(1);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "tuic stream {stream_id} request {} failed: {error}",
+                            request_index + 1
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(ClientStats { latencies, retries })
+}
+
+async fn run_one_tuic_tcp_request(
+    connection: &quinn::Connection,
+    echo_addr: SocketAddr,
+    payload: &[u8],
+) -> io::Result<u128> {
+    let started = Instant::now();
+    let mut response = vec![0u8; payload.len()];
+    let (mut send, mut recv) = connection.open_bi().await.map_err(io_other)?;
+    send.write_all(&tuic_connect_command(echo_addr))
+        .await
+        .map_err(io_other)?;
+    send.write_all(payload).await.map_err(io_other)?;
+    send.finish().map_err(io_other)?;
+    recv.read_exact(&mut response).await.map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("tuic stream finished before echo response: {error}"),
+        )
+    })?;
+    if response != payload {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tuic bench echo payload mismatch",
+        ));
+    }
+    Ok(started.elapsed().as_micros())
+}
+
+async fn run_tuic_udp_client(
+    server_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    echo_addr: SocketAddr,
+    stream_id: usize,
+    options: &BenchOptions,
+) -> io::Result<ClientStats> {
+    let client_endpoint = hy2_client_endpoint(cert_der)?;
+    let connection = client_endpoint
+        .connect(server_addr, "localhost")
+        .map_err(io_other)?
+        .await
+        .map_err(io_other)?;
+    authenticate_tuic(&connection).await?;
+    let payload = bench_payload(stream_id, options.payload_size);
+    let assoc_id = stream_id.saturating_add(1) as u16;
+    let mut latencies = Vec::with_capacity(options.requests);
+
+    for request_index in 0..options.requests {
+        let packet_id = ((request_index % usize::from(u16::MAX)) + 1) as u16;
+        let started = Instant::now();
+        let datagram = tuic_udp_packet(assoc_id, packet_id, Some(echo_addr), &payload)?;
+        connection
+            .send_datagram_wait(Bytes::from(datagram))
+            .await
+            .map_err(io_other)?;
+        let response = tokio::time::timeout(Duration::from_secs(10), connection.read_datagram())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tuic udp response timeout"))?
+            .map_err(io_other)?;
+        let response = parse_tuic_udp_packet(&response)?;
+        if response.assoc_id != assoc_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tuic udp response association id mismatch",
+            ));
+        }
+        if response.payload != payload {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tuic udp bench echo payload mismatch",
+            ));
+        }
+        latencies.push(started.elapsed().as_micros());
+    }
+
+    connection.close(0u32.into(), b"bench done");
+    client_endpoint.wait_idle().await;
+    Ok(ClientStats {
+        latencies,
+        retries: 0,
+    })
+}
+
+async fn authenticate_tuic(connection: &quinn::Connection) -> io::Result<()> {
+    let mut auth = connection.open_uni().await.map_err(io_other)?;
+    auth.write_all(&tuic_auth_command(connection)?)
+        .await
+        .map_err(io_other)?;
+    auth.finish().map_err(io_other)
+}
+
+fn tuic_auth_command(connection: &quinn::Connection) -> io::Result<Vec<u8>> {
+    let mut token = [0u8; 32];
+    connection
+        .export_keying_material(&mut token, &BENCH_USER_BYTES, TUIC_PASSWORD.as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, format!("{error:?}")))?;
+    let mut command = vec![TUIC_VERSION, TUIC_COMMAND_AUTHENTICATE];
+    command.extend_from_slice(&BENCH_USER_BYTES);
+    command.extend_from_slice(&token);
+    Ok(command)
+}
+
+fn tuic_connect_command(target: SocketAddr) -> Vec<u8> {
+    let mut command = vec![TUIC_VERSION, TUIC_COMMAND_CONNECT];
+    command.extend_from_slice(&tuic_address(Some(target)));
+    command
+}
+
+fn tuic_udp_packet(
+    assoc_id: u16,
+    packet_id: u16,
+    target: Option<SocketAddr>,
+    payload: &[u8],
+) -> io::Result<Vec<u8>> {
+    if payload.len() > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tuic udp packet payload is too large",
+        ));
+    }
+    let address = tuic_address(target);
+    let mut output = Vec::with_capacity(10 + address.len() + payload.len());
+    output.push(TUIC_VERSION);
+    output.push(TUIC_COMMAND_PACKET);
+    output.extend_from_slice(&assoc_id.to_be_bytes());
+    output.extend_from_slice(&packet_id.to_be_bytes());
+    output.push(1);
+    output.push(0);
+    output.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    output.extend_from_slice(&address);
+    output.extend_from_slice(payload);
+    Ok(output)
+}
+
+fn tuic_address(target: Option<SocketAddr>) -> Vec<u8> {
+    let Some(target) = target else {
+        return vec![TUIC_ATYP_NONE];
+    };
+    let mut output = Vec::new();
+    match target {
+        SocketAddr::V4(addr) => {
+            output.push(TUIC_ATYP_IPV4);
+            output.extend_from_slice(&addr.ip().octets());
+        }
+        SocketAddr::V6(addr) => {
+            output.push(TUIC_ATYP_IPV6);
+            output.extend_from_slice(&addr.ip().octets());
+        }
+    }
+    output.extend_from_slice(&target.port().to_be_bytes());
+    output
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TuicUdpPacket {
+    assoc_id: u16,
+    payload: Vec<u8>,
+}
+
+fn parse_tuic_udp_packet(input: &[u8]) -> io::Result<TuicUdpPacket> {
+    if input.len() < 10 || input[0] != TUIC_VERSION || input[1] != TUIC_COMMAND_PACKET {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid tuic udp packet header",
+        ));
+    }
+    let assoc_id = u16::from_be_bytes([input[2], input[3]]);
+    let fragment_total = input[6];
+    let fragment_id = input[7];
+    if fragment_total != 1 || fragment_id != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "tuic bench does not support fragmented udp responses",
+        ));
+    }
+    let payload_len = u16::from_be_bytes([input[8], input[9]]) as usize;
+    let mut offset = 10usize;
+    skip_tuic_address(input, &mut offset)?;
+    if input.len().saturating_sub(offset) != payload_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tuic udp payload length mismatch",
+        ));
+    }
+    Ok(TuicUdpPacket {
+        assoc_id,
+        payload: input[offset..].to_vec(),
+    })
+}
+
+fn skip_tuic_address(input: &[u8], offset: &mut usize) -> io::Result<()> {
+    let Some(atyp) = input.get(*offset).copied() else {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "missing tuic address type",
+        ));
+    };
+    *offset += 1;
+    match atyp {
+        TUIC_ATYP_NONE => Ok(()),
+        TUIC_ATYP_IPV4 => {
+            *offset = (*offset).saturating_add(4);
+            skip_tuic_port(input, offset)
+        }
+        TUIC_ATYP_IPV6 => {
+            *offset = (*offset).saturating_add(16);
+            skip_tuic_port(input, offset)
+        }
+        TUIC_ATYP_DOMAIN => {
+            let Some(length) = input.get(*offset).copied() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "missing tuic domain length",
+                ));
+            };
+            *offset += 1 + usize::from(length);
+            skip_tuic_port(input, offset)
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported tuic address type",
+        )),
+    }
+}
+
+fn skip_tuic_port(input: &[u8], offset: &mut usize) -> io::Result<()> {
+    if input.len().saturating_sub(*offset) < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated tuic port",
+        ));
+    }
+    *offset += 2;
+    if *offset > input.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated tuic address",
+        ));
+    }
+    Ok(())
 }
 
 fn hy2_client_endpoint(cert_der: CertificateDer<'static>) -> io::Result<quinn::Endpoint> {
@@ -1364,8 +1867,8 @@ fn join_server(handle: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_bench_options, run_hy2_udp_bench, run_vless_tcp_bench, run_vless_tcp_stream_bench,
-        BenchOptions,
+        parse_bench_options, run_hy2_udp_bench, run_tuic_tcp_bench, run_tuic_udp_bench,
+        run_vless_tcp_bench, run_vless_tcp_stream_bench, BenchOptions,
     };
 
     #[test]
@@ -1469,6 +1972,44 @@ mod tests {
 
         assert_eq!(report.protocol, "hy2-udp");
         assert_eq!(report.mode, "hy2-udp-datagram-connection-per-worker");
+        assert_eq!(report.total_requests, 2);
+        assert_eq!(report.completed_requests, 2);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert!(report.runtime_workers.unwrap_or_default() >= 2);
+        assert!(report.download_bytes > 0);
+    }
+
+    #[test]
+    fn runs_tuic_tcp_bench_smoke() {
+        let report = run_tuic_tcp_bench(&BenchOptions {
+            streams: 1,
+            requests: 2,
+            payload_size: 16,
+        })
+        .expect("bench");
+
+        assert_eq!(report.protocol, "tuic-tcp");
+        assert_eq!(report.mode, "single-quic-connection");
+        assert_eq!(report.total_requests, 2);
+        assert_eq!(report.completed_requests, 2);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert!(report.runtime_workers.unwrap_or_default() >= 2);
+        assert!(report.download_bytes > 0);
+    }
+
+    #[test]
+    fn runs_tuic_udp_bench_smoke() {
+        let report = run_tuic_udp_bench(&BenchOptions {
+            streams: 1,
+            requests: 2,
+            payload_size: 16,
+        })
+        .expect("bench");
+
+        assert_eq!(report.protocol, "tuic-udp");
+        assert_eq!(report.mode, "tuic-udp-datagram-connection-per-worker");
         assert_eq!(report.total_requests, 2);
         assert_eq!(report.completed_requests, 2);
         assert_eq!(report.errors, 0);

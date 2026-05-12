@@ -127,6 +127,8 @@ cargo run -- bench vless-tcp-stream --streams 8 --requests 1000 --payload 1024
 cargo run -- bench hy2-tcp --streams 8 --requests 1000 --payload 1024
 cargo run -- bench hy2-tcp-stream --streams 8 --requests 1000 --payload 1024
 cargo run -- bench hy2-udp --streams 8 --requests 1000 --payload 1024
+cargo run -- bench tuic-tcp --streams 8 --requests 1000 --payload 1024
+cargo run -- bench tuic-udp --streams 8 --requests 1000 --payload 1024
 ```
 
 ## Local Benchmarks
@@ -147,6 +149,8 @@ cargo run --release -- bench vless-tcp-stream --streams 16 --requests 5000 --pay
 cargo run --release -- bench hy2-tcp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-tcp-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-udp --streams 16 --requests 5000 --payload 1024
+cargo run --release -- bench tuic-tcp --streams 16 --requests 5000 --payload 1024
+cargo run --release -- bench tuic-udp --streams 16 --requests 5000 --payload 1024
 ```
 
 Use the same host, release build, payload, stream count, and request count when comparing

@@ -65,6 +65,8 @@ Loopback benchmarks are useful for regression detection, not production certific
 cargo run --release -- bench hy2-tcp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-tcp-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-udp --streams 16 --requests 5000 --payload 1024
+cargo run --release -- bench tuic-tcp --streams 16 --requests 5000 --payload 1024
+cargo run --release -- bench tuic-udp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench vless-tcp-stream --streams 16 --requests 5000 --payload 1024
 ```
 
