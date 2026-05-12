@@ -27,6 +27,7 @@ pub struct HttpProxyServerConfig {
 pub struct HttpProxyServer {
     config: HttpProxyServerConfig,
     users: UserStore,
+    auth_required: bool,
     router: RouteMatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
@@ -70,11 +71,13 @@ impl HttpProxyServer {
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
+        let auth_required = !config.users.is_empty();
         let users = UserStore::from_uuid_users(&config.users);
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,
             users,
+            auth_required,
             traffic,
             sessions,
             bandwidth,
@@ -186,7 +189,7 @@ impl HttpProxyServer {
     }
 
     fn authenticate(&self, headers: &[(String, String)]) -> io::Result<Option<CoreUser>> {
-        if self.users.is_empty() {
+        if !self.auth_required {
             return Ok(None);
         }
         let Some(value) = header_value(headers, "proxy-authorization") else {
@@ -510,7 +513,7 @@ mod tests {
 
     use crate::config::{RouteAction, RouteRule};
     use crate::http_proxy::{HttpProxyServer, HttpProxyServerConfig};
-    use crate::user::CoreUser;
+    use crate::user::{CoreUser, CoreUserDelta};
 
     fn user() -> CoreUser {
         CoreUser {
@@ -618,6 +621,104 @@ mod tests {
         assert_eq!(records[0].user_id, Some(1));
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn deleting_http_user_stops_existing_connect_relay_on_next_payload_and_reports_tail() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (second_payload_tx, second_payload_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .expect("echo timeout");
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).expect("first payload");
+            stream.write_all(&first).expect("first echo");
+            let mut second = [0u8; 1];
+            let received_second = stream.read_exact(&mut second).is_ok();
+            second_payload_tx
+                .send(received_second)
+                .expect("send result");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("proxy bind");
+        let proxy_addr = listener.local_addr().expect("proxy addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || server_clone.serve_tcp_once(&listener));
+
+        let mut client = TcpStream::connect(proxy_addr).expect("client connect");
+        let request = format!(
+            "CONNECT {} HTTP/1.1\r\nHost: {}\r\n{}\r\n",
+            echo_addr,
+            echo_addr,
+            basic_auth_header()
+        );
+        client
+            .write_all(request.as_bytes())
+            .expect("connect request");
+        let mut response = [0u8; 39];
+        client.read_exact(&mut response).expect("connect response");
+        assert!(String::from_utf8_lossy(&response).contains("200 Connection established"));
+        client.write_all(b"x").expect("first write");
+        let mut echoed = [0u8; 1];
+        client.read_exact(&mut echoed).expect("first echo");
+        assert_eq!(echoed, *b"x");
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec!["user-a".to_string()],
+            ..CoreUserDelta::default()
+        });
+        assert_eq!(result.deleted, 1);
+        let old_headers = vec![(
+            "Proxy-Authorization".to_string(),
+            basic_auth_value("user-a", "user-a"),
+        )];
+        let error = server
+            .authenticate(&old_headers)
+            .expect_err("deleted user should fail new authentication");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let _ = client.write_all(b"y");
+        assert!(
+            !second_payload_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("echo result"),
+            "deleted user's existing HTTP CONNECT relay should stop forwarding new payload"
+        );
+        drop(client);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|http|1");
+        assert_eq!(records[0].user_uuid, "user-a");
+        assert_eq!(records[0].user_id, Some(1));
+        assert_eq!(records[0].upload, 1);
+        assert_eq!(records[0].download, 1);
+    }
+
+    #[test]
+    fn deleting_last_http_user_does_not_enable_no_auth_proxy() {
+        let server = server();
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec!["user-a".to_string()],
+            ..CoreUserDelta::default()
+        });
+        assert_eq!(result.deleted, 1);
+
+        let error = server
+            .authenticate(&[])
+            .expect_err("auth should still be required after deleting all users");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]

@@ -26,7 +26,7 @@ The control boundary accepts transport-neutral commands:
 
 `ApplyConfig` starts the real `CoreService` for implemented protocols. If only inbound users change, it returns `updated` and patches the existing listeners in place; otherwise it reloads the service. This lets `kelinode-rs` later use an in-process adapter, a Unix socket, or another local transport without changing the core model.
 
-`ApplyUserDelta` is the native small-change path. It applies added, updated, deleted, or full-snapshot users to one inbound without rebinding the listener. The core tracks an optional revision per inbound: non-full deltas with a known `base_revision` must match the current revision, while a full snapshot may reset the revision after a mismatch. Deleting a user immediately rejects new authentication for that user. Existing accepted connections are not force-closed in this phase; they run until normal close and keep their captured `user_id` for tail traffic accounting.
+`ApplyUserDelta` is the native small-change path. It applies added, updated, deleted, or full-snapshot users to one inbound without rebinding the listener. The core tracks an optional revision per inbound: non-full deltas with a known `base_revision` must match the current revision, while a full snapshot may reset the revision after a mismatch. Deleting a user immediately rejects new authentication for that user. Existing accepted connections are not force-closed by a central socket registry in this phase; relays that hold the shared user bandwidth limiter stop on the next upload/download checkpoint after revocation, and already captured `user_id` values remain available for tail traffic accounting.
 
 The binary also exposes a minimal process boundary:
 

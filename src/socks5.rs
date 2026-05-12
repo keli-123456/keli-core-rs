@@ -49,6 +49,7 @@ pub struct SocksTarget {
 pub struct Socks5Server {
     config: Socks5ServerConfig,
     users: UserStore,
+    auth_required: bool,
     router: RouteMatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
@@ -90,11 +91,13 @@ impl Socks5Server {
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
+        let auth_required = !config.users.is_empty();
         let users = UserStore::from_uuid_users(&config.users);
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,
             users,
+            auth_required,
             traffic,
             sessions,
             bandwidth,
@@ -201,10 +204,10 @@ impl Socks5Server {
     }
 
     fn select_auth_method(&self, methods: &[u8]) -> u8 {
-        let required = if self.users.is_empty() {
-            AUTH_NONE
-        } else {
+        let required = if self.auth_required {
             AUTH_PASSWORD
+        } else {
+            AUTH_NONE
         };
         methods
             .iter()
@@ -925,14 +928,23 @@ mod tests {
     }
 
     #[test]
-    fn delete_user_keeps_existing_socks_connection_until_close_and_reports_tail() {
+    fn deleting_socks_user_stops_existing_tcp_relay_on_next_payload_and_reports_tail() {
         let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
         let echo_addr = echo.local_addr().expect("echo addr");
+        let (second_payload_tx, second_payload_rx) = mpsc::channel();
         let echo_thread = thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("echo accept");
-            let mut bytes = [0u8; 4];
-            stream.read_exact(&mut bytes).expect("echo read");
-            stream.write_all(&bytes).expect("echo write");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .expect("echo timeout");
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).expect("first payload");
+            stream.write_all(&first).expect("first echo");
+            let mut second = [0u8; 1];
+            let received_second = stream.read_exact(&mut second).is_ok();
+            second_payload_tx
+                .send(received_second)
+                .expect("send result");
         });
 
         let server = server();
@@ -946,6 +958,11 @@ mod tests {
         let mut response = [0u8; 14];
         client.read_exact(&mut response).expect("client response");
         assert_eq!(&response[2..4], &[0x01, 0x00]);
+
+        client.write_all(b"x").expect("first write");
+        let mut echoed = [0u8; 1];
+        client.read_exact(&mut echoed).expect("first echo");
+        assert_eq!(echoed, *b"x");
 
         let result = server.apply_user_delta(&CoreUserDelta {
             deleted: vec!["user-a".to_string()],
@@ -963,10 +980,14 @@ mod tests {
             .expect_err("deleted user should fail new authentication");
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 
-        client.write_all(b"tail").expect("client write payload");
-        let mut echoed = [0u8; 4];
-        client.read_exact(&mut echoed).expect("client read payload");
-        assert_eq!(&echoed, b"tail");
+        let _ = client.write_all(b"y");
+        assert!(
+            !second_payload_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("echo result"),
+            "deleted user's existing SOCKS relay should stop forwarding new payload"
+        );
+
         drop(client);
 
         server_thread
@@ -979,8 +1000,27 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].user_uuid, "user-a");
         assert_eq!(records[0].user_id, Some(1));
-        assert_eq!(records[0].upload, 4);
-        assert_eq!(records[0].download, 4);
+        assert_eq!(records[0].upload, 1);
+        assert_eq!(records[0].download, 1);
+    }
+
+    #[test]
+    fn deleting_last_socks_user_does_not_enable_no_auth_proxy() {
+        let server = server();
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec!["user-a".to_string()],
+            ..CoreUserDelta::default()
+        });
+        assert_eq!(result.deleted, 1);
+
+        let mut stream = MemoryStream::new(vec![0x05, 0x01, 0x00]);
+        let error = server
+            .read_request(&mut stream)
+            .expect_err("auth should still be required after deleting all users");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(stream.output, vec![0x05, 0xff]);
     }
 
     #[test]
