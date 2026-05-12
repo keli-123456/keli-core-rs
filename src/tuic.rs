@@ -458,7 +458,9 @@ impl TuicServer {
 
         if let Some(outbound) = outbound {
             if let Some(limiter) = bandwidth.as_deref() {
-                limiter.wait_for(packet.payload.len());
+                if !limiter.wait_for(packet.payload.len()) {
+                    return Ok(());
+                }
             }
             match send_udp_outbound_tokio(
                 outbound,
@@ -533,6 +535,7 @@ impl TuicServer {
                 sessions,
                 packet.assoc_id,
                 target_addr,
+                bandwidth.clone(),
                 reply_mode,
                 client_ip,
             )
@@ -541,7 +544,9 @@ impl TuicServer {
             return Ok(());
         }
         if let Some(limiter) = bandwidth.as_deref() {
-            limiter.wait_for(packet.payload.len());
+            if !limiter.wait_for(packet.payload.len()) {
+                return Ok(());
+            }
         }
         session.socket.send_to(&packet.payload, target_addr).await?;
         self.traffic.add_with_user_id(
@@ -563,6 +568,7 @@ impl TuicServer {
         sessions: &Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
         assoc_id: u16,
         target_addr: SocketAddr,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
         reply_mode: UdpReplyMode,
         client_ip: IpAddr,
     ) -> io::Result<Arc<UdpRelaySession>> {
@@ -599,9 +605,11 @@ impl TuicServer {
         let node_tag = self.config.node_tag.clone();
         let user_uuid = user_uuid.to_string();
         let traffic = self.traffic.clone();
+        let bandwidth = bandwidth.clone();
         tokio::spawn(async move {
             let _ = receive_udp_replies(
-                assoc_id, receiver, connection, node_tag, user_uuid, user_id, traffic, client_ip,
+                assoc_id, receiver, connection, node_tag, user_uuid, user_id, traffic, bandwidth,
+                client_ip,
             )
             .await;
         });
@@ -756,6 +764,7 @@ async fn receive_udp_replies(
     user_uuid: String,
     user_id: u64,
     traffic: SharedTrafficRegistry,
+    bandwidth: Option<Arc<BandwidthLimiter>>,
     client_ip: IpAddr,
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; UDP_PACKET_BUFFER_SIZE];
@@ -769,6 +778,11 @@ async fn receive_udp_replies(
             _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
         };
         let (read, peer) = result?;
+        if let Some(limiter) = bandwidth.as_deref() {
+            if !limiter.wait_for(read) {
+                return Ok(());
+            }
+        }
         let packet_id = session.next_packet_id.fetch_add(1, Ordering::Relaxed);
         let target = socket_addr_to_target(&peer);
         let command = encode_udp_packet(assoc_id, packet_id, 1, 0, Some(&target), &buffer[..read])?;
@@ -819,7 +833,10 @@ async fn relay_streams(
                 return Ok::<u64, io::Error>(total);
             };
             if let Some(limiter) = bandwidth.as_deref() {
-                limiter.wait_for(read);
+                if !limiter.wait_for(read) {
+                    let _ = remote_write.shutdown().await;
+                    return Ok::<u64, io::Error>(total);
+                }
             }
             remote_write.write_all(&buffer[..read]).await?;
             total = total.saturating_add(read as u64);
