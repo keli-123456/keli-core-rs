@@ -1,5 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::user::CoreUser;
+use crate::user::{CoreUser, CoreUserDelta};
 
 const USER_LIMIT_SHARDS: usize = 64;
 
@@ -146,6 +146,28 @@ impl UserSessionTracker {
             .map(UserSessionState::device_count)
             .unwrap_or(0)
     }
+
+    pub fn revoke_users(&self, user_uuids: &[String]) {
+        for user_uuid in user_uuids {
+            user_session_shard(&self.active, user_uuid)
+                .lock()
+                .expect("user session lock poisoned")
+                .remove(user_uuid);
+        }
+    }
+
+    pub fn sync_users(&self, users: &[CoreUser]) {
+        let active_uuids = users
+            .iter()
+            .map(|user| user.uuid.as_str())
+            .collect::<HashSet<_>>();
+        for shard in self.active.iter() {
+            shard
+                .lock()
+                .expect("user session lock poisoned")
+                .retain(|uuid, _| active_uuids.contains(uuid.as_str()));
+        }
+    }
 }
 
 impl UserSessionState {
@@ -209,6 +231,22 @@ impl UserBandwidthLimiters {
         }
     }
 
+    pub fn sync_full_users(&self, users: &[CoreUser]) {
+        let active_uuids = users
+            .iter()
+            .map(|user| user.uuid.as_str())
+            .collect::<HashSet<_>>();
+        for shard in self.limiters.iter() {
+            let limiters = shard.lock().expect("user bandwidth limiter lock poisoned");
+            for (uuid, limiter) in limiters.iter() {
+                if !active_uuids.contains(uuid.as_str()) {
+                    limiter.revoke();
+                }
+            }
+        }
+        self.sync_users(users);
+    }
+
     pub fn revoke_users(&self, user_uuids: &[String]) {
         for user_uuid in user_uuids {
             let limiters = bandwidth_limiter_shard(&self.limiters, user_uuid)
@@ -218,6 +256,22 @@ impl UserBandwidthLimiters {
                 limiter.revoke();
             }
         }
+    }
+}
+
+pub fn sync_user_limit_delta(
+    bandwidth: &UserBandwidthLimiters,
+    sessions: &UserSessionTracker,
+    delta: &CoreUserDelta,
+) {
+    if let Some(full) = delta.full.as_ref() {
+        bandwidth.sync_full_users(full);
+        sessions.sync_users(full);
+    } else {
+        bandwidth.revoke_users(&delta.deleted);
+        sessions.revoke_users(&delta.deleted);
+        bandwidth.sync_users(&delta.added);
+        bandwidth.sync_users(&delta.updated);
     }
 }
 
@@ -561,6 +615,61 @@ mod tests {
         limiters.sync_users(&[user]);
 
         assert_eq!(limiter.bytes_per_second(), 0);
+    }
+
+    #[test]
+    fn deleted_user_clears_active_device_sessions() {
+        let tracker = UserSessionTracker::default();
+        let user = user(1);
+        let guard = tracker
+            .try_acquire(Some(&user))
+            .expect("session acquire")
+            .expect("tracked session");
+
+        tracker.revoke_users(std::slice::from_ref(&user.uuid));
+
+        assert_eq!(tracker.active_count(&user.uuid), 0);
+        drop(guard);
+        assert_eq!(tracker.active_count(&user.uuid), 0);
+    }
+
+    #[test]
+    fn full_user_snapshot_prunes_removed_sessions() {
+        let tracker = UserSessionTracker::default();
+        let user_a = user(1);
+        let mut user_b = user(1);
+        user_b.uuid = "user-b".to_string();
+        let guard_a = tracker
+            .try_acquire(Some(&user_a))
+            .expect("session a")
+            .expect("guard a");
+        let guard_b = tracker
+            .try_acquire(Some(&user_b))
+            .expect("session b")
+            .expect("guard b");
+
+        tracker.sync_users(std::slice::from_ref(&user_b));
+
+        assert_eq!(tracker.active_count(&user_a.uuid), 0);
+        assert_eq!(tracker.active_count(&user_b.uuid), 1);
+        drop(guard_a);
+        drop(guard_b);
+        assert_eq!(tracker.active_count(&user_b.uuid), 0);
+    }
+
+    #[test]
+    fn full_user_snapshot_revokes_removed_bandwidth_limiters() {
+        let limiters = UserBandwidthLimiters::default();
+        let user_a = user(0);
+        let mut user_b = user(0);
+        user_b.uuid = "user-b".to_string();
+        let limiter_a = limiters.limiter_for(Some(&user_a)).expect("limiter a");
+        let limiter_b = limiters.limiter_for(Some(&user_b)).expect("limiter b");
+
+        limiters.sync_full_users(std::slice::from_ref(&user_b));
+
+        assert!(limiter_a.is_revoked());
+        assert!(!limiter_b.is_revoked());
     }
 
     #[test]

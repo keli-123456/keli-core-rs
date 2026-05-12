@@ -11,7 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
 use crate::limits::{
-    BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
+    sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard,
+    UserSessionTracker,
 };
 use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 use crate::socks5::SocksTarget;
@@ -143,7 +144,7 @@ impl TuicServer {
     }
 
     pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
-        sync_delta_bandwidth(&self.bandwidth, delta);
+        sync_delta_bandwidth(&self.bandwidth, &self.sessions, delta);
         let mut current = self.users.write().expect("tuic users lock poisoned");
         apply_user_delta_to_keyed_map(&mut current, delta, |user| {
             parse_uuid_bytes(&user.uuid).ok()
@@ -627,14 +628,12 @@ impl TuicServer {
     }
 }
 
-fn sync_delta_bandwidth(bandwidth: &UserBandwidthLimiters, delta: &CoreUserDelta) {
-    if let Some(full) = delta.full.as_ref() {
-        bandwidth.sync_users(full);
-    } else {
-        bandwidth.revoke_users(&delta.deleted);
-        bandwidth.sync_users(&delta.added);
-        bandwidth.sync_users(&delta.updated);
-    }
+fn sync_delta_bandwidth(
+    bandwidth: &UserBandwidthLimiters,
+    sessions: &UserSessionTracker,
+    delta: &CoreUserDelta,
+) {
+    sync_user_limit_delta(bandwidth, sessions, delta);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -7,7 +7,8 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 
 use crate::limits::{
-    BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
+    sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard,
+    UserSessionTracker,
 };
 use crate::stream::{copy_count_best_effort_limited, relay_tcp_streams_limited};
 use crate::traffic::{SharedTrafficRegistry, TrafficDelta, TrafficRegistry};
@@ -124,7 +125,7 @@ impl HttpProxyServer {
     }
 
     pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
-        sync_delta_bandwidth(&self.bandwidth, delta);
+        sync_delta_bandwidth(&self.bandwidth, &self.sessions, delta);
         self.users.apply_uuid_delta(delta)
     }
 
@@ -340,14 +341,12 @@ impl HttpProxyServer {
     }
 }
 
-fn sync_delta_bandwidth(bandwidth: &UserBandwidthLimiters, delta: &CoreUserDelta) {
-    if let Some(full) = delta.full.as_ref() {
-        bandwidth.sync_users(full);
-    } else {
-        bandwidth.revoke_users(&delta.deleted);
-        bandwidth.sync_users(&delta.added);
-        bandwidth.sync_users(&delta.updated);
-    }
+fn sync_delta_bandwidth(
+    bandwidth: &UserBandwidthLimiters,
+    sessions: &UserSessionTracker,
+    delta: &CoreUserDelta,
+) {
+    sync_user_limit_delta(bandwidth, sessions, delta);
 }
 
 fn connect_target(target: &HttpTarget, timeout: Duration) -> io::Result<TcpStream> {

@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::limits::{
-    BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
+    sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard,
+    UserSessionTracker,
 };
 use crate::outbound::recv_udp_response;
 use crate::stream::relay_tcp_streams_limited;
@@ -165,7 +166,7 @@ impl Socks5Server {
     }
 
     pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
-        sync_delta_bandwidth(&self.bandwidth, delta);
+        sync_delta_bandwidth(&self.bandwidth, &self.sessions, delta);
         self.users.apply_uuid_delta(delta)
     }
 
@@ -477,14 +478,12 @@ impl Socks5Server {
     }
 }
 
-fn sync_delta_bandwidth(bandwidth: &UserBandwidthLimiters, delta: &CoreUserDelta) {
-    if let Some(full) = delta.full.as_ref() {
-        bandwidth.sync_users(full);
-    } else {
-        bandwidth.revoke_users(&delta.deleted);
-        bandwidth.sync_users(&delta.added);
-        bandwidth.sync_users(&delta.updated);
-    }
+fn sync_delta_bandwidth(
+    bandwidth: &UserBandwidthLimiters,
+    sessions: &UserSessionTracker,
+    delta: &CoreUserDelta,
+) {
+    sync_user_limit_delta(bandwidth, sessions, delta);
 }
 
 fn udp_bind_addr(control_addr: SocketAddr) -> SocketAddr {
@@ -950,6 +949,29 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn apply_user_delta_delete_clears_socks_device_sessions() {
+        let server = server();
+        let mut tracked = user();
+        tracked.device_limit = 1;
+        let guard = server
+            .sessions
+            .try_acquire(Some(&tracked))
+            .expect("session acquire")
+            .expect("tracked session");
+        assert_eq!(server.sessions.active_count(&tracked.uuid), 1);
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![tracked.uuid.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.deleted, 1);
+        assert_eq!(server.sessions.active_count(&tracked.uuid), 0);
+        drop(guard);
+        assert_eq!(server.sessions.active_count(&tracked.uuid), 0);
     }
 
     #[test]

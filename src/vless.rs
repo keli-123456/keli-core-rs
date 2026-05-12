@@ -19,7 +19,8 @@ use crate::grpc::{connect_grpc_client, GrpcClientStream};
 use crate::http2::{connect_http2_client, local_bridge_for_http2};
 use crate::httpupgrade::connect_httpupgrade_client;
 use crate::limits::{
-    BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
+    sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard,
+    UserSessionTracker,
 };
 use crate::outbound::recv_udp_response;
 use crate::quic::connect_quic_client_stream;
@@ -391,7 +392,7 @@ impl VlessServer {
     }
 
     pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
-        sync_delta_bandwidth(&self.bandwidth, delta);
+        sync_delta_bandwidth(&self.bandwidth, &self.sessions, delta);
         self.users
             .apply_keyed_delta(delta, |user| compact_uuid(&user.uuid))
     }
@@ -1033,14 +1034,12 @@ impl VlessServer {
     }
 }
 
-fn sync_delta_bandwidth(bandwidth: &UserBandwidthLimiters, delta: &CoreUserDelta) {
-    if let Some(full) = delta.full.as_ref() {
-        bandwidth.sync_users(full);
-    } else {
-        bandwidth.revoke_users(&delta.deleted);
-        bandwidth.sync_users(&delta.added);
-        bandwidth.sync_users(&delta.updated);
-    }
+fn sync_delta_bandwidth(
+    bandwidth: &UserBandwidthLimiters,
+    sessions: &UserSessionTracker,
+    delta: &CoreUserDelta,
+) {
+    sync_user_limit_delta(bandwidth, sessions, delta);
 }
 
 impl VlessUdpRelayState {
