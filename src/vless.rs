@@ -12,6 +12,7 @@ use rustls::{
     ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
     StreamOwned,
 };
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::config::{outbound_transport_network, OutboundConfig, OutboundTlsConfig};
 use crate::grpc::{connect_grpc_client, GrpcClientStream};
@@ -36,7 +37,8 @@ use crate::websocket::{
     WebSocketClientStream,
 };
 use crate::{
-    connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
+    connect_tcp_outbound, connect_tcp_outbound_tokio, route_protocol_labels, send_udp_outbound,
+    send_udp_outbound_tokio, RouteDecision, RouteMatcher,
 };
 
 const VERSION: u8 = 0x00;
@@ -88,6 +90,14 @@ enum VlessCommand {
 struct VlessUdpRelayState {
     ipv4: Option<UdpSocket>,
     ipv6: Option<UdpSocket>,
+    target: Option<SocksTarget>,
+    target_addr: Option<SocketAddr>,
+    timeout: Duration,
+}
+
+struct AsyncVlessUdpRelayState {
+    ipv4: Option<tokio::net::UdpSocket>,
+    ipv6: Option<tokio::net::UdpSocket>,
     target: Option<SocksTarget>,
     target_addr: Option<SocketAddr>,
     timeout: Duration,
@@ -165,6 +175,61 @@ impl VlessServer {
             };
         client.write_all(&[VERSION, 0x00])?;
         self.relay(client, remote, request, bandwidth)
+    }
+
+    pub async fn handle_tcp_client_async(
+        &self,
+        mut client: tokio::net::TcpStream,
+    ) -> io::Result<()> {
+        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        let mut request = self.read_request_async(&mut client).await?;
+        request.client_ip = client_ip;
+        let user = self.request_user(&request);
+        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
+        if request.command == VlessCommand::Udp {
+            client.write_all(&[VERSION, 0x00]).await?;
+            return self
+                .relay_udp_stream_async(client, request, bandwidth)
+                .await;
+        }
+        if request.flow == FLOW_XTLS_RPRX_VISION {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "vless vision requires the tls handler",
+            ));
+        }
+        let remote =
+            match self
+                .router
+                .decide_target(&request.target.host, request.target.port, "tcp")
+            {
+                RouteDecision::Direct => {
+                    connect_target_async(&request.target, self.config.connect_timeout).await?
+                }
+                RouteDecision::Outbound(outbound) => {
+                    connect_tcp_outbound_tokio(
+                        &outbound,
+                        &request.target,
+                        self.config.connect_timeout,
+                    )
+                    .await?
+                }
+                RouteDecision::Block => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "target blocked by route",
+                    ));
+                }
+                RouteDecision::UnsupportedOutbound(tag) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("outbound route {tag} is not implemented"),
+                    ));
+                }
+            };
+        client.write_all(&[VERSION, 0x00]).await?;
+        self.relay_async(client, remote, request, bandwidth).await
     }
 
     pub fn handle_websocket_client(&self, client: TcpStream, path: Option<&str>) -> io::Result<()> {
@@ -382,6 +447,62 @@ impl VlessServer {
         })
     }
 
+    async fn read_request_async<R>(&self, stream: &mut R) -> io::Result<VlessRequest>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let version = read_u8_async(stream).await?;
+        if version != VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported vless version",
+            ));
+        }
+
+        let mut uuid = [0u8; 16];
+        stream.read_exact(&mut uuid).await?;
+        let user_key = format_uuid_compact(&uuid);
+        let Some(user) = self.users.get(&user_key) else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unknown vless user",
+            ));
+        };
+
+        let flow = self.read_addon_flow_async(stream).await?;
+        self.validate_request_flow(&flow)?;
+
+        let command = read_u8_async(stream).await?;
+        let command = match command {
+            COMMAND_TCP => VlessCommand::Tcp,
+            COMMAND_UDP => VlessCommand::Udp,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "only vless tcp and udp commands are supported",
+                ));
+            }
+        };
+        if command == VlessCommand::Udp && !flow.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "vless udp command does not support flow",
+            ));
+        }
+
+        let target = read_vless_target_async(stream).await?;
+
+        Ok(VlessRequest {
+            command,
+            user_key,
+            user_uuid: user.uuid.clone(),
+            user_id: uuid,
+            flow,
+            target,
+            client_ip: None,
+        })
+    }
+
     fn read_addon_flow<T>(&self, stream: &mut T) -> io::Result<String>
     where
         T: Read,
@@ -392,6 +513,19 @@ impl VlessServer {
         }
         let mut addon = vec![0u8; usize::from(addon_len)];
         stream.read_exact(&mut addon)?;
+        parse_addon_flow(&addon)
+    }
+
+    async fn read_addon_flow_async<R>(&self, stream: &mut R) -> io::Result<String>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let addon_len = read_u8_async(stream).await?;
+        if addon_len == 0 {
+            return Ok(String::new());
+        }
+        let mut addon = vec![0u8; usize::from(addon_len)];
+        stream.read_exact(&mut addon).await?;
         parse_addon_flow(&addon)
     }
 
@@ -427,6 +561,27 @@ impl VlessServer {
         } else {
             relay_tcp_streams_limited(client, remote, bandwidth)?
         };
+        self.traffic
+            .lock()
+            .expect("traffic registry lock poisoned")
+            .add_with_ip(
+                self.config.node_tag.clone(),
+                request.user_uuid,
+                upload,
+                download,
+                request.client_ip,
+            );
+        Ok(())
+    }
+
+    async fn relay_async(
+        &self,
+        client: tokio::net::TcpStream,
+        remote: tokio::net::TcpStream,
+        request: VlessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()> {
+        let (upload, download) = relay_tcp_streams_async(client, remote, bandwidth).await?;
         self.traffic
             .lock()
             .expect("traffic registry lock poisoned")
@@ -568,6 +723,43 @@ impl VlessServer {
         result
     }
 
+    async fn relay_udp_stream_async(
+        &self,
+        mut stream: tokio::net::TcpStream,
+        request: VlessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()> {
+        let mut state = AsyncVlessUdpRelayState::new(self.config.connect_timeout);
+        let mut upload = 0u64;
+        let mut download = 0u64;
+        let result = loop {
+            match read_vless_udp_payload_async(&mut stream).await {
+                Ok(payload) => {
+                    match self
+                        .forward_udp_payload_async(
+                            &mut state,
+                            &mut stream,
+                            &request.target,
+                            &payload,
+                            bandwidth.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok((sent, received)) => {
+                            upload = upload.saturating_add(sent);
+                            download = download.saturating_add(received);
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+                Err(error) if is_stream_closed(&error) => break Ok(()),
+                Err(error) => break Err(error),
+            }
+        };
+        self.record_traffic(request.user_uuid, upload, download, request.client_ip);
+        result
+    }
+
     fn relay_udp_split<R, W>(
         &self,
         mut reader: R,
@@ -679,6 +871,86 @@ impl VlessServer {
         Ok((payload.len() as u64, download))
     }
 
+    async fn forward_udp_payload_async<W>(
+        &self,
+        state: &mut AsyncVlessUdpRelayState,
+        writer: &mut W,
+        target: &SocksTarget,
+        payload: &[u8],
+        bandwidth: Option<&BandwidthLimiter>,
+    ) -> io::Result<(u64, u64)>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let protocol_labels = route_protocol_labels("udp", payload);
+        let decision = self
+            .router
+            .decide_target(&target.host, target.port, &protocol_labels);
+        let outbound = match &decision {
+            RouteDecision::Direct => None,
+            RouteDecision::Outbound(outbound) => Some(outbound),
+            RouteDecision::Block => return Ok((0, 0)),
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
+
+        if let Some(limiter) = bandwidth {
+            limiter.wait_for_async(payload.len()).await;
+        }
+
+        if let Some(outbound) = outbound {
+            return match send_udp_outbound_tokio(
+                outbound,
+                target,
+                payload,
+                self.config.connect_timeout,
+            )
+            .await
+            {
+                Ok((_, response)) => {
+                    write_vless_udp_payload_async(writer, &response).await?;
+                    Ok((payload.len() as u64, response.len() as u64))
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    Ok((payload.len() as u64, 0))
+                }
+                Err(error) => Err(error),
+            };
+        }
+
+        let remote_addr = state.remote_addr_for(target).await?;
+        let timeout = state.timeout;
+        let udp = state.socket_for(remote_addr).await?;
+        udp.send_to(payload, remote_addr).await?;
+        let mut response = vec![0u8; MAX_UDP_PACKET_SIZE];
+        let download = match recv_udp_response_async(udp, &mut response, timeout).await {
+            Ok((read, _)) => {
+                write_vless_udp_payload_async(writer, &response[..read]).await?;
+                read as u64
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                0
+            }
+            Err(error) => return Err(error),
+        };
+
+        Ok((payload.len() as u64, download))
+    }
+
     fn record_traffic(
         &self,
         user_uuid: String,
@@ -755,6 +1027,43 @@ impl VlessUdpRelayState {
     }
 }
 
+impl AsyncVlessUdpRelayState {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            ipv4: None,
+            ipv6: None,
+            target: None,
+            target_addr: None,
+            timeout,
+        }
+    }
+
+    async fn remote_addr_for(&mut self, target: &SocksTarget) -> io::Result<SocketAddr> {
+        if self.target.as_ref() == Some(target) {
+            if let Some(target_addr) = self.target_addr {
+                return Ok(target_addr);
+            }
+        }
+        let target_addr = resolve_udp_target_async(target).await?;
+        self.target = Some(target.clone());
+        self.target_addr = Some(target_addr);
+        Ok(target_addr)
+    }
+
+    async fn socket_for(&mut self, remote: SocketAddr) -> io::Result<&tokio::net::UdpSocket> {
+        let slot = if remote.is_ipv4() {
+            &mut self.ipv4
+        } else {
+            &mut self.ipv6
+        };
+        if slot.is_none() {
+            let socket = tokio::net::UdpSocket::bind(udp_bind_addr_for_remote(remote)).await?;
+            *slot = Some(socket);
+        }
+        Ok(slot.as_ref().expect("udp socket initialized"))
+    }
+}
+
 fn read_vless_target<R: Read>(reader: &mut R) -> io::Result<SocksTarget> {
     let mut port = [0u8; 2];
     reader.read_exact(&mut port)?;
@@ -784,8 +1093,47 @@ fn read_vless_target<R: Read>(reader: &mut R) -> io::Result<SocksTarget> {
     Ok(SocksTarget { host, port })
 }
 
+async fn read_vless_target_async<R>(reader: &mut R) -> io::Result<SocksTarget>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut port = [0u8; 2];
+    reader.read_exact(&mut port).await?;
+    let port = u16::from_be_bytes(port);
+    let host = match read_u8_async(reader).await? {
+        ATYP_IPV4 => {
+            let mut bytes = [0u8; 4];
+            reader.read_exact(&mut bytes).await?;
+            Ipv4Addr::from(bytes).to_string()
+        }
+        ATYP_DOMAIN => {
+            let len = read_u8_async(reader).await?;
+            read_string_async(reader, usize::from(len)).await?
+        }
+        ATYP_IPV6 => {
+            let mut bytes = [0u8; 16];
+            reader.read_exact(&mut bytes).await?;
+            Ipv6Addr::from(bytes).to_string()
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported vless address type",
+            ));
+        }
+    };
+    Ok(SocksTarget { host, port })
+}
+
 fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStream> {
     crate::dns::connect_tcp(&target.host, target.port, timeout)
+}
+
+async fn connect_target_async(
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<tokio::net::TcpStream> {
+    crate::dns::connect_tcp_tokio(&target.host, target.port, timeout).await
 }
 
 pub(crate) fn connect_vless_tcp_outbound(
@@ -1235,12 +1583,28 @@ fn resolve_udp_target(target: &SocksTarget) -> io::Result<SocketAddr> {
     crate::dns::resolve_socket_addr(&target.host, target.port, Duration::from_secs(5))
 }
 
+async fn resolve_udp_target_async(target: &SocksTarget) -> io::Result<SocketAddr> {
+    crate::dns::resolve_socket_addr_tokio(&target.host, target.port, Duration::from_secs(5)).await
+}
+
 fn read_vless_udp_payload<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     let mut len = [0u8; 2];
     reader.read_exact(&mut len)?;
     let len = u16::from_be_bytes(len) as usize;
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload)?;
+    Ok(payload)
+}
+
+async fn read_vless_udp_payload_async<R>(reader: &mut R) -> io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut len = [0u8; 2];
+    reader.read_exact(&mut len).await?;
+    let len = u16::from_be_bytes(len) as usize;
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload).await?;
     Ok(payload)
 }
 
@@ -1253,6 +1617,49 @@ fn write_vless_udp_payload<W: Write>(writer: &mut W, payload: &[u8]) -> io::Resu
     }
     writer.write_all(&(payload.len() as u16).to_be_bytes())?;
     writer.write_all(payload)
+}
+
+async fn write_vless_udp_payload_async<W>(writer: &mut W, payload: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if payload.len() > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "vless udp payload is too large",
+        ));
+    }
+    writer
+        .write_all(&(payload.len() as u16).to_be_bytes())
+        .await?;
+    writer.write_all(payload).await
+}
+
+async fn recv_udp_response_async(
+    udp: &tokio::net::UdpSocket,
+    response: &mut [u8],
+    timeout: Duration,
+) -> io::Result<(usize, SocketAddr)> {
+    let mut resets = 0usize;
+    loop {
+        match tokio::time::timeout(timeout, udp.recv_from(response)).await {
+            Ok(Ok(result)) => return Ok(result),
+            Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionReset => {
+                resets += 1;
+                if resets <= 256 {
+                    continue;
+                }
+                return Err(error);
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "udp response timed out",
+                ));
+            }
+        }
+    }
 }
 
 fn relay_plain_to_tls(
@@ -1647,6 +2054,49 @@ fn is_stream_closed(error: &io::Error) -> bool {
     )
 }
 
+async fn relay_tcp_streams_async(
+    client: tokio::net::TcpStream,
+    remote: tokio::net::TcpStream,
+    limiter: Option<Arc<BandwidthLimiter>>,
+) -> io::Result<(u64, u64)> {
+    let (mut client_read, mut client_write) = client.into_split();
+    let (mut remote_read, mut remote_write) = remote.into_split();
+    let upload_limiter = limiter.clone();
+    let upload = async {
+        let mut total = 0u64;
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            let read = client_read.read(&mut buffer).await?;
+            if read == 0 {
+                let _ = remote_write.shutdown().await;
+                return Ok::<u64, io::Error>(total);
+            }
+            if let Some(limiter) = upload_limiter.as_deref() {
+                limiter.wait_for_async(read).await;
+            }
+            remote_write.write_all(&buffer[..read]).await?;
+            total = total.saturating_add(read as u64);
+        }
+    };
+    let download = async {
+        let mut total = 0u64;
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            let read = remote_read.read(&mut buffer).await?;
+            if read == 0 {
+                let _ = client_write.shutdown().await;
+                return Ok::<u64, io::Error>(total);
+            }
+            if let Some(limiter) = limiter.as_deref() {
+                limiter.wait_for_async(read).await;
+            }
+            client_write.write_all(&buffer[..read]).await?;
+            total = total.saturating_add(read as u64);
+        }
+    };
+    tokio::try_join!(upload, download)
+}
+
 fn relay_vision_tcp_streams(
     client: TcpStream,
     remote: TcpStream,
@@ -1802,9 +2252,28 @@ fn read_u8<R: Read>(reader: &mut R) -> io::Result<u8> {
     Ok(byte[0])
 }
 
+async fn read_u8_async<R>(reader: &mut R) -> io::Result<u8>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut byte = [0u8; 1];
+    reader.read_exact(&mut byte).await?;
+    Ok(byte[0])
+}
+
 fn read_string<R: Read>(reader: &mut R, len: usize) -> io::Result<String> {
     let mut bytes = vec![0u8; len];
     reader.read_exact(&mut bytes)?;
+    String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8"))
+}
+
+async fn read_string_async<R>(reader: &mut R, len: usize) -> io::Result<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = vec![0u8; len];
+    reader.read_exact(&mut bytes).await?;
     String::from_utf8(bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8"))
 }
@@ -1947,6 +2416,7 @@ mod tests {
     use crate::vision::{VisionReader, VisionWriter};
     use crate::vless::{connect_vless_tcp_outbound, VlessServer, VlessServerConfig};
     use crate::websocket::{accept_websocket, accept_websocket_tls};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     struct MemoryStream {
         input: Cursor<Vec<u8>>,
@@ -1962,7 +2432,7 @@ mod tests {
 
     impl Read for MemoryStream {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            self.input.read(buf)
+            std::io::Read::read(&mut self.input, buf)
         }
     }
 
@@ -2819,6 +3289,67 @@ mod tests {
         assert_eq!(records[0].download, 8);
     }
 
+    #[tokio::test]
+    async fn proxies_async_tcp_and_records_user_traffic() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            for _ in 0..2 {
+                let mut bytes = [0u8; 4];
+                stream.read_exact(&mut bytes).expect("echo read");
+                stream.write_all(&bytes).expect("echo write");
+            }
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vless bind");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+        let server_clone = server.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("vless accept");
+            server_clone.handle_tcp_client_async(stream).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(vless_addr)
+            .await
+            .expect("client connect");
+        client
+            .write_all(&vless_request(echo_addr))
+            .await
+            .expect("client request");
+        let mut response = [0u8; 2];
+        client
+            .read_exact(&mut response)
+            .await
+            .expect("client response");
+        assert_eq!(response, [0x00, 0x00]);
+
+        client.write_all(b"ping").await.expect("client payload");
+        let mut echoed = [0u8; 4];
+        client.read_exact(&mut echoed).await.expect("client echo");
+        assert_eq!(&echoed, b"ping");
+        client.write_all(b"pong").await.expect("client payload");
+        let mut echoed = [0u8; 4];
+        client.read_exact(&mut echoed).await.expect("client echo");
+        assert_eq!(&echoed, b"pong");
+        drop(client);
+
+        server_task.await.expect("server task").expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|vless|1");
+        assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(records[0].upload, 8);
+        assert_eq!(records[0].download, 8);
+    }
+
     #[test]
     fn proxies_udp_and_records_user_traffic() {
         let echo = UdpSocket::bind("127.0.0.1:0").expect("echo bind");
@@ -2861,6 +3392,66 @@ mod tests {
             .join()
             .expect("server thread")
             .expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_tag, "panel|vless|1");
+        assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[tokio::test]
+    async fn proxies_async_udp_and_records_user_traffic() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let mut bytes = [0u8; 1024];
+            let (read, source) = echo.recv_from(&mut bytes).expect("echo read");
+            assert_eq!(&bytes[..read], b"ping");
+            echo.send_to(b"pong", source).expect("echo write");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vless bind");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+        let server_clone = server.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("vless accept");
+            server_clone.handle_tcp_client_async(stream).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(vless_addr)
+            .await
+            .expect("client connect");
+        client
+            .write_all(&vless_udp_request(echo_addr))
+            .await
+            .expect("client request");
+        let mut response = [0u8; 2];
+        client
+            .read_exact(&mut response)
+            .await
+            .expect("client response");
+        assert_eq!(response, [0x00, 0x00]);
+
+        client
+            .write_all(&vless_udp_payload(b"ping"))
+            .await
+            .expect("client udp packet");
+        let mut len = [0u8; 2];
+        client.read_exact(&mut len).await.expect("udp response len");
+        let mut payload = vec![0u8; u16::from_be_bytes(len) as usize];
+        client.read_exact(&mut payload).await.expect("udp response");
+        assert_eq!(payload, b"pong");
+        drop(client);
+
+        server_task.await.expect("server task").expect("serve once");
         echo_thread.join().expect("echo thread");
 
         let records = server.drain_traffic(1);

@@ -530,28 +530,43 @@ fn start_vless_server(
     listener.set_nonblocking(true)?;
     let addr = listener.local_addr()?;
     let handle = thread::spawn(move || {
-        while !stop.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let _ = stream.set_nonblocking(false);
-                    let _ = stream.set_nodelay(true);
-                    let server = server.clone();
-                    thread::spawn(move || {
-                        if let Err(error) = server.handle_tcp_client(stream) {
-                            eprintln!("bench vless server connection error: {error}");
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener)?;
+                while !stop.load(Ordering::SeqCst) {
+                    match tokio::time::timeout(Duration::from_millis(20), listener.accept()).await {
+                        Ok(Ok((stream, _))) => {
+                            let _ = stream.set_nodelay(true);
+                            let server = server.clone();
+                            tokio::spawn(async move {
+                                if let Err(error) = server.handle_tcp_client_async(stream).await {
+                                    if !is_expected_bench_disconnect(&error) {
+                                        eprintln!("bench vless server connection error: {error}");
+                                    }
+                                }
+                            });
                         }
-                    });
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => {}
+                    }
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(2));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        let _ = echo_addr;
-        Ok(())
+                let _ = echo_addr;
+                Ok(())
+            })
     });
     Ok((addr, handle))
+}
+
+fn is_expected_bench_disconnect(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+    )
 }
 
 fn run_vless_tcp_client(

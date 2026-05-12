@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1027,6 +1028,32 @@ fn start_vless_listener(
     let httpupgrade_host = inbound.transport.host.clone();
     let tls_acceptor = tls_acceptor_for(inbound)?;
     let runtime_server = server.clone();
+    if tls_acceptor.is_none() && network == "tcp" {
+        let join = spawn_async_tcp_accept_loop(
+            listener,
+            stop_for_thread,
+            workers_for_thread,
+            move |stream| {
+                let server = server.clone();
+                async move {
+                    let _ = server.handle_tcp_client_async(stream).await;
+                }
+            },
+        );
+
+        return Ok(ListenerHandle {
+            status: ListenerStatus {
+                tag: inbound.tag.clone(),
+                protocol: Protocol::Vless,
+                local_addr,
+            },
+            runtime: ListenerRuntime::Vless(runtime_server),
+            stop,
+            workers,
+            join: Some(join),
+        });
+    }
+
     let join = spawn_tcp_accept_loop(
         listener,
         stop_for_thread,
@@ -1498,8 +1525,36 @@ impl ConnectionWorkerGroup {
         }
     }
 
+    fn spawn_async<F>(&self, future: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if !self.state.acquire() {
+            return false;
+        }
+
+        let guard = ConnectionWorkerAsyncGuard {
+            state: Arc::clone(&self.state),
+        };
+        tokio::spawn(async move {
+            let _guard = guard;
+            future.await;
+        });
+        true
+    }
+
     fn join(&self) {
         self.state.wait_until_idle();
+    }
+}
+
+struct ConnectionWorkerAsyncGuard {
+    state: Arc<ConnectionWorkerGroupState>,
+}
+
+impl Drop for ConnectionWorkerAsyncGuard {
+    fn drop(&mut self) {
+        self.state.release();
     }
 }
 
@@ -1665,6 +1720,13 @@ where
     workers.spawn(task)
 }
 
+fn spawn_async_connection_worker<F>(workers: &ConnectionWorkerGroup, future: F) -> bool
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    workers.spawn_async(future)
+}
+
 fn spawn_tcp_accept_loop<F>(
     listener: TcpListener,
     stop: Arc<AtomicBool>,
@@ -1705,6 +1767,47 @@ where
             });
         })
         .expect("failed to spawn tcp accept thread")
+}
+
+fn spawn_async_tcp_accept_loop<F, Fut>(
+    listener: TcpListener,
+    stop: Arc<AtomicBool>,
+    workers: ConnectionWorkerGroup,
+    handler: F,
+) -> JoinHandle<()>
+where
+    F: Fn(tokio::net::TcpStream) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let handler = Arc::new(handler);
+    thread::Builder::new()
+        .name("keli-core-tcp-accept".to_string())
+        .spawn(move || {
+            let Ok(runtime) = tcp_accept_runtime() else {
+                return;
+            };
+            let _ = runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener)?;
+                while !stop.load(Ordering::SeqCst) {
+                    match tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
+                    {
+                        Ok(Ok((stream, _))) => {
+                            if stop.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let _ = stream.set_nodelay(true);
+                            let handler = Arc::clone(&handler);
+                            let future = handler(stream);
+                            spawn_async_connection_worker(&workers, future);
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_) => {}
+                    }
+                }
+                Ok::<(), io::Error>(())
+            });
+        })
+        .expect("failed to spawn async tcp accept thread")
 }
 
 fn tcp_accept_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
