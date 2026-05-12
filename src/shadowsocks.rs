@@ -191,6 +191,7 @@ impl ShadowsocksServer {
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
+        self.bandwidth.sync_users(&users);
         let mut current = self.users.write().expect("shadowsocks users lock poisoned");
         *current = active_user_list(&users);
     }

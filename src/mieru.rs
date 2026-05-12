@@ -317,6 +317,7 @@ impl MieruServer {
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
+        self.bandwidth.sync_users(&users);
         let mut current = self.users.write().expect("mieru users lock poisoned");
         *current = active_user_list(&users);
     }

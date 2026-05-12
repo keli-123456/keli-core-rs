@@ -385,6 +385,7 @@ impl VlessServer {
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
+        self.bandwidth.sync_users(&users);
         self.users
             .replace_keyed_users(users, |user| compact_uuid(&user.uuid));
     }
@@ -2745,6 +2746,22 @@ mod tests {
             .read_request(&mut new_stream)
             .expect("new user should authenticate");
         assert_eq!(request.user_uuid, "22222222-2222-2222-2222-222222222222");
+    }
+
+    #[test]
+    fn replace_users_updates_active_vless_bandwidth_limiter() {
+        let server = server();
+        let mut limited = user();
+        limited.speed_limit = 8;
+        let limiter = server
+            .bandwidth
+            .limiter_for(Some(&limited))
+            .expect("limited user");
+
+        limited.speed_limit = 16;
+        server.replace_users(vec![limited]);
+
+        assert_eq!(limiter.bytes_per_second(), 2 * 1024 * 1024);
     }
 
     #[test]

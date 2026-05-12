@@ -181,6 +181,7 @@ impl AnyTlsServer {
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
+        self.bandwidth.sync_users(&users);
         let mut current = self.users.write().expect("anytls users lock poisoned");
         *current = anytls_user_map(&users);
     }

@@ -165,6 +165,7 @@ impl Hysteria2Server {
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
+        self.bandwidth.sync_users(&users);
         self.users
             .replace_keyed_users(users, |user| user.credential().to_string());
     }

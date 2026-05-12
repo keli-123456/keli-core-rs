@@ -297,6 +297,7 @@ impl VmessServer {
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
         let users = valid_vmess_users(&users);
+        self.bandwidth.sync_users(&users);
         self.users.replace_keyed_users(users.clone(), |user| {
             vmess_user_key(user).expect("valid vmess user")
         });

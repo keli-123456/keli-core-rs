@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,7 +40,7 @@ pub struct UserSessionGuard {
 
 #[derive(Debug)]
 pub struct BandwidthLimiter {
-    bytes_per_second: u64,
+    bytes_per_second: AtomicU64,
     state: Mutex<BandwidthState>,
 }
 
@@ -170,27 +171,49 @@ impl UserSessionState {
 impl UserBandwidthLimiters {
     pub fn limiter_for(&self, user: Option<&CoreUser>) -> Option<Arc<BandwidthLimiter>> {
         let user = user?;
-        let bytes_per_second = speed_limit_mbps_to_bytes_per_second(user.speed_limit)?;
+        let bytes_per_second = speed_limit_mbps_to_bytes_per_second(user.speed_limit);
         let mut limiters = bandwidth_limiter_shard(&self.limiters, &user.uuid)
             .lock()
             .expect("user bandwidth limiter lock poisoned");
 
-        if let Some(limiter) = limiters.get(&user.uuid) {
-            if limiter.bytes_per_second() == bytes_per_second {
-                return Some(Arc::clone(limiter));
+        let Some(bytes_per_second) = bytes_per_second else {
+            if let Some(limiter) = limiters.get(&user.uuid) {
+                limiter.set_unlimited();
             }
+            return None;
+        };
+
+        if let Some(limiter) = limiters.get(&user.uuid) {
+            limiter.set_bytes_per_second(bytes_per_second);
+            return Some(Arc::clone(limiter));
         }
 
         let limiter = Arc::new(BandwidthLimiter::new(bytes_per_second));
         limiters.insert(user.uuid.clone(), Arc::clone(&limiter));
         Some(limiter)
     }
+
+    pub fn sync_users(&self, users: &[CoreUser]) {
+        for user in users {
+            let bytes_per_second = speed_limit_mbps_to_bytes_per_second(user.speed_limit);
+            let limiters = bandwidth_limiter_shard(&self.limiters, &user.uuid)
+                .lock()
+                .expect("user bandwidth limiter lock poisoned");
+            let Some(limiter) = limiters.get(&user.uuid) else {
+                continue;
+            };
+            match bytes_per_second {
+                Some(bytes_per_second) => limiter.set_bytes_per_second(bytes_per_second),
+                None => limiter.set_unlimited(),
+            }
+        }
+    }
 }
 
 impl BandwidthLimiter {
     pub fn new(bytes_per_second: u64) -> Self {
         Self {
-            bytes_per_second: bytes_per_second.max(1),
+            bytes_per_second: AtomicU64::new(bytes_per_second.max(1)),
             state: Mutex::new(BandwidthState {
                 tokens: 0.0,
                 last_refill: Instant::now(),
@@ -199,7 +222,16 @@ impl BandwidthLimiter {
     }
 
     pub fn bytes_per_second(&self) -> u64 {
+        self.bytes_per_second.load(Ordering::Relaxed)
+    }
+
+    fn set_bytes_per_second(&self, bytes_per_second: u64) {
         self.bytes_per_second
+            .store(bytes_per_second.max(1), Ordering::Relaxed);
+    }
+
+    fn set_unlimited(&self) {
+        self.bytes_per_second.store(0, Ordering::Relaxed);
     }
 
     pub fn wait_for(&self, bytes: usize) {
@@ -230,7 +262,11 @@ impl BandwidthLimiter {
 
     fn reserve_wait_duration(&self, bytes: usize) -> Option<Duration> {
         let requested = bytes as f64;
-        let rate = self.bytes_per_second as f64;
+        let bytes_per_second = self.bytes_per_second();
+        if bytes_per_second == 0 {
+            return None;
+        }
+        let rate = bytes_per_second as f64;
         let mut state = self.state.lock().expect("bandwidth limiter lock poisoned");
         let now = Instant::now();
         let elapsed = now.duration_since(state.last_refill).as_secs_f64();
@@ -410,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn bandwidth_limiter_is_reused_until_speed_changes() {
+    fn bandwidth_limiter_updates_existing_arc_when_speed_changes() {
         let limiters = UserBandwidthLimiters::default();
         let mut user = user(0);
         user.speed_limit = 8;
@@ -421,8 +457,39 @@ mod tests {
 
         user.speed_limit = 16;
         let third = limiters.limiter_for(Some(&user)).expect("third limiter");
-        assert!(!Arc::ptr_eq(&first, &third));
+        assert!(Arc::ptr_eq(&first, &third));
         assert_eq!(third.bytes_per_second(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn bandwidth_limiter_can_disable_existing_arc() {
+        let limiters = UserBandwidthLimiters::default();
+        let mut user = user(0);
+        user.speed_limit = 8;
+        let limiter = limiters.limiter_for(Some(&user)).expect("limited");
+
+        user.speed_limit = 0;
+
+        assert!(limiters.limiter_for(Some(&user)).is_none());
+        assert_eq!(limiter.bytes_per_second(), 0);
+    }
+
+    #[test]
+    fn sync_users_updates_active_bandwidth_limiter() {
+        let limiters = UserBandwidthLimiters::default();
+        let mut user = user(0);
+        user.speed_limit = 8;
+        let limiter = limiters.limiter_for(Some(&user)).expect("limited");
+
+        user.speed_limit = 32;
+        limiters.sync_users(&[user.clone()]);
+
+        assert_eq!(limiter.bytes_per_second(), 4 * 1024 * 1024);
+
+        user.speed_limit = 0;
+        limiters.sync_users(&[user]);
+
+        assert_eq!(limiter.bytes_per_second(), 0);
     }
 
     #[test]

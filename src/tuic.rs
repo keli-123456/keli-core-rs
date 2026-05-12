@@ -137,6 +137,7 @@ impl TuicServer {
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
+        self.bandwidth.sync_users(&users);
         let mut current = self.users.write().expect("tuic users lock poisoned");
         *current = tuic_user_map(&users);
     }

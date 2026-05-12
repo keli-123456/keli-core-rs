@@ -307,6 +307,7 @@ impl TrojanServer {
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
+        self.bandwidth.sync_users(&users);
         self.users
             .replace_keyed_users(users, |user| trojan_password_hash(user.credential()));
     }

@@ -157,6 +157,7 @@ impl Socks5Server {
     }
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
+        self.bandwidth.sync_users(&users);
         self.users.replace_uuid_users(users);
     }
 
