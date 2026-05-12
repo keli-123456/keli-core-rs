@@ -303,10 +303,25 @@ where
     let mut total = 0u64;
     let mut buffer = [0u8; 16 * 1024];
     loop {
-        let read = match reader.read(&mut buffer).await {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(_) => break,
+        if limiter.map(BandwidthLimiter::is_revoked).unwrap_or(false) {
+            break;
+        }
+        let read = match limiter {
+            Some(limiter) => {
+                tokio::select! {
+                    read = reader.read(&mut buffer) => match read {
+                        Ok(0) => break,
+                        Ok(read) => read,
+                        Err(_) => break,
+                    },
+                    _ = wait_for_limiter_revoke(limiter) => break,
+                }
+            }
+            None => match reader.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(_) => break,
+            },
         };
         if let Some(limiter) = limiter {
             if !limiter.wait_for_async(read).await {
@@ -320,6 +335,12 @@ where
     }
     let _ = writer.shutdown().await;
     total
+}
+
+async fn wait_for_limiter_revoke(limiter: &BandwidthLimiter) {
+    while !limiter.is_revoked() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 pub fn copy_count_best_effort<R, W>(reader: &mut R, writer: &mut W) -> u64
@@ -362,12 +383,18 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
-    use crate::limits::BandwidthLimiter;
+    use crate::limits::{BandwidthLimiter, UserBandwidthLimiters};
     use crate::stream::{
-        copy_count_best_effort_limited, join_native_blocking_relay, spawn_native_blocking_relay,
+        copy_count_best_effort_limited, join_native_blocking_relay, relay_tcp_streams_limited,
+        spawn_native_blocking_relay,
     };
+    use crate::user::CoreUser;
 
     #[test]
     fn limited_copy_still_counts_transferred_bytes() {
@@ -394,6 +421,55 @@ mod tests {
 
         assert_eq!(copied, 0);
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn async_tcp_relay_exits_when_user_limiter_is_revoked_while_idle() {
+        let client_listener = TcpListener::bind("127.0.0.1:0").expect("client bind");
+        let remote_listener = TcpListener::bind("127.0.0.1:0").expect("remote bind");
+        let client_addr = client_listener.local_addr().expect("client addr");
+        let remote_addr = remote_listener.local_addr().expect("remote addr");
+        let client_peer = thread::spawn(move || TcpStream::connect(client_addr).expect("client"));
+        let remote_peer = thread::spawn(move || TcpStream::connect(remote_addr).expect("remote"));
+        let (client, _) = client_listener.accept().expect("client accept");
+        let (remote, _) = remote_listener.accept().expect("remote accept");
+        let mut client_peer = client_peer.join().expect("client thread");
+        let mut remote_peer = remote_peer.join().expect("remote thread");
+        let limiters = UserBandwidthLimiters::default();
+        let user = CoreUser {
+            id: 1,
+            uuid: "user-a".to_string(),
+            password: None,
+            email: None,
+            speed_limit: 0,
+            device_limit: 0,
+        };
+        let limiter = limiters.limiter_for(Some(&user)).expect("limiter");
+        let (done_tx, done_rx) = mpsc::channel();
+        let relay = thread::spawn(move || {
+            let result = relay_tcp_streams_limited(client, remote, Some(limiter));
+            done_tx.send(result).expect("send relay result");
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        limiters.revoke_users(std::slice::from_ref(&user.uuid));
+
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("relay should exit after revoke")
+            .expect("relay result");
+        assert_eq!(result, (0, 0));
+        let _ = client_peer.write_all(b"x");
+        let mut byte = [0u8; 1];
+        client_peer
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("client timeout");
+        assert!(matches!(client_peer.read(&mut byte), Ok(0) | Err(_)));
+        remote_peer
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("remote timeout");
+        assert!(matches!(remote_peer.read(&mut byte), Ok(0) | Err(_)));
+        relay.join().expect("relay thread");
     }
 
     #[test]
