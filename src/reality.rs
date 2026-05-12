@@ -226,8 +226,12 @@ pub fn authenticate_reality_client_hello(
 
     let aead =
         Aes256Gcm::new_from_slice(&derived).map_err(|_| RealityAuthError::AuthenticationFailed)?;
-    let mut associated_data = raw_record.to_vec();
-    associated_data[hello.session_id_offset..hello.session_id_offset + 32].fill(0);
+    let mut associated_data = raw_record[5..5 + hello.handshake_message_len].to_vec();
+    let session_id_offset = hello
+        .session_id_offset
+        .checked_sub(5)
+        .ok_or_else(|| invalid("reality session id offset is invalid"))?;
+    associated_data[session_id_offset..session_id_offset + 32].fill(0);
     let plaintext = aead
         .decrypt(
             Nonce::from_slice(&hello.random[20..32]),
@@ -701,6 +705,7 @@ fn connect_dest(dest: &str, timeout: Duration) -> io::Result<TcpStream> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ParsedClientHello {
+    handshake_message_len: usize,
     random: [u8; 32],
     session_id: [u8; 32],
     session_id_offset: usize,
@@ -763,6 +768,7 @@ fn parse_client_hello(input: &[u8]) -> Result<ParsedClientHello, RealityAuthErro
     }
 
     Ok(ParsedClientHello {
+        handshake_message_len: 4 + handshake_len,
         random,
         session_id,
         session_id_offset,
@@ -1685,7 +1691,7 @@ mod tests {
                 Nonce::from_slice(&random[20..32]),
                 aes_gcm::aead::Payload {
                     msg: &plain,
-                    aad: &record,
+                    aad: &record[5..],
                 },
             )
             .expect("encrypt");
