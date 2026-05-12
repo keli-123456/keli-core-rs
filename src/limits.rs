@@ -1,5 +1,7 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -7,14 +9,19 @@ use std::time::{Duration, Instant};
 
 use crate::user::CoreUser;
 
-#[derive(Clone, Debug, Default)]
+const USER_LIMIT_SHARDS: usize = 64;
+
+type UserSessionShards = Arc<Vec<Mutex<HashMap<String, UserSessionState>>>>;
+type BandwidthLimiterShards = Arc<Vec<Mutex<HashMap<String, Arc<BandwidthLimiter>>>>>;
+
+#[derive(Clone, Debug)]
 pub struct UserSessionTracker {
-    active: Arc<Mutex<HashMap<String, UserSessionState>>>,
+    active: UserSessionShards,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct UserBandwidthLimiters {
-    limiters: Arc<Mutex<HashMap<String, Arc<BandwidthLimiter>>>>,
+    limiters: BandwidthLimiterShards,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,7 +34,7 @@ pub struct DeviceLimitExceeded {
 pub struct UserSessionGuard {
     user_uuid: String,
     key: UserSessionKey,
-    active: Arc<Mutex<HashMap<String, UserSessionState>>>,
+    active: UserSessionShards,
 }
 
 #[derive(Debug)]
@@ -54,6 +61,22 @@ enum UserSessionKey {
     Anonymous,
 }
 
+impl Default for UserSessionTracker {
+    fn default() -> Self {
+        Self {
+            active: sharded_hash_maps(),
+        }
+    }
+}
+
+impl Default for UserBandwidthLimiters {
+    fn default() -> Self {
+        Self {
+            limiters: sharded_hash_maps(),
+        }
+    }
+}
+
 impl UserSessionTracker {
     pub fn try_acquire(
         &self,
@@ -75,7 +98,9 @@ impl UserSessionTracker {
         }
 
         let limit = user.device_limit as usize;
-        let mut active = self.active.lock().expect("user session lock poisoned");
+        let mut active = user_session_shard(&self.active, &user.uuid)
+            .lock()
+            .expect("user session lock poisoned");
         let state = active.entry(user.uuid.clone()).or_default();
         let key = if let Some(ip) = client_ip {
             if let Some(count) = state.ips.get_mut(&ip) {
@@ -112,7 +137,7 @@ impl UserSessionTracker {
     }
 
     pub fn active_count(&self, user_uuid: &str) -> usize {
-        self.active
+        user_session_shard(&self.active, user_uuid)
             .lock()
             .expect("user session lock poisoned")
             .get(user_uuid)
@@ -146,8 +171,7 @@ impl UserBandwidthLimiters {
     pub fn limiter_for(&self, user: Option<&CoreUser>) -> Option<Arc<BandwidthLimiter>> {
         let user = user?;
         let bytes_per_second = speed_limit_mbps_to_bytes_per_second(user.speed_limit)?;
-        let mut limiters = self
-            .limiters
+        let mut limiters = bandwidth_limiter_shard(&self.limiters, &user.uuid)
             .lock()
             .expect("user bandwidth limiter lock poisoned");
 
@@ -249,7 +273,7 @@ impl std::error::Error for DeviceLimitExceeded {}
 
 impl Drop for UserSessionGuard {
     fn drop(&mut self) {
-        let Ok(mut active) = self.active.lock() else {
+        let Ok(mut active) = user_session_shard(&self.active, &self.user_uuid).lock() else {
             return;
         };
         if let Some(state) = active.get_mut(&self.user_uuid) {
@@ -268,9 +292,38 @@ fn speed_limit_mbps_to_bytes_per_second(mbps: u64) -> Option<u64> {
     Some(mbps.saturating_mul(1024 * 1024).saturating_div(8).max(1))
 }
 
+fn sharded_hash_maps<T>() -> Arc<Vec<Mutex<HashMap<String, T>>>> {
+    Arc::new(
+        (0..USER_LIMIT_SHARDS)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect(),
+    )
+}
+
+fn user_session_shard<'a>(
+    shards: &'a UserSessionShards,
+    user_uuid: &str,
+) -> &'a Mutex<HashMap<String, UserSessionState>> {
+    &shards[user_limit_shard_index(user_uuid)]
+}
+
+fn bandwidth_limiter_shard<'a>(
+    shards: &'a BandwidthLimiterShards,
+    user_uuid: &str,
+) -> &'a Mutex<HashMap<String, Arc<BandwidthLimiter>>> {
+    &shards[user_limit_shard_index(user_uuid)]
+}
+
+fn user_limit_shard_index(user_uuid: &str) -> usize {
+    let mut hasher = DefaultHasher::new();
+    user_uuid.hash(&mut hasher);
+    (hasher.finish() as usize) % USER_LIMIT_SHARDS
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::thread;
 
     use crate::limits::{
         speed_limit_mbps_to_bytes_per_second, UserBandwidthLimiters, UserSessionTracker,
@@ -370,5 +423,59 @@ mod tests {
         let third = limiters.limiter_for(Some(&user)).expect("third limiter");
         assert!(!Arc::ptr_eq(&first, &third));
         assert_eq!(third.bytes_per_second(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn session_tracker_accepts_concurrent_users() {
+        let tracker = UserSessionTracker::default();
+        let mut workers = Vec::new();
+
+        for index in 0..16 {
+            let tracker = tracker.clone();
+            workers.push(thread::spawn(move || {
+                let mut user = user(1);
+                user.uuid = format!("user-{index}");
+                tracker
+                    .try_acquire_for_ip(Some(&user), Some("198.51.100.7".parse().unwrap()))
+                    .expect("concurrent acquire")
+                    .expect("tracked guard")
+            }));
+        }
+
+        let guards = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("session worker should not panic"))
+            .collect::<Vec<_>>();
+        for index in 0..16 {
+            assert_eq!(tracker.active_count(&format!("user-{index}")), 1);
+        }
+
+        drop(guards);
+        for index in 0..16 {
+            assert_eq!(tracker.active_count(&format!("user-{index}")), 0);
+        }
+    }
+
+    #[test]
+    fn bandwidth_limiters_share_same_user_limiter_across_threads() {
+        let limiters = UserBandwidthLimiters::default();
+        let mut workers = Vec::new();
+
+        for _ in 0..16 {
+            let limiters = limiters.clone();
+            workers.push(thread::spawn(move || {
+                let mut user = user(0);
+                user.speed_limit = 8;
+                limiters.limiter_for(Some(&user)).expect("limiter")
+            }));
+        }
+
+        let limiters = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("limiter worker should not panic"))
+            .collect::<Vec<_>>();
+        for limiter in &limiters[1..] {
+            assert!(Arc::ptr_eq(&limiters[0], limiter));
+        }
     }
 }
