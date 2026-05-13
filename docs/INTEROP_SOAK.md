@@ -94,14 +94,26 @@ cargo run --release -- bench external-suite \
   --core vless-tcp-stream=127.0.0.1:29104 \
   --core vmess-tcp-stream=127.0.0.1:29105 \
   --streams 16 --requests 5000 --payload 1024 --repeats 3 --label go-xray-tcp --out runtime/bench/go-suite.json
+cargo run --release -- bench external-suite \
+  --commands hy2-stream,hy2-udp,tuic-stream,tuic-udp \
+  --core hy2-stream=127.0.0.1:29300 \
+  --core hy2-udp=127.0.0.1:29300 \
+  --core tuic-stream=127.0.0.1:29301 \
+  --core tuic-udp=127.0.0.1:29301 \
+  --cert ./bench.crt \
+  --server-name localhost \
+  --streams 16 --requests 5000 --payload 1024 --repeats 3 --label external-quic --out runtime/bench/external-quic.json
 cargo run --release -- bench compare --baseline runtime/bench/go-suite.json --candidate runtime/bench/rust-suite.json --out runtime/bench/go-vs-rust.json
 ```
 
 `external-suite` starts the local echo target itself and sends that target through the external
 core. It accepts one `--core command=HOST:PORT` mapping per command. The older `--vless-core`
-flag remains as a compatibility shortcut for `vless-tcp` and `vless-tcp-stream` only. All baselines
-must be produced on the same host with the same release/debug mode, stream count, request count,
-payload size, repeat count, and report schema (`keli-core-bench-suite-v1`).
+flag remains as a compatibility shortcut for `vless-tcp` and `vless-tcp-stream` only. External
+HY2/TUIC commands also require a trusted certificate with `--cert CERT.pem`; use
+`--cert command=CERT.pem` when each external inbound has a different certificate and
+`--server-name` when the certificate SAN is not `localhost`. All baselines must be produced on
+the same host with the same release/debug mode, stream count, request count, payload size, repeat
+count, and report schema (`keli-core-bench-suite-v1`).
 
 For Go/Xray TCP baselines, start the old core with one loopback inbound per protocol and use
 benchmark credential `11111111-1111-1111-1111-111111111111`. The latest Linux matrix used:
@@ -116,6 +128,18 @@ benchmark credential `11111111-1111-1111-1111-111111111111`. The latest Linux ma
 VMess interop note: Go/Xray waits for the first request body before sending the VMess response
 header. The Rust outbound bridge must therefore start upload before reading the response header.
 Reading the response header immediately after the request header can deadlock against Go/Xray.
+
+The current old Go/Xray fork in this workspace does not expose HY2/TUIC inbounds: the Xray module
+contains no `hysteria`/`tuic` protocol implementation, and test configs fail before startup. A
+fair HY2/TUIC Go baseline therefore needs a production Go `v2node`/`kelinode` binary or another
+old Go sidecar that actually supports these protocols. Once such a binary is started on loopback,
+the external QUIC command above can collect the report with the same Rust client and echo target.
+
+HY2/TUIC external harness smoke on the Linux host was verified by starting a temporary Rust
+`keli-core-rs` external core on `127.0.0.1:29300` and `127.0.0.1:29301`, then running
+`hy2-stream`, `hy2-udp`, `tuic-stream`, and `tuic-udp` through `external-suite`. The smoke used
+`2` streams, `5` requests, `256` byte payloads, and all four commands completed `10 / 10` requests
+with `0` errors and `0` retries.
 
 Recent Windows loopback release baseline for VLESS stream mode (`16` streams, `5000` requests
 per stream, `1024` byte payload, `3` repeats):

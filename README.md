@@ -134,6 +134,7 @@ cargo run -- bench tuic-tcp-stream --streams 8 --requests 1000 --payload 1024
 cargo run -- bench tuic-udp --streams 8 --requests 1000 --payload 1024
 cargo run -- bench suite --streams 8 --requests 1000 --payload 1024 --repeats 3 --out runtime/bench/rust-suite.json
 cargo run -- bench external-suite --vless-core 127.0.0.1:19080 --commands vless-tcp-stream --streams 8 --requests 1000 --payload 1024 --repeats 3 --label go-xray --out runtime/bench/go-suite.json
+cargo run -- bench external-suite --commands hy2-stream,hy2-udp,tuic-stream,tuic-udp --core hy2-stream=127.0.0.1:29300 --core hy2-udp=127.0.0.1:29300 --core tuic-stream=127.0.0.1:29301 --core tuic-udp=127.0.0.1:29301 --cert ./bench.crt --server-name localhost --streams 8 --requests 1000 --payload 1024 --label external-quic --out runtime/bench/external-quic.json
 cargo run -- bench compare --baseline runtime/bench/go-suite.json --candidate runtime/bench/rust-suite.json
 ```
 
@@ -183,10 +184,17 @@ outbound, then run:
 cargo run --release -- bench external-suite --vless-core 127.0.0.1:19080 --commands vless-tcp-stream --streams 16 --requests 5000 --payload 1024 --repeats 3 --label go-xray-vless --out runtime/bench/go-suite.json
 ```
 
-`external-suite` starts its own local echo target and sends the target address inside
-the VLESS request, so the external Go core should not need a special outbound beyond
-normal direct/freedom routing. External HY2/TUIC baselines still need dedicated harness
-support before they can be compared with the same command.
+`external-suite` starts its own local echo target and sends the target address through
+the external core, so the external Go core should not need a special outbound beyond
+normal direct/freedom routing. For TCP protocols, provide one `--core command=HOST:PORT`
+mapping per external inbound. For HY2/TUIC, also provide the server certificate with
+`--cert CERT.pem` or `--cert command=CERT.pem`; use `--server-name` when the certificate
+SAN is not `localhost`.
+
+The old Go/Xray fork in this workspace does not currently expose HY2/TUIC inbounds, so
+there is no honest Go/Xray HY2/TUIC baseline from that binary. If a production Go
+`v2node`/`kelinode` binary with HY2/TUIC support is available, start its HY2 and TUIC
+inbounds on loopback and collect the baseline with the external QUIC command above.
 
 Use `bench compare` only with reports generated from the same host, release mode,
 stream count, request count, payload size, and repeat count:

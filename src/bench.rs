@@ -189,6 +189,8 @@ struct ExternalBenchSuiteOptions {
     label: String,
     out: Option<PathBuf>,
     cores: HashMap<String, SocketAddr>,
+    certs: HashMap<String, CertificateDer<'static>>,
+    server_name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -469,6 +471,9 @@ fn parse_external_bench_suite_options(
     let mut label = "external-core".to_string();
     let mut out = None;
     let mut cores = HashMap::<String, SocketAddr>::new();
+    let mut certs = HashMap::<String, CertificateDer<'static>>::new();
+    let mut default_cert = None;
+    let mut server_name = "localhost".to_string();
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -492,11 +497,17 @@ fn parse_external_bench_suite_options(
                                 | "shadowsocks-tcp-stream"
                                 | "socks-tcp-stream"
                                 | "trojan-tcp-stream"
+                                | "hy2-tcp"
+                                | "hy2-tcp-stream"
+                                | "hy2-udp"
+                                | "tuic-tcp"
+                                | "tuic-tcp-stream"
+                                | "tuic-udp"
                                 | "vless-tcp"
                                 | "vless-tcp-stream"
                                 | "vmess-tcp-stream" => Ok(command.to_string()),
                                 _ => Err(format!(
-                                    "external-suite does not support {value}; use TCP stream commands backed by one external inbound"
+                                    "external-suite does not support {value}; use TCP stream or QUIC commands backed by one external inbound"
                                 )),
                             })
                     })
@@ -521,6 +532,35 @@ fn parse_external_bench_suite_options(
                     .ok_or_else(|| "--core requires command=host:port".to_string())?;
                 let (command, addr) = parse_external_core_mapping(&value)?;
                 cores.insert(command, addr);
+            }
+            "--cert" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--cert requires path or command=path".to_string())?;
+                if let Some((command, path)) = value.split_once('=') {
+                    let command = canonical_bench_command(command.trim()).ok_or_else(|| {
+                        format!("unknown external bench command {}", command.trim())
+                    })?;
+                    if !is_external_quic_command(command) {
+                        return Err(format!(
+                            "--cert is only used by external QUIC commands, got {command}"
+                        ));
+                    }
+                    certs.insert(
+                        command.to_string(),
+                        load_bench_certificate(Path::new(path.trim()))?,
+                    );
+                } else {
+                    default_cert = Some(load_bench_certificate(Path::new(value.trim()))?);
+                }
+            }
+            "--server-name" => {
+                server_name = args
+                    .next()
+                    .ok_or_else(|| "--server-name requires a value".to_string())?;
+                if server_name.trim().is_empty() {
+                    return Err("--server-name cannot be empty".to_string());
+                }
             }
             "--label" => {
                 label = args
@@ -548,6 +588,13 @@ fn parse_external_bench_suite_options(
         if !cores.contains_key(command) {
             return Err(format!("missing --core {command}=host:port"));
         }
+        if is_external_quic_command(command) && !certs.contains_key(command) {
+            let cert = default_cert
+                .as_ref()
+                .ok_or_else(|| format!("missing --cert for external QUIC command {command}"))?
+                .clone();
+            certs.insert(command.clone(), cert);
+        }
     }
     Ok(ExternalBenchSuiteOptions {
         bench,
@@ -556,6 +603,8 @@ fn parse_external_bench_suite_options(
         label,
         out,
         cores,
+        certs,
+        server_name,
     })
 }
 
@@ -567,15 +616,21 @@ fn parse_external_core_mapping(value: &str) -> Result<(String, SocketAddr), Stri
         .ok_or_else(|| format!("unknown external bench command {}", command.trim()))?;
     let command = match command {
         "http-connect-stream"
+        | "hy2-tcp"
+        | "hy2-tcp-stream"
+        | "hy2-udp"
         | "shadowsocks-tcp-stream"
         | "socks-tcp-stream"
         | "trojan-tcp-stream"
+        | "tuic-tcp"
+        | "tuic-tcp-stream"
+        | "tuic-udp"
         | "vless-tcp"
         | "vless-tcp-stream"
         | "vmess-tcp-stream" => command.to_string(),
         _ => {
             return Err(format!(
-                "external-suite does not support {command}; use TCP stream commands backed by one external inbound"
+                "external-suite does not support {command}; use TCP stream or QUIC commands backed by one external inbound"
             ));
         }
     };
@@ -584,6 +639,29 @@ fn parse_external_core_mapping(value: &str) -> Result<(String, SocketAddr), Stri
         .parse::<SocketAddr>()
         .map_err(|_| "--core requires command=host:port".to_string())?;
     Ok((command, addr))
+}
+
+fn is_external_quic_command(command: &str) -> bool {
+    matches!(
+        command,
+        "hy2-tcp" | "hy2-tcp-stream" | "hy2-udp" | "tuic-tcp" | "tuic-tcp-stream" | "tuic-udp"
+    )
+}
+
+fn load_bench_certificate(path: &Path) -> Result<CertificateDer<'static>, String> {
+    let data = fs::read(path)
+        .map_err(|error| format!("failed to read cert {}: {error}", path.display()))?;
+    let mut reader = std::io::BufReader::new(data.as_slice());
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to parse PEM cert {}: {error}", path.display()))?;
+    if let Some(cert) = certs.into_iter().next() {
+        return Ok(cert);
+    }
+    if data.is_empty() {
+        return Err(format!("cert {} is empty", path.display()));
+    }
+    Ok(CertificateDer::from(data))
 }
 
 fn bench_quic_runtime_workers() -> usize {
@@ -595,7 +673,7 @@ fn bench_quic_runtime_workers() -> usize {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench direct-tcp-proxy-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --core command=HOST:PORT [--core other=HOST:PORT] [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
+        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench direct-tcp-proxy-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --core command=HOST:PORT [--core other=HOST:PORT] [--cert CERT.pem] [--cert command=CERT.pem] [--server-name NAME] [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
     );
 }
 
@@ -683,7 +761,7 @@ fn run_external_bench_suite(options: &ExternalBenchSuiteOptions) -> io::Result<B
                     format!("missing external core addr for {command}"),
                 )
             })?;
-            let report = run_external_named_bench(command, &options.bench, core_addr)?;
+            let report = run_external_named_bench(command, options, core_addr)?;
             runs.push(BenchSuiteRun {
                 command: command.clone(),
                 repeat,
@@ -708,10 +786,29 @@ fn run_external_bench_suite(options: &ExternalBenchSuiteOptions) -> io::Result<B
 
 fn run_external_named_bench(
     command: &str,
-    options: &BenchOptions,
+    suite_options: &ExternalBenchSuiteOptions,
     core_addr: SocketAddr,
 ) -> io::Result<BenchReport> {
+    let options = &suite_options.bench;
     match canonical_bench_command(command) {
+        Some("hy2-tcp") => run_external_hy2_tcp_bench(
+            options,
+            core_addr,
+            external_cert_for(command, suite_options)?,
+            &suite_options.server_name,
+        ),
+        Some("hy2-tcp-stream") => run_external_hy2_tcp_stream_bench(
+            options,
+            core_addr,
+            external_cert_for(command, suite_options)?,
+            &suite_options.server_name,
+        ),
+        Some("hy2-udp") => run_external_hy2_udp_bench(
+            options,
+            core_addr,
+            external_cert_for(command, suite_options)?,
+            &suite_options.server_name,
+        ),
         Some("http-connect-stream") => run_external_stream_bench(
             options,
             core_addr,
@@ -740,6 +837,24 @@ fn run_external_named_bench(
             "connection-per-stream",
             run_trojan_tcp_stream_client,
         ),
+        Some("tuic-tcp") => run_external_tuic_tcp_bench(
+            options,
+            core_addr,
+            external_cert_for(command, suite_options)?,
+            &suite_options.server_name,
+        ),
+        Some("tuic-tcp-stream") => run_external_tuic_tcp_stream_bench(
+            options,
+            core_addr,
+            external_cert_for(command, suite_options)?,
+            &suite_options.server_name,
+        ),
+        Some("tuic-udp") => run_external_tuic_udp_bench(
+            options,
+            core_addr,
+            external_cert_for(command, suite_options)?,
+            &suite_options.server_name,
+        ),
         Some("vless-tcp") => run_external_vless_tcp_bench(options, core_addr),
         Some("vless-tcp-stream") => run_external_vless_tcp_stream_bench(options, core_addr),
         Some("vmess-tcp-stream") => run_external_stream_bench(
@@ -754,6 +869,18 @@ fn run_external_named_bench(
             format!("external bench command {command} is not supported yet"),
         )),
     }
+}
+
+fn external_cert_for(
+    command: &str,
+    options: &ExternalBenchSuiteOptions,
+) -> io::Result<CertificateDer<'static>> {
+    options.certs.get(command).cloned().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("missing external cert for {command}"),
+        )
+    })
 }
 
 fn run_external_stream_bench(
@@ -805,6 +932,114 @@ fn run_external_stream_bench(
         elapsed,
         &latencies,
     ))
+}
+
+fn run_external_hy2_tcp_bench(
+    options: &BenchOptions,
+    core_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    server_name: &str,
+) -> io::Result<BenchReport> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(bench_quic_runtime_workers())
+        .enable_all()
+        .build()?
+        .block_on(run_external_hy2_tcp_bench_async(
+            options,
+            core_addr,
+            cert_der,
+            server_name,
+        ))
+}
+
+fn run_external_hy2_tcp_stream_bench(
+    options: &BenchOptions,
+    core_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    server_name: &str,
+) -> io::Result<BenchReport> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(bench_quic_runtime_workers())
+        .enable_all()
+        .build()?
+        .block_on(run_external_hy2_tcp_stream_bench_async(
+            options,
+            core_addr,
+            cert_der,
+            server_name,
+        ))
+}
+
+fn run_external_hy2_udp_bench(
+    options: &BenchOptions,
+    core_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    server_name: &str,
+) -> io::Result<BenchReport> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(bench_quic_runtime_workers())
+        .enable_all()
+        .build()?
+        .block_on(run_external_hy2_udp_bench_async(
+            options,
+            core_addr,
+            cert_der,
+            server_name,
+        ))
+}
+
+fn run_external_tuic_tcp_bench(
+    options: &BenchOptions,
+    core_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    server_name: &str,
+) -> io::Result<BenchReport> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(bench_quic_runtime_workers())
+        .enable_all()
+        .build()?
+        .block_on(run_external_tuic_tcp_bench_async(
+            options,
+            core_addr,
+            cert_der,
+            server_name,
+        ))
+}
+
+fn run_external_tuic_tcp_stream_bench(
+    options: &BenchOptions,
+    core_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    server_name: &str,
+) -> io::Result<BenchReport> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(bench_quic_runtime_workers())
+        .enable_all()
+        .build()?
+        .block_on(run_external_tuic_tcp_stream_bench_async(
+            options,
+            core_addr,
+            cert_der,
+            server_name,
+        ))
+}
+
+fn run_external_tuic_udp_bench(
+    options: &BenchOptions,
+    core_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    server_name: &str,
+) -> io::Result<BenchReport> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(bench_quic_runtime_workers())
+        .enable_all()
+        .build()?
+        .block_on(run_external_tuic_udp_bench_async(
+            options,
+            core_addr,
+            cert_der,
+            server_name,
+        ))
 }
 
 fn run_direct_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
@@ -1432,6 +1667,370 @@ fn run_tuic_udp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
         .block_on(run_tuic_udp_bench_async(options))
 }
 
+async fn collect_quic_workers(
+    workers: Vec<tokio::task::JoinHandle<io::Result<ClientStats>>>,
+    label: &str,
+) -> io::Result<(Vec<u128>, usize)> {
+    let mut latencies = Vec::new();
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker.await.map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, format!("{label} worker panicked"))
+        })??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+    }
+    Ok((latencies, retries))
+}
+
+fn start_udp_echo_task(
+    echo_stop: Arc<AtomicBool>,
+) -> io::Result<(
+    Arc<tokio::net::UdpSocket>,
+    SocketAddr,
+    tokio::task::JoinHandle<io::Result<()>>,
+)> {
+    let echo = Arc::new(bind_bench_udp_echo_socket()?);
+    let echo_addr = echo.local_addr()?;
+    let echo_task = {
+        let echo = echo.clone();
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; 65_535];
+            while !echo_stop.load(Ordering::SeqCst) {
+                match tokio::time::timeout(Duration::from_millis(20), echo.recv_from(&mut buffer))
+                    .await
+                {
+                    Ok(Ok((read, peer))) => {
+                        echo.send_to(&buffer[..read], peer).await?;
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {}
+                }
+            }
+            Ok::<(), io::Error>(())
+        })
+    };
+    Ok((echo, echo_addr, echo_task))
+}
+
+async fn run_external_hy2_tcp_bench_async(
+    options: &BenchOptions,
+    core_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    server_name: &str,
+) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let client_endpoint = hy2_client_endpoint(cert_der)?;
+    let connection = client_endpoint
+        .connect(core_addr, server_name)
+        .map_err(io_other)?
+        .await
+        .map_err(io_other)?;
+    authenticate_hy2(&connection).await?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        let connection = connection.clone();
+        workers.push(tokio::spawn(async move {
+            run_hy2_tcp_client(connection, echo_addr, stream_id, &options).await
+        }));
+    }
+
+    let (mut latencies, retries) = collect_quic_workers(workers, "external hy2 tcp").await?;
+    let elapsed = started.elapsed();
+
+    connection.close(0u32.into(), b"bench done");
+    client_endpoint.wait_idle().await;
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        "hy2-tcp",
+        "external-single-quic-connection",
+        options,
+        Some(bench_quic_runtime_workers()),
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
+}
+
+async fn run_external_hy2_tcp_stream_bench_async(
+    options: &BenchOptions,
+    core_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    server_name: &str,
+) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let client_endpoint = hy2_client_endpoint(cert_der)?;
+    let connection = client_endpoint
+        .connect(core_addr, server_name)
+        .map_err(io_other)?
+        .await
+        .map_err(io_other)?;
+    authenticate_hy2(&connection).await?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        let connection = connection.clone();
+        workers.push(tokio::spawn(async move {
+            run_hy2_tcp_stream_client(connection, echo_addr, stream_id, &options).await
+        }));
+    }
+
+    let (mut latencies, retries) = collect_quic_workers(workers, "external hy2 stream").await?;
+    let elapsed = started.elapsed();
+
+    connection.close(0u32.into(), b"bench done");
+    client_endpoint.wait_idle().await;
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        "hy2-tcp",
+        "external-hy2-tcp-stream-per-worker",
+        options,
+        Some(bench_quic_runtime_workers()),
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
+}
+
+async fn run_external_hy2_udp_bench_async(
+    options: &BenchOptions,
+    core_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    server_name: &str,
+) -> io::Result<BenchReport> {
+    validate_udp_bench_payload(options)?;
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo, echo_addr, echo_task) = start_udp_echo_task(echo_stop.clone())?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        let cert_der = cert_der.clone();
+        let server_name = server_name.to_string();
+        workers.push(tokio::spawn(async move {
+            run_hy2_udp_client(
+                core_addr,
+                cert_der,
+                server_name,
+                echo_addr,
+                stream_id,
+                &options,
+            )
+            .await
+        }));
+    }
+
+    let (mut latencies, retries) = collect_quic_workers(workers, "external hy2 udp").await?;
+    let elapsed = started.elapsed();
+
+    echo_stop.store(true, Ordering::SeqCst);
+    drop(echo);
+    echo_task
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "hy2 udp echo task panicked"))??;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        "hy2-udp",
+        "external-hy2-udp-datagram-connection-per-worker",
+        options,
+        Some(bench_quic_runtime_workers()),
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
+}
+
+async fn run_external_tuic_tcp_bench_async(
+    options: &BenchOptions,
+    core_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    server_name: &str,
+) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let client_endpoint = hy2_client_endpoint(cert_der)?;
+    let connection = client_endpoint
+        .connect(core_addr, server_name)
+        .map_err(io_other)?
+        .await
+        .map_err(io_other)?;
+    authenticate_tuic(&connection).await?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        let connection = connection.clone();
+        workers.push(tokio::spawn(async move {
+            run_tuic_tcp_client(connection, echo_addr, stream_id, &options).await
+        }));
+    }
+
+    let (mut latencies, retries) = collect_quic_workers(workers, "external tuic tcp").await?;
+    let elapsed = started.elapsed();
+
+    connection.close(0u32.into(), b"bench done");
+    client_endpoint.wait_idle().await;
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        "tuic-tcp",
+        "external-single-quic-connection",
+        options,
+        Some(bench_quic_runtime_workers()),
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
+}
+
+async fn run_external_tuic_tcp_stream_bench_async(
+    options: &BenchOptions,
+    core_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    server_name: &str,
+) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let client_endpoint = hy2_client_endpoint(cert_der)?;
+    let connection = client_endpoint
+        .connect(core_addr, server_name)
+        .map_err(io_other)?
+        .await
+        .map_err(io_other)?;
+    authenticate_tuic(&connection).await?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        let connection = connection.clone();
+        workers.push(tokio::spawn(async move {
+            run_tuic_tcp_stream_client(connection, echo_addr, stream_id, &options).await
+        }));
+    }
+
+    let (mut latencies, retries) = collect_quic_workers(workers, "external tuic stream").await?;
+    let elapsed = started.elapsed();
+
+    connection.close(0u32.into(), b"bench done");
+    client_endpoint.wait_idle().await;
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        "tuic-tcp",
+        "external-tuic-tcp-stream-per-worker",
+        options,
+        Some(bench_quic_runtime_workers()),
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
+}
+
+async fn run_external_tuic_udp_bench_async(
+    options: &BenchOptions,
+    core_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    server_name: &str,
+) -> io::Result<BenchReport> {
+    validate_udp_bench_payload(options)?;
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo, echo_addr, echo_task) = start_udp_echo_task(echo_stop.clone())?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        let cert_der = cert_der.clone();
+        let server_name = server_name.to_string();
+        workers.push(tokio::spawn(async move {
+            run_tuic_udp_client(
+                core_addr,
+                cert_der,
+                server_name,
+                echo_addr,
+                stream_id,
+                &options,
+            )
+            .await
+        }));
+    }
+
+    let (mut latencies, retries) = collect_quic_workers(workers, "external tuic udp").await?;
+    let elapsed = started.elapsed();
+
+    echo_stop.store(true, Ordering::SeqCst);
+    drop(echo);
+    echo_task
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "tuic udp echo task panicked"))??;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        "tuic-udp",
+        "external-tuic-udp-datagram-connection-per-worker",
+        options,
+        Some(bench_quic_runtime_workers()),
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
+}
+
 async fn run_hy2_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchReport> {
     let echo_stop = Arc::new(AtomicBool::new(false));
     let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
@@ -1644,8 +2243,17 @@ async fn run_hy2_udp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
     for stream_id in 0..options.streams {
         let options = options.clone();
         let cert_der = cert.cert_der.clone();
+        let server_name = "localhost".to_string();
         workers.push(tokio::spawn(async move {
-            run_hy2_udp_client(server_addr, cert_der, echo_addr, stream_id, &options).await
+            run_hy2_udp_client(
+                server_addr,
+                cert_der,
+                server_name,
+                echo_addr,
+                stream_id,
+                &options,
+            )
+            .await
         }));
     }
 
@@ -1889,8 +2497,17 @@ async fn run_tuic_udp_bench_async(options: &BenchOptions) -> io::Result<BenchRep
     for stream_id in 0..options.streams {
         let options = options.clone();
         let cert_der = cert.cert_der.clone();
+        let server_name = "localhost".to_string();
         workers.push(tokio::spawn(async move {
-            run_tuic_udp_client(server_addr, cert_der, echo_addr, stream_id, &options).await
+            run_tuic_udp_client(
+                server_addr,
+                cert_der,
+                server_name,
+                echo_addr,
+                stream_id,
+                &options,
+            )
+            .await
         }));
     }
 
@@ -3083,13 +3700,14 @@ async fn run_hy2_tcp_stream_client(
 async fn run_hy2_udp_client(
     server_addr: SocketAddr,
     cert_der: CertificateDer<'static>,
+    server_name: String,
     echo_addr: SocketAddr,
     stream_id: usize,
     options: &BenchOptions,
 ) -> io::Result<ClientStats> {
     let client_endpoint = hy2_client_endpoint(cert_der)?;
     let connection = client_endpoint
-        .connect(server_addr, "localhost")
+        .connect(server_addr, &server_name)
         .map_err(io_other)?
         .await
         .map_err(io_other)?;
@@ -3266,13 +3884,14 @@ async fn run_tuic_tcp_stream_client(
 async fn run_tuic_udp_client(
     server_addr: SocketAddr,
     cert_der: CertificateDer<'static>,
+    server_name: String,
     echo_addr: SocketAddr,
     stream_id: usize,
     options: &BenchOptions,
 ) -> io::Result<ClientStats> {
     let client_endpoint = hy2_client_endpoint(cert_der)?;
     let connection = client_endpoint
-        .connect(server_addr, "localhost")
+        .connect(server_addr, &server_name)
         .map_err(io_other)?
         .await
         .map_err(io_other)?;
@@ -3993,7 +4612,8 @@ mod tests {
         run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench, run_tuic_tcp_bench,
         run_tuic_tcp_stream_bench, run_tuic_udp_bench, run_vless_tcp_bench,
         run_vless_tcp_stream_bench, run_vmess_tcp_stream_bench, summarize_bench_runs,
-        validate_udp_bench_payload, BenchOptions, BenchReport, BenchSuiteRun, LatencyReport,
+        validate_udp_bench_payload, BenchCert, BenchOptions, BenchReport, BenchSuiteRun,
+        LatencyReport,
     };
     use std::net::{SocketAddr, TcpStream};
     use std::path::PathBuf;
@@ -4117,12 +4737,61 @@ mod tests {
     #[test]
     fn rejects_unsupported_external_bench_command() {
         let error = parse_external_bench_suite_options(
-            ["--vless-core", "127.0.0.1:12345", "--commands", "hy2-tcp"]
-                .into_iter()
-                .map(str::to_string),
+            [
+                "--core",
+                "direct-stream=127.0.0.1:12345",
+                "--commands",
+                "direct-stream",
+            ]
+            .into_iter()
+            .map(str::to_string),
         )
         .expect_err("unsupported command");
         assert!(error.contains("external-suite does not support"));
+    }
+
+    #[test]
+    fn parses_external_quic_bench_suite_options() {
+        let cert = BenchCert::new("external-quic-parse").expect("cert");
+        let cert_path = cert.cert_path.to_string_lossy().to_string();
+        let options = parse_external_bench_suite_options(
+            [
+                "--commands",
+                "hy2-stream,tuic-udp",
+                "--core",
+                "hy2-stream=127.0.0.1:29200",
+                "--core",
+                "tuic-udp=127.0.0.1:29201",
+                "--cert",
+                cert_path.as_str(),
+                "--server-name",
+                "localhost",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("external quic suite options");
+
+        assert_eq!(options.commands, vec!["hy2-tcp-stream", "tuic-udp"]);
+        assert!(options.certs.contains_key("hy2-tcp-stream"));
+        assert!(options.certs.contains_key("tuic-udp"));
+        assert_eq!(options.server_name, "localhost");
+    }
+
+    #[test]
+    fn rejects_external_quic_command_without_cert() {
+        let error = parse_external_bench_suite_options(
+            [
+                "--commands",
+                "hy2-stream",
+                "--core",
+                "hy2-stream=127.0.0.1:29200",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect_err("missing cert");
+        assert!(error.contains("missing --cert for external QUIC command hy2-tcp-stream"));
     }
 
     #[test]
