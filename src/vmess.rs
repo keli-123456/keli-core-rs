@@ -77,7 +77,8 @@ const CMD_KEY_SALT: &[u8] = b"c48619fe-8f02-49e0-b9e9-edf763e17e21";
 const ALTER_ID_SALT: &[u8] = b"16167dc8-16b6-4e6d-b8bb-65dd68113a81";
 const ALTER_ID_RETRY_SALT: &[u8] = b"533eff8a-4113-4b10-b5ce-0f5d76b98cd2";
 const MAX_HEADER_LEN: usize = 4096;
-const MAX_CHUNK_SIZE: usize = 16 * 1024;
+const MAX_CHUNK_SIZE: usize = 64 * 1024 - 80;
+const VMESS_RELAY_BUFFER_SIZE: usize = 64 * 1024;
 const AUTH_ID_WINDOW_SECONDS: i64 = 120;
 const AUTH_ID_REPLAY_TTL: Duration = Duration::from_secs(180);
 
@@ -1800,7 +1801,6 @@ pub(crate) fn connect_vmess_tcp_outbound(
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let request = write_vmess_tcp_request(&mut stream, outbound, target)?;
-    read_vmess_response_header(&mut stream, &request)?;
     local_bridge_for_vmess_tcp(stream, request)
 }
 
@@ -1822,7 +1822,6 @@ fn connect_vmess_h2_tcp_outbound(
     )?;
     let request = write_vmess_tcp_request(&mut h2, outbound, target)?;
     h2.flush()?;
-    read_vmess_response_header(&mut h2, &request)?;
     h2.set_nonblocking(true);
     local_bridge_for_vmess(h2, request)
 }
@@ -1840,7 +1839,6 @@ fn connect_vmess_quic_tcp_outbound(
         outbound.transport.as_ref(),
     )?;
     let request = write_vmess_tcp_request(&mut quic, outbound, target)?;
-    read_vmess_response_header(&mut quic, &request)?;
     quic.set_nonblocking(true)?;
     local_bridge_for_vmess(quic, request)
 }
@@ -1861,7 +1859,6 @@ fn connect_vmess_grpc_tcp_outbound(
     )?;
     let request = write_vmess_tcp_request(&mut grpc, outbound, target)?;
     grpc.flush()?;
-    read_vmess_response_header(&mut grpc, &request)?;
     grpc.set_nonblocking(true);
     local_bridge_for_vmess(grpc, request)
 }
@@ -1879,7 +1876,6 @@ fn connect_vmess_httpupgrade_tcp_outbound(
             connect_httpupgrade_client(tls_stream, outbound_transport_path(outbound), &host)?;
         let request = write_vmess_tcp_request(&mut tls_stream, outbound, target)?;
         tls_stream.flush()?;
-        read_vmess_response_header(&mut tls_stream, &request)?;
         tls_stream.sock.set_nonblocking(true)?;
         return local_bridge_for_vmess(tls_stream, request);
     }
@@ -1890,7 +1886,6 @@ fn connect_vmess_httpupgrade_tcp_outbound(
     let host = outbound_transport_host(outbound, server);
     let mut stream = connect_httpupgrade_client(remote, outbound_transport_path(outbound), &host)?;
     let request = write_vmess_tcp_request(&mut stream, outbound, target)?;
-    read_vmess_response_header(&mut stream, &request)?;
     stream.set_nonblocking(true)?;
     local_bridge_for_vmess(stream, request)
 }
@@ -1908,7 +1903,6 @@ fn connect_vmess_websocket_tcp_outbound(
             connect_websocket_client(tls_stream, outbound_transport_path(outbound), &host)?;
         let request = write_vmess_tcp_request(&mut websocket, outbound, target)?;
         websocket.flush()?;
-        read_vmess_response_header(&mut websocket, &request)?;
         websocket.get_mut().sock.set_nonblocking(true)?;
         return local_bridge_for_vmess(websocket, request);
     }
@@ -1920,7 +1914,6 @@ fn connect_vmess_websocket_tcp_outbound(
     let mut websocket = connect_websocket_client(remote, outbound_transport_path(outbound), &host)?;
     let request = write_vmess_tcp_request(&mut websocket, outbound, target)?;
     websocket.flush()?;
-    read_vmess_response_header(&mut websocket, &request)?;
     websocket.get_mut().set_nonblocking(true)?;
     local_bridge_for_vmess(websocket, request)
 }
@@ -1934,7 +1927,6 @@ fn connect_vmess_tls_tcp_outbound(
     let mut tls_stream = connect_vmess_tls_stream(outbound, server, timeout)?;
     let request = write_vmess_tcp_request(&mut tls_stream, outbound, target)?;
     tls_stream.flush()?;
-    read_vmess_response_header(&mut tls_stream, &request)?;
     tls_stream.sock.set_nonblocking(true)?;
     local_bridge_for_vmess(tls_stream, request)
 }
@@ -2410,7 +2402,7 @@ fn read_vmess_response_header<R: Read>(reader: &mut R, request: &VmessRequest) -
     }
 
     let mut len_cipher = [0u8; 18];
-    reader.read_exact(&mut len_cipher)?;
+    read_exact_wait(reader, &mut len_cipher)?;
     let len_key = kdf16(&request.response_body_key, &[RESPONSE_HEADER_LENGTH_KEY]);
     let len_nonce = first_12(&kdf(
         &request.response_body_iv,
@@ -2425,7 +2417,7 @@ fn read_vmess_response_header<R: Read>(reader: &mut R, request: &VmessRequest) -
     }
     let len = u16::from_be_bytes([len[0], len[1]]) as usize;
     let mut payload_cipher = vec![0u8; len + 16];
-    reader.read_exact(&mut payload_cipher)?;
+    read_exact_wait(reader, &mut payload_cipher)?;
     let payload_key = kdf16(&request.response_body_key, &[RESPONSE_HEADER_PAYLOAD_KEY]);
     let payload_nonce = first_12(&kdf(
         &request.response_body_iv,
@@ -2462,7 +2454,7 @@ fn read_legacy_vmess_response_header<R: Read>(
 ) -> io::Result<()> {
     let mut cipher = Aes128Cfb::new(&request.response_body_key, &request.response_body_iv)?;
     let mut header = [0u8; 4];
-    reader.read_exact(&mut header)?;
+    read_exact_wait(reader, &mut header)?;
     cipher.decrypt(&mut header);
     if header[0] != request.response_header {
         return Err(io::Error::new(
@@ -2477,8 +2469,30 @@ fn read_legacy_vmess_response_header<R: Read>(
     };
     if command_len > 0 {
         let mut command = vec![0u8; command_len];
-        reader.read_exact(&mut command)?;
+        read_exact_wait(reader, &mut command)?;
         cipher.decrypt(&mut command);
+    }
+    Ok(())
+}
+
+fn read_exact_wait<R: Read>(reader: &mut R, mut output: &mut [u8]) -> io::Result<()> {
+    while !output.is_empty() {
+        match reader.read(output) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated vmess response",
+                ));
+            }
+            Ok(read) => {
+                let (_, remaining) = output.split_at_mut(read);
+                output = remaining;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
@@ -2541,7 +2555,7 @@ fn relay_plain_to_vmess_tcp(
             upload_request.options,
             upload_request.security,
         );
-        let mut buffer = [0u8; 16 * 1024];
+        let mut buffer = [0u8; VMESS_RELAY_BUFFER_SIZE];
         loop {
             match plain_reader.read(&mut buffer) {
                 Ok(0) => break,
@@ -2562,7 +2576,8 @@ fn relay_plain_to_vmess_tcp(
         request.options,
         request.security,
     );
-    let mut buffer = [0u8; 16 * 1024];
+    read_vmess_response_header(&mut remote_reader, &request)?;
+    let mut buffer = [0u8; VMESS_RELAY_BUFFER_SIZE];
     loop {
         match response_body.read_plain(&mut remote_reader, &mut buffer) {
             Ok(0) => break,
@@ -2603,8 +2618,10 @@ where
     );
     let mut upload_done = false;
     let mut download_done = false;
-    let mut upload_buffer = [0u8; 16 * 1024];
-    let mut download_buffer = [0u8; 16 * 1024];
+    let mut upload_started = false;
+    let mut response_header_read = false;
+    let mut upload_buffer = [0u8; VMESS_RELAY_BUFFER_SIZE];
+    let mut download_buffer = [0u8; VMESS_RELAY_BUFFER_SIZE];
 
     while !upload_done || !download_done {
         let mut progressed = false;
@@ -2618,6 +2635,7 @@ where
                 }
                 Ok(read) => {
                     request_body.write_plain(&mut remote, &upload_buffer[..read])?;
+                    upload_started = true;
                     progressed = true;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -2630,6 +2648,17 @@ where
         }
 
         if !download_done {
+            if !response_header_read {
+                if !upload_started && !upload_done {
+                    if !progressed {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    continue;
+                }
+                read_vmess_response_header(&mut remote, &request)?;
+                response_header_read = true;
+                progressed = true;
+            }
             match response_body.read_plain(&mut remote, &mut download_buffer) {
                 Ok(0) => {
                     download_done = true;

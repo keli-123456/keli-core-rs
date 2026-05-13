@@ -12,6 +12,7 @@ use crate::limits::BandwidthLimiter;
 
 static TCP_RELAY_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static NATIVE_RELAY_POOL: OnceLock<NativeRelayPool> = OnceLock::new();
+const RELAY_COPY_BUFFER_SIZE: usize = 64 * 1024;
 
 pub type BlockingRelayHandle<T> = tokio::task::JoinHandle<T>;
 type NativeRelayJob = Box<dyn FnOnce() + Send + 'static>;
@@ -341,7 +342,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut total = 0u64;
-    let mut buffer = [0u8; 16 * 1024];
+    let mut buffer = [0u8; RELAY_COPY_BUFFER_SIZE];
     loop {
         if limiter.map(BandwidthLimiter::is_revoked).unwrap_or(false) {
             break;
@@ -399,7 +400,7 @@ where
     W: Write,
 {
     let mut total = 0u64;
-    let mut buffer = [0u8; 16 * 1024];
+    let mut buffer = [0u8; RELAY_COPY_BUFFER_SIZE];
     loop {
         let read = match reader.read(&mut buffer) {
             Ok(0) => break,

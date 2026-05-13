@@ -85,19 +85,37 @@ one-off command output:
 ```bash
 cargo run --release -- bench suite --streams 16 --requests 5000 --payload 1024 --repeats 3 --label rust-native --out runtime/bench/rust-suite.json
 cargo run --release -- bench suite --commands hy2-tcp,hy2-tcp-stream,hy2-udp --streams 16 --requests 5000 --payload 1024 --repeats 3 --label rust-hy2 --out runtime/bench/rust-hy2-suite.json
-cargo run --release -- bench external-suite --vless-core 127.0.0.1:19080 --commands vless-tcp-stream --streams 16 --requests 5000 --payload 1024 --repeats 3 --label go-xray-vless --out runtime/bench/go-suite.json
+cargo run --release -- bench external-suite \
+  --commands socks-tcp-stream,http-connect-stream,shadowsocks-tcp-stream,trojan-tcp-stream,vless-tcp-stream,vmess-tcp-stream \
+  --core socks-tcp-stream=127.0.0.1:29100 \
+  --core http-connect-stream=127.0.0.1:29101 \
+  --core shadowsocks-tcp-stream=127.0.0.1:29102 \
+  --core trojan-tcp-stream=127.0.0.1:29103 \
+  --core vless-tcp-stream=127.0.0.1:29104 \
+  --core vmess-tcp-stream=127.0.0.1:29105 \
+  --streams 16 --requests 5000 --payload 1024 --repeats 3 --label go-xray-tcp --out runtime/bench/go-suite.json
 cargo run --release -- bench compare --baseline runtime/bench/go-suite.json --candidate runtime/bench/rust-suite.json --out runtime/bench/go-vs-rust.json
 ```
 
-The Go/Xray VLESS baseline can be collected by running the old core with a VLESS TCP inbound
-using benchmark user UUID `11111111-1111-1111-1111-111111111111` and normal direct/freedom
-outbound routing. `external-suite` starts the local echo target itself and sends that target
-inside the VLESS request. HY2/TUIC external Go baselines still need dedicated harness support.
-All baselines must be produced on the same host with the same release/debug mode, stream count,
-request count, payload size, repeat count, and report schema (`keli-core-bench-suite-v1`).
-Until every target protocol has a baseline in this schema, treat `bench compare` as a focused
-VLESS/Rust-regression tool rather than proof that Rust has already beaten the whole production
-Go stack.
+`external-suite` starts the local echo target itself and sends that target through the external
+core. It accepts one `--core command=HOST:PORT` mapping per command. The older `--vless-core`
+flag remains as a compatibility shortcut for `vless-tcp` and `vless-tcp-stream` only. All baselines
+must be produced on the same host with the same release/debug mode, stream count, request count,
+payload size, repeat count, and report schema (`keli-core-bench-suite-v1`).
+
+For Go/Xray TCP baselines, start the old core with one loopback inbound per protocol and use
+benchmark credential `11111111-1111-1111-1111-111111111111`. The latest Linux matrix used:
+
+- SOCKS on `127.0.0.1:29100`, username/password set to the benchmark credential.
+- HTTP CONNECT on `127.0.0.1:29101`, basic auth set to the benchmark credential.
+- Shadowsocks on `127.0.0.1:29102`, `aes-128-gcm`, password set to the benchmark credential.
+- Trojan on `127.0.0.1:29103`, password set to the benchmark credential.
+- VLESS on `127.0.0.1:29104`, UUID set to the benchmark credential.
+- VMess on `127.0.0.1:29105`, UUID set to the benchmark credential, `alterId: 0`.
+
+VMess interop note: Go/Xray waits for the first request body before sending the VMess response
+header. The Rust outbound bridge must therefore start upload before reading the response header.
+Reading the response header immediately after the request header can deadlock against Go/Xray.
 
 Recent Windows loopback release baseline for VLESS stream mode (`16` streams, `5000` requests
 per stream, `1024` byte payload, `3` repeats):
@@ -110,49 +128,39 @@ per stream, `1024` byte payload, `3` repeats):
 Keep the Windows row as a local regression marker only; do not use it to judge Linux production
 capacity.
 
-Recent Linux loopback release baseline on a 4 vCPU Debian 12 test host (`64` streams, `5000`
-requests per stream, single repeat). Rust and Go/Xray were measured with the same Rust benchmark
-client and echo target; Go/Xray was started as an external VLESS TCP inbound with normal
-direct/freedom outbound routing:
+Latest Linux same-host TCP stream matrix on the 4 vCPU Debian 12 test host (`64` streams, `5000`
+requests per stream, single repeat). Rust native and Go/Xray used the same Rust benchmark client,
+same local echo target, same credentials, same host, and release builds. Every row completed
+`320000 / 320000` requests with `0` errors and `0` retries.
 
-| Command / Core | Payload | Roundtrip Mbps | p95 | p99 | Errors | Retries |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `direct-tcp-stream` | 1024 | 2069.81 | 788 us | 2093 us | 0 | 0 |
-| `direct-tcp-proxy-stream` | 1024 | 859.55 | 2177 us | 5367 us | 0 | 0 |
-| Rust `vless-tcp-stream` | 1024 | 953.53 | 2100 us | 4890 us | 0 | 0 |
-| Go/Xray `vless-tcp-stream` | 1024 | 575.57 | 4165 us | 7599 us | 0 | 0 |
-| Rust `vless-tcp-stream` | 4096 | 3980.22 | 1825 us | 3355 us | 0 | 0 |
-| Go/Xray `vless-tcp-stream` | 4096 | 2343.89 | 4147 us | 7518 us | 0 | 0 |
-| Rust `vless-tcp-stream` | 65536 | 13403.88 | 11942 us | 18661 us | 0 | 0 |
-| Go/Xray `vless-tcp-stream` | 65536 | 8280.22 | 18260 us | 26798 us | 0 | 0 |
+| Protocol | Payload | Rust Mbps | Go/Xray Mbps | Rust p95 | Go/Xray p95 | Rust p99 | Go/Xray p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| SOCKS | 1024 | 908.11 | 595.80 | 1746 us | 4124 us | 3486 us | 7729 us |
+| SOCKS | 4096 | 3363.09 | 2339.80 | 2242 us | 4468 us | 4786 us | 8674 us |
+| SOCKS | 65536 | 12944.64 | 11143.37 | 9609 us | 13616 us | 14748 us | 22613 us |
+| HTTP CONNECT | 1024 | 846.99 | 655.23 | 2217 us | 3824 us | 4485 us | 8029 us |
+| HTTP CONNECT | 4096 | 3392.09 | 2314.53 | 2179 us | 4707 us | 4690 us | 9522 us |
+| HTTP CONNECT | 65536 | 13214.25 | 10820.07 | 9051 us | 13895 us | 15509 us | 22077 us |
+| Shadowsocks | 1024 | 355.48 | 256.36 | 5036 us | 9194 us | 13002 us | 14972 us |
+| Shadowsocks | 4096 | 1255.35 | 873.66 | 5653 us | 10934 us | 10335 us | 19212 us |
+| Shadowsocks | 65536 | 1466.63 | 1456.43 | 49691 us | 51712 us | 54784 us | 55797 us |
+| Trojan | 1024 | 817.27 | 400.56 | 2186 us | 6711 us | 6608 us | 12717 us |
+| Trojan | 4096 | 2902.33 | 1793.39 | 2391 us | 5437 us | 4621 us | 10167 us |
+| Trojan | 65536 | 14010.70 | 9429.10 | 9037 us | 16248 us | 14852 us | 24865 us |
+| VLESS | 1024 | 785.34 | 503.98 | 2249 us | 5193 us | 9510 us | 10183 us |
+| VLESS | 4096 | 3196.70 | 1917.81 | 2533 us | 5147 us | 5441 us | 9938 us |
+| VLESS | 65536 | 12517.96 | 7834.71 | 13429 us | 19409 us | 21833 us | 28638 us |
+| VMess | 1024 | 280.02 | 243.86 | 6461 us | 9806 us | 12729 us | 16362 us |
+| VMess | 4096 | 1070.08 | 988.42 | 6134 us | 8962 us | 9988 us | 14382 us |
+| VMess | 65536 | 3970.82 | 3334.78 | 39739 us | 40419 us | 109034 us | 66918 us |
 
-On this Linux host, Rust VLESS is above the Go/Xray baseline under the same harness. The remaining
-small-packet limit is closer to the raw two-hop TCP proxy relay ceiling than to VLESS parsing
-overhead, so future TCP optimizations should target the shared relay architecture and validate
-against `direct-tcp-proxy-stream`, not only VLESS parser code. A single-thread poll relay prototype
-and Linux `splice(2)` relay prototype were rejected because they did not improve the 1 KiB raw proxy
-baseline.
-
-Same-host 1 KiB TCP stream cross-protocol spot checks show the next hotspots. SOCKS, HTTP CONNECT,
-Trojan, and VLESS are near the raw proxy ceiling, while Shadowsocks and VMess are slower because
-their per-frame encryption/authenticated-length work dominates small payloads:
-
-| Command | Roundtrip Mbps | p95 | p99 | Errors | Retries |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `direct-tcp-proxy-stream` | 859.55 | 2177 us | 5367 us | 0 | 0 |
-| `socks-tcp-stream` | 888.71 | 1994 us | 4629 us | 0 | 0 |
-| `http-connect-stream` | 917.10 | 1829 us | 4478 us | 0 | 0 |
-| `trojan-tcp-stream` | 1003.81 | 1902 us | 4336 us | 0 | 0 |
-| `vless-tcp-stream` | 953.53 | 2100 us | 4890 us | 0 | 0 |
-| `shadowsocks-tcp-stream` | 401.09 | 4408 us | 8931 us | 0 | 0 |
-| `vmess-tcp-stream` | 326.52 | 5133 us | 7907 us | 0 | 0 |
-
-At 4 KiB, the slower encrypted/framed paths improve but remain the next optimization target:
-
-| Command | Roundtrip Mbps | p95 | p99 | Errors | Retries |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `shadowsocks-tcp-stream` | 1247.54 | 5837 us | 10257 us | 0 | 0 |
-| `vmess-tcp-stream` | 1075.34 | 6210 us | 9884 us | 0 | 0 |
+On this Linux host, Rust native is above the Go/Xray baseline for the measured TCP stream protocols
+and payload sizes. The shared stream relay buffer is now `64 KiB`, which helps large-payload relay
+without regressing 1 KiB rows. VMess remains the most sensitive path because authenticated length
+and body framing add fixed work per chunk; the current bridge defers VMess response-header reads
+until upload starts to avoid Go/Xray interop deadlock, and uses larger relay/chunk buffers for
+better 64 KiB throughput. A native blocking relay prototype, VMess cipher reuse prototype, and
+smaller VMess chunk-size prototypes were rejected because they reduced same-host throughput.
 
 Recent Linux loopback release baseline for QUIC UDP datagram paths after HY2/TUIC UDP reply
 fragmentation and the benchmark echo socket buffer fix. UDP benchmarks reject payloads above

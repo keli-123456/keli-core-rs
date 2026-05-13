@@ -188,7 +188,7 @@ struct ExternalBenchSuiteOptions {
     repeats: usize,
     label: String,
     out: Option<PathBuf>,
-    vless_core: SocketAddr,
+    cores: HashMap<String, SocketAddr>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -468,7 +468,7 @@ fn parse_external_bench_suite_options(
     let mut commands = vec!["vless-tcp-stream".to_string()];
     let mut label = "external-core".to_string();
     let mut out = None;
-    let mut vless_core = None;
+    let mut cores = HashMap::<String, SocketAddr>::new();
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -488,9 +488,15 @@ fn parse_external_bench_suite_options(
                         canonical_bench_command(value)
                             .ok_or_else(|| format!("unknown bench command {value}"))
                             .and_then(|command| match command {
-                                "vless-tcp" | "vless-tcp-stream" => Ok(command.to_string()),
+                                "http-connect-stream"
+                                | "shadowsocks-tcp-stream"
+                                | "socks-tcp-stream"
+                                | "trojan-tcp-stream"
+                                | "vless-tcp"
+                                | "vless-tcp-stream"
+                                | "vmess-tcp-stream" => Ok(command.to_string()),
                                 _ => Err(format!(
-                                    "external-suite currently supports vless-tcp and vless-tcp-stream, got {value}"
+                                    "external-suite does not support {value}; use TCP stream commands backed by one external inbound"
                                 )),
                             })
                     })
@@ -503,11 +509,18 @@ fn parse_external_bench_suite_options(
                 let value = args
                     .next()
                     .ok_or_else(|| "--vless-core requires host:port".to_string())?;
-                vless_core = Some(
-                    value
-                        .parse::<SocketAddr>()
-                        .map_err(|_| "--vless-core requires a socket address".to_string())?,
-                );
+                let addr = value
+                    .parse::<SocketAddr>()
+                    .map_err(|_| "--vless-core requires a socket address".to_string())?;
+                cores.insert("vless-tcp".to_string(), addr);
+                cores.insert("vless-tcp-stream".to_string(), addr);
+            }
+            "--core" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--core requires command=host:port".to_string())?;
+                let (command, addr) = parse_external_core_mapping(&value)?;
+                cores.insert(command, addr);
             }
             "--label" => {
                 label = args
@@ -531,14 +544,46 @@ fn parse_external_bench_suite_options(
     if repeats == 0 || repeats > 100 {
         return Err("--repeats must be between 1 and 100".to_string());
     }
+    for command in &commands {
+        if !cores.contains_key(command) {
+            return Err(format!("missing --core {command}=host:port"));
+        }
+    }
     Ok(ExternalBenchSuiteOptions {
         bench,
         commands,
         repeats,
         label,
         out,
-        vless_core: vless_core.ok_or_else(|| "--vless-core is required".to_string())?,
+        cores,
     })
+}
+
+fn parse_external_core_mapping(value: &str) -> Result<(String, SocketAddr), String> {
+    let (command, addr) = value
+        .split_once('=')
+        .ok_or_else(|| "--core requires command=host:port".to_string())?;
+    let command = canonical_bench_command(command.trim())
+        .ok_or_else(|| format!("unknown external bench command {}", command.trim()))?;
+    let command = match command {
+        "http-connect-stream"
+        | "shadowsocks-tcp-stream"
+        | "socks-tcp-stream"
+        | "trojan-tcp-stream"
+        | "vless-tcp"
+        | "vless-tcp-stream"
+        | "vmess-tcp-stream" => command.to_string(),
+        _ => {
+            return Err(format!(
+                "external-suite does not support {command}; use TCP stream commands backed by one external inbound"
+            ));
+        }
+    };
+    let addr = addr
+        .trim()
+        .parse::<SocketAddr>()
+        .map_err(|_| "--core requires command=host:port".to_string())?;
+    Ok((command, addr))
 }
 
 fn bench_quic_runtime_workers() -> usize {
@@ -550,7 +595,7 @@ fn bench_quic_runtime_workers() -> usize {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench direct-tcp-proxy-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --vless-core HOST:PORT [--commands vless-tcp,vless-tcp-stream] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
+        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench direct-tcp-proxy-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --core command=HOST:PORT [--core other=HOST:PORT] [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
     );
 }
 
@@ -632,7 +677,13 @@ fn run_external_bench_suite(options: &ExternalBenchSuiteOptions) -> io::Result<B
     let mut runs = Vec::new();
     for command in &options.commands {
         for repeat in 1..=options.repeats {
-            let report = run_external_named_bench(command, &options.bench, options.vless_core)?;
+            let core_addr = *options.cores.get(command).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("missing external core addr for {command}"),
+                )
+            })?;
+            let report = run_external_named_bench(command, &options.bench, core_addr)?;
             runs.push(BenchSuiteRun {
                 command: command.clone(),
                 repeat,
@@ -658,16 +709,102 @@ fn run_external_bench_suite(options: &ExternalBenchSuiteOptions) -> io::Result<B
 fn run_external_named_bench(
     command: &str,
     options: &BenchOptions,
-    vless_core: SocketAddr,
+    core_addr: SocketAddr,
 ) -> io::Result<BenchReport> {
     match canonical_bench_command(command) {
-        Some("vless-tcp") => run_external_vless_tcp_bench(options, vless_core),
-        Some("vless-tcp-stream") => run_external_vless_tcp_stream_bench(options, vless_core),
+        Some("http-connect-stream") => run_external_stream_bench(
+            options,
+            core_addr,
+            "http-connect",
+            "connection-per-stream",
+            run_http_connect_stream_client,
+        ),
+        Some("shadowsocks-tcp-stream") => run_external_stream_bench(
+            options,
+            core_addr,
+            "shadowsocks-tcp",
+            "connection-per-stream",
+            run_shadowsocks_tcp_stream_client,
+        ),
+        Some("socks-tcp-stream") => run_external_stream_bench(
+            options,
+            core_addr,
+            "socks-tcp",
+            "connection-per-stream",
+            run_socks_tcp_stream_client,
+        ),
+        Some("trojan-tcp-stream") => run_external_stream_bench(
+            options,
+            core_addr,
+            "trojan-tcp",
+            "connection-per-stream",
+            run_trojan_tcp_stream_client,
+        ),
+        Some("vless-tcp") => run_external_vless_tcp_bench(options, core_addr),
+        Some("vless-tcp-stream") => run_external_vless_tcp_stream_bench(options, core_addr),
+        Some("vmess-tcp-stream") => run_external_stream_bench(
+            options,
+            core_addr,
+            "vmess-tcp",
+            "connection-per-stream",
+            run_vmess_tcp_stream_client,
+        ),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("external bench command {command} is not supported yet"),
         )),
     }
+}
+
+fn run_external_stream_bench(
+    options: &BenchOptions,
+    core_addr: SocketAddr,
+    protocol: &'static str,
+    mode: &'static str,
+    client: fn(SocketAddr, SocketAddr, usize, &BenchOptions) -> io::Result<ClientStats>,
+) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        workers.push(thread::spawn(move || {
+            client(core_addr, echo_addr, stream_id, &options)
+        }));
+    }
+
+    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+    }
+    let elapsed = started.elapsed();
+
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        protocol,
+        mode,
+        options,
+        None,
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
 }
 
 fn run_direct_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
@@ -3929,7 +4066,9 @@ mod tests {
                 "--vless-core",
                 "127.0.0.1:12345",
                 "--commands",
-                "vless-tcp,vless-stream",
+                "socks-stream,vless-tcp,vless-stream",
+                "--core",
+                "socks-stream=127.0.0.1:12344",
                 "--streams",
                 "2",
                 "--requests",
@@ -3948,13 +4087,27 @@ mod tests {
         )
         .expect("external suite options");
 
-        assert_eq!(options.commands, vec!["vless-tcp", "vless-tcp-stream"]);
+        assert_eq!(
+            options.commands,
+            vec!["socks-tcp-stream", "vless-tcp", "vless-tcp-stream"]
+        );
         assert_eq!(options.bench.streams, 2);
         assert_eq!(options.bench.requests, 3);
         assert_eq!(options.bench.payload_size, 4);
         assert_eq!(options.repeats, 2);
         assert_eq!(options.label, "go-xray");
-        assert_eq!(options.vless_core, "127.0.0.1:12345".parse().unwrap());
+        assert_eq!(
+            options.cores.get("socks-tcp-stream"),
+            Some(&"127.0.0.1:12344".parse().unwrap())
+        );
+        assert_eq!(
+            options.cores.get("vless-tcp"),
+            Some(&"127.0.0.1:12345".parse().unwrap())
+        );
+        assert_eq!(
+            options.cores.get("vless-tcp-stream"),
+            Some(&"127.0.0.1:12345".parse().unwrap())
+        );
         assert_eq!(
             options.out,
             Some(PathBuf::from("runtime/bench/go-suite.json"))
@@ -3969,7 +4122,18 @@ mod tests {
                 .map(str::to_string),
         )
         .expect_err("unsupported command");
-        assert!(error.contains("external-suite currently supports vless-tcp"));
+        assert!(error.contains("external-suite does not support"));
+    }
+
+    #[test]
+    fn rejects_external_command_without_core_mapping() {
+        let error = parse_external_bench_suite_options(
+            ["--commands", "socks-stream"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect_err("missing core");
+        assert!(error.contains("missing --core socks-tcp-stream"));
     }
 
     #[test]
