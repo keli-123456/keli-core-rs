@@ -47,6 +47,7 @@ const DEFAULT_PAYLOAD_SIZE: usize = 1_024;
 const MAX_STREAMS: usize = 1024;
 const MAX_PAYLOAD_SIZE: usize = 1024 * 1024;
 const MAX_REQUEST_RETRIES: usize = 3;
+const UDP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_SUITE_COMMANDS: &[&str] = &[
     "http-connect-stream",
     "shadowsocks-tcp-stream",
@@ -2806,41 +2807,60 @@ async fn run_hy2_udp_client(
     let payload = bench_payload(stream_id, options.payload_size);
     let session_id = stream_id.saturating_add(1) as u32;
     let mut latencies = Vec::with_capacity(options.requests);
+    let mut retries = 0usize;
 
     for request_index in 0..options.requests {
-        let packet_id = ((request_index % usize::from(u16::MAX)) + 1) as u16;
-        let started = Instant::now();
-        let datagram = hy2_udp_datagram(session_id, packet_id, echo_addr, &payload)?;
-        connection
-            .send_datagram_wait(Bytes::from(datagram))
-            .await
-            .map_err(io_other)?;
-        let response = tokio::time::timeout(Duration::from_secs(10), connection.read_datagram())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "hy2 udp response timeout"))?
-            .map_err(io_other)?;
-        let response = parse_hy2_udp_datagram(&response)?;
-        if response.session_id != session_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "hy2 udp response id mismatch",
-            ));
+        let mut attempts = 0usize;
+        loop {
+            let packet_id = (((request_index + attempts) % usize::from(u16::MAX)) + 1) as u16;
+            let started = Instant::now();
+            let datagram = hy2_udp_datagram(session_id, packet_id, echo_addr, &payload)?;
+            connection
+                .send_datagram_wait(Bytes::from(datagram))
+                .await
+                .map_err(io_other)?;
+            let response =
+                tokio::time::timeout(UDP_RESPONSE_TIMEOUT, connection.read_datagram()).await;
+            let response = match response {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => return Err(io_other(error)),
+                Err(_) if attempts < MAX_REQUEST_RETRIES => {
+                    attempts = attempts.saturating_add(1);
+                    retries = retries.saturating_add(1);
+                    continue;
+                }
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "hy2 udp stream {stream_id} request {} response timeout after {} retries",
+                            request_index + 1,
+                            attempts
+                        ),
+                    ));
+                }
+            };
+            let response = parse_hy2_udp_datagram(&response)?;
+            if response.session_id != session_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "hy2 udp response id mismatch",
+                ));
+            }
+            if response.data != payload {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "hy2 udp bench echo payload mismatch",
+                ));
+            }
+            latencies.push(started.elapsed().as_micros());
+            break;
         }
-        if response.data != payload {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "hy2 udp bench echo payload mismatch",
-            ));
-        }
-        latencies.push(started.elapsed().as_micros());
     }
 
     connection.close(0u32.into(), b"bench done");
     client_endpoint.wait_idle().await;
-    Ok(ClientStats {
-        latencies,
-        retries: 0,
-    })
+    Ok(ClientStats { latencies, retries })
 }
 
 async fn run_tuic_tcp_client(
@@ -2978,41 +2998,60 @@ async fn run_tuic_udp_client(
     let payload = bench_payload(stream_id, options.payload_size);
     let assoc_id = stream_id.saturating_add(1) as u16;
     let mut latencies = Vec::with_capacity(options.requests);
+    let mut retries = 0usize;
 
     for request_index in 0..options.requests {
-        let packet_id = ((request_index % usize::from(u16::MAX)) + 1) as u16;
-        let started = Instant::now();
-        let datagram = tuic_udp_packet(assoc_id, packet_id, Some(echo_addr), &payload)?;
-        connection
-            .send_datagram_wait(Bytes::from(datagram))
-            .await
-            .map_err(io_other)?;
-        let response = tokio::time::timeout(Duration::from_secs(10), connection.read_datagram())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tuic udp response timeout"))?
-            .map_err(io_other)?;
-        let response = parse_tuic_udp_packet(&response)?;
-        if response.assoc_id != assoc_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "tuic udp response association id mismatch",
-            ));
+        let mut attempts = 0usize;
+        loop {
+            let packet_id = (((request_index + attempts) % usize::from(u16::MAX)) + 1) as u16;
+            let started = Instant::now();
+            let datagram = tuic_udp_packet(assoc_id, packet_id, Some(echo_addr), &payload)?;
+            connection
+                .send_datagram_wait(Bytes::from(datagram))
+                .await
+                .map_err(io_other)?;
+            let response =
+                tokio::time::timeout(UDP_RESPONSE_TIMEOUT, connection.read_datagram()).await;
+            let response = match response {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => return Err(io_other(error)),
+                Err(_) if attempts < MAX_REQUEST_RETRIES => {
+                    attempts = attempts.saturating_add(1);
+                    retries = retries.saturating_add(1);
+                    continue;
+                }
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "tuic udp stream {stream_id} request {} response timeout after {} retries",
+                            request_index + 1,
+                            attempts
+                        ),
+                    ));
+                }
+            };
+            let response = parse_tuic_udp_packet(&response)?;
+            if response.assoc_id != assoc_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tuic udp response association id mismatch",
+                ));
+            }
+            if response.payload != payload {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tuic udp bench echo payload mismatch",
+                ));
+            }
+            latencies.push(started.elapsed().as_micros());
+            break;
         }
-        if response.payload != payload {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "tuic udp bench echo payload mismatch",
-            ));
-        }
-        latencies.push(started.elapsed().as_micros());
     }
 
     connection.close(0u32.into(), b"bench done");
     client_endpoint.wait_idle().await;
-    Ok(ClientStats {
-        latencies,
-        retries: 0,
-    })
+    Ok(ClientStats { latencies, retries })
 }
 
 async fn authenticate_tuic(connection: &quinn::Connection) -> io::Result<()> {
