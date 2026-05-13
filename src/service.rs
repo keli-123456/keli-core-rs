@@ -28,7 +28,7 @@ use crate::reality::{
 };
 use crate::shadowsocks::{ShadowsocksServer, ShadowsocksServerConfig};
 use crate::socks5::{Socks5Server, Socks5ServerConfig};
-use crate::tls::TlsAcceptor;
+use crate::tls::{relay_tls_stream, TlsAcceptor, TlsConnection};
 use crate::traffic::{SharedTrafficRegistry, TrafficDelta, TrafficRegistry};
 use crate::trojan::{TrojanServer, TrojanServerConfig};
 use crate::tuic::{TuicServer, TuicServerConfig};
@@ -768,6 +768,7 @@ fn start_anytls_listener(
     let stop_for_thread = stop.clone();
     let workers = ConnectionWorkerGroup::new();
     let workers_for_thread = workers.clone();
+    let tls_acceptor = tls_acceptor_for(inbound)?;
     let runtime_server = server.clone();
     let join = spawn_tcp_accept_loop(
         listener,
@@ -775,7 +776,16 @@ fn start_anytls_listener(
         workers_for_thread,
         move |stream| {
             let server = server.clone();
-            let _ = server.handle_tcp_client(stream);
+            let tls_acceptor = tls_acceptor.clone();
+            let result = if let Some(acceptor) = tls_acceptor {
+                acceptor
+                    .accept(stream)
+                    .and_then(local_bridge_for_tls)
+                    .and_then(|stream| server.handle_tcp_client(stream))
+            } else {
+                server.handle_tcp_client(stream)
+            };
+            let _ = result;
         },
     );
 
@@ -790,6 +800,19 @@ fn start_anytls_listener(
         workers,
         join: Some(join),
     })
+}
+
+fn local_bridge_for_tls(tls: TlsConnection) -> io::Result<TcpStream> {
+    let local_listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+    let local_addr = local_listener.local_addr()?;
+    let local_client = TcpStream::connect(local_addr)?;
+    let (local_plain, _) = local_listener.accept()?;
+
+    let _ = crate::stream::spawn_native_blocking_relay(move || {
+        let _ = relay_tls_stream(tls, local_plain, None);
+    })?;
+
+    Ok(local_client)
 }
 
 fn start_shadowsocks_listener(

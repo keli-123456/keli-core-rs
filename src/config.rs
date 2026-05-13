@@ -929,12 +929,13 @@ impl InboundConfig {
         }
         if self.protocol == Protocol::AnyTls {
             let network = self.transport.network.trim();
-            if network != "tcp" || self.tls.is_some() {
+            if network != "tcp" {
                 return Err(ValidationError::new(format!(
-                    "{} anytls currently supports only plain tcp framing",
+                    "{} anytls currently supports only tcp transport",
                     self.tag
                 )));
             }
+            validate_tls_config("anytls", &self.tag, network, self.tls.as_ref())?;
             if self.users.is_empty() {
                 return Err(ValidationError::new(format!(
                     "{} anytls requires at least one user",
@@ -2749,5 +2750,32 @@ mod tests {
             .expect_err("anytls users should be required");
 
         assert!(error.to_string().contains("requires at least one user"));
+    }
+
+    #[test]
+    fn allows_anytls_with_tls_transport() {
+        let inbound = InboundConfig {
+            tag: "panel|anytls|1".to_string(),
+            protocol: Protocol::AnyTls,
+            listen: "0.0.0.0".to_string(),
+            port: 8443,
+            users: vec![user()],
+            cipher: None,
+            flow: String::new(),
+            padding_scheme: Vec::new(),
+            transport: TransportConfig::default(),
+            tls: Some(TlsConfig {
+                server_name: "anytls.example.test".to_string(),
+                cert_file: Some("/tmp/anytls.crt".to_string()),
+                key_file: Some("/tmp/anytls.key".to_string()),
+                alpn: vec!["http/1.1".to_string()],
+                reject_unknown_sni: false,
+                reality: None,
+            }),
+            sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
+        };
+
+        inbound.validate().expect("anytls tls should validate");
     }
 }
