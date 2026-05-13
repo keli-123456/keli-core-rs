@@ -129,6 +129,8 @@ cargo run -- bench hy2-tcp-stream --streams 8 --requests 1000 --payload 1024
 cargo run -- bench hy2-udp --streams 8 --requests 1000 --payload 1024
 cargo run -- bench tuic-tcp --streams 8 --requests 1000 --payload 1024
 cargo run -- bench tuic-udp --streams 8 --requests 1000 --payload 1024
+cargo run -- bench suite --streams 8 --requests 1000 --payload 1024 --repeats 3 --out runtime/bench/rust-suite.json
+cargo run -- bench compare --baseline runtime/bench/go-suite.json --candidate runtime/bench/rust-suite.json
 ```
 
 ## Local Benchmarks
@@ -152,6 +154,24 @@ cargo run --release -- bench hy2-udp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench tuic-tcp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench tuic-udp --streams 16 --requests 5000 --payload 1024
 ```
+
+Use `bench suite` when collecting comparable protocol results:
+
+```bash
+cargo run --release -- bench suite --streams 16 --requests 5000 --payload 1024 --repeats 3 --label rust-native --out runtime/bench/rust-suite.json
+cargo run --release -- bench suite --commands hy2-tcp,hy2-tcp-stream,hy2-udp --streams 16 --requests 5000 --payload 1024 --repeats 3 --label rust-hy2 --out runtime/bench/rust-hy2-suite.json
+```
+
+Use `bench compare` only with reports generated from the same host, release mode,
+stream count, request count, payload size, and repeat count:
+
+```bash
+cargo run --release -- bench compare --baseline runtime/bench/go-suite.json --candidate runtime/bench/rust-suite.json --out runtime/bench/go-vs-rust.json
+```
+
+The baseline file must use the same `keli-core-bench-suite-v1` schema. Until the old
+Go/Xray harness emits that schema, do not claim a Go-vs-Rust performance win from
+single-run or mismatched numbers.
 
 Use the same host, release build, payload, stream count, and request count when comparing
 against Xray or another core. The JSON includes `runtime_workers` when applicable, `completed_requests`,

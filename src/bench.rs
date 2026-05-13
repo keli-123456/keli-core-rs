@@ -2,7 +2,7 @@ use std::fs;
 use std::future::poll_fn;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::CertificateDer;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
 use crate::hysteria2::{Hysteria2Server, Hysteria2ServerConfig};
@@ -38,6 +38,14 @@ const DEFAULT_PAYLOAD_SIZE: usize = 1_024;
 const MAX_STREAMS: usize = 1024;
 const MAX_PAYLOAD_SIZE: usize = 1024 * 1024;
 const MAX_REQUEST_RETRIES: usize = 3;
+const DEFAULT_SUITE_COMMANDS: &[&str] = &[
+    "vless-tcp-stream",
+    "hy2-tcp",
+    "hy2-tcp-stream",
+    "hy2-udp",
+    "tuic-tcp",
+    "tuic-udp",
+];
 
 #[derive(Clone, Debug)]
 struct BenchOptions {
@@ -56,10 +64,10 @@ impl Default for BenchOptions {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct BenchReport {
-    protocol: &'static str,
-    mode: &'static str,
+    protocol: String,
+    mode: String,
     streams: usize,
     runtime_workers: Option<usize>,
     requests_per_stream: usize,
@@ -94,8 +102,8 @@ impl BenchReport {
         let errors = total_requests.saturating_sub(completed_requests);
         let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
         Self {
-            protocol,
-            mode,
+            protocol: protocol.to_string(),
+            mode: mode.to_string(),
             streams: options.streams,
             runtime_workers,
             requests_per_stream: options.requests,
@@ -119,7 +127,7 @@ impl BenchReport {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct LatencyReport {
     min_us: u128,
     p50_us: u128,
@@ -134,66 +142,111 @@ struct ClientStats {
     retries: usize,
 }
 
+#[derive(Clone, Debug)]
+struct BenchSuiteOptions {
+    bench: BenchOptions,
+    commands: Vec<String>,
+    repeats: usize,
+    label: String,
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct BenchCompareOptions {
+    baseline: PathBuf,
+    candidate: PathBuf,
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BenchSuiteReport {
+    schema: String,
+    label: String,
+    core: String,
+    generated_at_unix: u64,
+    streams: usize,
+    requests_per_stream: usize,
+    payload_bytes: usize,
+    repeats: usize,
+    runs: Vec<BenchSuiteRun>,
+    summaries: Vec<BenchSummary>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BenchSuiteRun {
+    command: String,
+    repeat: usize,
+    report: BenchReport,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BenchSummary {
+    command: String,
+    protocol: String,
+    mode: String,
+    repeats: usize,
+    total_requests: usize,
+    completed_requests_min: usize,
+    errors_total: usize,
+    retries_total: usize,
+    requests_per_second_avg: f64,
+    roundtrip_mbps_avg: f64,
+    roundtrip_mbps_min: f64,
+    roundtrip_mbps_max: f64,
+    p95_us_avg: f64,
+    p99_us_avg: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchComparisonReport {
+    schema: String,
+    baseline_label: String,
+    candidate_label: String,
+    rows: Vec<BenchComparisonRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchComparisonRow {
+    command: String,
+    baseline_roundtrip_mbps: f64,
+    candidate_roundtrip_mbps: f64,
+    throughput_change_percent: Option<f64>,
+    baseline_p99_us: f64,
+    candidate_p99_us: f64,
+    p99_change_percent: Option<f64>,
+    baseline_errors_total: usize,
+    candidate_errors_total: usize,
+    baseline_retries_total: usize,
+    candidate_retries_total: usize,
+}
+
 pub fn run_bench(args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut args = args;
     match args.next().as_deref() {
-        Some("vless-tcp") => {
-            let options = parse_bench_options(args)?;
-            let report = run_vless_tcp_bench(&options).map_err(|error| error.to_string())?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
-            );
+        Some("suite") => {
+            let options = parse_bench_suite_options(args)?;
+            let report = run_bench_suite(&options).map_err(|error| error.to_string())?;
+            let json = serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?;
+            if let Some(path) = options.out.as_ref() {
+                write_text_file(path, &json).map_err(|error| error.to_string())?;
+            }
+            println!("{json}");
             Ok(())
         }
-        Some("vless-tcp-stream") | Some("vless-stream") => {
-            let options = parse_bench_options(args)?;
-            let report = run_vless_tcp_stream_bench(&options).map_err(|error| error.to_string())?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
-            );
+        Some("compare") => {
+            let options = parse_bench_compare_options(args)?;
+            let report = compare_bench_suites(&options).map_err(|error| error.to_string())?;
+            let json = serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?;
+            if let Some(path) = options.out.as_ref() {
+                write_text_file(path, &json).map_err(|error| error.to_string())?;
+            }
+            println!("{json}");
             Ok(())
         }
-        Some("hy2-tcp") | Some("hysteria2-tcp") => {
+        Some(command) if canonical_bench_command(command).is_some() => {
+            let command = canonical_bench_command(command).expect("known bench command");
             let options = parse_bench_options(args)?;
-            let report = run_hy2_tcp_bench(&options).map_err(|error| error.to_string())?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
-            );
-            Ok(())
-        }
-        Some("hy2-tcp-stream") | Some("hysteria2-tcp-stream") | Some("hy2-stream") => {
-            let options = parse_bench_options(args)?;
-            let report = run_hy2_tcp_stream_bench(&options).map_err(|error| error.to_string())?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
-            );
-            Ok(())
-        }
-        Some("hy2-udp") | Some("hysteria2-udp") => {
-            let options = parse_bench_options(args)?;
-            let report = run_hy2_udp_bench(&options).map_err(|error| error.to_string())?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
-            );
-            Ok(())
-        }
-        Some("tuic-tcp") => {
-            let options = parse_bench_options(args)?;
-            let report = run_tuic_tcp_bench(&options).map_err(|error| error.to_string())?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
-            );
-            Ok(())
-        }
-        Some("tuic-udp") => {
-            let options = parse_bench_options(args)?;
-            let report = run_tuic_udp_bench(&options).map_err(|error| error.to_string())?;
+            let report = run_named_bench(command, &options).map_err(|error| error.to_string())?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
@@ -259,6 +312,111 @@ fn validate_bench_options(options: &BenchOptions) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_bench_suite_options(
+    args: impl Iterator<Item = String>,
+) -> Result<BenchSuiteOptions, String> {
+    let mut bench = BenchOptions::default();
+    let mut repeats = 1usize;
+    let mut commands = DEFAULT_SUITE_COMMANDS
+        .iter()
+        .map(|command| command.to_string())
+        .collect::<Vec<_>>();
+    let mut label = "keli-core-rs".to_string();
+    let mut out = None;
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--streams" => bench.streams = parse_next_usize(&mut args, "--streams")?,
+            "--requests" => bench.requests = parse_next_usize(&mut args, "--requests")?,
+            "--payload" => bench.payload_size = parse_next_usize(&mut args, "--payload")?,
+            "--repeats" => repeats = parse_next_usize(&mut args, "--repeats")?,
+            "--commands" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--commands requires a comma-separated list".to_string())?;
+                commands = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| {
+                        canonical_bench_command(value)
+                            .ok_or_else(|| format!("unknown bench command {value}"))
+                            .map(str::to_string)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if commands.is_empty() {
+                    return Err("--commands must contain at least one command".to_string());
+                }
+            }
+            "--label" => {
+                label = args
+                    .next()
+                    .ok_or_else(|| "--label requires a value".to_string())?;
+                if label.trim().is_empty() {
+                    return Err("--label cannot be empty".to_string());
+                }
+            }
+            "--out" => {
+                out = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "--out requires a file path".to_string())?,
+                ));
+            }
+            "--help" | "help" => print_bench_usage(),
+            other => return Err(format!("unknown bench suite option {other}")),
+        }
+    }
+    validate_bench_options(&bench)?;
+    if repeats == 0 || repeats > 100 {
+        return Err("--repeats must be between 1 and 100".to_string());
+    }
+    Ok(BenchSuiteOptions {
+        bench,
+        commands,
+        repeats,
+        label,
+        out,
+    })
+}
+
+fn parse_bench_compare_options(
+    args: impl Iterator<Item = String>,
+) -> Result<BenchCompareOptions, String> {
+    let mut baseline = None;
+    let mut candidate = None;
+    let mut out = None;
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--baseline" => {
+                baseline =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        "--baseline requires a suite json path".to_string()
+                    })?));
+            }
+            "--candidate" => {
+                candidate =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        "--candidate requires a suite json path".to_string()
+                    })?));
+            }
+            "--out" => {
+                out = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "--out requires a file path".to_string())?,
+                ));
+            }
+            "--help" | "help" => print_bench_usage(),
+            other => return Err(format!("unknown bench compare option {other}")),
+        }
+    }
+    Ok(BenchCompareOptions {
+        baseline: baseline.ok_or_else(|| "--baseline is required".to_string())?,
+        candidate: candidate.ok_or_else(|| "--candidate is required".to_string())?,
+        out,
+    })
+}
+
 fn bench_quic_runtime_workers() -> usize {
     thread::available_parallelism()
         .map(usize::from)
@@ -268,8 +426,196 @@ fn bench_quic_runtime_workers() -> usize {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]"
+        "bench commands:\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
     );
+}
+
+fn canonical_bench_command(command: &str) -> Option<&'static str> {
+    match command {
+        "vless-tcp" => Some("vless-tcp"),
+        "vless-tcp-stream" | "vless-stream" => Some("vless-tcp-stream"),
+        "hy2-tcp" | "hysteria2-tcp" => Some("hy2-tcp"),
+        "hy2-tcp-stream" | "hysteria2-tcp-stream" | "hy2-stream" => Some("hy2-tcp-stream"),
+        "hy2-udp" | "hysteria2-udp" => Some("hy2-udp"),
+        "tuic-tcp" => Some("tuic-tcp"),
+        "tuic-udp" => Some("tuic-udp"),
+        _ => None,
+    }
+}
+
+fn run_named_bench(command: &str, options: &BenchOptions) -> io::Result<BenchReport> {
+    match canonical_bench_command(command) {
+        Some("vless-tcp") => run_vless_tcp_bench(options),
+        Some("vless-tcp-stream") => run_vless_tcp_stream_bench(options),
+        Some("hy2-tcp") => run_hy2_tcp_bench(options),
+        Some("hy2-tcp-stream") => run_hy2_tcp_stream_bench(options),
+        Some("hy2-udp") => run_hy2_udp_bench(options),
+        Some("tuic-tcp") => run_tuic_tcp_bench(options),
+        Some("tuic-udp") => run_tuic_udp_bench(options),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown bench command {command}"),
+        )),
+    }
+}
+
+fn run_bench_suite(options: &BenchSuiteOptions) -> io::Result<BenchSuiteReport> {
+    let mut runs = Vec::new();
+    for command in &options.commands {
+        for repeat in 1..=options.repeats {
+            let report = run_named_bench(command, &options.bench)?;
+            runs.push(BenchSuiteRun {
+                command: command.clone(),
+                repeat,
+                report,
+            });
+        }
+    }
+    let summaries = summarize_bench_runs(&runs);
+    Ok(BenchSuiteReport {
+        schema: "keli-core-bench-suite-v1".to_string(),
+        label: options.label.clone(),
+        core: "keli-core-rs".to_string(),
+        generated_at_unix: now_unix_secs(),
+        streams: options.bench.streams,
+        requests_per_stream: options.bench.requests,
+        payload_bytes: options.bench.payload_size,
+        repeats: options.repeats,
+        runs,
+        summaries,
+    })
+}
+
+fn summarize_bench_runs(runs: &[BenchSuiteRun]) -> Vec<BenchSummary> {
+    let mut commands = Vec::<String>::new();
+    for run in runs {
+        if !commands.contains(&run.command) {
+            commands.push(run.command.clone());
+        }
+    }
+    commands
+        .into_iter()
+        .filter_map(|command| {
+            let reports = runs
+                .iter()
+                .filter(|run| run.command == command)
+                .map(|run| &run.report)
+                .collect::<Vec<_>>();
+            summarize_reports(&command, &reports)
+        })
+        .collect()
+}
+
+fn summarize_reports(command: &str, reports: &[&BenchReport]) -> Option<BenchSummary> {
+    let first = reports.first()?;
+    let repeats = reports.len();
+    let completed_requests_min = reports
+        .iter()
+        .map(|report| report.completed_requests)
+        .min()
+        .unwrap_or(0);
+    Some(BenchSummary {
+        command: command.to_string(),
+        protocol: first.protocol.clone(),
+        mode: first.mode.clone(),
+        repeats,
+        total_requests: reports
+            .iter()
+            .map(|report| report.total_requests)
+            .max()
+            .unwrap_or(0),
+        completed_requests_min,
+        errors_total: reports.iter().map(|report| report.errors).sum(),
+        retries_total: reports.iter().map(|report| report.retries).sum(),
+        requests_per_second_avg: avg_f64(reports.iter().map(|report| report.requests_per_second)),
+        roundtrip_mbps_avg: avg_f64(reports.iter().map(|report| report.roundtrip_mbps)),
+        roundtrip_mbps_min: reports
+            .iter()
+            .map(|report| report.roundtrip_mbps)
+            .fold(f64::INFINITY, f64::min),
+        roundtrip_mbps_max: reports
+            .iter()
+            .map(|report| report.roundtrip_mbps)
+            .fold(0.0, f64::max),
+        p95_us_avg: avg_f64(reports.iter().map(|report| report.latency.p95_us as f64)),
+        p99_us_avg: avg_f64(reports.iter().map(|report| report.latency.p99_us as f64)),
+    })
+}
+
+fn compare_bench_suites(options: &BenchCompareOptions) -> io::Result<BenchComparisonReport> {
+    let baseline = read_bench_suite(&options.baseline)?;
+    let candidate = read_bench_suite(&options.candidate)?;
+    let mut rows = Vec::new();
+    for baseline_summary in &baseline.summaries {
+        if let Some(candidate_summary) = candidate
+            .summaries
+            .iter()
+            .find(|summary| summary.command == baseline_summary.command)
+        {
+            rows.push(BenchComparisonRow {
+                command: baseline_summary.command.clone(),
+                baseline_roundtrip_mbps: baseline_summary.roundtrip_mbps_avg,
+                candidate_roundtrip_mbps: candidate_summary.roundtrip_mbps_avg,
+                throughput_change_percent: percent_change(
+                    baseline_summary.roundtrip_mbps_avg,
+                    candidate_summary.roundtrip_mbps_avg,
+                ),
+                baseline_p99_us: baseline_summary.p99_us_avg,
+                candidate_p99_us: candidate_summary.p99_us_avg,
+                p99_change_percent: percent_change(
+                    baseline_summary.p99_us_avg,
+                    candidate_summary.p99_us_avg,
+                ),
+                baseline_errors_total: baseline_summary.errors_total,
+                candidate_errors_total: candidate_summary.errors_total,
+                baseline_retries_total: baseline_summary.retries_total,
+                candidate_retries_total: candidate_summary.retries_total,
+            });
+        }
+    }
+    Ok(BenchComparisonReport {
+        schema: "keli-core-bench-comparison-v1".to_string(),
+        baseline_label: baseline.label,
+        candidate_label: candidate.label,
+        rows,
+    })
+}
+
+fn read_bench_suite(path: &Path) -> io::Result<BenchSuiteReport> {
+    let contents = fs::read_to_string(path)?;
+    serde_json::from_str(&contents).map_err(io_other)
+}
+
+fn write_text_file(path: &Path, contents: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, contents)
+}
+
+fn avg_f64(values: impl Iterator<Item = f64>) -> f64 {
+    let mut count = 0usize;
+    let mut total = 0.0;
+    for value in values {
+        count += 1;
+        total += value;
+    }
+    if count == 0 {
+        0.0
+    } else {
+        total / count as f64
+    }
+}
+
+fn percent_change(baseline: f64, candidate: f64) -> Option<f64> {
+    (baseline > 0.0).then(|| ((candidate - baseline) / baseline) * 100.0)
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn run_vless_tcp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
@@ -1867,9 +2213,12 @@ fn join_server(handle: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_bench_options, run_hy2_udp_bench, run_tuic_tcp_bench, run_tuic_udp_bench,
-        run_vless_tcp_bench, run_vless_tcp_stream_bench, BenchOptions,
+        canonical_bench_command, parse_bench_options, parse_bench_suite_options, percent_change,
+        run_hy2_udp_bench, run_tuic_tcp_bench, run_tuic_udp_bench, run_vless_tcp_bench,
+        run_vless_tcp_stream_bench, summarize_bench_runs, BenchOptions, BenchReport, BenchSuiteRun,
+        LatencyReport,
     };
+    use std::path::PathBuf;
 
     #[test]
     fn parses_bench_options() {
@@ -1883,6 +2232,110 @@ mod tests {
         assert_eq!(options.streams, 2);
         assert_eq!(options.requests, 3);
         assert_eq!(options.payload_size, 4);
+    }
+
+    #[test]
+    fn parses_bench_suite_options() {
+        let options = parse_bench_suite_options(
+            [
+                "--commands",
+                "hysteria2-tcp,vless-stream",
+                "--streams",
+                "2",
+                "--requests",
+                "3",
+                "--payload",
+                "4",
+                "--repeats",
+                "5",
+                "--label",
+                "rust-candidate",
+                "--out",
+                "runtime/bench/rust.json",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("suite options");
+
+        assert_eq!(options.commands, vec!["hy2-tcp", "vless-tcp-stream"]);
+        assert_eq!(options.bench.streams, 2);
+        assert_eq!(options.bench.requests, 3);
+        assert_eq!(options.bench.payload_size, 4);
+        assert_eq!(options.repeats, 5);
+        assert_eq!(options.label, "rust-candidate");
+        assert_eq!(options.out, Some(PathBuf::from("runtime/bench/rust.json")));
+    }
+
+    #[test]
+    fn canonicalizes_bench_command_aliases() {
+        assert_eq!(canonical_bench_command("hysteria2-tcp"), Some("hy2-tcp"));
+        assert_eq!(
+            canonical_bench_command("hysteria2-tcp-stream"),
+            Some("hy2-tcp-stream")
+        );
+        assert_eq!(
+            canonical_bench_command("vless-stream"),
+            Some("vless-tcp-stream")
+        );
+        assert_eq!(canonical_bench_command("unknown"), None);
+    }
+
+    #[test]
+    fn rejects_invalid_bench_suite_options() {
+        let error = parse_bench_suite_options(
+            ["--commands", "hy2-tcp,unknown"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect_err("invalid command");
+        assert!(error.contains("unknown bench command unknown"));
+
+        let error = parse_bench_suite_options(["--repeats", "0"].into_iter().map(str::to_string))
+            .expect_err("invalid repeats");
+        assert!(error.contains("--repeats must be between 1 and 100"));
+    }
+
+    #[test]
+    fn summarizes_bench_suite_runs() {
+        let runs = vec![
+            BenchSuiteRun {
+                command: "hy2-tcp".to_string(),
+                repeat: 1,
+                report: synthetic_report("hy2-tcp", 10.0, 100, 0, 1),
+            },
+            BenchSuiteRun {
+                command: "hy2-tcp".to_string(),
+                repeat: 2,
+                report: synthetic_report("hy2-tcp", 20.0, 300, 1, 2),
+            },
+            BenchSuiteRun {
+                command: "tuic-udp".to_string(),
+                repeat: 1,
+                report: synthetic_report("tuic-udp", 5.0, 200, 0, 0),
+            },
+        ];
+
+        let summaries = summarize_bench_runs(&runs);
+        assert_eq!(summaries.len(), 2);
+
+        let hy2 = summaries
+            .iter()
+            .find(|summary| summary.command == "hy2-tcp")
+            .expect("hy2 summary");
+        assert_eq!(hy2.repeats, 2);
+        assert_eq!(hy2.completed_requests_min, 9);
+        assert_eq!(hy2.errors_total, 1);
+        assert_eq!(hy2.retries_total, 3);
+        assert!((hy2.roundtrip_mbps_avg - 15.0).abs() < f64::EPSILON);
+        assert!((hy2.p99_us_avg - 200.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn computes_percent_change_for_comparison() {
+        assert_eq!(percent_change(0.0, 10.0), None);
+        assert_eq!(percent_change(100.0, 125.0), Some(25.0));
+        assert_eq!(percent_change(100.0, 80.0), Some(-20.0));
     }
 
     #[test]
@@ -2021,5 +2474,39 @@ mod tests {
         assert_eq!(report.error_rate, 0.0);
         assert!(report.runtime_workers.unwrap_or_default() >= 2);
         assert!(report.download_bytes > 0);
+    }
+
+    fn synthetic_report(
+        protocol: &str,
+        roundtrip_mbps: f64,
+        p99_us: u128,
+        errors: usize,
+        retries: usize,
+    ) -> BenchReport {
+        BenchReport {
+            protocol: protocol.to_string(),
+            mode: "synthetic".to_string(),
+            streams: 1,
+            runtime_workers: Some(2),
+            requests_per_stream: 10,
+            payload_bytes: 16,
+            total_requests: 10,
+            completed_requests: 10usize.saturating_sub(errors),
+            upload_bytes: 160,
+            download_bytes: 160,
+            retries,
+            errors,
+            error_rate: errors as f64 / 10.0,
+            elapsed_ms: 10,
+            requests_per_second: 1000.0,
+            roundtrip_mbps,
+            latency: LatencyReport {
+                min_us: 10,
+                p50_us: 20,
+                p95_us: p99_us.saturating_sub(1),
+                p99_us,
+                max_us: p99_us,
+            },
+        }
     }
 }

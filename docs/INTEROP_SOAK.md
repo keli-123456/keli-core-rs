@@ -76,6 +76,21 @@ cargo run --release -- bench tuic-udp --streams 16 --requests 5000 --payload 102
 cargo run --release -- bench vless-tcp-stream --streams 16 --requests 5000 --payload 1024
 ```
 
+For repeatable Rust-vs-baseline comparisons, collect a suite report instead of copying
+one-off command output:
+
+```bash
+cargo run --release -- bench suite --streams 16 --requests 5000 --payload 1024 --repeats 3 --label rust-native --out runtime/bench/rust-suite.json
+cargo run --release -- bench suite --commands hy2-tcp,hy2-tcp-stream,hy2-udp --streams 16 --requests 5000 --payload 1024 --repeats 3 --label rust-hy2 --out runtime/bench/rust-hy2-suite.json
+cargo run --release -- bench compare --baseline runtime/bench/go-suite.json --candidate runtime/bench/rust-suite.json --out runtime/bench/go-vs-rust.json
+```
+
+The Go/Xray baseline must be produced on the same host with the same release/debug mode,
+stream count, request count, payload size, repeat count, and report schema
+(`keli-core-bench-suite-v1`). Until the Go baseline harness emits that schema, treat
+`bench compare` as a Rust-regression and harness-validation tool, not proof that Rust has
+already beaten the production Go stack.
+
 Record the JSON output and compare `runtime_workers` where present, `completed_requests`, `errors`, `error_rate`, `roundtrip_mbps`, p95/p99 latency, and `retries` across commits on the same host.
 
 Small local smoke sample from a Windows loopback release build on `v0.1.32` after the active
