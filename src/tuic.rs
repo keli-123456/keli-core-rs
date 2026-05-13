@@ -511,26 +511,29 @@ impl TuicServer {
             {
                 Ok((source, response)) => {
                     let response_target = socket_addr_to_target(&source);
-                    let command = encode_udp_packet(
-                        packet.assoc_id,
-                        packet.packet_id,
-                        1,
-                        0,
-                        Some(&response_target),
-                        &response,
-                    )?;
                     match reply_mode {
                         UdpReplyMode::Datagram => {
-                            if let Some(max_size) = connection.max_datagram_size() {
-                                if command.len() <= max_size {
-                                    connection
-                                        .send_datagram_wait(Bytes::from(command))
-                                        .await
-                                        .map_err(io_other)?;
-                                }
+                            if !send_udp_packet_fragments(
+                                connection,
+                                packet.assoc_id,
+                                packet.packet_id,
+                                Some(&response_target),
+                                &response,
+                            )
+                            .await?
+                            {
+                                return Ok(());
                             }
                         }
                         UdpReplyMode::UniStream => {
+                            let command = encode_udp_packet(
+                                packet.assoc_id,
+                                packet.packet_id,
+                                1,
+                                0,
+                                Some(&response_target),
+                                &response,
+                            )?;
                             let mut send = connection.open_uni().await.map_err(io_other)?;
                             send.write_all(&command).await.map_err(io_other)?;
                             let _ = send.finish();
@@ -837,21 +840,23 @@ async fn receive_udp_replies(
         }
         let packet_id = session.next_packet_id.fetch_add(1, Ordering::Relaxed);
         let target = socket_addr_to_target(&peer);
-        let command = encode_udp_packet(assoc_id, packet_id, 1, 0, Some(&target), &buffer[..read])?;
         match session.reply_mode {
             UdpReplyMode::Datagram => {
-                let Some(max_size) = connection.max_datagram_size() else {
-                    return Ok(());
-                };
-                if command.len() > max_size {
+                if !send_udp_packet_fragments(
+                    &connection,
+                    assoc_id,
+                    packet_id,
+                    Some(&target),
+                    &buffer[..read],
+                )
+                .await?
+                {
                     continue;
                 }
-                connection
-                    .send_datagram_wait(Bytes::from(command))
-                    .await
-                    .map_err(io_other)?;
             }
             UdpReplyMode::UniStream => {
+                let command =
+                    encode_udp_packet(assoc_id, packet_id, 1, 0, Some(&target), &buffer[..read])?;
                 let mut send = connection.open_uni().await.map_err(io_other)?;
                 send.write_all(&command).await.map_err(io_other)?;
                 let _ = send.finish();
@@ -866,6 +871,46 @@ async fn receive_udp_replies(
             Some(client_ip),
         );
     }
+}
+
+async fn send_udp_packet_fragments(
+    connection: &quinn::Connection,
+    assoc_id: u16,
+    packet_id: u16,
+    target: Option<&SocksTarget>,
+    payload: &[u8],
+) -> io::Result<bool> {
+    let Some(max_size) = connection.max_datagram_size() else {
+        return Ok(false);
+    };
+    let header_len = encode_udp_packet(assoc_id, packet_id, 1, 0, target, &[])?.len();
+    let max_payload = max_size.saturating_sub(header_len);
+    if max_payload == 0 {
+        return Ok(false);
+    }
+    let fragment_count = payload.len().saturating_add(max_payload - 1) / max_payload;
+    if fragment_count == 0 || fragment_count > u8::MAX as usize {
+        return Ok(false);
+    }
+    let fragment_count = fragment_count as u8;
+    for (fragment_id, chunk) in payload.chunks(max_payload).enumerate() {
+        let command = encode_udp_packet(
+            assoc_id,
+            packet_id,
+            fragment_count,
+            fragment_id as u8,
+            target,
+            chunk,
+        )?;
+        if command.len() > max_size {
+            return Ok(false);
+        }
+        connection
+            .send_datagram_wait(Bytes::from(command))
+            .await
+            .map_err(io_other)?;
+    }
+    Ok(true)
 }
 
 async fn relay_streams(

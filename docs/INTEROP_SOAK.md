@@ -133,6 +133,25 @@ against `direct-tcp-proxy-stream`, not only VLESS parser code. A single-thread p
 and Linux `splice(2)` relay prototype were rejected because they did not improve the 1 KiB raw proxy
 baseline.
 
+Recent Linux loopback release baseline for QUIC UDP datagram paths after HY2/TUIC UDP reply
+fragmentation and the benchmark echo socket buffer fix. UDP benchmarks reject payloads above
+`65507` bytes because a single IPv4 UDP payload cannot legally carry `65536` bytes; large datagram
+payloads are useful as fragmentation stress tests, not as the default production PPS shape.
+
+| Command | Shape | Roundtrip Mbps | p95 | p99 | Errors | Retries |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `hy2-udp` | `64 x 5000 x 1024` | 534.37 | 2564 us | 3249 us | 0 | 26 |
+| `hy2-udp` | `64 x 5000 x 4096` | 1484.03 | 2820 us | 3496 us | 0 | 108 |
+| `hy2-udp` | `64 x 100 x 32768` | 321.67 | 4339 us | 30205 us | 0 | 131 |
+| `tuic-udp` | `64 x 5000 x 1024` | 490.75 | 2872 us | 3585 us | 0 | 22 |
+| `tuic-udp` | `64 x 5000 x 4096` | 1450.43 | 2705 us | 3500 us | 0 | 123 |
+| `tuic-udp` | `64 x 100 x 16384` | 264.38 | 3581 us | 13827 us | 0 | 113 |
+
+The 4 KiB rows verify that HY2/TUIC can now move payloads larger than one QUIC datagram MTU through
+the local benchmark without errors. Very large 32 KiB+ datagram stress runs are retry-heavy because
+QUIC datagrams remain unreliable; treat those rows as boundary checks and keep the primary HY2/TUIC
+UDP regression target at 1 KiB and 4 KiB.
+
 Recent Windows loopback release baseline for QUIC stream/datagram paths with the same `16 x 5000 x
 1024` shape and `3` repeats:
 

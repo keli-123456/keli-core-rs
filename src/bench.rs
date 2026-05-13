@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::future::poll_fn;
 use std::io::{self, Read, Write};
@@ -13,6 +14,7 @@ use bytes::Bytes;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::AsyncReadExt;
 
 use crate::config::OutboundConfig;
@@ -47,8 +49,10 @@ const DEFAULT_REQUESTS: usize = 200;
 const DEFAULT_PAYLOAD_SIZE: usize = 1_024;
 const MAX_STREAMS: usize = 1024;
 const MAX_PAYLOAD_SIZE: usize = 1024 * 1024;
+const MAX_UDP_PAYLOAD_SIZE: usize = 65_507;
 const MAX_REQUEST_RETRIES: usize = 3;
 const UDP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const UDP_ECHO_SOCKET_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 const DEFAULT_SUITE_COMMANDS: &[&str] = &[
     "direct-tcp-stream",
     "direct-tcp-proxy-stream",
@@ -1452,8 +1456,9 @@ async fn run_hy2_tcp_stream_bench_async(options: &BenchOptions) -> io::Result<Be
 }
 
 async fn run_hy2_udp_bench_async(options: &BenchOptions) -> io::Result<BenchReport> {
+    validate_udp_bench_payload(options)?;
     let echo_stop = Arc::new(AtomicBool::new(false));
-    let echo = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await?);
+    let echo = Arc::new(bind_bench_udp_echo_socket()?);
     let echo_addr = echo.local_addr()?;
     let echo_task = {
         let echo = echo.clone();
@@ -1699,8 +1704,9 @@ async fn run_tuic_tcp_stream_bench_async(options: &BenchOptions) -> io::Result<B
 }
 
 async fn run_tuic_udp_bench_async(options: &BenchOptions) -> io::Result<BenchReport> {
+    validate_udp_bench_payload(options)?;
     let echo_stop = Arc::new(AtomicBool::new(false));
-    let echo = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await?);
+    let echo = Arc::new(bind_bench_udp_echo_socket()?);
     let echo_addr = echo.local_addr()?;
     let echo_task = {
         let echo = echo.clone();
@@ -2961,13 +2967,12 @@ async fn run_hy2_udp_client(
         loop {
             let packet_id = (((request_index + attempts) % usize::from(u16::MAX)) + 1) as u16;
             let started = Instant::now();
-            let datagram = hy2_udp_datagram(session_id, packet_id, echo_addr, &payload)?;
-            connection
-                .send_datagram_wait(Bytes::from(datagram))
-                .await
-                .map_err(io_other)?;
-            let response =
-                tokio::time::timeout(UDP_RESPONSE_TIMEOUT, connection.read_datagram()).await;
+            send_hy2_udp_datagrams(&connection, session_id, packet_id, echo_addr, &payload).await?;
+            let response = tokio::time::timeout(
+                UDP_RESPONSE_TIMEOUT,
+                read_hy2_udp_response_payload(&connection, session_id),
+            )
+            .await;
             let response = match response {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) => return Err(io_other(error)),
@@ -2987,14 +2992,7 @@ async fn run_hy2_udp_client(
                     ));
                 }
             };
-            let response = parse_hy2_udp_datagram(&response)?;
-            if response.session_id != session_id {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "hy2 udp response id mismatch",
-                ));
-            }
-            if response.data != payload {
+            if response != payload {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "hy2 udp bench echo payload mismatch",
@@ -3152,13 +3150,13 @@ async fn run_tuic_udp_client(
         loop {
             let packet_id = (((request_index + attempts) % usize::from(u16::MAX)) + 1) as u16;
             let started = Instant::now();
-            let datagram = tuic_udp_packet(assoc_id, packet_id, Some(echo_addr), &payload)?;
-            connection
-                .send_datagram_wait(Bytes::from(datagram))
-                .await
-                .map_err(io_other)?;
-            let response =
-                tokio::time::timeout(UDP_RESPONSE_TIMEOUT, connection.read_datagram()).await;
+            send_tuic_udp_datagrams(&connection, assoc_id, packet_id, Some(echo_addr), &payload)
+                .await?;
+            let response = tokio::time::timeout(
+                UDP_RESPONSE_TIMEOUT,
+                read_tuic_udp_response_payload(&connection, assoc_id),
+            )
+            .await;
             let response = match response {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) => return Err(io_other(error)),
@@ -3178,14 +3176,7 @@ async fn run_tuic_udp_client(
                     ));
                 }
             };
-            let response = parse_tuic_udp_packet(&response)?;
-            if response.assoc_id != assoc_id {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "tuic udp response association id mismatch",
-                ));
-            }
-            if response.payload != payload {
+            if response != payload {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "tuic udp bench echo payload mismatch",
@@ -3226,9 +3217,11 @@ fn tuic_connect_command(target: SocketAddr) -> Vec<u8> {
     command
 }
 
-fn tuic_udp_packet(
+fn tuic_udp_packet_fragment(
     assoc_id: u16,
     packet_id: u16,
+    fragment_total: u8,
+    fragment_id: u8,
     target: Option<SocketAddr>,
     payload: &[u8],
 ) -> io::Result<Vec<u8>> {
@@ -3244,12 +3237,58 @@ fn tuic_udp_packet(
     output.push(TUIC_COMMAND_PACKET);
     output.extend_from_slice(&assoc_id.to_be_bytes());
     output.extend_from_slice(&packet_id.to_be_bytes());
-    output.push(1);
-    output.push(0);
+    output.push(fragment_total);
+    output.push(fragment_id);
     output.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     output.extend_from_slice(&address);
     output.extend_from_slice(payload);
     Ok(output)
+}
+
+async fn send_tuic_udp_datagrams(
+    connection: &quinn::Connection,
+    assoc_id: u16,
+    packet_id: u16,
+    target: Option<SocketAddr>,
+    payload: &[u8],
+) -> io::Result<()> {
+    let Some(max_size) = connection.max_datagram_size() else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "tuic udp datagram size is unavailable",
+        ));
+    };
+    let header_len = tuic_udp_packet_fragment(assoc_id, packet_id, 1, 0, target, &[])?.len();
+    let max_payload = max_size.saturating_sub(header_len);
+    if max_payload == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tuic udp datagram overhead exceeds max datagram size",
+        ));
+    }
+    let fragment_count = payload.len().saturating_add(max_payload - 1) / max_payload;
+    if fragment_count == 0 || fragment_count > u8::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tuic udp payload requires too many fragments",
+        ));
+    }
+    let fragment_count = fragment_count as u8;
+    for (fragment_id, chunk) in payload.chunks(max_payload).enumerate() {
+        let datagram = tuic_udp_packet_fragment(
+            assoc_id,
+            packet_id,
+            fragment_count,
+            fragment_id as u8,
+            target,
+            chunk,
+        )?;
+        connection
+            .send_datagram_wait(Bytes::from(datagram))
+            .await
+            .map_err(io_other)?;
+    }
+    Ok(())
 }
 
 fn tuic_address(target: Option<SocketAddr>) -> Vec<u8> {
@@ -3274,6 +3313,9 @@ fn tuic_address(target: Option<SocketAddr>) -> Vec<u8> {
 #[derive(Debug, PartialEq, Eq)]
 struct TuicUdpPacket {
     assoc_id: u16,
+    packet_id: u16,
+    fragment_total: u8,
+    fragment_id: u8,
     payload: Vec<u8>,
 }
 
@@ -3285,12 +3327,13 @@ fn parse_tuic_udp_packet(input: &[u8]) -> io::Result<TuicUdpPacket> {
         ));
     }
     let assoc_id = u16::from_be_bytes([input[2], input[3]]);
+    let packet_id = u16::from_be_bytes([input[4], input[5]]);
     let fragment_total = input[6];
     let fragment_id = input[7];
-    if fragment_total != 1 || fragment_id != 0 {
+    if fragment_total == 0 || fragment_id >= fragment_total {
         return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "tuic bench does not support fragmented udp responses",
+            io::ErrorKind::InvalidData,
+            "invalid tuic udp fragment index",
         ));
     }
     let payload_len = u16::from_be_bytes([input[8], input[9]]) as usize;
@@ -3304,8 +3347,49 @@ fn parse_tuic_udp_packet(input: &[u8]) -> io::Result<TuicUdpPacket> {
     }
     Ok(TuicUdpPacket {
         assoc_id,
+        packet_id,
+        fragment_total,
+        fragment_id,
         payload: input[offset..].to_vec(),
     })
+}
+
+async fn read_tuic_udp_response_payload(
+    connection: &quinn::Connection,
+    assoc_id: u16,
+) -> io::Result<Vec<u8>> {
+    let mut fragments: HashMap<u16, Vec<Option<Vec<u8>>>> = HashMap::new();
+    loop {
+        let datagram = connection.read_datagram().await.map_err(io_other)?;
+        let packet = parse_tuic_udp_packet(&datagram)?;
+        if packet.assoc_id != assoc_id {
+            continue;
+        }
+        if packet.fragment_total == 1 {
+            return Ok(packet.payload);
+        }
+        let parts = fragments
+            .entry(packet.packet_id)
+            .or_insert_with(|| vec![None; packet.fragment_total as usize]);
+        if parts.len() != packet.fragment_total as usize {
+            fragments.remove(&packet.packet_id);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mismatched tuic udp response fragment count",
+            ));
+        }
+        parts[packet.fragment_id as usize] = Some(packet.payload);
+        if parts.iter().all(Option::is_some) {
+            let parts = fragments
+                .remove(&packet.packet_id)
+                .expect("fragment set exists");
+            let mut payload = Vec::new();
+            for part in parts {
+                payload.extend_from_slice(&part.expect("all fragments present"));
+            }
+            return Ok(payload);
+        }
+    }
 }
 
 fn skip_tuic_address(input: &[u8], offset: &mut usize) -> io::Result<()> {
@@ -3358,6 +3442,29 @@ fn skip_tuic_port(input: &[u8], offset: &mut usize) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn bind_bench_udp_echo_socket() -> io::Result<tokio::net::UdpSocket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_recv_buffer_size(UDP_ECHO_SOCKET_BUFFER_SIZE)?;
+    socket.set_send_buffer_size(UDP_ECHO_SOCKET_BUFFER_SIZE)?;
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid bench udp addr");
+    socket.bind(&addr.into())?;
+    socket.set_nonblocking(true)?;
+    tokio::net::UdpSocket::from_std(socket.into())
+}
+
+fn validate_udp_bench_payload(options: &BenchOptions) -> io::Result<()> {
+    if options.payload_size <= MAX_UDP_PAYLOAD_SIZE {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "udp bench payload {} exceeds max UDP payload {}; use 65507 or lower",
+            options.payload_size, MAX_UDP_PAYLOAD_SIZE
+        ),
+    ))
 }
 
 fn hy2_client_endpoint(cert_der: CertificateDer<'static>) -> io::Result<quinn::Endpoint> {
@@ -3428,12 +3535,17 @@ fn hy2_tcp_request(target: SocketAddr) -> Vec<u8> {
 
 struct Hy2UdpBenchDatagram {
     session_id: u32,
+    packet_id: u16,
+    fragment_id: u8,
+    fragment_count: u8,
     data: Vec<u8>,
 }
 
-fn hy2_udp_datagram(
+fn hy2_udp_datagram_fragment(
     session_id: u32,
     packet_id: u16,
+    fragment_id: u8,
+    fragment_count: u8,
     target: SocketAddr,
     data: &[u8],
 ) -> io::Result<Vec<u8>> {
@@ -3441,12 +3553,58 @@ fn hy2_udp_datagram(
     let mut output = Vec::with_capacity(8 + address.len() + data.len() + 8);
     output.extend_from_slice(&session_id.to_be_bytes());
     output.extend_from_slice(&packet_id.to_be_bytes());
-    output.push(0);
-    output.push(1);
+    output.push(fragment_id);
+    output.push(fragment_count);
     output.extend_from_slice(&encode_hy2_varint(address.len() as u64)?);
     output.extend_from_slice(address.as_bytes());
     output.extend_from_slice(data);
     Ok(output)
+}
+
+async fn send_hy2_udp_datagrams(
+    connection: &quinn::Connection,
+    session_id: u32,
+    packet_id: u16,
+    target: SocketAddr,
+    payload: &[u8],
+) -> io::Result<()> {
+    let Some(max_size) = connection.max_datagram_size() else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "hy2 udp datagram size is unavailable",
+        ));
+    };
+    let header_len = hy2_udp_datagram_fragment(session_id, packet_id, 0, 1, target, &[])?.len();
+    let max_payload = max_size.saturating_sub(header_len);
+    if max_payload == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hy2 udp datagram overhead exceeds max datagram size",
+        ));
+    }
+    let fragment_count = payload.len().saturating_add(max_payload - 1) / max_payload;
+    if fragment_count == 0 || fragment_count > u8::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hy2 udp payload requires too many fragments",
+        ));
+    }
+    let fragment_count = fragment_count as u8;
+    for (fragment_id, chunk) in payload.chunks(max_payload).enumerate() {
+        let datagram = hy2_udp_datagram_fragment(
+            session_id,
+            packet_id,
+            fragment_id as u8,
+            fragment_count,
+            target,
+            chunk,
+        )?;
+        connection
+            .send_datagram_wait(Bytes::from(datagram))
+            .await
+            .map_err(io_other)?;
+    }
+    Ok(())
 }
 
 fn parse_hy2_udp_datagram(input: &[u8]) -> io::Result<Hy2UdpBenchDatagram> {
@@ -3457,11 +3615,13 @@ fn parse_hy2_udp_datagram(input: &[u8]) -> io::Result<Hy2UdpBenchDatagram> {
         ));
     }
     let session_id = u32::from_be_bytes(input[0..4].try_into().expect("fixed slice"));
-    let _packet_id = u16::from_be_bytes(input[4..6].try_into().expect("fixed slice"));
-    if input[6] != 0 || input[7] != 1 {
+    let packet_id = u16::from_be_bytes(input[4..6].try_into().expect("fixed slice"));
+    let fragment_id = input[6];
+    let fragment_count = input[7];
+    if fragment_count == 0 || fragment_id >= fragment_count {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "hy2 udp bench expects unfragmented datagram",
+            "invalid hy2 udp fragment index",
         ));
     }
     let mut offset = 8usize;
@@ -3481,8 +3641,49 @@ fn parse_hy2_udp_datagram(input: &[u8]) -> io::Result<Hy2UdpBenchDatagram> {
     offset += address_len;
     Ok(Hy2UdpBenchDatagram {
         session_id,
+        packet_id,
+        fragment_id,
+        fragment_count,
         data: input[offset..].to_vec(),
     })
+}
+
+async fn read_hy2_udp_response_payload(
+    connection: &quinn::Connection,
+    session_id: u32,
+) -> io::Result<Vec<u8>> {
+    let mut fragments: HashMap<u16, Vec<Option<Vec<u8>>>> = HashMap::new();
+    loop {
+        let datagram = connection.read_datagram().await.map_err(io_other)?;
+        let packet = parse_hy2_udp_datagram(&datagram)?;
+        if packet.session_id != session_id {
+            continue;
+        }
+        if packet.fragment_count == 1 {
+            return Ok(packet.data);
+        }
+        let parts = fragments
+            .entry(packet.packet_id)
+            .or_insert_with(|| vec![None; packet.fragment_count as usize]);
+        if parts.len() != packet.fragment_count as usize {
+            fragments.remove(&packet.packet_id);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mismatched hy2 udp response fragment count",
+            ));
+        }
+        parts[packet.fragment_id as usize] = Some(packet.data);
+        if parts.iter().all(Option::is_some) {
+            let parts = fragments
+                .remove(&packet.packet_id)
+                .expect("fragment set exists");
+            let mut payload = Vec::new();
+            for part in parts {
+                payload.extend_from_slice(&part.expect("all fragments present"));
+            }
+            return Ok(payload);
+        }
+    }
 }
 
 async fn read_hy2_tcp_response_header(recv: &mut quinn::RecvStream) -> io::Result<()> {
@@ -3654,8 +3855,8 @@ mod tests {
         run_http_connect_stream_bench, run_hy2_udp_bench, run_shadowsocks_tcp_stream_bench,
         run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench, run_tuic_tcp_bench,
         run_tuic_tcp_stream_bench, run_tuic_udp_bench, run_vless_tcp_bench,
-        run_vless_tcp_stream_bench, run_vmess_tcp_stream_bench, summarize_bench_runs, BenchOptions,
-        BenchReport, BenchSuiteRun, LatencyReport,
+        run_vless_tcp_stream_bench, run_vmess_tcp_stream_bench, summarize_bench_runs,
+        validate_udp_bench_payload, BenchOptions, BenchReport, BenchSuiteRun, LatencyReport,
     };
     use std::net::{SocketAddr, TcpStream};
     use std::path::PathBuf;
@@ -3674,6 +3875,18 @@ mod tests {
         assert_eq!(options.streams, 2);
         assert_eq!(options.requests, 3);
         assert_eq!(options.payload_size, 4);
+    }
+
+    #[test]
+    fn udp_bench_rejects_payload_above_udp_datagram_limit() {
+        let options = BenchOptions {
+            streams: 1,
+            requests: 1,
+            payload_size: 65_508,
+        };
+
+        let error = validate_udp_bench_payload(&options).expect_err("payload rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

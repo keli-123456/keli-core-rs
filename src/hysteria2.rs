@@ -495,21 +495,16 @@ impl Hysteria2Server {
                         return Ok(());
                     }
                     let address = format_socket_addr(&source);
-                    let datagram = encode_udp_datagram(
+                    if !send_udp_datagram_fragments(
+                        connection,
                         message.session_id,
                         message.packet_id,
-                        0,
-                        1,
                         &address,
                         &response,
-                    )?;
-                    if let Some(max_size) = connection.max_datagram_size() {
-                        if datagram.len() <= max_size {
-                            connection
-                                .send_datagram_wait(Bytes::from(datagram))
-                                .await
-                                .map_err(io_other)?;
-                        }
+                    )
+                    .await?
+                    {
+                        return Ok(());
                     }
                     self.traffic.add_with_user_id(
                         self.config.node_tag.clone(),
@@ -887,17 +882,17 @@ async fn receive_udp_replies(
         }
         let packet_id = session.next_packet_id.fetch_add(1, Ordering::Relaxed);
         let address = format_socket_addr(&peer);
-        let datagram = encode_udp_datagram(session_id, packet_id, 0, 1, &address, &buffer[..read])?;
-        let Some(max_size) = connection.max_datagram_size() else {
-            return Ok(());
-        };
-        if datagram.len() > max_size {
+        if !send_udp_datagram_fragments(
+            &connection,
+            session_id,
+            packet_id,
+            &address,
+            &buffer[..read],
+        )
+        .await?
+        {
             continue;
         }
-        connection
-            .send_datagram_wait(Bytes::from(datagram))
-            .await
-            .map_err(io_other)?;
         traffic.add_with_user_id(
             node_tag.clone(),
             user_uuid.clone(),
@@ -907,6 +902,46 @@ async fn receive_udp_replies(
             Some(client_ip),
         );
     }
+}
+
+async fn send_udp_datagram_fragments(
+    connection: &quinn::Connection,
+    session_id: u32,
+    packet_id: u16,
+    address: &str,
+    data: &[u8],
+) -> io::Result<bool> {
+    let Some(max_size) = connection.max_datagram_size() else {
+        return Ok(false);
+    };
+    let header_len = encode_udp_datagram(session_id, packet_id, 0, 1, address, &[])?.len();
+    let max_payload = max_size.saturating_sub(header_len);
+    if max_payload == 0 {
+        return Ok(false);
+    }
+    let fragment_count = data.len().saturating_add(max_payload - 1) / max_payload;
+    if fragment_count == 0 || fragment_count > u8::MAX as usize {
+        return Ok(false);
+    }
+    let fragment_count = fragment_count as u8;
+    for (fragment_id, chunk) in data.chunks(max_payload).enumerate() {
+        let datagram = encode_udp_datagram(
+            session_id,
+            packet_id,
+            fragment_id as u8,
+            fragment_count,
+            address,
+            chunk,
+        )?;
+        if datagram.len() > max_size {
+            return Ok(false);
+        }
+        connection
+            .send_datagram_wait(Bytes::from(datagram))
+            .await
+            .map_err(io_other)?;
+    }
+    Ok(true)
 }
 
 async fn send_h3_status<S, B>(
