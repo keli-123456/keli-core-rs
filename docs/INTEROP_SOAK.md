@@ -133,6 +133,27 @@ against `direct-tcp-proxy-stream`, not only VLESS parser code. A single-thread p
 and Linux `splice(2)` relay prototype were rejected because they did not improve the 1 KiB raw proxy
 baseline.
 
+Same-host 1 KiB TCP stream cross-protocol spot checks show the next hotspots. SOCKS, HTTP CONNECT,
+Trojan, and VLESS are near the raw proxy ceiling, while Shadowsocks and VMess are slower because
+their per-frame encryption/authenticated-length work dominates small payloads:
+
+| Command | Roundtrip Mbps | p95 | p99 | Errors | Retries |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `direct-tcp-proxy-stream` | 859.55 | 2177 us | 5367 us | 0 | 0 |
+| `socks-tcp-stream` | 888.71 | 1994 us | 4629 us | 0 | 0 |
+| `http-connect-stream` | 917.10 | 1829 us | 4478 us | 0 | 0 |
+| `trojan-tcp-stream` | 1003.81 | 1902 us | 4336 us | 0 | 0 |
+| `vless-tcp-stream` | 953.53 | 2100 us | 4890 us | 0 | 0 |
+| `shadowsocks-tcp-stream` | 401.09 | 4408 us | 8931 us | 0 | 0 |
+| `vmess-tcp-stream` | 326.52 | 5133 us | 7907 us | 0 | 0 |
+
+At 4 KiB, the slower encrypted/framed paths improve but remain the next optimization target:
+
+| Command | Roundtrip Mbps | p95 | p99 | Errors | Retries |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `shadowsocks-tcp-stream` | 1247.54 | 5837 us | 10257 us | 0 | 0 |
+| `vmess-tcp-stream` | 1075.34 | 6210 us | 9884 us | 0 | 0 |
+
 Recent Linux loopback release baseline for QUIC UDP datagram paths after HY2/TUIC UDP reply
 fragmentation and the benchmark echo socket buffer fix. UDP benchmarks reject payloads above
 `65507` bytes because a single IPv4 UDP payload cannot legally carry `65536` bytes; large datagram
