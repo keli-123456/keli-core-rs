@@ -49,6 +49,7 @@ const MAX_PAYLOAD_SIZE: usize = 1024 * 1024;
 const MAX_REQUEST_RETRIES: usize = 3;
 const UDP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_SUITE_COMMANDS: &[&str] = &[
+    "direct-tcp-stream",
     "http-connect-stream",
     "shadowsocks-tcp-stream",
     "socks-tcp-stream",
@@ -543,12 +544,13 @@ fn bench_quic_runtime_workers() -> usize {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --vless-core HOST:PORT [--commands vless-tcp,vless-tcp-stream] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
+        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --vless-core HOST:PORT [--commands vless-tcp,vless-tcp-stream] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
     );
 }
 
 fn canonical_bench_command(command: &str) -> Option<&'static str> {
     match command {
+        "direct-tcp-stream" | "direct-stream" | "tcp-stream" => Some("direct-tcp-stream"),
         "http-connect-stream" | "http-tcp-stream" | "http-stream" => Some("http-connect-stream"),
         "shadowsocks-tcp-stream" | "ss-tcp-stream" | "ss-stream" => Some("shadowsocks-tcp-stream"),
         "socks-tcp-stream" | "socks5-tcp-stream" | "socks-stream" => Some("socks-tcp-stream"),
@@ -568,6 +570,7 @@ fn canonical_bench_command(command: &str) -> Option<&'static str> {
 
 fn run_named_bench(command: &str, options: &BenchOptions) -> io::Result<BenchReport> {
     match canonical_bench_command(command) {
+        Some("direct-tcp-stream") => run_direct_tcp_stream_bench(options),
         Some("http-connect-stream") => run_http_connect_stream_bench(options),
         Some("shadowsocks-tcp-stream") => run_shadowsocks_tcp_stream_bench(options),
         Some("socks-tcp-stream") => run_socks_tcp_stream_bench(options),
@@ -655,6 +658,52 @@ fn run_external_named_bench(
             format!("external bench command {command} is not supported yet"),
         )),
     }
+}
+
+fn run_direct_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        workers.push(thread::spawn(move || {
+            let mut stream = TcpStream::connect(echo_addr)?;
+            run_plain_stream_echo_client(&mut stream, "direct-tcp", stream_id, &options)
+        }));
+    }
+
+    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+    }
+    let elapsed = started.elapsed();
+
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        "direct-tcp",
+        "direct-echo-stream",
+        options,
+        None,
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
 }
 
 fn run_http_connect_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
@@ -3502,10 +3551,10 @@ fn join_server(handle: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
 mod tests {
     use super::{
         canonical_bench_command, parse_bench_options, parse_bench_suite_options,
-        parse_external_bench_suite_options, percent_change, run_external_vless_tcp_stream_bench,
-        run_http_connect_stream_bench, run_hy2_udp_bench, run_shadowsocks_tcp_stream_bench,
-        run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench, run_tuic_tcp_bench,
-        run_tuic_tcp_stream_bench, run_tuic_udp_bench, run_vless_tcp_bench,
+        parse_external_bench_suite_options, percent_change, run_direct_tcp_stream_bench,
+        run_external_vless_tcp_stream_bench, run_http_connect_stream_bench, run_hy2_udp_bench,
+        run_shadowsocks_tcp_stream_bench, run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench,
+        run_tuic_tcp_bench, run_tuic_tcp_stream_bench, run_tuic_udp_bench, run_vless_tcp_bench,
         run_vless_tcp_stream_bench, run_vmess_tcp_stream_bench, summarize_bench_runs, BenchOptions,
         BenchReport, BenchSuiteRun, LatencyReport,
     };
@@ -3613,6 +3662,10 @@ mod tests {
 
     #[test]
     fn canonicalizes_bench_command_aliases() {
+        assert_eq!(
+            canonical_bench_command("direct-stream"),
+            Some("direct-tcp-stream")
+        );
         assert_eq!(canonical_bench_command("hysteria2-tcp"), Some("hy2-tcp"));
         assert_eq!(
             canonical_bench_command("hysteria2-tcp-stream"),
@@ -3704,6 +3757,25 @@ mod tests {
         assert_eq!(percent_change(0.0, 10.0), None);
         assert_eq!(percent_change(100.0, 125.0), Some(25.0));
         assert_eq!(percent_change(100.0, 80.0), Some(-20.0));
+    }
+
+    #[test]
+    fn runs_direct_tcp_stream_bench_smoke() {
+        let report = run_direct_tcp_stream_bench(&BenchOptions {
+            streams: 1,
+            requests: 3,
+            payload_size: 16,
+        })
+        .expect("bench");
+
+        assert_eq!(report.protocol, "direct-tcp");
+        assert_eq!(report.mode, "direct-echo-stream");
+        assert_eq!(report.total_requests, 3);
+        assert_eq!(report.completed_requests, 3);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert_eq!(report.runtime_workers, None);
+        assert!(report.download_bytes > 0);
     }
 
     #[test]
