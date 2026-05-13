@@ -130,19 +130,18 @@ cargo run --example interop_matrix -- --sing-box /path/to/sing-box --only hy2 --
 ```
 
 The matrix currently verifies TCP forwarding through sing-box for SOCKS, HTTP proxy,
-Shadowsocks, VLESS, VMess, Trojan, AnyTLS, Hysteria2, and TUIC combinations, plus UDP relay
-through Shadowsocks, Hysteria2, and TUIC. It intentionally skips Naive because the native core
-treats it as a sidecar, skips Mieru until an official client is installed in the test
-environment, and skips VLESS REALITY until there is a deterministic local REALITY destination
-fixture.
+Shadowsocks, VLESS, VLESS REALITY Vision, VMess, Trojan, AnyTLS, Hysteria2, and TUIC
+combinations, plus UDP relay through Shadowsocks, Hysteria2, and TUIC. It uses a deterministic
+local TLS destination fixture for REALITY. It intentionally skips Naive because the native core
+treats it as a sidecar, and skips Mieru until an official client is installed in the test
+environment.
 
 Latest local Windows loopback sample:
 
 ```text
-interop matrix summary: 33 passed, 0 failed
+interop matrix summary: 34 passed, 0 failed
 SKIP mieru: no official mieru client is bundled with this matrix
 SKIP naive: native core intentionally treats Naive as a sidecar
-SKIP vless-reality: requires a deterministic REALITY destination fixture
 ```
 
 The same matrix is available from GitHub Actions as the manual `Native Interop Matrix`

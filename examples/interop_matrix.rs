@@ -11,8 +11,12 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use rcgen::generate_simple_self_signed;
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde_json::{json, Value};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 const HTTP_BODY: &[u8] = b"keli-ok";
 const UDP_PAYLOAD: &[u8] = b"udp-ping";
@@ -21,6 +25,8 @@ const USER_UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
 const USER_PASSWORD: &str = "interop-password";
 const SS_PASSWORD: &str = "ss-password";
 const TUIC_PASSWORD: &str = "tuic-password";
+const REALITY_PRIVATE_KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+const REALITY_SHORT_ID: &str = "6ba85179e30d4fc2";
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -184,6 +190,71 @@ impl Drop for UdpEcho {
     }
 }
 
+struct TlsDest {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl TlsDest {
+    fn start() -> Result<Self> {
+        let cert = generate_simple_self_signed(vec!["localhost".to_string()])?;
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())),
+            )?;
+        let server_config = Arc::new(server_config);
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_for_thread.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let config = Arc::clone(&server_config);
+                        thread::spawn(move || {
+                            let _ = handle_tls_dest_client(stream, config);
+                        });
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            addr,
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for TlsDest {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn handle_tls_dest_client(stream: TcpStream, config: Arc<ServerConfig>) -> io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_millis(800)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(800)))?;
+    let connection = ServerConnection::new(config).map_err(io_other)?;
+    let mut tls = StreamOwned::new(connection, stream);
+    let mut buffer = [0u8; 1024];
+    let _ = tls.read(&mut buffer);
+    Ok(())
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("interop matrix failed: {error}");
@@ -211,9 +282,15 @@ fn run() -> Result<()> {
     prepare_work_dir(&args.work_dir)?;
     let tcp_echo = TcpEcho::start()?;
     let udp_echo = UdpEcho::start()?;
+    let reality_dest = TlsDest::start()?;
     let cert = write_test_cert(&args.work_dir)?;
     let cases = filtered_cases(
-        build_cases(args.base_port, &cert.cert_path, &cert.key_path),
+        build_cases(
+            args.base_port,
+            &cert.cert_path,
+            &cert.key_path,
+            reality_dest.addr,
+        ),
         &args.only,
     );
     if cases.is_empty() {
@@ -256,7 +333,6 @@ fn run() -> Result<()> {
 
     println!("SKIP mieru: no official mieru client is bundled with this matrix");
     println!("SKIP naive: native core intentionally treats Naive as a sidecar");
-    println!("SKIP vless-reality: requires a deterministic REALITY destination fixture");
 
     if !failed.is_empty() {
         println!(
@@ -402,7 +478,12 @@ fn filtered_cases(cases: Vec<InteropCase>, only: &[String]) -> Vec<InteropCase> 
         .collect()
 }
 
-fn build_cases(base_port: u16, cert: &Path, key: &Path) -> Vec<InteropCase> {
+fn build_cases(
+    base_port: u16,
+    cert: &Path,
+    key: &Path,
+    reality_dest: SocketAddr,
+) -> Vec<InteropCase> {
     let mut port = base_port;
     let mut next_port = || {
         let current = port;
@@ -438,6 +519,7 @@ fn build_cases(base_port: u16, cert: &Path, key: &Path) -> Vec<InteropCase> {
         "xtls-rprx-vision",
         None,
     ));
+    cases.push(vless_reality_case(next_port(), reality_dest));
     cases.push(vless_case(
         next_port(),
         "vless-ws-none",
@@ -646,6 +728,37 @@ fn vless_case(
         core_port: port,
         inbound: inbound_value,
         sing_outbound: outbound,
+        probes: vec![Probe::Tcp],
+    }
+}
+
+fn vless_reality_case(port: u16, reality_dest: SocketAddr) -> InteropCase {
+    let mut inbound_value = inbound(
+        "vless-reality-vision",
+        "vless",
+        port,
+        vec![user(USER_UUID, None)],
+        "tcp",
+        Some(reality_tls_config(reality_dest)),
+        None,
+        "xtls-rprx-vision",
+    );
+    inbound_value["tls"]["cert_file"] = Value::Null;
+    inbound_value["tls"]["key_file"] = Value::Null;
+
+    InteropCase {
+        name: "vless-reality-vision".to_string(),
+        core_port: port,
+        inbound: inbound_value,
+        sing_outbound: json!({
+            "type": "vless",
+            "tag": "proxy",
+            "server": "127.0.0.1",
+            "server_port": port,
+            "uuid": USER_UUID,
+            "flow": "xtls-rprx-vision",
+            "tls": sing_reality_tls()
+        }),
         probes: vec![Probe::Tcp],
     }
 }
@@ -910,6 +1023,24 @@ fn tls_config() -> Value {
     })
 }
 
+fn reality_tls_config(dest: SocketAddr) -> Value {
+    json!({
+        "server_name": "localhost",
+        "cert_file": null,
+        "key_file": null,
+        "alpn": [],
+        "reject_unknown_sni": false,
+        "reality": {
+            "dest": dest.to_string(),
+            "server_port": null,
+            "private_key": REALITY_PRIVATE_KEY,
+            "short_id": REALITY_SHORT_ID,
+            "xver": 0,
+            "mldsa65_seed": null
+        }
+    })
+}
+
 fn with_optional_tls(mut outbound: Value, enabled: bool, network: &str) -> Value {
     if enabled {
         outbound["tls"] = sing_tls(network);
@@ -933,6 +1064,32 @@ fn sing_tls(network: &str) -> Value {
     tls
 }
 
+fn sing_reality_tls() -> Value {
+    json!({
+        "enabled": true,
+        "server_name": "localhost",
+        "utls": {
+            "enabled": true,
+            "fingerprint": "chrome"
+        },
+        "reality": {
+            "enabled": true,
+            "public_key": reality_public_key(),
+            "short_id": REALITY_SHORT_ID
+        }
+    })
+}
+
+fn reality_public_key() -> String {
+    let private_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(REALITY_PRIVATE_KEY)
+        .expect("reality private key");
+    let private_key: [u8; 32] = private_key.try_into().expect("reality private key length");
+    let secret = StaticSecret::from(private_key);
+    let public = PublicKey::from(&secret);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public.as_bytes())
+}
+
 fn sing_transport(network: &str) -> Value {
     match network {
         "tcp" => Value::Null,
@@ -952,6 +1109,10 @@ fn sing_transport(network: &str) -> Value {
         }),
         other => json!({ "type": other }),
     }
+}
+
+fn io_other(error: impl std::fmt::Debug) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, format!("{error:?}"))
 }
 
 fn write_core_config(path: &Path, cases: &[InteropCase]) -> Result<()> {

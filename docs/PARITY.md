@@ -37,7 +37,7 @@ keliboard -> kelinode-rs -> keli-core-rs
 | HTTP proxy | Rendered by `kelinode-rs` | Code path | Basic auth, HTTP CONNECT, plain HTTP forwarding, block routes, per-user traffic, speed/device limits | Keep-alive reuse, real workload soak |
 | Shadowsocks | Rendered by `kelinode-rs` for supported AEAD ciphers | Partial | TCP and UDP AEAD for `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`, per-user traffic, TCP speed/device limits, UDP traffic accounting, UDP client-source device limits, ApplyUserDelta TCP relay revocation/tail-traffic coverage | 2022 ciphers, HTTP obfs, real-client interop |
 | VLESS | Rendered by `kelinode-rs` | Partial | TCP, UDP command, WS, HTTPUpgrade, gRPC, TLS, VLESS Vision over TCP TLS, block routes, per-user traffic, speed/device limits, ApplyUserDelta TCP relay revocation/tail-traffic coverage | XUDP/Mux, real-client matrix |
-| VLESS REALITY | Rendered by `kelinode-rs` | Partial | Config validation, ClientHello auth, fallback routing, destination ServerHello validation/capture, temporary certificate generation, REALITY cert signature embedding, rustls accept, VLESS/Vision handoff | Real-client TLS 1.3 interop, ML-DSA-65 |
+| VLESS REALITY | Rendered by `kelinode-rs` | Partial | Config validation, ClientHello auth, fallback routing, destination ServerHello validation/capture, temporary certificate generation, REALITY cert signature embedding, rustls accept, VLESS/Vision handoff, local sing-box interop for REALITY Vision | ML-DSA-65, broader client matrix and soak |
 | VMess | Rendered by `kelinode-rs` | Partial | AEAD TCP and UDP command, legacy alterId outbound auth, TLS, WS, TLS WS, HTTPUpgrade, gRPC, authenticated length, replay protection, per-user traffic, speed/device limits, ApplyUserDelta TCP relay revocation/tail-traffic coverage | Legacy alterId inbound, real-client matrix |
 | Trojan | Rendered by `kelinode-rs` | Partial | TCP, UDP ASSOCIATE over stream, TLS, WS, TLS WS, HTTPUpgrade, gRPC, per-user traffic, speed/device limits, ApplyUserDelta auth plus TCP relay revocation/tail-traffic coverage | Real-client UDP/TLS/WS matrix |
 | AnyTLS | Rendered by `kelinode-rs` | Partial | TCP frame inbound, password authentication, TCP stream forwarding, UDP-over-TCP, padding-scheme update negotiation, per-user traffic, speed/device limits, ApplyUserDelta TCP relay revocation/tail-traffic coverage | Real-client matrix |
@@ -56,7 +56,7 @@ keliboard -> kelinode-rs -> keli-core-rs
 | TLS WS | VLESS, VMess, Trojan | Code path | Real-client matrix still required. |
 | HTTPUpgrade | VLESS, VMess, Trojan | Code path | Path and Host settings are accepted. |
 | gRPC | VLESS, VMess, Trojan | Code path | `TunMulti` is rejected. |
-| REALITY | VLESS only | Partial | TCP only. ML-DSA-65 is rejected. |
+| REALITY | VLESS only | Partial | TCP only, with deterministic local sing-box interop coverage for Vision. ML-DSA-65 is rejected. |
 | QUIC/Hysteria2 | Hysteria2 | Partial | TCP and UDP relay paths exist. |
 | QUIC/TUIC | TUIC | Partial | TCP and UDP relay paths exist. |
 | H2 custom outbound transport | Native route outbounds | Partial | VLESS, VMess, and Trojan route outbounds can carry TCP streams over HTTP/2 `httpSettings`; TLS, h2c, custom method, and request headers are supported. `kelinode-rs` may map XHTTP/splithttp `stream-one` route outbounds onto this H2 path with the required XHTTP-compatible headers. |
