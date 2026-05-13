@@ -96,6 +96,17 @@ Until every target protocol has a baseline in this schema, treat `bench compare`
 VLESS/Rust-regression tool rather than proof that Rust has already beaten the whole production
 Go stack.
 
+Recent Windows loopback release baseline for VLESS stream mode (`16` streams, `5000` requests
+per stream, `1024` byte payload, `3` repeats):
+
+| Baseline | Roundtrip Mbps avg | p99 avg | Errors | Retries |
+| --- | ---: | ---: | ---: | ---: |
+| Go/Xray VLESS | 1090.87 | 612 us | 0 | 0 |
+| Rust VLESS, 4MiB async traffic flush | 824.28 | 622 us | 0 | 0 |
+
+This keeps Rust VLESS stable under the benchmark but still below the Go/Xray throughput baseline,
+so keep using this suite to gate future VLESS relay optimizations.
+
 Record the JSON output and compare `runtime_workers` where present, `completed_requests`, `errors`, `error_rate`, `roundtrip_mbps`, p95/p99 latency, and `retries` across commits on the same host.
 
 Small local smoke sample from a Windows loopback release build on `v0.1.32` after the active

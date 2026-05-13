@@ -50,7 +50,7 @@ const ATYP_DOMAIN: u8 = 0x02;
 const ATYP_IPV6: u8 = 0x03;
 const FLOW_XTLS_RPRX_VISION: &str = "xtls-rprx-vision";
 const MAX_UDP_PACKET_SIZE: usize = 65_535;
-const ASYNC_TRAFFIC_FLUSH_BYTES: u64 = 1024 * 1024;
+const ASYNC_TRAFFIC_FLUSH_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct VlessServerConfig {
