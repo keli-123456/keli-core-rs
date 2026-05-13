@@ -22,6 +22,7 @@ use crate::shadowsocks::{
     connect_shadowsocks_tcp_outbound, ShadowsocksServer, ShadowsocksServerConfig,
 };
 use crate::socks5::{Socks5Server, Socks5ServerConfig, SocksTarget};
+use crate::stream::relay_tcp_fast_unlimited;
 use crate::trojan::{trojan_password_hash, TrojanServer, TrojanServerConfig};
 use crate::tuic::{TuicServer, TuicServerConfig};
 use crate::user::CoreUser;
@@ -50,6 +51,7 @@ const MAX_REQUEST_RETRIES: usize = 3;
 const UDP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_SUITE_COMMANDS: &[&str] = &[
     "direct-tcp-stream",
+    "direct-tcp-proxy-stream",
     "http-connect-stream",
     "shadowsocks-tcp-stream",
     "socks-tcp-stream",
@@ -544,13 +546,16 @@ fn bench_quic_runtime_workers() -> usize {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --vless-core HOST:PORT [--commands vless-tcp,vless-tcp-stream] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
+        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench direct-tcp-proxy-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --vless-core HOST:PORT [--commands vless-tcp,vless-tcp-stream] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
     );
 }
 
 fn canonical_bench_command(command: &str) -> Option<&'static str> {
     match command {
         "direct-tcp-stream" | "direct-stream" | "tcp-stream" => Some("direct-tcp-stream"),
+        "direct-tcp-proxy-stream" | "direct-proxy-stream" | "tcp-proxy-stream" => {
+            Some("direct-tcp-proxy-stream")
+        }
         "http-connect-stream" | "http-tcp-stream" | "http-stream" => Some("http-connect-stream"),
         "shadowsocks-tcp-stream" | "ss-tcp-stream" | "ss-stream" => Some("shadowsocks-tcp-stream"),
         "socks-tcp-stream" | "socks5-tcp-stream" | "socks-stream" => Some("socks-tcp-stream"),
@@ -571,6 +576,7 @@ fn canonical_bench_command(command: &str) -> Option<&'static str> {
 fn run_named_bench(command: &str, options: &BenchOptions) -> io::Result<BenchReport> {
     match canonical_bench_command(command) {
         Some("direct-tcp-stream") => run_direct_tcp_stream_bench(options),
+        Some("direct-tcp-proxy-stream") => run_direct_tcp_proxy_stream_bench(options),
         Some("http-connect-stream") => run_http_connect_stream_bench(options),
         Some("shadowsocks-tcp-stream") => run_shadowsocks_tcp_stream_bench(options),
         Some("socks-tcp-stream") => run_socks_tcp_stream_bench(options),
@@ -696,6 +702,57 @@ fn run_direct_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport
     Ok(BenchReport::completed(
         "direct-tcp",
         "direct-echo-stream",
+        options,
+        None,
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
+}
+
+fn run_direct_tcp_proxy_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let proxy_stop = Arc::new(AtomicBool::new(false));
+    let (proxy_addr, proxy_thread) = start_direct_tcp_proxy(echo_addr, proxy_stop.clone())?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        workers.push(thread::spawn(move || {
+            let mut stream = TcpStream::connect(proxy_addr)?;
+            run_plain_stream_echo_client(&mut stream, "direct-tcp-proxy", stream_id, &options)
+        }));
+    }
+
+    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+    }
+    let elapsed = started.elapsed();
+
+    proxy_stop.store(true, Ordering::SeqCst);
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(proxy_addr);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(proxy_thread)?;
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        "direct-tcp-proxy",
+        "raw-proxy-stream",
         options,
         None,
         upload_bytes,
@@ -1853,6 +1910,47 @@ fn start_echo_server(
                                 }
                                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                                 Err(_) => break,
+                            }
+                        }
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    });
+    Ok((addr, handle))
+}
+
+fn start_direct_tcp_proxy(
+    target: SocketAddr,
+    stop: Arc<AtomicBool>,
+) -> io::Result<(SocketAddr, thread::JoinHandle<io::Result<()>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let addr = listener.local_addr()?;
+    let handle = thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((client, _)) => {
+                    let _ = client.set_nonblocking(false);
+                    let _ = client.set_nodelay(true);
+                    thread::spawn(move || {
+                        let remote = match TcpStream::connect(target) {
+                            Ok(remote) => remote,
+                            Err(error) => {
+                                eprintln!("bench direct proxy connect error: {error}");
+                                return;
+                            }
+                        };
+                        let _ = remote.set_nonblocking(false);
+                        let _ = remote.set_nodelay(true);
+                        if let Err(error) = relay_tcp_fast_unlimited(client, remote) {
+                            if !is_expected_bench_disconnect(&error) {
+                                eprintln!("bench direct proxy relay error: {error}");
                             }
                         }
                     });
@@ -3551,10 +3649,11 @@ fn join_server(handle: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
 mod tests {
     use super::{
         canonical_bench_command, parse_bench_options, parse_bench_suite_options,
-        parse_external_bench_suite_options, percent_change, run_direct_tcp_stream_bench,
-        run_external_vless_tcp_stream_bench, run_http_connect_stream_bench, run_hy2_udp_bench,
-        run_shadowsocks_tcp_stream_bench, run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench,
-        run_tuic_tcp_bench, run_tuic_tcp_stream_bench, run_tuic_udp_bench, run_vless_tcp_bench,
+        parse_external_bench_suite_options, percent_change, run_direct_tcp_proxy_stream_bench,
+        run_direct_tcp_stream_bench, run_external_vless_tcp_stream_bench,
+        run_http_connect_stream_bench, run_hy2_udp_bench, run_shadowsocks_tcp_stream_bench,
+        run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench, run_tuic_tcp_bench,
+        run_tuic_tcp_stream_bench, run_tuic_udp_bench, run_vless_tcp_bench,
         run_vless_tcp_stream_bench, run_vmess_tcp_stream_bench, summarize_bench_runs, BenchOptions,
         BenchReport, BenchSuiteRun, LatencyReport,
     };
@@ -3666,6 +3765,10 @@ mod tests {
             canonical_bench_command("direct-stream"),
             Some("direct-tcp-stream")
         );
+        assert_eq!(
+            canonical_bench_command("direct-proxy-stream"),
+            Some("direct-tcp-proxy-stream")
+        );
         assert_eq!(canonical_bench_command("hysteria2-tcp"), Some("hy2-tcp"));
         assert_eq!(
             canonical_bench_command("hysteria2-tcp-stream"),
@@ -3770,6 +3873,25 @@ mod tests {
 
         assert_eq!(report.protocol, "direct-tcp");
         assert_eq!(report.mode, "direct-echo-stream");
+        assert_eq!(report.total_requests, 3);
+        assert_eq!(report.completed_requests, 3);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert_eq!(report.runtime_workers, None);
+        assert!(report.download_bytes > 0);
+    }
+
+    #[test]
+    fn runs_direct_tcp_proxy_stream_bench_smoke() {
+        let report = run_direct_tcp_proxy_stream_bench(&BenchOptions {
+            streams: 1,
+            requests: 3,
+            payload_size: 16,
+        })
+        .expect("bench");
+
+        assert_eq!(report.protocol, "direct-tcp-proxy");
+        assert_eq!(report.mode, "raw-proxy-stream");
         assert_eq!(report.total_requests, 3);
         assert_eq!(report.completed_requests, 3);
         assert_eq!(report.errors, 0);
