@@ -42,7 +42,7 @@ pub fn relay_tcp_streams(client: TcpStream, remote: TcpStream) -> io::Result<(u6
 }
 
 pub fn relay_tcp_fast_unlimited(client: TcpStream, remote: TcpStream) -> io::Result<(u64, u64)> {
-    relay_tcp_streams_limited(client, remote, None)
+    relay_tcp_streams_unlimited_async(client, remote)
 }
 
 pub fn relay_tcp_limited(
@@ -118,6 +118,9 @@ fn relay_tcp_streams_async(
     remote: TcpStream,
     limiter: Option<Arc<BandwidthLimiter>>,
 ) -> io::Result<(u64, u64)> {
+    if limiter.is_none() {
+        return relay_tcp_streams_unlimited_async(client, remote);
+    }
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
     tcp_relay_runtime()?.block_on(async move {
@@ -138,6 +141,23 @@ fn relay_tcp_streams_async(
         );
         let (upload, download) = tokio::join!(upload, download);
         Ok((upload, download))
+    })
+}
+
+fn relay_tcp_streams_unlimited_async(
+    client: TcpStream,
+    remote: TcpStream,
+) -> io::Result<(u64, u64)> {
+    client.set_nonblocking(true)?;
+    remote.set_nonblocking(true)?;
+    tcp_relay_runtime()?.block_on(async move {
+        let client = tokio::net::TcpStream::from_std(client)?;
+        let remote = tokio::net::TcpStream::from_std(remote)?;
+        let (mut client_read, mut client_write) = client.into_split();
+        let (mut remote_read, mut remote_write) = remote.into_split();
+        let upload = copy_count_best_effort_async(&mut client_read, &mut remote_write);
+        let download = copy_count_best_effort_async(&mut remote_read, &mut client_write);
+        Ok(tokio::join!(upload, download))
     })
 }
 
@@ -301,6 +321,28 @@ fn native_relay_stack_size() -> usize {
 
 fn native_relay_idle_timeout() -> Duration {
     Duration::from_secs(30)
+}
+
+async fn copy_count_best_effort_async<R, W>(reader: &mut R, writer: &mut W) -> u64
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut total = 0u64;
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => break,
+        };
+        if writer.write_all(&buffer[..read]).await.is_err() {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+    }
+    let _ = writer.shutdown().await;
+    total
 }
 
 async fn copy_count_best_effort_limited_async<R, W>(
