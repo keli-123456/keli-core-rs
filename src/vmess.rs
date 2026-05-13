@@ -4117,6 +4117,7 @@ mod tests {
 
     #[test]
     fn proxies_udp_and_records_user_traffic() {
+        let _network_guard = crate::test_support::network_test_lock();
         let echo = UdpSocket::bind("127.0.0.1:0").expect("echo bind");
         let echo_addr = echo.local_addr().expect("echo addr");
         let echo_thread = thread::spawn(move || {

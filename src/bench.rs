@@ -1925,6 +1925,7 @@ mod tests {
 
     #[test]
     fn runs_hy2_tcp_bench_smoke() {
+        let _network_guard = crate::test_support::network_test_lock();
         let report = super::run_hy2_tcp_bench(&BenchOptions {
             streams: 1,
             requests: 2,
@@ -1944,6 +1945,7 @@ mod tests {
 
     #[test]
     fn runs_hy2_tcp_stream_bench_smoke() {
+        let _network_guard = crate::test_support::network_test_lock();
         let report = super::run_hy2_tcp_stream_bench(&BenchOptions {
             streams: 1,
             requests: 3,
@@ -1963,6 +1965,7 @@ mod tests {
 
     #[test]
     fn runs_hy2_udp_bench_smoke() {
+        let _network_guard = crate::test_support::network_test_lock();
         let report = run_hy2_udp_bench(&BenchOptions {
             streams: 1,
             requests: 2,
@@ -1982,6 +1985,7 @@ mod tests {
 
     #[test]
     fn runs_tuic_tcp_bench_smoke() {
+        let _network_guard = crate::test_support::network_test_lock();
         let report = run_tuic_tcp_bench(&BenchOptions {
             streams: 1,
             requests: 2,
@@ -2001,6 +2005,7 @@ mod tests {
 
     #[test]
     fn runs_tuic_udp_bench_smoke() {
+        let _network_guard = crate::test_support::network_test_lock();
         let report = run_tuic_udp_bench(&BenchOptions {
             streams: 1,
             requests: 2,

@@ -2041,12 +2041,14 @@ fn resolve_listen_addr(listen: &str, port: u16) -> io::Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use quinn::crypto::rustls::QuicClientConfig;
     use rustls::pki_types::{CertificateDer, ServerName};
     use rustls::{ClientConfig, RootCertStore};
     use sha2::{Digest, Sha224};
     use std::fs;
-    use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::future::poll_fn;
+    use std::io::{self, Read, Write};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
@@ -2388,6 +2390,247 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    fn io_other(error: impl std::fmt::Debug) -> io::Error {
+        io::Error::new(io::ErrorKind::Other, format!("{error:?}"))
+    }
+
+    fn quic_client_endpoint(cert_der: CertificateDer<'static>) -> quinn::Endpoint {
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).expect("root cert");
+        let mut crypto = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        crypto.alpn_protocols = vec![b"h3".to_vec()];
+        let mut client_config =
+            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto).unwrap()));
+        let mut transport = quinn::TransportConfig::default();
+        transport
+            .datagram_receive_buffer_size(Some(1024 * 1024))
+            .datagram_send_buffer_size(1024 * 1024);
+        client_config.transport_config(Arc::new(transport));
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_config);
+        endpoint
+    }
+
+    async fn hy2_auth_succeeds(
+        server_addr: SocketAddr,
+        cert_der: CertificateDer<'static>,
+        password: &str,
+    ) -> bool {
+        matches!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                hy2_auth_status(server_addr, cert_der, password)
+            )
+            .await,
+            Ok(Some(233))
+        )
+    }
+
+    async fn hy2_auth_status(
+        server_addr: SocketAddr,
+        cert_der: CertificateDer<'static>,
+        password: &str,
+    ) -> Option<u16> {
+        let client_endpoint = quic_client_endpoint(cert_der);
+        let connecting = client_endpoint.connect(server_addr, "localhost").ok()?;
+        let connection = connecting.await.ok()?;
+        let status = hy2_authenticate_status(&connection, password).await.ok();
+        connection.close(0u32.into(), b"probe done");
+        status
+    }
+
+    async fn hy2_authenticate_status(
+        connection: &quinn::Connection,
+        password: &str,
+    ) -> io::Result<u16> {
+        let quic = h3_quinn::Connection::new(connection.clone());
+        let (mut h3_connection, mut send_request) =
+            h3::client::new(quic).await.map_err(io_other)?;
+        let driver = tokio::spawn(async move {
+            let _ = poll_fn(|cx| h3_connection.poll_close(cx)).await;
+        });
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://hysteria/auth")
+            .header("Hysteria-Auth", password)
+            .header("Hysteria-CC-RX", "0")
+            .body(())
+            .expect("auth request");
+        let mut stream = send_request.send_request(request).await.map_err(io_other)?;
+        stream.finish().await.map_err(io_other)?;
+        let response = stream.recv_response().await.map_err(io_other)?;
+        let status = response.status().as_u16();
+        drop(send_request);
+        driver.abort();
+        Ok(status)
+    }
+
+    fn tuic_auth_command_for(
+        connection: &quinn::Connection,
+        uuid: &str,
+        password: &str,
+    ) -> Vec<u8> {
+        let uuid = uuid_bytes(uuid);
+        let mut token = [0u8; 32];
+        connection
+            .export_keying_material(&mut token, &uuid, password.as_bytes())
+            .expect("token");
+        let mut command = vec![0x05, 0x00];
+        command.extend_from_slice(&uuid);
+        command.extend_from_slice(&token);
+        command
+    }
+
+    fn tuic_connect_command(addr: SocketAddr) -> Vec<u8> {
+        let mut command = vec![0x05, 0x01, 0x01];
+        let ip = addr
+            .ip()
+            .to_string()
+            .parse::<Ipv4Addr>()
+            .expect("ipv4 echo addr");
+        command.extend_from_slice(&ip.octets());
+        command.extend_from_slice(&addr.port().to_be_bytes());
+        command
+    }
+
+    async fn tuic_tcp_probe(
+        server_addr: SocketAddr,
+        cert_der: CertificateDer<'static>,
+        uuid: &str,
+        password: &str,
+        echo_addr: SocketAddr,
+    ) -> bool {
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            tuic_tcp_probe_inner(server_addr, cert_der, uuid, password, echo_addr),
+        )
+        .await
+        .unwrap_or(false)
+    }
+
+    async fn tuic_tcp_probe_eventually(
+        server_addr: SocketAddr,
+        cert_der: CertificateDer<'static>,
+        uuid: &str,
+        password: &str,
+        echo_addr: SocketAddr,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if tuic_tcp_probe(server_addr, cert_der.clone(), uuid, password, echo_addr).await {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn tuic_tcp_probe_inner(
+        server_addr: SocketAddr,
+        cert_der: CertificateDer<'static>,
+        uuid: &str,
+        password: &str,
+        echo_addr: SocketAddr,
+    ) -> bool {
+        let client_endpoint = quic_client_endpoint(cert_der);
+        let connection = match client_endpoint.connect(server_addr, "localhost") {
+            Ok(connecting) => match connecting.await {
+                Ok(connection) => connection,
+                Err(_) => return false,
+            },
+            Err(_) => return false,
+        };
+        let mut auth = match connection.open_uni().await {
+            Ok(auth) => auth,
+            Err(_) => return false,
+        };
+        if auth
+            .write_all(&tuic_auth_command_for(&connection, uuid, password))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        if auth.finish().is_err() {
+            return false;
+        }
+        let (mut send, mut recv) = match connection.open_bi().await {
+            Ok(streams) => streams,
+            Err(_) => return false,
+        };
+        if send
+            .write_all(&tuic_connect_command(echo_addr))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        if send.write_all(b"x").await.is_err() {
+            return false;
+        }
+        if send.finish().is_err() {
+            return false;
+        }
+        let mut echoed = [0u8; 1];
+        let read_result =
+            tokio::time::timeout(Duration::from_secs(2), recv.read_exact(&mut echoed)).await;
+        connection.close(0u32.into(), b"probe done");
+        matches!(read_result, Ok(Ok(_)) if echoed == *b"x")
+    }
+
+    fn quic_tls_config(cert: &TestCert) -> TlsConfig {
+        TlsConfig {
+            server_name: "localhost".to_string(),
+            cert_file: Some(cert.cert_path.to_string_lossy().to_string()),
+            key_file: Some(cert.key_path.to_string_lossy().to_string()),
+            alpn: vec!["h3".to_string()],
+            reject_unknown_sni: false,
+            reality: None,
+        }
+    }
+
+    fn core_user(id: u64, uuid: &str, password: Option<&str>) -> CoreUser {
+        CoreUser {
+            id,
+            uuid: uuid.to_string(),
+            password: password.map(ToString::to_string),
+            email: None,
+            speed_limit: 0,
+            device_limit: 0,
+        }
+    }
+
+    fn quic_inbound(
+        tag: &str,
+        protocol: Protocol,
+        network: &str,
+        port: u16,
+        users: Vec<CoreUser>,
+        cert: &TestCert,
+    ) -> InboundConfig {
+        InboundConfig {
+            tag: tag.to_string(),
+            protocol,
+            listen: "127.0.0.1".to_string(),
+            port,
+            users,
+            cipher: None,
+            flow: String::new(),
+            padding_scheme: Vec::new(),
+            transport: TransportConfig {
+                network: network.to_string(),
+                ..TransportConfig::default()
+            },
+            tls: Some(quic_tls_config(cert)),
+            sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
+        }
     }
 
     fn run_grpc_vless_client(
@@ -2869,6 +3112,227 @@ mod tests {
         );
 
         service.stop();
+    }
+
+    #[test]
+    fn apply_user_delta_targets_hysteria2_without_rebinding_or_affecting_tuic() {
+        let _network_guard = crate::test_support::network_test_lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let echo = EchoServer::start();
+            let cert = test_cert("service-hy2-tuic-delta");
+            let hy2_tag = "panel|hysteria|1";
+            let tuic_tag = "panel|tuic|1";
+            let old_hy2_uuid = "hy2-password";
+            let new_hy2_uuid = "hy2-user-b";
+            let tuic_uuid = "11111111-1111-1111-1111-111111111111";
+            let hy2_user = core_user(10, old_hy2_uuid, None);
+            let tuic_user = core_user(20, tuic_uuid, Some("tuic-password"));
+
+            let mut config = config(free_port());
+            config.inbounds = vec![
+                quic_inbound(
+                    hy2_tag,
+                    Protocol::Hysteria2,
+                    "hysteria",
+                    free_port(),
+                    vec![hy2_user.clone()],
+                    &cert,
+                ),
+                quic_inbound(
+                    tuic_tag,
+                    Protocol::Tuic,
+                    "tuic",
+                    free_port(),
+                    vec![tuic_user.clone()],
+                    &cert,
+                ),
+            ];
+
+            let mut service = CoreService::start(config).expect("service start");
+            let before = service.listeners();
+            let hy2_addr = before
+                .iter()
+                .find(|listener| listener.tag == hy2_tag)
+                .expect("hy2 listener")
+                .local_addr;
+            let tuic_addr = before
+                .iter()
+                .find(|listener| listener.tag == tuic_tag)
+                .expect("tuic listener")
+                .local_addr;
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(hy2_auth_succeeds(hy2_addr, cert.cert_der.clone(), old_hy2_uuid).await);
+            assert!(
+                tuic_tcp_probe_eventually(
+                    tuic_addr,
+                    cert.cert_der.clone(),
+                    tuic_uuid,
+                    "tuic-password",
+                    echo.addr
+                )
+                .await
+            );
+
+            let mut added = core_user(11, new_hy2_uuid, Some("secret-b"));
+            added.speed_limit = 2048;
+            added.device_limit = 2;
+            let result = service
+                .apply_user_delta(
+                    hy2_tag,
+                    &CoreUserDelta {
+                        added: vec![added],
+                        deleted: vec![old_hy2_uuid.to_string()],
+                        revision: Some("hy2-rev-2".to_string()),
+                        ..CoreUserDelta::default()
+                    },
+                )
+                .expect("hy2 delta apply");
+
+            assert_eq!(result.added, 1);
+            assert_eq!(result.deleted, 1);
+            assert_eq!(result.active_users, 1);
+            assert_eq!(service.listeners(), before);
+            assert!(
+                !hy2_auth_succeeds(hy2_addr, cert.cert_der.clone(), old_hy2_uuid).await,
+                "deleted HY2 user must not authenticate after delta"
+            );
+            assert!(
+                hy2_auth_succeeds(hy2_addr, cert.cert_der.clone(), "secret-b").await,
+                "added HY2 user must authenticate after delta"
+            );
+            assert!(
+                tuic_tcp_probe_eventually(
+                    tuic_addr,
+                    cert.cert_der.clone(),
+                    tuic_uuid,
+                    "tuic-password",
+                    echo.addr
+                )
+                .await,
+                "ApplyUserDelta for HY2 must not alter the TUIC inbound"
+            );
+
+            service.stop();
+        });
+    }
+
+    #[test]
+    fn apply_user_delta_targets_tuic_without_rebinding_or_affecting_hysteria2() {
+        let _network_guard = crate::test_support::network_test_lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let echo = EchoServer::start();
+            let cert = test_cert("service-tuic-hy2-delta");
+            let hy2_tag = "panel|hysteria|1";
+            let tuic_tag = "panel|tuic|1";
+            let hy2_uuid = "hy2-password";
+            let old_tuic_uuid = "11111111-1111-1111-1111-111111111111";
+            let new_tuic_uuid = "22222222-2222-2222-2222-222222222222";
+            let hy2_user = core_user(10, hy2_uuid, None);
+            let tuic_user = core_user(20, old_tuic_uuid, Some("tuic-password"));
+
+            let mut config = config(free_port());
+            config.inbounds = vec![
+                quic_inbound(
+                    hy2_tag,
+                    Protocol::Hysteria2,
+                    "hysteria",
+                    free_port(),
+                    vec![hy2_user.clone()],
+                    &cert,
+                ),
+                quic_inbound(
+                    tuic_tag,
+                    Protocol::Tuic,
+                    "tuic",
+                    free_port(),
+                    vec![tuic_user.clone()],
+                    &cert,
+                ),
+            ];
+
+            let mut service = CoreService::start(config).expect("service start");
+            let before = service.listeners();
+            let hy2_addr = before
+                .iter()
+                .find(|listener| listener.tag == hy2_tag)
+                .expect("hy2 listener")
+                .local_addr;
+            let tuic_addr = before
+                .iter()
+                .find(|listener| listener.tag == tuic_tag)
+                .expect("tuic listener")
+                .local_addr;
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(hy2_auth_succeeds(hy2_addr, cert.cert_der.clone(), hy2_uuid).await);
+            assert!(
+                tuic_tcp_probe_eventually(
+                    tuic_addr,
+                    cert.cert_der.clone(),
+                    old_tuic_uuid,
+                    "tuic-password",
+                    echo.addr
+                )
+                .await
+            );
+
+            let mut added = core_user(21, new_tuic_uuid, Some("secret-b"));
+            added.speed_limit = 4096;
+            added.device_limit = 3;
+            let result = service
+                .apply_user_delta(
+                    tuic_tag,
+                    &CoreUserDelta {
+                        added: vec![added],
+                        deleted: vec![old_tuic_uuid.to_string()],
+                        revision: Some("tuic-rev-2".to_string()),
+                        ..CoreUserDelta::default()
+                    },
+                )
+                .expect("tuic delta apply");
+
+            assert_eq!(result.added, 1);
+            assert_eq!(result.deleted, 1);
+            assert_eq!(result.active_users, 1);
+            assert_eq!(service.listeners(), before);
+            assert!(
+                !tuic_tcp_probe(
+                    tuic_addr,
+                    cert.cert_der.clone(),
+                    old_tuic_uuid,
+                    "tuic-password",
+                    echo.addr
+                )
+                .await,
+                "deleted TUIC user must not authenticate after delta"
+            );
+            assert!(
+                tuic_tcp_probe_eventually(
+                    tuic_addr,
+                    cert.cert_der.clone(),
+                    new_tuic_uuid,
+                    "secret-b",
+                    echo.addr
+                )
+                .await,
+                "added TUIC user must authenticate after delta"
+            );
+            assert!(
+                hy2_auth_succeeds(hy2_addr, cert.cert_der.clone(), hy2_uuid).await,
+                "ApplyUserDelta for TUIC must not alter the HY2 inbound"
+            );
+
+            service.stop();
+        });
     }
 
     #[test]

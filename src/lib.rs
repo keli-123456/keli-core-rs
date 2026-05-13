@@ -36,6 +36,20 @@ pub mod vless;
 pub mod vmess;
 pub mod websocket;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static NETWORK_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    pub(crate) fn network_test_lock() -> MutexGuard<'static, ()> {
+        NETWORK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("network test lock poisoned")
+    }
+}
+
 pub use anytls::{AnyTlsServer, AnyTlsServerConfig};
 pub use config::{
     CoreConfig, InboundConfig, OutboundConfig, RealityConfig, RouteAction, RouteRule,

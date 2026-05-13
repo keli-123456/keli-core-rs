@@ -106,6 +106,7 @@ fn config(port: u16, user_uuid: &str) -> CoreConfig {
                 enabled: false,
                 dest_override: Vec::new(),
             },
+            routes: Vec::new(),
         }],
         outbounds: vec![OutboundConfig {
             tag: "direct".to_string(),
