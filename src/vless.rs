@@ -634,7 +634,13 @@ impl VlessServer {
             false,
             None,
         );
-        relay_tcp_streams_async(client, remote, bandwidth, upload_flush, download_flush).await?;
+        if bandwidth.is_none() {
+            relay_tcp_streams_async_native_unlimited(client, remote, upload_flush, download_flush)
+                .await?;
+        } else {
+            relay_tcp_streams_async(client, remote, bandwidth, upload_flush, download_flush)
+                .await?;
+        }
         Ok(())
     }
 
@@ -1055,6 +1061,78 @@ impl VlessServer {
             )),
         }
     }
+}
+
+async fn relay_tcp_streams_async_native_unlimited(
+    client: tokio::net::TcpStream,
+    remote: tokio::net::TcpStream,
+    on_upload: impl FnMut(u64) + Send + 'static,
+    on_download: impl FnMut(u64) + Send + 'static,
+) -> io::Result<(u64, u64)> {
+    let client = client.into_std()?;
+    client.set_nonblocking(false)?;
+    let remote = remote.into_std()?;
+    remote.set_nonblocking(false)?;
+    tokio::task::spawn_blocking(move || {
+        relay_tcp_streams_native_unlimited_with_flush(client, remote, on_upload, on_download)
+    })
+    .await
+    .map_err(|error| io::Error::new(io::ErrorKind::Other, format!("relay task failed: {error}")))?
+}
+
+fn relay_tcp_streams_native_unlimited_with_flush<U, D>(
+    client: TcpStream,
+    remote: TcpStream,
+    mut on_upload: U,
+    mut on_download: D,
+) -> io::Result<(u64, u64)>
+where
+    U: FnMut(u64) + Send + 'static,
+    D: FnMut(u64) + Send + 'static,
+{
+    let mut client_read = client.try_clone()?;
+    let mut client_write = client;
+    let mut remote_read = remote.try_clone()?;
+    let mut remote_write = remote;
+    let upload_task = spawn_native_blocking_relay(move || {
+        let copied =
+            copy_count_best_effort_with_flush(&mut client_read, &mut remote_write, &mut on_upload);
+        let _ = remote_write.shutdown(Shutdown::Write);
+        copied
+    })?;
+    let download =
+        copy_count_best_effort_with_flush(&mut remote_read, &mut client_write, &mut on_download);
+    let _ = client_write.shutdown(Shutdown::Write);
+    let upload = join_native_blocking_relay(upload_task, "vless upload relay task panicked")?;
+    Ok((upload, download))
+}
+
+fn copy_count_best_effort_with_flush<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    on_chunk: &mut impl FnMut(u64),
+) -> u64
+where
+    R: Read,
+    W: Write,
+{
+    let mut total = 0u64;
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => break,
+        };
+        if writer.write_all(&buffer[..read]).is_err() {
+            break;
+        }
+        let read = read as u64;
+        on_chunk(read);
+        total = total.saturating_add(read);
+    }
+    on_chunk(0);
+    total
 }
 
 fn sync_delta_bandwidth(
