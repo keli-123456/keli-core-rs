@@ -68,6 +68,8 @@ Expected semantics:
 Loopback benchmarks are useful for regression detection, not production certification:
 
 ```bash
+cargo run --release -- bench direct-tcp-stream --streams 16 --requests 5000 --payload 1024
+cargo run --release -- bench direct-tcp-proxy-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-tcp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-tcp-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-udp --streams 16 --requests 5000 --payload 1024
@@ -105,8 +107,31 @@ per stream, `1024` byte payload, `3` repeats):
 | Go/Xray VLESS | 1090.87 | 612 us | 0 | 0 |
 | Rust VLESS, 4MiB async traffic flush | 824.28 | 622 us | 0 | 0 |
 
-This keeps Rust VLESS stable under the benchmark but still below the Go/Xray throughput baseline,
-so keep using this suite to gate future VLESS relay optimizations.
+Keep the Windows row as a local regression marker only; do not use it to judge Linux production
+capacity.
+
+Recent Linux loopback release baseline on a 4 vCPU Debian 12 test host (`64` streams, `5000`
+requests per stream, single repeat). Rust and Go/Xray were measured with the same Rust benchmark
+client and echo target; Go/Xray was started as an external VLESS TCP inbound with normal
+direct/freedom outbound routing:
+
+| Command / Core | Payload | Roundtrip Mbps | p95 | p99 | Errors | Retries |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `direct-tcp-stream` | 1024 | 2069.81 | 788 us | 2093 us | 0 | 0 |
+| `direct-tcp-proxy-stream` | 1024 | 859.55 | 2177 us | 5367 us | 0 | 0 |
+| Rust `vless-tcp-stream` | 1024 | 953.53 | 2100 us | 4890 us | 0 | 0 |
+| Go/Xray `vless-tcp-stream` | 1024 | 575.57 | 4165 us | 7599 us | 0 | 0 |
+| Rust `vless-tcp-stream` | 4096 | 3980.22 | 1825 us | 3355 us | 0 | 0 |
+| Go/Xray `vless-tcp-stream` | 4096 | 2343.89 | 4147 us | 7518 us | 0 | 0 |
+| Rust `vless-tcp-stream` | 65536 | 13403.88 | 11942 us | 18661 us | 0 | 0 |
+| Go/Xray `vless-tcp-stream` | 65536 | 8280.22 | 18260 us | 26798 us | 0 | 0 |
+
+On this Linux host, Rust VLESS is above the Go/Xray baseline under the same harness. The remaining
+small-packet limit is closer to the raw two-hop TCP proxy relay ceiling than to VLESS parsing
+overhead, so future TCP optimizations should target the shared relay architecture and validate
+against `direct-tcp-proxy-stream`, not only VLESS parser code. A single-thread poll relay prototype
+and Linux `splice(2)` relay prototype were rejected because they did not improve the 1 KiB raw proxy
+baseline.
 
 Recent Windows loopback release baseline for QUIC stream/datagram paths with the same `16 x 5000 x
 1024` shape and `3` repeats:

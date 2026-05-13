@@ -122,6 +122,8 @@ cargo run -- health
 cargo run -- check-config ./core.json
 cargo run -- run-config ./core.json
 cargo run -- run-config ./core.json --control 127.0.0.1:18080
+cargo run -- bench direct-tcp-stream --streams 8 --requests 1000 --payload 1024
+cargo run -- bench direct-tcp-proxy-stream --streams 8 --requests 1000 --payload 1024
 cargo run -- bench vless-tcp --streams 8 --requests 1000 --payload 1024
 cargo run -- bench vless-tcp-stream --streams 8 --requests 1000 --payload 1024
 cargo run -- bench hy2-tcp --streams 8 --requests 1000 --payload 1024
@@ -138,7 +140,10 @@ cargo run -- bench compare --baseline runtime/bench/go-suite.json --candidate ru
 ## Local Benchmarks
 
 The benchmark command starts local loopback echo and core listeners, drives real protocol
-traffic through the core, and prints JSON metrics. The current `vless-tcp` benchmark is
+traffic through the core, and prints JSON metrics. `direct-tcp-stream` measures the local
+echo ceiling without a proxy hop. `direct-tcp-proxy-stream` measures raw TCP proxy relay
+without protocol parsing, which is the baseline for TCP stream fixed overhead. The current
+`vless-tcp` benchmark is
 connection-per-request so it measures VLESS TCP setup plus one echo payload per request.
 The `vless-tcp-stream` benchmark opens one VLESS TCP connection per stream and sends
 all request payloads through that connection, so it isolates the steady-state relay path.
@@ -151,6 +156,8 @@ sessions, while `tuic-tcp-stream` keeps one CONNECT stream per worker and measur
 TUIC relay without exhausting local ephemeral ports on Windows.
 
 ```bash
+cargo run --release -- bench direct-tcp-stream --streams 16 --requests 5000 --payload 1024
+cargo run --release -- bench direct-tcp-proxy-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench vless-tcp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench vless-tcp-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-tcp --streams 16 --requests 5000 --payload 1024
@@ -188,9 +195,9 @@ stream count, request count, payload size, and repeat count:
 cargo run --release -- bench compare --baseline runtime/bench/go-suite.json --candidate runtime/bench/rust-suite.json --out runtime/bench/go-vs-rust.json
 ```
 
-The baseline file must use the same `keli-core-bench-suite-v1` schema. Until the old
-Go/Xray harness emits that schema, do not claim a Go-vs-Rust performance win from
-single-run or mismatched numbers.
+The baseline file must use the same `keli-core-bench-suite-v1` schema. Do not claim a
+Go-vs-Rust performance win from single-run output copied from a different host, debug
+build, payload size, stream count, request count, or schema.
 
 Use the same host, release build, payload, stream count, and request count when comparing
 against Xray or another core. The JSON includes `runtime_workers` when applicable, `completed_requests`,
