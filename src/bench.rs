@@ -44,6 +44,7 @@ const DEFAULT_SUITE_COMMANDS: &[&str] = &[
     "hy2-tcp-stream",
     "hy2-udp",
     "tuic-tcp",
+    "tuic-tcp-stream",
     "tuic-udp",
 ];
 
@@ -527,7 +528,7 @@ fn bench_quic_runtime_workers() -> usize {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --vless-core HOST:PORT [--commands vless-tcp,vless-tcp-stream] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
+        "bench commands:\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --vless-core HOST:PORT [--commands vless-tcp,vless-tcp-stream] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
     );
 }
 
@@ -539,6 +540,7 @@ fn canonical_bench_command(command: &str) -> Option<&'static str> {
         "hy2-tcp-stream" | "hysteria2-tcp-stream" | "hy2-stream" => Some("hy2-tcp-stream"),
         "hy2-udp" | "hysteria2-udp" => Some("hy2-udp"),
         "tuic-tcp" => Some("tuic-tcp"),
+        "tuic-tcp-stream" | "tuic-stream" => Some("tuic-tcp-stream"),
         "tuic-udp" => Some("tuic-udp"),
         _ => None,
     }
@@ -552,6 +554,7 @@ fn run_named_bench(command: &str, options: &BenchOptions) -> io::Result<BenchRep
         Some("hy2-tcp-stream") => run_hy2_tcp_stream_bench(options),
         Some("hy2-udp") => run_hy2_udp_bench(options),
         Some("tuic-tcp") => run_tuic_tcp_bench(options),
+        Some("tuic-tcp-stream") => run_tuic_tcp_stream_bench(options),
         Some("tuic-udp") => run_tuic_udp_bench(options),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -891,6 +894,14 @@ fn run_tuic_tcp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
         .block_on(run_tuic_tcp_bench_async(options))
 }
 
+fn run_tuic_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(bench_quic_runtime_workers())
+        .enable_all()
+        .build()?
+        .block_on(run_tuic_tcp_stream_bench_async(options))
+}
+
 fn run_tuic_udp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(bench_quic_runtime_workers())
@@ -1219,6 +1230,83 @@ async fn run_tuic_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchRep
     Ok(BenchReport::completed(
         "tuic-tcp",
         "single-quic-connection",
+        options,
+        Some(bench_quic_runtime_workers()),
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
+}
+
+async fn run_tuic_tcp_stream_bench_async(options: &BenchOptions) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let cert = BenchCert::new("tuic-tcp-stream-bench")?;
+    let server = TuicServer::new(TuicServerConfig {
+        node_tag: "bench|tuic|tcp-stream".to_string(),
+        listen: "127.0.0.1:0".parse().expect("valid listen addr"),
+        users: vec![tuic_user()],
+        routes: Vec::new(),
+        cert_file: cert.cert_path.to_string_lossy().to_string(),
+        key_file: cert.key_path.to_string_lossy().to_string(),
+        server_name: "localhost".to_string(),
+        alpn: vec!["h3".to_string()],
+        reject_unknown_sni: false,
+        congestion_control: String::new(),
+        connect_timeout: Duration::from_secs(3),
+    });
+    let endpoint = server.bind()?;
+    let server_addr = endpoint.local_addr()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_task = tokio::spawn(server.run(endpoint, stop.clone()));
+    let client_endpoint = hy2_client_endpoint(cert.cert_der.clone())?;
+    let connection = client_endpoint
+        .connect(server_addr, "localhost")
+        .map_err(io_other)?
+        .await
+        .map_err(io_other)?;
+    authenticate_tuic(&connection).await?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        let connection = connection.clone();
+        workers.push(tokio::spawn(async move {
+            run_tuic_tcp_stream_client(connection, echo_addr, stream_id, &options).await
+        }));
+    }
+
+    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker.await.map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "tuic stream bench worker panicked")
+        })??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+    }
+    let elapsed = started.elapsed();
+
+    connection.close(0u32.into(), b"bench done");
+    client_endpoint.wait_idle().await;
+    stop.store(true, Ordering::SeqCst);
+    server_task
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "tuic bench server task panicked"))?;
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        "tuic-tcp",
+        "tuic-tcp-stream-per-worker",
         options,
         Some(bench_quic_runtime_workers()),
         upload_bytes,
@@ -1955,6 +2043,56 @@ async fn run_one_tuic_tcp_request(
     Ok(started.elapsed().as_micros())
 }
 
+async fn run_tuic_tcp_stream_client(
+    connection: quinn::Connection,
+    echo_addr: SocketAddr,
+    stream_id: usize,
+    options: &BenchOptions,
+) -> io::Result<ClientStats> {
+    let payload = bench_payload(stream_id, options.payload_size);
+    let mut response = vec![0u8; payload.len()];
+    let mut latencies = Vec::with_capacity(options.requests);
+    let (mut send, mut recv) = connection.open_bi().await.map_err(io_other)?;
+    send.write_all(&tuic_connect_command(echo_addr))
+        .await
+        .map_err(io_other)?;
+
+    for request_index in 0..options.requests {
+        let started = Instant::now();
+        send.write_all(&payload).await.map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "tuic stream {stream_id} request {} write failed: {error}",
+                    request_index + 1
+                ),
+            )
+        })?;
+        recv.read_exact(&mut response).await.map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "tuic stream {stream_id} request {} read failed: {error}",
+                    request_index + 1
+                ),
+            )
+        })?;
+        if response != payload {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tuic stream bench echo payload mismatch",
+            ));
+        }
+        latencies.push(started.elapsed().as_micros());
+    }
+
+    send.finish().map_err(io_other)?;
+    Ok(ClientStats {
+        latencies,
+        retries: 0,
+    })
+}
+
 async fn run_tuic_udp_client(
     server_addr: SocketAddr,
     cert_der: CertificateDer<'static>,
@@ -2458,9 +2596,9 @@ mod tests {
     use super::{
         canonical_bench_command, parse_bench_options, parse_bench_suite_options,
         parse_external_bench_suite_options, percent_change, run_external_vless_tcp_stream_bench,
-        run_hy2_udp_bench, run_tuic_tcp_bench, run_tuic_udp_bench, run_vless_tcp_bench,
-        run_vless_tcp_stream_bench, summarize_bench_runs, BenchOptions, BenchReport, BenchSuiteRun,
-        LatencyReport,
+        run_hy2_udp_bench, run_tuic_tcp_bench, run_tuic_tcp_stream_bench, run_tuic_udp_bench,
+        run_vless_tcp_bench, run_vless_tcp_stream_bench, summarize_bench_runs, BenchOptions,
+        BenchReport, BenchSuiteRun, LatencyReport,
     };
     use std::net::{SocketAddr, TcpStream};
     use std::path::PathBuf;
@@ -2574,6 +2712,10 @@ mod tests {
         assert_eq!(
             canonical_bench_command("vless-stream"),
             Some("vless-tcp-stream")
+        );
+        assert_eq!(
+            canonical_bench_command("tuic-stream"),
+            Some("tuic-tcp-stream")
         );
         assert_eq!(canonical_bench_command("unknown"), None);
     }
@@ -2778,6 +2920,26 @@ mod tests {
         assert_eq!(report.mode, "single-quic-connection");
         assert_eq!(report.total_requests, 2);
         assert_eq!(report.completed_requests, 2);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert!(report.runtime_workers.unwrap_or_default() >= 2);
+        assert!(report.download_bytes > 0);
+    }
+
+    #[test]
+    fn runs_tuic_tcp_stream_bench_smoke() {
+        let _network_guard = crate::test_support::network_test_lock();
+        let report = run_tuic_tcp_stream_bench(&BenchOptions {
+            streams: 1,
+            requests: 3,
+            payload_size: 16,
+        })
+        .expect("bench");
+
+        assert_eq!(report.protocol, "tuic-tcp");
+        assert_eq!(report.mode, "tuic-tcp-stream-per-worker");
+        assert_eq!(report.total_requests, 3);
+        assert_eq!(report.completed_requests, 3);
         assert_eq!(report.errors, 0);
         assert_eq!(report.error_rate, 0.0);
         assert!(report.runtime_workers.unwrap_or_default() >= 2);

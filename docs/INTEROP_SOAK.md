@@ -72,6 +72,7 @@ cargo run --release -- bench hy2-tcp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-tcp-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-udp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench tuic-tcp --streams 16 --requests 5000 --payload 1024
+cargo run --release -- bench tuic-tcp-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench tuic-udp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench vless-tcp-stream --streams 16 --requests 5000 --payload 1024
 ```
@@ -106,6 +107,20 @@ per stream, `1024` byte payload, `3` repeats):
 
 This keeps Rust VLESS stable under the benchmark but still below the Go/Xray throughput baseline,
 so keep using this suite to gate future VLESS relay optimizations.
+
+Recent Windows loopback release baseline for QUIC stream/datagram paths with the same `16 x 5000 x
+1024` shape and `3` repeats:
+
+| Command | Roundtrip Mbps avg | p99 avg | Errors | Retries |
+| --- | ---: | ---: | ---: | ---: |
+| `hy2-tcp-stream` | 529.76 | 911 us | 0 | 0 |
+| `hy2-udp` | 584.69 | 764 us | 0 | 0 |
+| `tuic-tcp-stream` | 495.25 | 951 us | 0 | 0 |
+| `tuic-udp` | 558.66 | 787 us | 0 | 0 |
+
+Use `tuic-tcp-stream` for steady-state TUIC relay benchmarking on Windows. The older `tuic-tcp`
+command intentionally opens one proxied TCP connection per request, which can exhaust local
+ephemeral ports under very high loopback request counts before it measures core throughput.
 
 Record the JSON output and compare `runtime_workers` where present, `completed_requests`, `errors`, `error_rate`, `roundtrip_mbps`, p95/p99 latency, and `retries` across commits on the same host.
 

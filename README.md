@@ -128,6 +128,7 @@ cargo run -- bench hy2-tcp --streams 8 --requests 1000 --payload 1024
 cargo run -- bench hy2-tcp-stream --streams 8 --requests 1000 --payload 1024
 cargo run -- bench hy2-udp --streams 8 --requests 1000 --payload 1024
 cargo run -- bench tuic-tcp --streams 8 --requests 1000 --payload 1024
+cargo run -- bench tuic-tcp-stream --streams 8 --requests 1000 --payload 1024
 cargo run -- bench tuic-udp --streams 8 --requests 1000 --payload 1024
 cargo run -- bench suite --streams 8 --requests 1000 --payload 1024 --repeats 3 --out runtime/bench/rust-suite.json
 cargo run -- bench external-suite --vless-core 127.0.0.1:19080 --commands vless-tcp-stream --streams 8 --requests 1000 --payload 1024 --repeats 3 --label go-xray --out runtime/bench/go-suite.json
@@ -145,6 +146,9 @@ The `hy2-tcp` benchmark authenticates once and opens TCP request streams over a 
 QUIC connection, so the stream count represents HY2 multiplexed concurrency.
 The `hy2-tcp-stream` benchmark opens one HY2 TCP stream per worker and sends all request
 payloads through that stream, isolating steady-state relay inside an established HY2 stream:
+`tuic-tcp` follows the same connection-per-request shape as a proxy opening many short TCP
+sessions, while `tuic-tcp-stream` keeps one CONNECT stream per worker and measures steady-state
+TUIC relay without exhausting local ephemeral ports on Windows.
 
 ```bash
 cargo run --release -- bench vless-tcp --streams 16 --requests 5000 --payload 1024
@@ -153,6 +157,7 @@ cargo run --release -- bench hy2-tcp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-tcp-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-udp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench tuic-tcp --streams 16 --requests 5000 --payload 1024
+cargo run --release -- bench tuic-tcp-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench tuic-udp --streams 16 --requests 5000 --payload 1024
 ```
 
