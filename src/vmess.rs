@@ -4109,10 +4109,12 @@ mod tests {
         let mut client = TcpStream::connect(vmess_addr).expect("client connect");
         client.write_all(&request_bytes).expect("client request");
         decode_response_header(&mut client, &request);
-        let mut body = VmessBodyReader::new(
+        let mut body = VmessBodyReader::new_with_length_seed(
             client,
             request.response_body_key,
             request.response_body_iv,
+            request.request_body_key,
+            request.request_body_iv,
             request.options,
             request.security,
         )

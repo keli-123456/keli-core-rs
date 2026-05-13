@@ -15,13 +15,18 @@ use rustls::pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
+use crate::config::OutboundConfig;
 use crate::http_proxy::{HttpProxyServer, HttpProxyServerConfig};
 use crate::hysteria2::{Hysteria2Server, Hysteria2ServerConfig};
-use crate::socks5::{Socks5Server, Socks5ServerConfig};
+use crate::shadowsocks::{
+    connect_shadowsocks_tcp_outbound, ShadowsocksServer, ShadowsocksServerConfig,
+};
+use crate::socks5::{Socks5Server, Socks5ServerConfig, SocksTarget};
 use crate::trojan::{trojan_password_hash, TrojanServer, TrojanServerConfig};
 use crate::tuic::{TuicServer, TuicServerConfig};
 use crate::user::CoreUser;
 use crate::vless::{VlessServer, VlessServerConfig};
+use crate::vmess::{connect_vmess_tcp_outbound, VmessServer, VmessServerConfig};
 
 const BENCH_USER_UUID: &str = "11111111-1111-1111-1111-111111111111";
 const BENCH_USER_BYTES: [u8; 16] = [0x11; 16];
@@ -44,9 +49,11 @@ const MAX_PAYLOAD_SIZE: usize = 1024 * 1024;
 const MAX_REQUEST_RETRIES: usize = 3;
 const DEFAULT_SUITE_COMMANDS: &[&str] = &[
     "http-connect-stream",
+    "shadowsocks-tcp-stream",
     "socks-tcp-stream",
     "trojan-tcp-stream",
     "vless-tcp-stream",
+    "vmess-tcp-stream",
     "hy2-tcp",
     "hy2-tcp-stream",
     "hy2-udp",
@@ -535,17 +542,19 @@ fn bench_quic_runtime_workers() -> usize {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --vless-core HOST:PORT [--commands vless-tcp,vless-tcp-stream] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
+        "bench commands:\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --vless-core HOST:PORT [--commands vless-tcp,vless-tcp-stream] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
     );
 }
 
 fn canonical_bench_command(command: &str) -> Option<&'static str> {
     match command {
         "http-connect-stream" | "http-tcp-stream" | "http-stream" => Some("http-connect-stream"),
+        "shadowsocks-tcp-stream" | "ss-tcp-stream" | "ss-stream" => Some("shadowsocks-tcp-stream"),
         "socks-tcp-stream" | "socks5-tcp-stream" | "socks-stream" => Some("socks-tcp-stream"),
         "trojan-tcp-stream" | "trojan-stream" => Some("trojan-tcp-stream"),
         "vless-tcp" => Some("vless-tcp"),
         "vless-tcp-stream" | "vless-stream" => Some("vless-tcp-stream"),
+        "vmess-tcp-stream" | "vmess-stream" => Some("vmess-tcp-stream"),
         "hy2-tcp" | "hysteria2-tcp" => Some("hy2-tcp"),
         "hy2-tcp-stream" | "hysteria2-tcp-stream" | "hy2-stream" => Some("hy2-tcp-stream"),
         "hy2-udp" | "hysteria2-udp" => Some("hy2-udp"),
@@ -559,10 +568,12 @@ fn canonical_bench_command(command: &str) -> Option<&'static str> {
 fn run_named_bench(command: &str, options: &BenchOptions) -> io::Result<BenchReport> {
     match canonical_bench_command(command) {
         Some("http-connect-stream") => run_http_connect_stream_bench(options),
+        Some("shadowsocks-tcp-stream") => run_shadowsocks_tcp_stream_bench(options),
         Some("socks-tcp-stream") => run_socks_tcp_stream_bench(options),
         Some("trojan-tcp-stream") => run_trojan_tcp_stream_bench(options),
         Some("vless-tcp") => run_vless_tcp_bench(options),
         Some("vless-tcp-stream") => run_vless_tcp_stream_bench(options),
+        Some("vmess-tcp-stream") => run_vmess_tcp_stream_bench(options),
         Some("hy2-tcp") => run_hy2_tcp_bench(options),
         Some("hy2-tcp-stream") => run_hy2_tcp_stream_bench(options),
         Some("hy2-udp") => run_hy2_udp_bench(options),
@@ -684,6 +695,56 @@ fn run_http_connect_stream_bench(options: &BenchOptions) -> io::Result<BenchRepo
     let download_bytes = upload_bytes;
     Ok(BenchReport::completed(
         "http-connect",
+        "connection-per-stream",
+        options,
+        None,
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
+}
+
+fn run_shadowsocks_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let core_stop = Arc::new(AtomicBool::new(false));
+    let (core_addr, core_thread) = start_shadowsocks_server(core_stop.clone())?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        workers.push(thread::spawn(move || {
+            run_shadowsocks_tcp_stream_client(core_addr, echo_addr, stream_id, &options)
+        }));
+    }
+
+    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+    }
+    let elapsed = started.elapsed();
+
+    core_stop.store(true, Ordering::SeqCst);
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(core_addr);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(core_thread)?;
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        "shadowsocks-tcp",
         "connection-per-stream",
         options,
         None,
@@ -1015,6 +1076,56 @@ fn run_external_vless_tcp_bench(
     Ok(BenchReport::completed(
         "vless-tcp",
         "connection-per-request",
+        options,
+        None,
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
+}
+
+fn run_vmess_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let core_stop = Arc::new(AtomicBool::new(false));
+    let (core_addr, core_thread) = start_vmess_server(core_stop.clone())?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        workers.push(thread::spawn(move || {
+            run_vmess_tcp_stream_client(core_addr, echo_addr, stream_id, &options)
+        }));
+    }
+
+    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+    }
+    let elapsed = started.elapsed();
+
+    core_stop.store(true, Ordering::SeqCst);
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(core_addr);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(core_thread)?;
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        "vmess-tcp",
+        "connection-per-stream",
         options,
         None,
         upload_bytes,
@@ -1746,6 +1857,46 @@ fn start_http_proxy_server(
     Ok((addr, handle))
 }
 
+fn start_shadowsocks_server(
+    stop: Arc<AtomicBool>,
+) -> io::Result<(SocketAddr, thread::JoinHandle<io::Result<()>>)> {
+    let server = ShadowsocksServer::new(ShadowsocksServerConfig {
+        node_tag: "bench|shadowsocks|tcp".to_string(),
+        listen: "127.0.0.1:0".parse().expect("valid listen addr"),
+        method: "aes-128-gcm".to_string(),
+        users: vec![bench_user()],
+        routes: Vec::new(),
+        connect_timeout: Duration::from_secs(3),
+    });
+    let listener = server.bind()?;
+    listener.set_nonblocking(true)?;
+    let addr = listener.local_addr()?;
+    let handle = thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_nodelay(true);
+                    let server = server.clone();
+                    thread::spawn(move || {
+                        if let Err(error) = server.handle_tcp_client(stream) {
+                            if !is_expected_bench_disconnect(&error) {
+                                eprintln!("bench shadowsocks server connection error: {error}");
+                            }
+                        }
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    });
+    Ok((addr, handle))
+}
+
 fn start_socks_server(
     stop: Arc<AtomicBool>,
 ) -> io::Result<(SocketAddr, thread::JoinHandle<io::Result<()>>)> {
@@ -1809,6 +1960,45 @@ fn start_trojan_server(
                         if let Err(error) = server.handle_tcp_client(stream) {
                             if !is_expected_bench_disconnect(&error) {
                                 eprintln!("bench trojan server connection error: {error}");
+                            }
+                        }
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    });
+    Ok((addr, handle))
+}
+
+fn start_vmess_server(
+    stop: Arc<AtomicBool>,
+) -> io::Result<(SocketAddr, thread::JoinHandle<io::Result<()>>)> {
+    let server = VmessServer::new(VmessServerConfig {
+        node_tag: "bench|vmess|tcp".to_string(),
+        listen: "127.0.0.1:0".parse().expect("valid listen addr"),
+        users: vec![bench_user()],
+        routes: Vec::new(),
+        connect_timeout: Duration::from_secs(3),
+    });
+    let listener = server.bind()?;
+    listener.set_nonblocking(true)?;
+    let addr = listener.local_addr()?;
+    let handle = thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_nodelay(true);
+                    let server = server.clone();
+                    thread::spawn(move || {
+                        if let Err(error) = server.handle_tcp_client(stream) {
+                            if !is_expected_bench_disconnect(&error) {
+                                eprintln!("bench vmess server connection error: {error}");
                             }
                         }
                     });
@@ -1929,6 +2119,21 @@ fn run_http_connect_stream_client(
     })
 }
 
+fn run_shadowsocks_tcp_stream_client(
+    core_addr: SocketAddr,
+    echo_addr: SocketAddr,
+    stream_id: usize,
+    options: &BenchOptions,
+) -> io::Result<ClientStats> {
+    let target = socket_addr_target(echo_addr);
+    let mut stream = connect_shadowsocks_tcp_outbound(
+        &shadowsocks_outbound(core_addr),
+        &target,
+        Duration::from_secs(10),
+    )?;
+    run_plain_stream_echo_client(&mut stream, "shadowsocks", stream_id, options)
+}
+
 fn run_socks_tcp_stream_client(
     core_addr: SocketAddr,
     echo_addr: SocketAddr,
@@ -1979,6 +2184,18 @@ fn run_socks_tcp_stream_client(
     })
 }
 
+fn run_vmess_tcp_stream_client(
+    core_addr: SocketAddr,
+    echo_addr: SocketAddr,
+    stream_id: usize,
+    options: &BenchOptions,
+) -> io::Result<ClientStats> {
+    let target = socket_addr_target(echo_addr);
+    let mut stream =
+        connect_vmess_tcp_outbound(&vmess_outbound(core_addr), &target, Duration::from_secs(10))?;
+    run_plain_stream_echo_client(&mut stream, "vmess", stream_id, options)
+}
+
 fn run_trojan_tcp_stream_client(
     core_addr: SocketAddr,
     echo_addr: SocketAddr,
@@ -2018,6 +2235,54 @@ fn run_trojan_tcp_stream_client(
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "trojan bench echo payload mismatch",
+            ));
+        }
+        latencies.push(started.elapsed().as_micros());
+    }
+
+    Ok(ClientStats {
+        latencies,
+        retries: 0,
+    })
+}
+
+fn run_plain_stream_echo_client(
+    stream: &mut TcpStream,
+    label: &str,
+    stream_id: usize,
+    options: &BenchOptions,
+) -> io::Result<ClientStats> {
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let payload = bench_payload(stream_id, options.payload_size);
+    let mut response = vec![0u8; payload.len()];
+    let mut latencies = Vec::with_capacity(options.requests);
+
+    for request_index in 0..options.requests {
+        let started = Instant::now();
+        stream.write_all(&payload).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{label} stream {stream_id} request {} write failed: {error}",
+                    request_index + 1
+                ),
+            )
+        })?;
+        stream.read_exact(&mut response).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{label} stream {stream_id} request {} read failed: {error}",
+                    request_index + 1
+                ),
+            )
+        })?;
+        if response != payload {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{label} bench echo payload mismatch"),
             ));
         }
         latencies.push(started.elapsed().as_micros());
@@ -2306,6 +2571,43 @@ fn socks_target_bytes(target: SocketAddr) -> Vec<u8> {
     }
     bytes.extend_from_slice(&target.port().to_be_bytes());
     bytes
+}
+
+fn socket_addr_target(addr: SocketAddr) -> SocksTarget {
+    SocksTarget {
+        host: addr.ip().to_string(),
+        port: addr.port(),
+    }
+}
+
+fn shadowsocks_outbound(server: SocketAddr) -> OutboundConfig {
+    OutboundConfig {
+        tag: "bench-ss-out".to_string(),
+        protocol: "shadowsocks".to_string(),
+        method: Some("aes-128-gcm".to_string()),
+        alter_id: None,
+        address: Some(server.ip().to_string()),
+        port: Some(server.port()),
+        username: None,
+        password: Some(BENCH_USER_UUID.to_string()),
+        tls: None,
+        transport: None,
+    }
+}
+
+fn vmess_outbound(server: SocketAddr) -> OutboundConfig {
+    OutboundConfig {
+        tag: "bench-vmess-out".to_string(),
+        protocol: "vmess".to_string(),
+        method: Some("aes-128-gcm".to_string()),
+        alter_id: None,
+        address: Some(server.ip().to_string()),
+        port: Some(server.port()),
+        username: Some(BENCH_USER_UUID.to_string()),
+        password: None,
+        tls: None,
+        transport: None,
+    }
 }
 
 fn vless_tcp_request(target: SocketAddr) -> Vec<u8> {
@@ -3162,10 +3464,11 @@ mod tests {
     use super::{
         canonical_bench_command, parse_bench_options, parse_bench_suite_options,
         parse_external_bench_suite_options, percent_change, run_external_vless_tcp_stream_bench,
-        run_http_connect_stream_bench, run_hy2_udp_bench, run_socks_tcp_stream_bench,
-        run_trojan_tcp_stream_bench, run_tuic_tcp_bench, run_tuic_tcp_stream_bench,
-        run_tuic_udp_bench, run_vless_tcp_bench, run_vless_tcp_stream_bench, summarize_bench_runs,
-        BenchOptions, BenchReport, BenchSuiteRun, LatencyReport,
+        run_http_connect_stream_bench, run_hy2_udp_bench, run_shadowsocks_tcp_stream_bench,
+        run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench, run_tuic_tcp_bench,
+        run_tuic_tcp_stream_bench, run_tuic_udp_bench, run_vless_tcp_bench,
+        run_vless_tcp_stream_bench, run_vmess_tcp_stream_bench, summarize_bench_runs, BenchOptions,
+        BenchReport, BenchSuiteRun, LatencyReport,
     };
     use std::net::{SocketAddr, TcpStream};
     use std::path::PathBuf;
@@ -3296,6 +3599,14 @@ mod tests {
             canonical_bench_command("http-stream"),
             Some("http-connect-stream")
         );
+        assert_eq!(
+            canonical_bench_command("ss-stream"),
+            Some("shadowsocks-tcp-stream")
+        );
+        assert_eq!(
+            canonical_bench_command("vmess-stream"),
+            Some("vmess-tcp-stream")
+        );
         assert_eq!(canonical_bench_command("unknown"), None);
     }
 
@@ -3414,6 +3725,25 @@ mod tests {
     }
 
     #[test]
+    fn runs_shadowsocks_tcp_stream_bench_smoke() {
+        let report = run_shadowsocks_tcp_stream_bench(&BenchOptions {
+            streams: 1,
+            requests: 3,
+            payload_size: 16,
+        })
+        .expect("bench");
+
+        assert_eq!(report.protocol, "shadowsocks-tcp");
+        assert_eq!(report.mode, "connection-per-stream");
+        assert_eq!(report.total_requests, 3);
+        assert_eq!(report.completed_requests, 3);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert_eq!(report.runtime_workers, None);
+        assert!(report.download_bytes > 0);
+    }
+
+    #[test]
     fn runs_trojan_tcp_stream_bench_smoke() {
         let report = run_trojan_tcp_stream_bench(&BenchOptions {
             streams: 1,
@@ -3442,6 +3772,25 @@ mod tests {
         .expect("bench");
 
         assert_eq!(report.protocol, "vless-tcp");
+        assert_eq!(report.mode, "connection-per-stream");
+        assert_eq!(report.total_requests, 3);
+        assert_eq!(report.completed_requests, 3);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert_eq!(report.runtime_workers, None);
+        assert!(report.download_bytes > 0);
+    }
+
+    #[test]
+    fn runs_vmess_tcp_stream_bench_smoke() {
+        let report = run_vmess_tcp_stream_bench(&BenchOptions {
+            streams: 1,
+            requests: 3,
+            payload_size: 16,
+        })
+        .expect("bench");
+
+        assert_eq!(report.protocol, "vmess-tcp");
         assert_eq!(report.mode, "connection-per-stream");
         assert_eq!(report.total_requests, 3);
         assert_eq!(report.completed_requests, 3);
