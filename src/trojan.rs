@@ -26,8 +26,8 @@ use crate::outbound::recv_udp_response;
 use crate::quic::connect_quic_client_stream;
 use crate::socks5::SocksTarget;
 use crate::stream::{
-    copy_count_best_effort_limited, join_native_blocking_relay, relay_tcp_streams_limited,
-    spawn_native_blocking_relay,
+    copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
+    relay_tcp_fast_unlimited, relay_tcp_limited, spawn_native_blocking_relay,
 };
 use crate::tls::{relay_tls_stream, TlsConnection};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
@@ -134,7 +134,11 @@ impl TrojanServer {
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
+        let bandwidth = if request.command == TrojanCommand::UdpAssociate {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
         if request.command == TrojanCommand::UdpAssociate {
             return self.relay_udp_stream(client, request, bandwidth);
         }
@@ -193,7 +197,11 @@ impl TrojanServer {
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
+        let bandwidth = if request.command == TrojanCommand::UdpAssociate {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
         if request.command == TrojanCommand::UdpAssociate {
             return self.relay_udp_split(reader, writer, request, bandwidth);
         }
@@ -230,7 +238,11 @@ impl TrojanServer {
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
+        let bandwidth = if request.command == TrojanCommand::UdpAssociate {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
         if request.command == TrojanCommand::UdpAssociate {
             return self.relay_udp_stream(client, request, bandwidth);
         }
@@ -272,7 +284,11 @@ impl TrojanServer {
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
+        let bandwidth = if request.command == TrojanCommand::UdpAssociate {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
         if request.command == TrojanCommand::UdpAssociate {
             return self.relay_udp_stream(websocket, request, bandwidth);
         }
@@ -371,7 +387,10 @@ impl TrojanServer {
         let _connection = self
             .bandwidth
             .register_tcp_connection(Some(&request.user_uuid), &[&client, &remote])?;
-        let (upload, download) = relay_tcp_streams_limited(client, remote, bandwidth)?;
+        let (upload, download) = match bandwidth {
+            Some(limiter) => relay_tcp_limited(client, remote, limiter)?,
+            None => relay_tcp_fast_unlimited(client, remote)?,
+        };
         self.traffic.add_with_user_id(
             self.config.node_tag.clone(),
             request.user_uuid,
@@ -401,15 +420,18 @@ impl TrojanServer {
             .bandwidth
             .register_tcp_connection(Some(&request.user_uuid), &[&remote_read])?;
         let upload_limiter = bandwidth.clone();
-        let upload_task = spawn_native_blocking_relay(move || {
-            copy_count_best_effort_limited(
-                &mut reader,
-                &mut remote_write,
-                upload_limiter.as_deref(),
-            )
+        let upload_task = spawn_native_blocking_relay(move || match upload_limiter.as_deref() {
+            Some(limiter) => {
+                copy_count_best_effort_limited(&mut reader, &mut remote_write, Some(limiter))
+            }
+            None => copy_count_best_effort(&mut reader, &mut remote_write),
         })?;
-        let download =
-            copy_count_best_effort_limited(&mut remote_read, &mut writer, bandwidth.as_deref());
+        let download = match bandwidth.as_deref() {
+            Some(limiter) => {
+                copy_count_best_effort_limited(&mut remote_read, &mut writer, Some(limiter))
+            }
+            None => copy_count_best_effort(&mut remote_read, &mut writer),
+        };
         let upload = join_native_blocking_relay(upload_task, "upload relay task panicked")?;
         self.traffic.add_with_user_id(
             self.config.node_tag.clone(),

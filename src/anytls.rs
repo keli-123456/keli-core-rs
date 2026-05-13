@@ -147,7 +147,7 @@ impl AnyTlsServer {
             .register_tcp_connection(Some(&user.uuid), &[&client])?;
         let writer = Arc::new(Mutex::new(client.try_clone()?));
         let mut session = AnyTlsSession {
-            bandwidth: self.bandwidth.limiter_for(Some(&user)),
+            bandwidth: self.bandwidth.limiter_for_limited(Some(&user)),
             user,
             client_ip,
             writer,

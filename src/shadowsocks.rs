@@ -22,7 +22,8 @@ use crate::limits::{
 use crate::outbound::recv_udp_response;
 use crate::socks5::SocksTarget;
 use crate::stream::{
-    copy_count_best_effort_limited, join_native_blocking_relay, spawn_native_blocking_relay,
+    copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
+    spawn_native_blocking_relay,
 };
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{apply_user_delta_to_vec, CoreUser, CoreUserDelta, CoreUserDeltaResult};
@@ -160,7 +161,7 @@ impl ShadowsocksServer {
         let mut request = self.read_request(client, method)?;
         request.client_ip = client_ip;
         let _session = self.acquire_user_session(&request.user, client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(Some(&request.user));
+        let bandwidth = self.bandwidth.limiter_for_limited(Some(&request.user));
         let protocol_labels = route_protocol_labels("tcp", &request.initial_payload);
         let remote = match self.router.decide_target(
             &request.target.host,
@@ -477,11 +478,14 @@ impl ShadowsocksServer {
         let mut remote_write = remote.try_clone()?;
         let upload_limiter = bandwidth.clone();
         let upload_task = spawn_native_blocking_relay(move || {
-            let copied = copy_count_best_effort_limited(
-                &mut encrypted_client,
-                &mut remote_write,
-                upload_limiter.as_deref(),
-            );
+            let copied = match upload_limiter.as_deref() {
+                Some(limiter) => copy_count_best_effort_limited(
+                    &mut encrypted_client,
+                    &mut remote_write,
+                    Some(limiter),
+                ),
+                None => copy_count_best_effort(&mut encrypted_client, &mut remote_write),
+            };
             let _ = remote_write.shutdown(Shutdown::Write);
             copied
         })?;
@@ -489,11 +493,14 @@ impl ShadowsocksServer {
         let mut remote_read = remote;
         let mut encrypted_writer =
             ShadowsocksWriter::new_response(response_stream, method, &password)?;
-        let download = copy_count_best_effort_limited(
-            &mut remote_read,
-            &mut encrypted_writer,
-            bandwidth.as_deref(),
-        );
+        let download = match bandwidth.as_deref() {
+            Some(limiter) => copy_count_best_effort_limited(
+                &mut remote_read,
+                &mut encrypted_writer,
+                Some(limiter),
+            ),
+            None => copy_count_best_effort(&mut remote_read, &mut encrypted_writer),
+        };
         let _ = encrypted_writer.shutdown();
         upload = upload.saturating_add(join_native_blocking_relay(
             upload_task,

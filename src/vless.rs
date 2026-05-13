@@ -26,8 +26,8 @@ use crate::outbound::recv_udp_response;
 use crate::quic::connect_quic_client_stream;
 use crate::socks5::SocksTarget;
 use crate::stream::{
-    copy_count_best_effort_limited, join_native_blocking_relay, relay_tcp_streams_limited,
-    spawn_native_blocking_relay,
+    copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
+    relay_tcp_fast_unlimited, relay_tcp_limited, spawn_native_blocking_relay,
 };
 use crate::tls::{relay_tls_stream, TlsConnection, TlsSocket};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
@@ -147,11 +147,12 @@ impl VlessServer {
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.command == VlessCommand::Udp {
+            let bandwidth = self.bandwidth.limiter_for(user.as_ref());
             client.write_all(&[VERSION, 0x00])?;
             return self.relay_udp_stream(client, request, bandwidth);
         }
+        let bandwidth = self.bandwidth.limiter_for_limited(user.as_ref());
         let remote =
             match self
                 .router
@@ -189,13 +190,14 @@ impl VlessServer {
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
         if request.command == VlessCommand::Udp {
+            let bandwidth = self.bandwidth.limiter_for(user.as_ref());
             client.write_all(&[VERSION, 0x00]).await?;
             return self
                 .relay_udp_stream_async(client, request, bandwidth)
                 .await;
         }
+        let bandwidth = self.bandwidth.limiter_for_limited(user.as_ref());
         if request.flow == FLOW_XTLS_RPRX_VISION {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -263,7 +265,11 @@ impl VlessServer {
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
+        let bandwidth = if request.command == VlessCommand::Udp {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
         if request.command == VlessCommand::Udp {
             writer.write_all(&[VERSION, 0x00])?;
             return self.relay_udp_split(reader, writer, request, bandwidth);
@@ -305,7 +311,11 @@ impl VlessServer {
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
+        let bandwidth = if request.command == VlessCommand::Udp {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
         if request.command == VlessCommand::Udp {
             client.write_all(&[VERSION, 0x00])?;
             return self.relay_udp_stream(client, request, bandwidth);
@@ -349,7 +359,11 @@ impl VlessServer {
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
+        let bandwidth = if request.command == VlessCommand::Udp {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
         if request.command == VlessCommand::Udp {
             websocket.write_all(&[VERSION, 0x00])?;
             return self.relay_udp_stream(websocket, request, bandwidth);
@@ -570,8 +584,10 @@ impl VlessServer {
             .register_tcp_connection(Some(&request.user_uuid), &[&client, &remote])?;
         let (upload, download) = if request.flow == FLOW_XTLS_RPRX_VISION {
             relay_vision_tcp_streams(client, remote, request.user_id, bandwidth)?
+        } else if let Some(limiter) = bandwidth {
+            relay_tcp_limited(client, remote, limiter)?
         } else {
-            relay_tcp_streams_limited(client, remote, bandwidth)?
+            relay_tcp_fast_unlimited(client, remote)?
         };
         self.traffic.add_with_user_id(
             self.config.node_tag.clone(),
@@ -591,6 +607,9 @@ impl VlessServer {
         request: VlessRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
+        let _connection = self
+            .bandwidth
+            .register_tokio_tcp_connection(Some(&request.user_uuid), &[&client, &remote])?;
         let upload_traffic = self.traffic.clone();
         let upload_node_tag = self.config.node_tag.clone();
         let upload_user_uuid = request.user_uuid.clone();
@@ -640,15 +659,21 @@ impl VlessServer {
                 .bandwidth
                 .register_tcp_connection(Some(&request.user_uuid), &[&remote_read])?;
             let upload_limiter = bandwidth.clone();
-            let upload_task = spawn_native_blocking_relay(move || {
-                copy_count_best_effort_limited(
-                    &mut reader,
-                    &mut remote_write,
-                    upload_limiter.as_deref(),
-                )
-            })?;
-            let download =
-                copy_count_best_effort_limited(&mut remote_read, &mut writer, bandwidth.as_deref());
+            let upload_task =
+                spawn_native_blocking_relay(move || match upload_limiter.as_deref() {
+                    Some(limiter) => copy_count_best_effort_limited(
+                        &mut reader,
+                        &mut remote_write,
+                        Some(limiter),
+                    ),
+                    None => copy_count_best_effort(&mut reader, &mut remote_write),
+                })?;
+            let download = match bandwidth.as_deref() {
+                Some(limiter) => {
+                    copy_count_best_effort_limited(&mut remote_read, &mut writer, Some(limiter))
+                }
+                None => copy_count_best_effort(&mut remote_read, &mut writer),
+            };
             let upload = join_native_blocking_relay(upload_task, "upload relay task panicked")?;
             (upload, download)
         };
@@ -1029,48 +1054,6 @@ impl VlessServer {
                 error.to_string(),
             )),
         }
-    }
-}
-
-fn traffic_flush_callback(
-    traffic: SharedTrafficRegistry,
-    node_tag: String,
-    user_uuid: String,
-    user_id: Option<u64>,
-    upload: bool,
-    mut client_ip: Option<IpAddr>,
-) -> impl FnMut(u64) {
-    let mut pending = 0u64;
-    let mut flushed_once = false;
-    move |bytes| {
-        pending = pending.saturating_add(bytes);
-        if pending == 0 {
-            return;
-        }
-        if flushed_once && bytes != 0 && pending < ASYNC_TRAFFIC_FLUSH_BYTES {
-            return;
-        }
-        if upload {
-            traffic.add_with_user_id(
-                node_tag.clone(),
-                user_uuid.clone(),
-                user_id,
-                pending,
-                0,
-                client_ip.take(),
-            );
-        } else {
-            traffic.add_with_user_id(
-                node_tag.clone(),
-                user_uuid.clone(),
-                user_id,
-                0,
-                pending,
-                None,
-            );
-        }
-        pending = 0;
-        flushed_once = true;
     }
 }
 
@@ -2147,6 +2130,48 @@ fn is_stream_closed(error: &io::Error) -> bool {
     )
 }
 
+fn traffic_flush_callback(
+    traffic: SharedTrafficRegistry,
+    node_tag: String,
+    user_uuid: String,
+    user_id: Option<u64>,
+    upload: bool,
+    mut client_ip: Option<IpAddr>,
+) -> impl FnMut(u64) {
+    let mut pending = 0u64;
+    let mut flushed_once = false;
+    move |bytes| {
+        pending = pending.saturating_add(bytes);
+        if pending == 0 {
+            return;
+        }
+        if flushed_once && bytes != 0 && pending < ASYNC_TRAFFIC_FLUSH_BYTES {
+            return;
+        }
+        if upload {
+            traffic.add_with_user_id(
+                node_tag.clone(),
+                user_uuid.clone(),
+                user_id,
+                pending,
+                0,
+                client_ip.take(),
+            );
+        } else {
+            traffic.add_with_user_id(
+                node_tag.clone(),
+                user_uuid.clone(),
+                user_id,
+                0,
+                pending,
+                None,
+            );
+        }
+        pending = 0;
+        flushed_once = true;
+    }
+}
+
 async fn relay_tcp_streams_async(
     client: tokio::net::TcpStream,
     remote: tokio::net::TcpStream,
@@ -2282,18 +2307,23 @@ where
     let upload_limiter = limiter.clone();
     let upload_task = spawn_native_blocking_relay(move || {
         let mut vision_reader = VisionReader::new(reader, user_id);
-        let bytes = copy_count_best_effort_limited(
-            &mut vision_reader,
-            &mut remote_write,
-            upload_limiter.as_deref(),
-        );
+        let bytes = match upload_limiter.as_deref() {
+            Some(limiter) => {
+                copy_count_best_effort_limited(&mut vision_reader, &mut remote_write, Some(limiter))
+            }
+            None => copy_count_best_effort(&mut vision_reader, &mut remote_write),
+        };
         let _ = remote_write.shutdown(Shutdown::Write);
         bytes
     })?;
 
     let mut vision_writer = VisionWriter::new(writer, user_id);
-    let download =
-        copy_count_best_effort_limited(&mut remote_read, &mut vision_writer, limiter.as_deref());
+    let download = match limiter.as_deref() {
+        Some(limiter) => {
+            copy_count_best_effort_limited(&mut remote_read, &mut vision_writer, Some(limiter))
+        }
+        None => copy_count_best_effort(&mut remote_read, &mut vision_writer),
+    };
     let upload = join_native_blocking_relay(upload_task, "vision upload relay task panicked")?;
 
     Ok((upload, download))
@@ -2646,6 +2676,17 @@ mod tests {
 
     fn server() -> VlessServer {
         server_with_flow("")
+    }
+
+    fn server_with_user(user: CoreUser) -> VlessServer {
+        VlessServer::new(VlessServerConfig {
+            node_tag: "panel|vless|1".to_string(),
+            listen: "127.0.0.1:0".parse().expect("listen addr"),
+            users: vec![user],
+            routes: Vec::new(),
+            flow: String::new(),
+            connect_timeout: Duration::from_secs(3),
+        })
     }
 
     fn server_with_flow(flow: &str) -> VlessServer {
@@ -3753,6 +3794,166 @@ mod tests {
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+    }
+
+    #[tokio::test]
+    async fn async_vless_tcp_unlimited_user_uses_fast_path_and_delete_closes_connection() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (second_payload_tx, second_payload_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .expect("echo timeout");
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).expect("first payload");
+            stream.write_all(&first).expect("first echo");
+            let mut second = [0u8; 1];
+            let received_second = stream.read_exact(&mut second).is_ok();
+            second_payload_tx
+                .send(received_second)
+                .expect("send result");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vless bind");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+        let server_clone = server.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("vless accept");
+            server_clone.handle_tcp_client_async(stream).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(vless_addr)
+            .await
+            .expect("client connect");
+        client
+            .write_all(&vless_request(echo_addr))
+            .await
+            .expect("vless request");
+        let mut header = [0u8; 2];
+        client
+            .read_exact(&mut header)
+            .await
+            .expect("vless response");
+        assert_eq!(header, [super::VERSION, 0x00]);
+        client.write_all(b"x").await.expect("first write");
+        let mut echoed = [0u8; 1];
+        client.read_exact(&mut echoed).await.expect("first echo");
+        assert_eq!(echoed, *b"x");
+
+        assert!(
+            !server.bandwidth.has_limiter_for(&user().uuid),
+            "unlimited VLESS TCP should not create limiter hot-path state"
+        );
+        assert_eq!(server.bandwidth.active_connection_count(&user().uuid), 1);
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            deleted: vec![user().uuid],
+            ..CoreUserDelta::default()
+        });
+        assert_eq!(result.deleted, 1);
+
+        let _ = client.write_all(b"y").await;
+        assert!(
+            !second_payload_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("echo result"),
+            "deleted unlimited user's existing async VLESS relay should stop forwarding"
+        );
+        drop(client);
+        let result = server_task.await.expect("server task");
+        if let Err(error) = result {
+            assert!(
+                super::is_stream_closed(&error),
+                "unexpected relay error: {error}"
+            );
+        }
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].user_uuid, user().uuid);
+        assert_eq!(records[0].user_id, Some(1));
+        assert_eq!(records[0].upload, 1);
+        assert_eq!(records[0].download, 1);
+    }
+
+    #[tokio::test]
+    async fn limited_vless_tcp_uses_limiter_and_limiter_revoke_stops_relay() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (second_payload_tx, second_payload_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .expect("echo timeout");
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).expect("first payload");
+            stream.write_all(&first).expect("first echo");
+            let mut second = [0u8; 1];
+            let received_second = stream.read_exact(&mut second).is_ok();
+            second_payload_tx
+                .send(received_second)
+                .expect("send result");
+        });
+
+        let mut limited = user();
+        limited.speed_limit = 8192;
+        let server = server_with_user(limited.clone());
+        let listener = server.bind().expect("vless bind");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+        let server_clone = server.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("vless accept");
+            server_clone.handle_tcp_client_async(stream).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(vless_addr)
+            .await
+            .expect("client connect");
+        client
+            .write_all(&vless_request(echo_addr))
+            .await
+            .expect("vless request");
+        let mut header = [0u8; 2];
+        client
+            .read_exact(&mut header)
+            .await
+            .expect("vless response");
+        assert_eq!(header, [super::VERSION, 0x00]);
+        client.write_all(b"x").await.expect("first write");
+        let mut echoed = [0u8; 1];
+        client.read_exact(&mut echoed).await.expect("first echo");
+        assert_eq!(echoed, *b"x");
+
+        assert!(server.bandwidth.has_limiter_for(&limited.uuid));
+        let limiter = server
+            .bandwidth
+            .limiter_for_limited(Some(&limited))
+            .expect("limited user limiter");
+        limiter.revoke();
+
+        let _ = client.write_all(b"y").await;
+        assert!(
+            !second_payload_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("echo result"),
+            "revoked limited VLESS relay should stop forwarding"
+        );
+        drop(client);
+        server_task.await.expect("server task").expect("serve once");
+        echo_thread.join().expect("echo thread");
     }
 
     #[test]

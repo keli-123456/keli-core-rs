@@ -37,7 +37,9 @@ use crate::limits::{
 use crate::outbound::recv_udp_response;
 use crate::quic::connect_quic_client_stream;
 use crate::socks5::SocksTarget;
-use crate::stream::{copy_count_best_effort_limited, spawn_native_blocking_relay};
+use crate::stream::{
+    copy_count_best_effort, copy_count_best_effort_limited, spawn_native_blocking_relay,
+};
 use crate::tls::TlsConnection;
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
@@ -205,7 +207,11 @@ impl VmessServer {
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
+        let bandwidth = if request.command == VmessCommand::Udp {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
         if request.command == VmessCommand::Udp {
             write_response_header(&mut client, &request)?;
             return self.relay_udp_single(client, request, bandwidth);
@@ -246,7 +252,11 @@ impl VmessServer {
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
+        let bandwidth = if request.command == VmessCommand::Udp {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
         if request.command == VmessCommand::Udp {
             write_response_header(&mut writer, &request)?;
             return self.relay_udp_split(reader, writer, request, bandwidth);
@@ -262,7 +272,11 @@ impl VmessServer {
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
+        let bandwidth = if request.command == VmessCommand::Udp {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
         if request.command == VmessCommand::Udp {
             write_response_header(&mut client, &request)?;
             return self.relay_udp_single(client, request, bandwidth);
@@ -284,7 +298,11 @@ impl VmessServer {
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
-        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
+        let bandwidth = if request.command == VmessCommand::Udp {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
         if request.command == VmessCommand::Udp {
             write_response_header(&mut websocket, &request)?;
             return self.relay_udp_single(websocket, request, bandwidth);
@@ -488,19 +506,23 @@ impl VmessServer {
         )?;
         let upload_limiter = bandwidth.clone();
         let upload_thread = thread::spawn(move || {
-            let copied = copy_count_best_effort_limited(
-                &mut request_body,
-                &mut remote_write,
-                upload_limiter.as_deref(),
-            );
+            let copied = match upload_limiter.as_deref() {
+                Some(limiter) => copy_count_best_effort_limited(
+                    &mut request_body,
+                    &mut remote_write,
+                    Some(limiter),
+                ),
+                None => copy_count_best_effort(&mut request_body, &mut remote_write),
+            };
             let _ = remote_write.shutdown(Shutdown::Write);
             copied
         });
-        let download = copy_count_best_effort_limited(
-            &mut remote_read,
-            &mut response_body,
-            bandwidth.as_deref(),
-        );
+        let download = match bandwidth.as_deref() {
+            Some(limiter) => {
+                copy_count_best_effort_limited(&mut remote_read, &mut response_body, Some(limiter))
+            }
+            None => copy_count_best_effort(&mut remote_read, &mut response_body),
+        };
         let _ = response_body.finish();
         let upload = upload_thread
             .join()

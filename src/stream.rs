@@ -38,7 +38,19 @@ struct NativeRelayPool {
 }
 
 pub fn relay_tcp_streams(client: TcpStream, remote: TcpStream) -> io::Result<(u64, u64)> {
+    relay_tcp_fast_unlimited(client, remote)
+}
+
+pub fn relay_tcp_fast_unlimited(client: TcpStream, remote: TcpStream) -> io::Result<(u64, u64)> {
     relay_tcp_streams_limited(client, remote, None)
+}
+
+pub fn relay_tcp_limited(
+    client: TcpStream,
+    remote: TcpStream,
+    limiter: Arc<BandwidthLimiter>,
+) -> io::Result<(u64, u64)> {
+    relay_tcp_streams_limited(client, remote, Some(limiter))
 }
 
 pub fn relay_tcp_streams_limited(

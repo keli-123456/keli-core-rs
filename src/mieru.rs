@@ -19,8 +19,8 @@ use crate::limits::{
 use crate::outbound::recv_udp_response;
 use crate::socks5::SocksTarget;
 use crate::stream::{
-    copy_count_best_effort_limited, join_native_blocking_relay, spawn_native_blocking_relay,
-    NativeRelayHandle,
+    copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
+    spawn_native_blocking_relay, NativeRelayHandle,
 };
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{apply_user_delta_to_vec, CoreUser, CoreUserDelta, CoreUserDeltaResult};
@@ -1676,16 +1676,21 @@ where
     let upload_limiter = limiter.clone();
     let stop_upload = reader.stop_handle();
     let upload_task = spawn_native_blocking_relay(move || {
-        let upload = copy_count_best_effort_limited(
-            &mut reader,
-            &mut remote_write,
-            upload_limiter.as_deref(),
-        );
+        let upload = match upload_limiter.as_deref() {
+            Some(limiter) => {
+                copy_count_best_effort_limited(&mut reader, &mut remote_write, Some(limiter))
+            }
+            None => copy_count_best_effort(&mut reader, &mut remote_write),
+        };
         let _ = remote_write.shutdown(Shutdown::Write);
         upload
     })?;
-    let download =
-        copy_count_best_effort_limited(&mut remote_read, &mut writer, limiter.as_deref());
+    let download = match limiter.as_deref() {
+        Some(limiter) => {
+            copy_count_best_effort_limited(&mut remote_read, &mut writer, Some(limiter))
+        }
+        None => copy_count_best_effort(&mut remote_read, &mut writer),
+    };
     if let Some(stop) = stop_upload {
         stop.store(true, Ordering::Relaxed);
     }

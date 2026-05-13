@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use socket2::SockRef;
+
 use crate::user::{CoreUser, CoreUserDelta};
 
 const USER_LIMIT_SHARDS: usize = 64;
@@ -224,6 +226,43 @@ impl UserBandwidthLimiters {
             .iter()
             .map(|socket| socket.try_clone())
             .collect::<io::Result<Vec<_>>>()?;
+        self.register_owned_tcp_connections(Some(user_uuid), sockets)
+    }
+
+    pub fn register_tokio_tcp_connection(
+        &self,
+        user_uuid: Option<&str>,
+        sockets: &[&tokio::net::TcpStream],
+    ) -> io::Result<Option<UserConnectionGuard>> {
+        let Some(user_uuid) = user_uuid.map(str::trim).filter(|uuid| !uuid.is_empty()) else {
+            return Ok(None);
+        };
+        if sockets.is_empty() {
+            return Ok(None);
+        }
+
+        let sockets = sockets
+            .iter()
+            .map(|socket| {
+                let cloned = SockRef::from(*socket).try_clone()?;
+                Ok(TcpStream::from(cloned))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        self.register_owned_tcp_connections(Some(user_uuid), sockets)
+    }
+
+    fn register_owned_tcp_connections(
+        &self,
+        user_uuid: Option<&str>,
+        sockets: Vec<TcpStream>,
+    ) -> io::Result<Option<UserConnectionGuard>> {
+        let Some(user_uuid) = user_uuid.map(str::trim).filter(|uuid| !uuid.is_empty()) else {
+            return Ok(None);
+        };
+        if sockets.is_empty() {
+            return Ok(None);
+        }
+
         let handle = Arc::new(UserConnectionHandle { sockets });
         let mut active = user_connection_shard(&self.connections, user_uuid)
             .lock()
@@ -258,6 +297,32 @@ impl UserBandwidthLimiters {
             Some(bytes_per_second) => BandwidthLimiter::new(bytes_per_second),
             None => BandwidthLimiter::unlimited(),
         });
+        limiters.insert(user.uuid.clone(), Arc::clone(&limiter));
+        Some(limiter)
+    }
+
+    pub fn limiter_for_limited(&self, user: Option<&CoreUser>) -> Option<Arc<BandwidthLimiter>> {
+        let user = user?;
+        let Some(bytes_per_second) = speed_limit_mbps_to_bytes_per_second(user.speed_limit) else {
+            let limiters = bandwidth_limiter_shard(&self.limiters, &user.uuid)
+                .lock()
+                .expect("user bandwidth limiter lock poisoned");
+            if let Some(limiter) = limiters.get(&user.uuid) {
+                limiter.set_unlimited();
+            }
+            return None;
+        };
+
+        let mut limiters = bandwidth_limiter_shard(&self.limiters, &user.uuid)
+            .lock()
+            .expect("user bandwidth limiter lock poisoned");
+
+        if let Some(limiter) = limiters.get(&user.uuid) {
+            limiter.set_bytes_per_second(bytes_per_second);
+            return Some(Arc::clone(limiter));
+        }
+
+        let limiter = Arc::new(BandwidthLimiter::new(bytes_per_second));
         limiters.insert(user.uuid.clone(), Arc::clone(&limiter));
         Some(limiter)
     }
@@ -322,6 +387,13 @@ impl UserBandwidthLimiters {
         count
     }
 
+    pub fn has_limiter_for(&self, user_uuid: &str) -> bool {
+        bandwidth_limiter_shard(&self.limiters, user_uuid)
+            .lock()
+            .expect("user bandwidth limiter lock poisoned")
+            .contains_key(user_uuid)
+    }
+
     fn close_user_connections(&self, user_uuids: &[String]) {
         for user_uuid in user_uuids {
             let handles = self.connection_handles(user_uuid);
@@ -376,6 +448,15 @@ pub fn sync_user_limit_delta(
         sessions.revoke_users(&delta.deleted);
         bandwidth.sync_users(&delta.added);
         bandwidth.sync_users(&delta.updated);
+        let updated = delta
+            .updated
+            .iter()
+            .map(|user| user.uuid.clone())
+            .collect::<Vec<_>>();
+        if !updated.is_empty() {
+            bandwidth.close_user_connections(&updated);
+            sessions.revoke_users(&updated);
+        }
     }
 }
 
@@ -720,6 +801,29 @@ mod tests {
         assert_eq!(limiter.bytes_per_second(), 0);
         assert!(!limiter.is_revoked());
         assert!(limiter.wait_for(16));
+    }
+
+    #[test]
+    fn limiter_for_limited_skips_new_unlimited_users() {
+        let limiters = UserBandwidthLimiters::default();
+        let user = user(0);
+
+        assert!(limiters.limiter_for_limited(Some(&user)).is_none());
+        assert!(!limiters.has_limiter_for(&user.uuid));
+    }
+
+    #[test]
+    fn limiter_for_limited_creates_limiter_for_limited_users() {
+        let limiters = UserBandwidthLimiters::default();
+        let mut user = user(0);
+        user.speed_limit = 8;
+
+        let limiter = limiters
+            .limiter_for_limited(Some(&user))
+            .expect("limited user should have limiter");
+
+        assert_eq!(limiter.bytes_per_second(), 1024 * 1024);
+        assert!(limiters.has_limiter_for(&user.uuid));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::limits::{
     UserSessionTracker,
 };
 use crate::outbound::recv_udp_response;
-use crate::stream::relay_tcp_streams_limited;
+use crate::stream::{relay_tcp_fast_unlimited, relay_tcp_limited};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::{
@@ -126,7 +126,11 @@ impl Socks5Server {
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), &mut client)?;
-        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
+        let bandwidth = if request.command == SocksCommand::UdpAssociate {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
         if request.command == SocksCommand::UdpAssociate {
             return self.handle_udp_associate(client, request, bandwidth);
         }
@@ -336,7 +340,10 @@ impl Socks5Server {
         let _connection = self
             .bandwidth
             .register_tcp_connection(request.user_uuid.as_deref(), &[&client, &remote])?;
-        let (upload, download) = relay_tcp_streams_limited(client, remote, bandwidth)?;
+        let (upload, download) = match bandwidth {
+            Some(limiter) => relay_tcp_limited(client, remote, limiter)?,
+            None => relay_tcp_fast_unlimited(client, remote)?,
+        };
         if let Some(user_uuid) = request.user_uuid {
             self.traffic.add_with_user_id(
                 self.config.node_tag.clone(),

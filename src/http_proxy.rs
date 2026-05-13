@@ -10,7 +10,10 @@ use crate::limits::{
     sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard,
     UserSessionTracker,
 };
-use crate::stream::{copy_count_best_effort_limited, relay_tcp_streams_limited};
+use crate::stream::{
+    copy_count_best_effort, copy_count_best_effort_limited, relay_tcp_fast_unlimited,
+    relay_tcp_limited,
+};
 use crate::traffic::{SharedTrafficRegistry, TrafficDelta, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::{connect_tcp_outbound, RouteDecision, RouteMatcher, SocksTarget};
@@ -107,7 +110,7 @@ impl HttpProxyServer {
         let user = self.request_user(&request);
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let _session = self.acquire_user_session(user.as_ref(), &mut client)?;
-        let bandwidth = self.bandwidth.limiter_for(user.as_ref());
+        let bandwidth = self.bandwidth.limiter_for_limited(user.as_ref());
         if request.method.eq_ignore_ascii_case("CONNECT") {
             self.handle_connect(client, request, bandwidth, client_ip)
         } else {
@@ -224,7 +227,10 @@ impl HttpProxyServer {
         let _connection = self
             .bandwidth
             .register_tcp_connection(request.user_uuid.as_deref(), &[&client, &remote])?;
-        let (upload, download) = relay_tcp_streams_limited(client, remote, bandwidth)?;
+        let (upload, download) = match bandwidth {
+            Some(limiter) => relay_tcp_limited(client, remote, limiter)?,
+            None => relay_tcp_fast_unlimited(client, remote)?,
+        };
         self.record_traffic(
             request.user_uuid,
             request.user_id,
@@ -261,7 +267,10 @@ impl HttpProxyServer {
             .bandwidth
             .register_tcp_connection(request.user_uuid.as_deref(), &[&*client, &remote])?;
         let upload = outbound.len() as u64;
-        let download = copy_count_best_effort_limited(&mut remote, client, bandwidth.as_deref());
+        let download = match bandwidth.as_deref() {
+            Some(limiter) => copy_count_best_effort_limited(&mut remote, client, Some(limiter)),
+            None => copy_count_best_effort(&mut remote, client),
+        };
         self.record_traffic(
             request.user_uuid,
             request.user_id,
