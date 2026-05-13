@@ -38,7 +38,8 @@ use crate::outbound::recv_udp_response;
 use crate::quic::connect_quic_client_stream;
 use crate::socks5::SocksTarget;
 use crate::stream::{
-    copy_count_best_effort, copy_count_best_effort_limited, spawn_native_blocking_relay,
+    copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
+    spawn_native_blocking_relay,
 };
 use crate::tls::TlsConnection;
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
@@ -1800,8 +1801,7 @@ pub(crate) fn connect_vmess_tcp_outbound(
     stream.set_write_timeout(Some(timeout))?;
     let request = write_vmess_tcp_request(&mut stream, outbound, target)?;
     read_vmess_response_header(&mut stream, &request)?;
-    stream.set_nonblocking(true)?;
-    local_bridge_for_vmess(stream, request)
+    local_bridge_for_vmess_tcp(stream, request)
 }
 
 fn connect_vmess_h2_tcp_outbound(
@@ -2497,6 +2497,83 @@ where
     })?;
 
     Ok(local_client)
+}
+
+fn local_bridge_for_vmess_tcp(remote: TcpStream, request: VmessRequest) -> io::Result<TcpStream> {
+    let local_listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let local_addr = local_listener.local_addr()?;
+    let local_client = TcpStream::connect(local_addr)?;
+    local_client.set_nodelay(true)?;
+    let (local_plain, _) = local_listener.accept()?;
+    local_plain.set_nodelay(true)?;
+
+    let plain_reader = local_plain.try_clone()?;
+    let plain_writer = local_plain;
+    let remote_writer = remote.try_clone()?;
+    let remote_reader = remote;
+    let _ = spawn_native_blocking_relay(move || {
+        let _ = relay_plain_to_vmess_tcp(
+            plain_reader,
+            plain_writer,
+            remote_reader,
+            remote_writer,
+            request,
+        );
+    })?;
+
+    Ok(local_client)
+}
+
+fn relay_plain_to_vmess_tcp(
+    mut plain_reader: TcpStream,
+    mut plain_writer: TcpStream,
+    mut remote_reader: TcpStream,
+    mut remote_writer: TcpStream,
+    request: VmessRequest,
+) -> io::Result<()> {
+    let upload_request = request.clone();
+    let upload_task = spawn_native_blocking_relay(move || {
+        let mut request_body = VmessBodyEncoder::new_with_length_seed(
+            upload_request.request_body_key,
+            upload_request.request_body_iv,
+            upload_request.request_body_key,
+            upload_request.request_body_iv,
+            upload_request.options,
+            upload_request.security,
+        );
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            match plain_reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => request_body.write_plain(&mut remote_writer, &buffer[..read])?,
+                Err(error) => return Err(error),
+            };
+        }
+        let _ = request_body.finish(&mut remote_writer);
+        let _ = remote_writer.shutdown(Shutdown::Write);
+        Ok::<(), io::Error>(())
+    })?;
+
+    let mut response_body = VmessBodyDecoder::new_with_length_seed(
+        request.response_body_key,
+        request.response_body_iv,
+        request.request_body_key,
+        request.request_body_iv,
+        request.options,
+        request.security,
+    );
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        match response_body.read_plain(&mut remote_reader, &mut buffer) {
+            Ok(0) => break,
+            Ok(read) => write_all_wait(&mut plain_writer, &buffer[..read])?,
+            Err(error) => return Err(error),
+        }
+    }
+    let _ = plain_writer.shutdown(Shutdown::Write);
+    let _ = join_native_blocking_relay(upload_task, "vmess tcp bridge upload panicked")?;
+    let _ = plain_writer.shutdown(Shutdown::Both);
+    Ok(())
 }
 
 fn relay_plain_to_vmess<S>(
