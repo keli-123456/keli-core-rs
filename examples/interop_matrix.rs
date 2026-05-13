@@ -42,16 +42,34 @@ struct InteropCase {
     core_port: u16,
     inbound: Value,
     sing_outbound: Value,
+    mihomo_proxy: Option<Value>,
     probes: Vec<Probe>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientKind {
+    SingBox,
+    Mihomo,
+}
+
+impl ClientKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SingBox => "sing-box",
+            Self::Mihomo => "mihomo",
+        }
+    }
 }
 
 #[derive(Debug)]
 struct Args {
     core: PathBuf,
-    sing_box: PathBuf,
+    sing_box: Option<PathBuf>,
+    mihomo: Option<PathBuf>,
     work_dir: PathBuf,
     base_port: u16,
     only: Vec<String>,
+    clients: Vec<ClientKind>,
     keep: bool,
 }
 
@@ -271,12 +289,29 @@ fn run() -> Result<()> {
         )
         .into());
     }
-    if !args.sing_box.exists() {
-        return Err(format!(
-            "sing-box binary not found at {}; pass --sing-box or set SING_BOX",
-            args.sing_box.display()
-        )
-        .into());
+    if args.clients.contains(&ClientKind::SingBox) {
+        let Some(sing_box) = args.sing_box.as_ref() else {
+            return Err("sing-box client selected but no binary path is configured".into());
+        };
+        if !sing_box.exists() {
+            return Err(format!(
+                "sing-box binary not found at {}; pass --sing-box or set SING_BOX",
+                sing_box.display()
+            )
+            .into());
+        }
+    }
+    if args.clients.contains(&ClientKind::Mihomo) {
+        let Some(mihomo) = args.mihomo.as_ref() else {
+            return Err("mihomo client selected; pass --mihomo <mihomo binary>".into());
+        };
+        if !mihomo.exists() {
+            return Err(format!(
+                "mihomo binary not found at {}; pass --mihomo",
+                mihomo.display()
+            )
+            .into());
+        }
     }
 
     prepare_work_dir(&args.work_dir)?;
@@ -316,19 +351,29 @@ fn run() -> Result<()> {
     );
 
     let mut passed = 0usize;
+    let mut skipped = 0usize;
     let mut failed = Vec::new();
-    for (index, case) in cases.iter().enumerate() {
-        match run_case(index, case, &args, tcp_echo.addr, udp_echo.addr) {
-            Ok(()) => {
-                passed += 1;
-                println!("PASS {}", case.name);
+    for client in &args.clients {
+        for (index, case) in cases.iter().enumerate() {
+            match run_case(*client, index, case, &args, tcp_echo.addr, udp_echo.addr) {
+                Ok(CaseOutcome::Passed) => {
+                    passed += 1;
+                    println!("PASS {} {}", client.label(), case.name);
+                }
+                Ok(CaseOutcome::Skipped(reason)) => {
+                    skipped += 1;
+                    println!("SKIP {} {}: {reason}", client.label(), case.name);
+                }
+                Err(error) => {
+                    println!("FAIL {} {}: {error}", client.label(), case.name);
+                    failed.push((
+                        format!("{} {}", client.label(), case.name),
+                        error.to_string(),
+                    ));
+                }
             }
-            Err(error) => {
-                println!("FAIL {}: {error}", case.name);
-                failed.push((case.name.clone(), error.to_string()));
-            }
+            core.fail_if_exited()?;
         }
-        core.fail_if_exited()?;
     }
 
     println!("SKIP mieru: no official mieru client is bundled with this matrix");
@@ -345,7 +390,7 @@ fn run() -> Result<()> {
         return Err("one or more interop cases failed".into());
     }
 
-    println!("interop matrix summary: {passed} passed, 0 failed");
+    println!("interop matrix summary: {passed} passed, {skipped} skipped, 0 failed");
     drop(core);
     if !args.keep {
         let _ = fs::remove_dir_all(&args.work_dir);
@@ -359,10 +404,12 @@ fn parse_args() -> Result<Args> {
     let mut core = default_core_path();
     let mut sing_box = env::var_os("SING_BOX")
         .map(PathBuf::from)
-        .unwrap_or_else(default_sing_box_path);
+        .or_else(|| Some(default_sing_box_path()));
+    let mut mihomo = env::var_os("MIHOMO").map(PathBuf::from);
     let mut work_dir = env::current_dir()?.join("runtime").join("interop-matrix");
     let mut base_port = 23100u16;
     let mut only = Vec::new();
+    let mut clients = Vec::new();
     let mut keep = false;
 
     let mut iter = env::args().skip(1);
@@ -372,7 +419,28 @@ fn parse_args() -> Result<Args> {
                 core = PathBuf::from(iter.next().ok_or("--core requires a path")?);
             }
             "--sing-box" => {
-                sing_box = PathBuf::from(iter.next().ok_or("--sing-box requires a path")?);
+                sing_box = Some(PathBuf::from(
+                    iter.next().ok_or("--sing-box requires a path")?,
+                ));
+            }
+            "--mihomo" => {
+                mihomo = Some(PathBuf::from(
+                    iter.next().ok_or("--mihomo requires a path")?,
+                ));
+            }
+            "--client" => {
+                let value = iter
+                    .next()
+                    .ok_or("--client requires sing-box, mihomo or both")?;
+                match value.as_str() {
+                    "sing-box" | "sing_box" => clients.push(ClientKind::SingBox),
+                    "mihomo" | "clash" => clients.push(ClientKind::Mihomo),
+                    "both" => {
+                        clients.push(ClientKind::SingBox);
+                        clients.push(ClientKind::Mihomo);
+                    }
+                    other => return Err(format!("unknown client {other}").into()),
+                }
             }
             "--work-dir" => {
                 work_dir = PathBuf::from(iter.next().ok_or("--work-dir requires a path")?);
@@ -395,21 +463,31 @@ fn parse_args() -> Result<Args> {
         }
     }
 
+    if clients.is_empty() {
+        clients.push(ClientKind::SingBox);
+        if mihomo.is_some() {
+            clients.push(ClientKind::Mihomo);
+        }
+    }
+    clients.dedup();
+
     Ok(Args {
         core,
         sing_box,
+        mihomo,
         work_dir,
         base_port,
         only,
+        clients,
         keep,
     })
 }
 
 fn print_help() {
     println!(
-        "Usage: cargo run --example interop_matrix -- --core <keli-core-rs> --sing-box <sing-box> [--only hy2] [--keep]"
+        "Usage: cargo run --example interop_matrix -- --core <keli-core-rs> --sing-box <sing-box> [--mihomo <mihomo>] [--client sing-box|mihomo|both] [--only hy2] [--keep]"
     );
-    println!("Runs local sing-box client interop against temporary keli-core-rs listeners.");
+    println!("Runs local real-client interop against temporary keli-core-rs listeners.");
 }
 
 fn default_core_path() -> PathBuf {
@@ -651,6 +729,7 @@ fn proxy_case(name: &str, port: u16, protocol: &str) -> InteropCase {
         core_port: port,
         inbound: inbound(name, protocol, port, vec![user], "tcp", None, None, ""),
         sing_outbound: outbound,
+        mihomo_proxy: Some(mihomo_proxy_case(protocol, port)),
         probes: vec![Probe::Tcp],
     }
 }
@@ -677,6 +756,15 @@ fn shadowsocks_case(port: u16, probes: Vec<Probe>) -> InteropCase {
             "method": "aes-128-gcm",
             "password": SS_PASSWORD
         }),
+        mihomo_proxy: Some(json!({
+            "name": "proxy",
+            "type": "ss",
+            "server": "127.0.0.1",
+            "port": port,
+            "cipher": "aes-128-gcm",
+            "password": SS_PASSWORD,
+            "udp": true
+        })),
         probes,
     }
 }
@@ -728,6 +816,8 @@ fn vless_case(
         core_port: port,
         inbound: inbound_value,
         sing_outbound: outbound,
+        mihomo_proxy: (network != "httpupgrade")
+            .then(|| mihomo_vless_proxy(port, network, tls, flow, None)),
         probes: vec![Probe::Tcp],
     }
 }
@@ -759,6 +849,13 @@ fn vless_reality_case(port: u16, reality_dest: SocketAddr) -> InteropCase {
             "flow": "xtls-rprx-vision",
             "tls": sing_reality_tls()
         }),
+        mihomo_proxy: Some(mihomo_vless_proxy(
+            port,
+            "tcp",
+            true,
+            "xtls-rprx-vision",
+            Some(mihomo_reality_opts()),
+        )),
         probes: vec![Probe::Tcp],
     }
 }
@@ -791,6 +888,7 @@ fn vmess_case(port: u16, name: &str, network: &str, tls: bool) -> InteropCase {
             tls,
             network,
         ),
+        mihomo_proxy: (network != "httpupgrade").then(|| mihomo_vmess_proxy(port, network, tls)),
         probes: vec![Probe::Tcp],
     }
 }
@@ -821,6 +919,7 @@ fn trojan_case(port: u16, name: &str, network: &str, tls: bool) -> InteropCase {
             tls,
             network,
         ),
+        mihomo_proxy: (tls && network != "httpupgrade").then(|| mihomo_trojan_proxy(port, network)),
         probes: vec![Probe::Tcp],
     }
 }
@@ -847,6 +946,7 @@ fn anytls_case(port: u16) -> InteropCase {
             "password": USER_PASSWORD,
             "tls": sing_tls("tcp")
         }),
+        mihomo_proxy: None,
         probes: vec![Probe::Tcp],
     }
 }
@@ -888,6 +988,7 @@ fn hysteria2_case(port: u16, name: &str, obfs: Option<(&str, &str)>) -> InteropC
             "",
         ),
         sing_outbound: outbound,
+        mihomo_proxy: Some(mihomo_hysteria2_proxy(port, obfs)),
         probes: vec![Probe::Tcp, Probe::Udp],
     }
 }
@@ -923,6 +1024,7 @@ fn tuic_case(port: u16) -> InteropCase {
                 "alpn": ["h3"]
             }
         }),
+        mihomo_proxy: Some(mihomo_tuic_proxy(port)),
         probes: vec![Probe::Tcp, Probe::Udp],
     }
 }
@@ -1111,6 +1213,150 @@ fn sing_transport(network: &str) -> Value {
     }
 }
 
+fn mihomo_proxy_case(protocol: &str, port: u16) -> Value {
+    let proxy_type = if protocol == "socks" {
+        "socks5"
+    } else {
+        protocol
+    };
+    json!({
+        "name": "proxy",
+        "type": proxy_type,
+        "server": "127.0.0.1",
+        "port": port,
+        "username": USER_UUID,
+        "password": USER_PASSWORD
+    })
+}
+
+fn mihomo_vless_proxy(
+    port: u16,
+    network: &str,
+    tls: bool,
+    flow: &str,
+    reality_opts: Option<Value>,
+) -> Value {
+    let mut proxy = json!({
+        "name": "proxy",
+        "type": "vless",
+        "server": "127.0.0.1",
+        "port": port,
+        "uuid": USER_UUID,
+        "tls": tls,
+        "servername": tls.then_some("localhost"),
+        "skip-cert-verify": tls.then_some(true),
+        "flow": flow
+    });
+    mihomo_apply_transport(&mut proxy, network);
+    if let Some(reality_opts) = reality_opts {
+        proxy["client-fingerprint"] = json!("chrome");
+        proxy["reality-opts"] = reality_opts;
+    }
+    proxy
+}
+
+fn mihomo_vmess_proxy(port: u16, network: &str, tls: bool) -> Value {
+    let mut proxy = json!({
+        "name": "proxy",
+        "type": "vmess",
+        "server": "127.0.0.1",
+        "port": port,
+        "uuid": USER_UUID,
+        "alterId": 0,
+        "cipher": "aes-128-gcm",
+        "tls": tls,
+        "servername": tls.then_some("localhost"),
+        "skip-cert-verify": tls.then_some(true)
+    });
+    mihomo_apply_transport(&mut proxy, network);
+    proxy
+}
+
+fn mihomo_trojan_proxy(port: u16, network: &str) -> Value {
+    let mut proxy = json!({
+        "name": "proxy",
+        "type": "trojan",
+        "server": "127.0.0.1",
+        "port": port,
+        "password": USER_PASSWORD,
+        "sni": "localhost",
+        "skip-cert-verify": true
+    });
+    mihomo_apply_transport(&mut proxy, network);
+    proxy
+}
+
+fn mihomo_hysteria2_proxy(port: u16, obfs: Option<(&str, &str)>) -> Value {
+    let mut proxy = json!({
+        "name": "proxy",
+        "type": "hysteria2",
+        "server": "127.0.0.1",
+        "port": port,
+        "password": USER_PASSWORD,
+        "sni": "localhost",
+        "skip-cert-verify": true,
+        "up": "100 Mbps",
+        "down": "100 Mbps"
+    });
+    if let Some((obfs_type, password)) = obfs {
+        proxy["obfs"] = json!(obfs_type);
+        proxy["obfs-password"] = json!(password);
+    }
+    proxy
+}
+
+fn mihomo_tuic_proxy(port: u16) -> Value {
+    json!({
+        "name": "proxy",
+        "type": "tuic",
+        "server": "127.0.0.1",
+        "port": port,
+        "uuid": USER_UUID,
+        "password": TUIC_PASSWORD,
+        "sni": "localhost",
+        "alpn": ["h3"],
+        "skip-cert-verify": true,
+        "congestion-controller": "bbr",
+        "udp-relay-mode": "native"
+    })
+}
+
+fn mihomo_reality_opts() -> Value {
+    json!({
+        "public-key": reality_public_key(),
+        "short-id": REALITY_SHORT_ID
+    })
+}
+
+fn mihomo_apply_transport(proxy: &mut Value, network: &str) {
+    match network {
+        "tcp" => {}
+        "ws" => {
+            proxy["network"] = json!("ws");
+            proxy["ws-opts"] = json!({
+                "path": "/ws",
+                "headers": { "Host": "localhost" }
+            });
+        }
+        "httpupgrade" => {
+            proxy["network"] = json!("httpupgrade");
+            proxy["httpupgrade-opts"] = json!({
+                "path": "/upgrade",
+                "host": "localhost"
+            });
+        }
+        "grpc" => {
+            proxy["network"] = json!("grpc");
+            proxy["grpc-opts"] = json!({
+                "grpc-service-name": "GunService"
+            });
+        }
+        other => {
+            proxy["network"] = json!(other);
+        }
+    }
+}
+
 fn io_other(error: impl std::fmt::Debug) -> io::Error {
     io::Error::new(io::ErrorKind::Other, format!("{error:?}"))
 }
@@ -1174,23 +1420,46 @@ fn wait_for_tcp(addr: (&str, u16), timeout: Duration) -> Result<()> {
     Err(format!("timed out waiting for {}:{}", addr.0, addr.1).into())
 }
 
+enum CaseOutcome {
+    Passed,
+    Skipped(String),
+}
+
 fn run_case(
+    client: ClientKind,
     index: usize,
     case: &InteropCase,
     args: &Args,
     tcp_echo: SocketAddr,
     udp_echo: SocketAddr,
-) -> Result<()> {
+) -> Result<CaseOutcome> {
+    match client {
+        ClientKind::SingBox => run_sing_box_case(index, case, args, tcp_echo, udp_echo),
+        ClientKind::Mihomo => run_mihomo_case(index, case, args, tcp_echo, udp_echo),
+    }
+}
+
+fn run_sing_box_case(
+    index: usize,
+    case: &InteropCase,
+    args: &Args,
+    tcp_echo: SocketAddr,
+    udp_echo: SocketAddr,
+) -> Result<CaseOutcome> {
     let socks_port = args
         .base_port
         .checked_add(1000)
         .and_then(|port| port.checked_add(index as u16))
         .ok_or("local socks port overflow")?;
+    let sing_box_path = args
+        .sing_box
+        .as_ref()
+        .ok_or("sing-box client selected without a binary path")?;
     let sing_config_path = args.work_dir.join(format!("{}.sing-box.json", case.name));
     write_sing_box_config(&sing_config_path, case, socks_port)?;
     let mut sing_box = start_process(
         &format!("sing-box-{}", case.name),
-        &args.sing_box,
+        sing_box_path,
         &[
             "run".into(),
             "-c".into(),
@@ -1201,7 +1470,82 @@ fn run_case(
     wait_for_tcp(("127.0.0.1", socks_port), Duration::from_secs(8))?;
     sing_box.fail_if_exited()?;
 
-    for probe in &case.probes {
+    run_probes_with_retry(socks_port, &case.probes, tcp_echo, udp_echo)?;
+    Ok(CaseOutcome::Passed)
+}
+
+fn run_mihomo_case(
+    index: usize,
+    case: &InteropCase,
+    args: &Args,
+    tcp_echo: SocketAddr,
+    udp_echo: SocketAddr,
+) -> Result<CaseOutcome> {
+    let Some(_) = case.mihomo_proxy.as_ref() else {
+        return Ok(CaseOutcome::Skipped(
+            "no mihomo-compatible proxy config for this case yet".to_string(),
+        ));
+    };
+    let socks_port = args
+        .base_port
+        .checked_add(2000)
+        .and_then(|port| port.checked_add(index as u16))
+        .ok_or("local mihomo socks port overflow")?;
+    let mihomo_path = args
+        .mihomo
+        .as_ref()
+        .ok_or("mihomo client selected without a binary path")?;
+    let config_dir = args.work_dir.join(format!("mihomo-{}", case.name));
+    fs::create_dir_all(&config_dir)?;
+    let config_path = config_dir.join("config.yaml");
+    write_mihomo_config(&config_path, case, socks_port)?;
+    let mut mihomo = start_process(
+        &format!("mihomo-{}", case.name),
+        mihomo_path,
+        &[
+            "-d".into(),
+            config_dir.display().to_string(),
+            "-f".into(),
+            config_path.display().to_string(),
+        ],
+        &args.work_dir,
+    )?;
+    wait_for_tcp(("127.0.0.1", socks_port), Duration::from_secs(8))?;
+    mihomo.fail_if_exited()?;
+
+    run_probes_with_retry(socks_port, &case.probes, tcp_echo, udp_echo)?;
+    Ok(CaseOutcome::Passed)
+}
+
+fn run_probes_with_retry(
+    socks_port: u16,
+    probes: &[Probe],
+    tcp_echo: SocketAddr,
+    udp_echo: SocketAddr,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match run_probes(socks_port, probes, tcp_echo, udp_echo) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error.to_string());
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| "probe timed out".to_string())
+        .into())
+}
+
+fn run_probes(
+    socks_port: u16,
+    probes: &[Probe],
+    tcp_echo: SocketAddr,
+    udp_echo: SocketAddr,
+) -> Result<()> {
+    for probe in probes {
         match probe {
             Probe::Tcp => {
                 let body = socks_http_probe(socks_port, tcp_echo)?;
@@ -1246,6 +1590,91 @@ fn write_sing_box_config(path: &Path, case: &InteropCase, socks_port: u16) -> Re
     });
     fs::write(path, serde_json::to_vec_pretty(&config)?)?;
     Ok(())
+}
+
+fn write_mihomo_config(path: &Path, case: &InteropCase, socks_port: u16) -> Result<()> {
+    let mut proxy = case
+        .mihomo_proxy
+        .clone()
+        .ok_or("case does not have a mihomo proxy config")?;
+    remove_nulls(&mut proxy);
+
+    let mut output = String::new();
+    output.push_str("allow-lan: false\n");
+    output.push_str("mode: rule\n");
+    output.push_str("log-level: debug\n");
+    output.push_str("ipv6: false\n");
+    output.push_str("find-process-mode: off\n");
+    output.push_str("unified-delay: true\n");
+    output.push_str("tcp-concurrent: false\n");
+    output.push_str(&format!("socks-port: {socks_port}\n"));
+    output.push_str("port: 0\n");
+    output.push_str("mixed-port: 0\n");
+    output.push_str("redir-port: 0\n");
+    output.push_str("tproxy-port: 0\n");
+    output.push_str("proxies:\n");
+    write_yaml_sequence_item(&mut output, 2, &proxy);
+    output.push_str("proxy-groups:\n");
+    write_yaml_sequence_item(
+        &mut output,
+        2,
+        &json!({
+            "name": "Proxy",
+            "type": "select",
+            "proxies": ["proxy"]
+        }),
+    );
+    output.push_str("rules:\n");
+    output.push_str("  - MATCH,Proxy\n");
+
+    fs::write(path, output)?;
+    Ok(())
+}
+
+fn write_yaml_sequence_item(output: &mut String, indent: usize, value: &Value) {
+    let pad = " ".repeat(indent);
+    match value {
+        Value::Object(map) => {
+            output.push_str(&format!("{pad}-\n"));
+            for (key, value) in map {
+                write_yaml_mapping_entry(output, indent + 2, key, value);
+            }
+        }
+        _ => {
+            output.push_str(&format!("{pad}- {}\n", yaml_scalar(value)));
+        }
+    }
+}
+
+fn write_yaml_mapping_entry(output: &mut String, indent: usize, key: &str, value: &Value) {
+    let pad = " ".repeat(indent);
+    match value {
+        Value::Object(map) => {
+            output.push_str(&format!("{pad}{key}:\n"));
+            for (child_key, child_value) in map {
+                write_yaml_mapping_entry(output, indent + 2, child_key, child_value);
+            }
+        }
+        Value::Array(values) => {
+            output.push_str(&format!("{pad}{key}:\n"));
+            for value in values {
+                write_yaml_sequence_item(output, indent + 2, value);
+            }
+        }
+        _ => {
+            output.push_str(&format!("{pad}{key}: {}\n", yaml_scalar(value)));
+        }
+    }
+}
+
+fn yaml_scalar(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => serde_json::to_string(value).expect("quote yaml string"),
+        Value::Array(_) | Value::Object(_) => serde_json::to_string(value).expect("json value"),
+    }
 }
 
 fn remove_nulls(value: &mut Value) {

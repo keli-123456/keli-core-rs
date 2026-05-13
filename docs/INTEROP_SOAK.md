@@ -108,43 +108,60 @@ Keep the protocol marked as `Partial` in `docs/PARITY.md` until the real-client 
 
 ## Local Real-Client Matrix
 
-For repeatable protocol smoke testing with a real client, run the local sing-box matrix. It
+For repeatable protocol smoke testing with a real client, run the local client matrix. It
 starts temporary loopback `keli-core-rs` listeners, a local HTTP echo server, a local UDP echo
-server, and one sing-box client config per case:
+server, and one client config per case:
 
 ```bash
 cargo build --release
 cargo run --example interop_matrix -- --sing-box /path/to/sing-box
+cargo run --example interop_matrix -- --client mihomo --mihomo /path/to/mihomo
+cargo run --example interop_matrix -- --client both --sing-box /path/to/sing-box --mihomo /path/to/mihomo
 ```
 
-On the Windows development workspace used for Keli, the bundled client path is usually:
+On the Windows development workspace used for Keli, the bundled client paths are usually:
 
 ```powershell
 cargo run --example interop_matrix -- --sing-box ..\tools\sing-box\sing-box-1.12.22-windows-amd64\sing-box.exe
+cargo run --example interop_matrix -- --client mihomo --mihomo ..\tools\mihomo\mihomo-windows-amd64-v1.19.24\mihomo-windows-amd64.exe
 ```
 
 Useful filters:
 
 ```bash
 cargo run --example interop_matrix -- --sing-box /path/to/sing-box --only vless
-cargo run --example interop_matrix -- --sing-box /path/to/sing-box --only hy2 --keep
+cargo run --example interop_matrix -- --client mihomo --mihomo /path/to/mihomo --only vless-reality
+cargo run --example interop_matrix -- --client both --sing-box /path/to/sing-box --mihomo /path/to/mihomo --only hy2 --keep
 ```
 
-The matrix currently verifies TCP forwarding through sing-box for SOCKS, HTTP proxy,
-Shadowsocks, VLESS, VLESS REALITY Vision, VMess, Trojan, AnyTLS, Hysteria2, and TUIC
-combinations, plus UDP relay through Shadowsocks, Hysteria2, and TUIC. It uses a deterministic
-local TLS destination fixture for REALITY. It intentionally skips Naive because the native core
-treats it as a sidecar, and skips Mieru until an official client is installed in the test
-environment.
+The sing-box client verifies TCP forwarding for SOCKS, HTTP proxy, Shadowsocks, VLESS, VLESS
+REALITY Vision, VMess, Trojan, AnyTLS, Hysteria2, and TUIC combinations, plus UDP relay through
+Shadowsocks, Hysteria2, and TUIC.
+
+The mihomo client currently verifies SOCKS, HTTP proxy, Shadowsocks TCP/UDP, VLESS TCP/TLS/Vision,
+VLESS REALITY Vision, VLESS WS/gRPC, VMess TCP/TLS/WS/gRPC, Trojan TLS/WS/gRPC, Hysteria2 TCP/UDP,
+Hysteria2 Salamander, and TUIC TCP/UDP. It skips cases without a reliable mihomo proxy equivalent
+in this matrix, such as HTTPUpgrade, Trojan plain TCP, AnyTLS, Mieru, and Naive.
+
+Both clients use a deterministic local TLS destination fixture for REALITY.
 
 Latest local Windows loopback sample:
 
 ```text
-interop matrix summary: 34 passed, 0 failed
+interop matrix summary: 34 passed, 0 skipped, 0 failed
+SKIP mieru: no official mieru client is bundled with this matrix
+SKIP naive: native core intentionally treats Naive as a sidecar
+```
+
+Latest local Windows loopback sample for mihomo v1.19.24:
+
+```text
+interop matrix summary: 24 passed, 10 skipped, 0 failed
 SKIP mieru: no official mieru client is bundled with this matrix
 SKIP naive: native core intentionally treats Naive as a sidecar
 ```
 
 The same matrix is available from GitHub Actions as the manual `Native Interop Matrix`
 workflow. Use the optional `case_filter` input to run one protocol family before a focused
-gray release, or leave it empty to run all supported sing-box cases.
+gray release, or leave it empty to run all supported sing-box cases. Mihomo coverage is currently
+a local matrix until the CI image has a pinned mihomo binary.
