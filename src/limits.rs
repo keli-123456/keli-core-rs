@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use socket2::SockRef;
+use tokio::sync::Notify;
 
 use crate::user::{CoreUser, CoreUserDelta};
 
@@ -54,6 +55,7 @@ pub struct UserConnectionGuard {
 pub struct BandwidthLimiter {
     bytes_per_second: AtomicU64,
     revoked: AtomicBool,
+    revoked_notify: Notify,
     state: Mutex<BandwidthState>,
 }
 
@@ -465,6 +467,7 @@ impl BandwidthLimiter {
         Self {
             bytes_per_second: AtomicU64::new(bytes_per_second.max(1)),
             revoked: AtomicBool::new(false),
+            revoked_notify: Notify::new(),
             state: Mutex::new(BandwidthState {
                 tokens: 0.0,
                 last_refill: Instant::now(),
@@ -476,6 +479,7 @@ impl BandwidthLimiter {
         Self {
             bytes_per_second: AtomicU64::new(0),
             revoked: AtomicBool::new(false),
+            revoked_notify: Notify::new(),
             state: Mutex::new(BandwidthState {
                 tokens: 0.0,
                 last_refill: Instant::now(),
@@ -499,11 +503,23 @@ impl BandwidthLimiter {
     }
 
     pub fn revoke(&self) {
-        self.revoked.store(true, Ordering::Relaxed);
+        if !self.revoked.swap(true, Ordering::AcqRel) {
+            self.revoked_notify.notify_waiters();
+        }
     }
 
     pub fn is_revoked(&self) -> bool {
-        self.revoked.load(Ordering::Relaxed)
+        self.revoked.load(Ordering::Acquire)
+    }
+
+    pub async fn wait_revoked(&self) {
+        loop {
+            let notified = self.revoked_notify.notified();
+            if self.is_revoked() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub fn wait_for(&self, bytes: usize) -> bool {

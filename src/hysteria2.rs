@@ -724,6 +724,27 @@ impl DirectionalLimiters {
             std::future::pending::<()>().await;
         }
 
+        let mut single = None;
+        let mut count = 0usize;
+        for limiter in self
+            .revoke
+            .iter()
+            .chain(self.upload.iter())
+            .chain(self.download.iter())
+        {
+            count = count.saturating_add(1);
+            single = Some(limiter);
+            if count > 1 {
+                break;
+            }
+        }
+        if count == 1 {
+            if let Some(limiter) = single {
+                limiter.wait_revoked().await;
+                return;
+            }
+        }
+
         while !self.is_revoked() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

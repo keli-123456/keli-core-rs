@@ -378,9 +378,7 @@ where
 }
 
 async fn wait_for_limiter_revoke(limiter: &BandwidthLimiter) {
-    while !limiter.is_revoked() {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    limiter.wait_revoked().await;
 }
 
 pub fn copy_count_best_effort<R, W>(reader: &mut R, writer: &mut W) -> u64

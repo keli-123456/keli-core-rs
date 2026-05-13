@@ -797,9 +797,7 @@ async fn resolve_udp_target(target: &SocksTarget, timeout: Duration) -> io::Resu
 }
 
 async fn wait_limiter_revoke(limiter: &BandwidthLimiter) {
-    while !limiter.is_revoked() {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    limiter.wait_revoked().await;
 }
 
 async fn receive_udp_replies(
