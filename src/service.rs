@@ -2043,9 +2043,10 @@ mod tests {
     use bytes::Bytes;
     use rustls::pki_types::{CertificateDer, ServerName};
     use rustls::{ClientConfig, RootCertStore};
+    use sha2::{Digest, Sha224};
     use std::fs;
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
@@ -2059,7 +2060,7 @@ mod tests {
     use crate::grpc::{decode_hunk_message, encode_grpc_hunk, take_grpc_message};
     use crate::protocol::Protocol;
     use crate::service::CoreService;
-    use crate::user::CoreUser;
+    use crate::user::{CoreUser, CoreUserDelta};
 
     use super::reality_tls_acceptor;
 
@@ -2253,9 +2254,13 @@ mod tests {
     }
 
     fn vless_tcp_request(target: std::net::SocketAddr) -> Vec<u8> {
+        vless_tcp_request_for_user("11111111-1111-1111-1111-111111111111", target)
+    }
+
+    fn vless_tcp_request_for_user(uuid: &str, target: std::net::SocketAddr) -> Vec<u8> {
         let mut request = Vec::new();
         request.push(0x00);
-        request.extend_from_slice(&uuid_bytes("11111111-1111-1111-1111-111111111111"));
+        request.extend_from_slice(&uuid_bytes(uuid));
         request.push(0x00);
         request.push(0x01);
         request.extend_from_slice(&target.port().to_be_bytes());
@@ -2269,6 +2274,120 @@ mod tests {
                 .octets(),
         );
         request
+    }
+
+    struct EchoServer {
+        addr: SocketAddr,
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl EchoServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+            listener.set_nonblocking(true).expect("echo nonblocking");
+            let addr = listener.local_addr().expect("echo addr");
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_for_thread = stop.clone();
+            let handle = thread::spawn(move || {
+                while !stop_for_thread.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                            let mut buffer = [0u8; 1];
+                            if stream.read_exact(&mut buffer).is_ok() {
+                                let _ = stream.write_all(&buffer);
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                addr,
+                stop,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for EchoServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.addr);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn vless_auth_succeeds(server_addr: SocketAddr, uuid: &str, target: SocketAddr) -> bool {
+        let Ok(mut stream) = TcpStream::connect(server_addr) else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+        if stream
+            .write_all(&vless_tcp_request_for_user(uuid, target))
+            .is_err()
+        {
+            return false;
+        }
+        if stream.write_all(b"x").is_err() {
+            return false;
+        }
+        let mut response = [0u8; 3];
+        stream.read_exact(&mut response).is_ok() && response == [0x00, 0x00, b'x']
+    }
+
+    fn trojan_auth_succeeds(server_addr: SocketAddr, password: &str, target: SocketAddr) -> bool {
+        let Ok(mut stream) = TcpStream::connect(server_addr) else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+        if stream
+            .write_all(&trojan_request_with_password(password, target))
+            .is_err()
+        {
+            return false;
+        }
+        if stream.write_all(b"x").is_err() {
+            return false;
+        }
+        let mut response = [0u8; 1];
+        stream.read_exact(&mut response).is_ok() && response == *b"x"
+    }
+
+    fn trojan_request_with_password(password: &str, target: SocketAddr) -> Vec<u8> {
+        let mut input = trojan_password_hash(password).into_bytes();
+        input.extend_from_slice(b"\r\n");
+        input.push(0x01);
+        input.push(0x01);
+        input.extend_from_slice(
+            &target
+                .ip()
+                .to_string()
+                .parse::<std::net::Ipv4Addr>()
+                .expect("ipv4")
+                .octets(),
+        );
+        input.extend_from_slice(&target.port().to_be_bytes());
+        input.extend_from_slice(b"\r\n");
+        input
+    }
+
+    fn trojan_password_hash(password: &str) -> String {
+        let mut hasher = Sha224::new();
+        hasher.update(password.as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     fn run_grpc_vless_client(
@@ -2676,6 +2795,79 @@ mod tests {
 
         assert_eq!(listeners.len(), 1);
         assert_eq!(listeners[0].protocol, Protocol::Trojan);
+        service.stop();
+    }
+
+    #[test]
+    fn apply_user_delta_targets_one_inbound_without_rebinding_or_cross_affecting() {
+        let echo = EchoServer::start();
+        let old_vless_uuid = "11111111-1111-1111-1111-111111111111";
+        let new_vless_uuid = "22222222-2222-2222-2222-222222222222";
+        let mut vless_user = user();
+        vless_user.uuid = old_vless_uuid.to_string();
+        let mut trojan_user = user();
+        trojan_user.id = 2;
+        trojan_user.uuid = "trojan-password".to_string();
+
+        let mut config = config(free_port());
+        config.inbounds[0].tag = "panel|vless|1".to_string();
+        config.inbounds[0].protocol = Protocol::Vless;
+        config.inbounds[0].users = vec![vless_user.clone()];
+        let mut trojan_inbound = config.inbounds[0].clone();
+        trojan_inbound.tag = "panel|trojan|1".to_string();
+        trojan_inbound.protocol = Protocol::Trojan;
+        trojan_inbound.port = free_port();
+        trojan_inbound.users = vec![trojan_user.clone()];
+        config.inbounds.push(trojan_inbound);
+
+        let mut service = CoreService::start(config).expect("service start");
+        let before = service.listeners();
+        let vless_addr = before
+            .iter()
+            .find(|listener| listener.tag == "panel|vless|1")
+            .expect("vless listener")
+            .local_addr;
+        let trojan_addr = before
+            .iter()
+            .find(|listener| listener.tag == "panel|trojan|1")
+            .expect("trojan listener")
+            .local_addr;
+
+        assert!(vless_auth_succeeds(vless_addr, old_vless_uuid, echo.addr));
+        assert!(trojan_auth_succeeds(
+            trojan_addr,
+            "trojan-password",
+            echo.addr
+        ));
+
+        let mut added = vless_user.clone();
+        added.id = 3;
+        added.uuid = new_vless_uuid.to_string();
+        added.speed_limit = 1024;
+        added.device_limit = 2;
+        let result = service
+            .apply_user_delta(
+                "panel|vless|1",
+                &CoreUserDelta {
+                    added: vec![added],
+                    deleted: vec![old_vless_uuid.to_string()],
+                    revision: Some("rev-2".to_string()),
+                    ..CoreUserDelta::default()
+                },
+            )
+            .expect("delta apply");
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.active_users, 1);
+        assert_eq!(service.listeners(), before);
+        assert!(!vless_auth_succeeds(vless_addr, old_vless_uuid, echo.addr));
+        assert!(vless_auth_succeeds(vless_addr, new_vless_uuid, echo.addr));
+        assert!(
+            trojan_auth_succeeds(trojan_addr, "trojan-password", echo.addr),
+            "ApplyUserDelta for VLESS must not alter the Trojan inbound"
+        );
+
         service.stop();
     }
 
