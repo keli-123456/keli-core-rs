@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
 use crate::hysteria2::{Hysteria2Server, Hysteria2ServerConfig};
+use crate::socks5::{Socks5Server, Socks5ServerConfig};
+use crate::trojan::{trojan_password_hash, TrojanServer, TrojanServerConfig};
 use crate::tuic::{TuicServer, TuicServerConfig};
 use crate::user::CoreUser;
 use crate::vless::{VlessServer, VlessServerConfig};
@@ -39,6 +41,8 @@ const MAX_STREAMS: usize = 1024;
 const MAX_PAYLOAD_SIZE: usize = 1024 * 1024;
 const MAX_REQUEST_RETRIES: usize = 3;
 const DEFAULT_SUITE_COMMANDS: &[&str] = &[
+    "socks-tcp-stream",
+    "trojan-tcp-stream",
     "vless-tcp-stream",
     "hy2-tcp",
     "hy2-tcp-stream",
@@ -528,12 +532,14 @@ fn bench_quic_runtime_workers() -> usize {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --vless-core HOST:PORT [--commands vless-tcp,vless-tcp-stream] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
+        "bench commands:\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --vless-core HOST:PORT [--commands vless-tcp,vless-tcp-stream] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
     );
 }
 
 fn canonical_bench_command(command: &str) -> Option<&'static str> {
     match command {
+        "socks-tcp-stream" | "socks5-tcp-stream" | "socks-stream" => Some("socks-tcp-stream"),
+        "trojan-tcp-stream" | "trojan-stream" => Some("trojan-tcp-stream"),
         "vless-tcp" => Some("vless-tcp"),
         "vless-tcp-stream" | "vless-stream" => Some("vless-tcp-stream"),
         "hy2-tcp" | "hysteria2-tcp" => Some("hy2-tcp"),
@@ -548,6 +554,8 @@ fn canonical_bench_command(command: &str) -> Option<&'static str> {
 
 fn run_named_bench(command: &str, options: &BenchOptions) -> io::Result<BenchReport> {
     match canonical_bench_command(command) {
+        Some("socks-tcp-stream") => run_socks_tcp_stream_bench(options),
+        Some("trojan-tcp-stream") => run_trojan_tcp_stream_bench(options),
         Some("vless-tcp") => run_vless_tcp_bench(options),
         Some("vless-tcp-stream") => run_vless_tcp_stream_bench(options),
         Some("hy2-tcp") => run_hy2_tcp_bench(options),
@@ -630,6 +638,106 @@ fn run_external_named_bench(
             format!("external bench command {command} is not supported yet"),
         )),
     }
+}
+
+fn run_socks_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let core_stop = Arc::new(AtomicBool::new(false));
+    let (core_addr, core_thread) = start_socks_server(core_stop.clone())?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        workers.push(thread::spawn(move || {
+            run_socks_tcp_stream_client(core_addr, echo_addr, stream_id, &options)
+        }));
+    }
+
+    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+    }
+    let elapsed = started.elapsed();
+
+    core_stop.store(true, Ordering::SeqCst);
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(core_addr);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(core_thread)?;
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        "socks-tcp",
+        "connection-per-stream",
+        options,
+        None,
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
+}
+
+fn run_trojan_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let core_stop = Arc::new(AtomicBool::new(false));
+    let (core_addr, core_thread) = start_trojan_server(core_stop.clone())?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        workers.push(thread::spawn(move || {
+            run_trojan_tcp_stream_client(core_addr, echo_addr, stream_id, &options)
+        }));
+    }
+
+    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+    }
+    let elapsed = started.elapsed();
+
+    core_stop.store(true, Ordering::SeqCst);
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(core_addr);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(core_thread)?;
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        "trojan-tcp",
+        "connection-per-stream",
+        options,
+        None,
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
 }
 
 fn summarize_bench_runs(runs: &[BenchSuiteRun]) -> Vec<BenchSummary> {
@@ -1544,6 +1652,84 @@ fn start_echo_server(
     Ok((addr, handle))
 }
 
+fn start_socks_server(
+    stop: Arc<AtomicBool>,
+) -> io::Result<(SocketAddr, thread::JoinHandle<io::Result<()>>)> {
+    let server = Socks5Server::new(Socks5ServerConfig {
+        node_tag: "bench|socks|tcp".to_string(),
+        listen: "127.0.0.1:0".parse().expect("valid listen addr"),
+        users: vec![bench_user()],
+        routes: Vec::new(),
+        connect_timeout: Duration::from_secs(3),
+    });
+    let listener = server.bind()?;
+    listener.set_nonblocking(true)?;
+    let addr = listener.local_addr()?;
+    let handle = thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_nodelay(true);
+                    let server = server.clone();
+                    thread::spawn(move || {
+                        if let Err(error) = server.handle_tcp_client(stream) {
+                            if !is_expected_bench_disconnect(&error) {
+                                eprintln!("bench socks server connection error: {error}");
+                            }
+                        }
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    });
+    Ok((addr, handle))
+}
+
+fn start_trojan_server(
+    stop: Arc<AtomicBool>,
+) -> io::Result<(SocketAddr, thread::JoinHandle<io::Result<()>>)> {
+    let server = TrojanServer::new(TrojanServerConfig {
+        node_tag: "bench|trojan|tcp".to_string(),
+        listen: "127.0.0.1:0".parse().expect("valid listen addr"),
+        users: vec![bench_user()],
+        routes: Vec::new(),
+        connect_timeout: Duration::from_secs(3),
+    });
+    let listener = server.bind()?;
+    listener.set_nonblocking(true)?;
+    let addr = listener.local_addr()?;
+    let handle = thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_nodelay(true);
+                    let server = server.clone();
+                    thread::spawn(move || {
+                        if let Err(error) = server.handle_tcp_client(stream) {
+                            if !is_expected_bench_disconnect(&error) {
+                                eprintln!("bench trojan server connection error: {error}");
+                            }
+                        }
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    });
+    Ok((addr, handle))
+}
+
 fn start_vless_server(
     echo_addr: SocketAddr,
     stop: Arc<AtomicBool>,
@@ -1597,6 +1783,106 @@ fn is_expected_bench_disconnect(error: &io::Error) -> bool {
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::BrokenPipe
     )
+}
+
+fn run_socks_tcp_stream_client(
+    core_addr: SocketAddr,
+    echo_addr: SocketAddr,
+    stream_id: usize,
+    options: &BenchOptions,
+) -> io::Result<ClientStats> {
+    let payload = bench_payload(stream_id, options.payload_size);
+    let mut response = vec![0u8; payload.len()];
+    let mut latencies = Vec::with_capacity(options.requests);
+    let mut stream = TcpStream::connect(core_addr)?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    write_socks5_connect(&mut stream, echo_addr)?;
+
+    for request_index in 0..options.requests {
+        let started = Instant::now();
+        stream.write_all(&payload).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "socks stream {stream_id} request {} write failed: {error}",
+                    request_index + 1
+                ),
+            )
+        })?;
+        stream.read_exact(&mut response).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "socks stream {stream_id} request {} read failed: {error}",
+                    request_index + 1
+                ),
+            )
+        })?;
+        if response != payload {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "socks bench echo payload mismatch",
+            ));
+        }
+        latencies.push(started.elapsed().as_micros());
+    }
+
+    Ok(ClientStats {
+        latencies,
+        retries: 0,
+    })
+}
+
+fn run_trojan_tcp_stream_client(
+    core_addr: SocketAddr,
+    echo_addr: SocketAddr,
+    stream_id: usize,
+    options: &BenchOptions,
+) -> io::Result<ClientStats> {
+    let payload = bench_payload(stream_id, options.payload_size);
+    let mut response = vec![0u8; payload.len()];
+    let mut latencies = Vec::with_capacity(options.requests);
+    let mut stream = TcpStream::connect(core_addr)?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    stream.write_all(&trojan_tcp_request(echo_addr))?;
+
+    for request_index in 0..options.requests {
+        let started = Instant::now();
+        stream.write_all(&payload).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "trojan stream {stream_id} request {} write failed: {error}",
+                    request_index + 1
+                ),
+            )
+        })?;
+        stream.read_exact(&mut response).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "trojan stream {stream_id} request {} read failed: {error}",
+                    request_index + 1
+                ),
+            )
+        })?;
+        if response != payload {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "trojan bench echo payload mismatch",
+            ));
+        }
+        latencies.push(started.elapsed().as_micros());
+    }
+
+    Ok(ClientStats {
+        latencies,
+        retries: 0,
+    })
 }
 
 fn run_vless_tcp_client(
@@ -1740,6 +2026,110 @@ fn read_vless_response_header(stream: &mut TcpStream) -> io::Result<()> {
         stream.read_exact(&mut addon)?;
     }
     Ok(())
+}
+
+fn write_socks5_connect(stream: &mut TcpStream, target: SocketAddr) -> io::Result<()> {
+    stream.write_all(&[0x05, 0x01, 0x02])?;
+    let mut method = [0u8; 2];
+    stream.read_exact(&mut method)?;
+    if method != [0x05, 0x02] {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socks bench auth method rejected",
+        ));
+    }
+
+    let username = BENCH_USER_UUID.as_bytes();
+    let password = BENCH_USER_UUID.as_bytes();
+    if username.len() > u8::MAX as usize || password.len() > u8::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socks bench credential is too long",
+        ));
+    }
+    let mut auth = Vec::with_capacity(3 + username.len() + password.len());
+    auth.push(0x01);
+    auth.push(username.len() as u8);
+    auth.extend_from_slice(username);
+    auth.push(password.len() as u8);
+    auth.extend_from_slice(password);
+    stream.write_all(&auth)?;
+    let mut auth_status = [0u8; 2];
+    stream.read_exact(&mut auth_status)?;
+    if auth_status != [0x01, 0x00] {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socks bench password auth rejected",
+        ));
+    }
+
+    let mut request = Vec::with_capacity(32);
+    request.extend_from_slice(&[0x05, 0x01, 0x00]);
+    request.extend_from_slice(&socks_target_bytes(target));
+    stream.write_all(&request)?;
+    read_socks5_response(stream)
+}
+
+fn read_socks5_response(stream: &mut TcpStream) -> io::Result<()> {
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header)?;
+    if header[0] != 0x05 || header[1] != 0x00 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("socks bench connect failed with status {}", header[1]),
+        ));
+    }
+    match header[3] {
+        0x01 => {
+            let mut addr = [0u8; 4];
+            stream.read_exact(&mut addr)?;
+        }
+        0x04 => {
+            let mut addr = [0u8; 16];
+            stream.read_exact(&mut addr)?;
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len)?;
+            let mut addr = vec![0u8; usize::from(len[0])];
+            stream.read_exact(&mut addr)?;
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "socks bench response has unsupported address type",
+            ));
+        }
+    }
+    let mut port = [0u8; 2];
+    stream.read_exact(&mut port)?;
+    Ok(())
+}
+
+fn trojan_tcp_request(target: SocketAddr) -> Vec<u8> {
+    let mut request = Vec::with_capacity(64);
+    request.extend_from_slice(trojan_password_hash(BENCH_USER_UUID).as_bytes());
+    request.extend_from_slice(b"\r\n");
+    request.push(0x01);
+    request.extend_from_slice(&socks_target_bytes(target));
+    request.extend_from_slice(b"\r\n");
+    request
+}
+
+fn socks_target_bytes(target: SocketAddr) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(32);
+    match target {
+        SocketAddr::V4(addr) => {
+            bytes.push(0x01);
+            bytes.extend_from_slice(&addr.ip().octets());
+        }
+        SocketAddr::V6(addr) => {
+            bytes.push(0x04);
+            bytes.extend_from_slice(&addr.ip().octets());
+        }
+    }
+    bytes.extend_from_slice(&target.port().to_be_bytes());
+    bytes
 }
 
 fn vless_tcp_request(target: SocketAddr) -> Vec<u8> {
@@ -2596,9 +2986,10 @@ mod tests {
     use super::{
         canonical_bench_command, parse_bench_options, parse_bench_suite_options,
         parse_external_bench_suite_options, percent_change, run_external_vless_tcp_stream_bench,
-        run_hy2_udp_bench, run_tuic_tcp_bench, run_tuic_tcp_stream_bench, run_tuic_udp_bench,
-        run_vless_tcp_bench, run_vless_tcp_stream_bench, summarize_bench_runs, BenchOptions,
-        BenchReport, BenchSuiteRun, LatencyReport,
+        run_hy2_udp_bench, run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench,
+        run_tuic_tcp_bench, run_tuic_tcp_stream_bench, run_tuic_udp_bench, run_vless_tcp_bench,
+        run_vless_tcp_stream_bench, summarize_bench_runs, BenchOptions, BenchReport, BenchSuiteRun,
+        LatencyReport,
     };
     use std::net::{SocketAddr, TcpStream};
     use std::path::PathBuf;
@@ -2717,6 +3108,14 @@ mod tests {
             canonical_bench_command("tuic-stream"),
             Some("tuic-tcp-stream")
         );
+        assert_eq!(
+            canonical_bench_command("socks5-tcp-stream"),
+            Some("socks-tcp-stream")
+        );
+        assert_eq!(
+            canonical_bench_command("trojan-stream"),
+            Some("trojan-tcp-stream")
+        );
         assert_eq!(canonical_bench_command("unknown"), None);
     }
 
@@ -2788,6 +3187,44 @@ mod tests {
 
         assert_eq!(report.protocol, "vless-tcp");
         assert_eq!(report.mode, "connection-per-request");
+        assert_eq!(report.total_requests, 3);
+        assert_eq!(report.completed_requests, 3);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert_eq!(report.runtime_workers, None);
+        assert!(report.download_bytes > 0);
+    }
+
+    #[test]
+    fn runs_socks_tcp_stream_bench_smoke() {
+        let report = run_socks_tcp_stream_bench(&BenchOptions {
+            streams: 1,
+            requests: 3,
+            payload_size: 16,
+        })
+        .expect("bench");
+
+        assert_eq!(report.protocol, "socks-tcp");
+        assert_eq!(report.mode, "connection-per-stream");
+        assert_eq!(report.total_requests, 3);
+        assert_eq!(report.completed_requests, 3);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert_eq!(report.runtime_workers, None);
+        assert!(report.download_bytes > 0);
+    }
+
+    #[test]
+    fn runs_trojan_tcp_stream_bench_smoke() {
+        let report = run_trojan_tcp_stream_bench(&BenchOptions {
+            streams: 1,
+            requests: 3,
+            payload_size: 16,
+        })
+        .expect("bench");
+
+        assert_eq!(report.protocol, "trojan-tcp");
+        assert_eq!(report.mode, "connection-per-stream");
         assert_eq!(report.total_requests, 3);
         assert_eq!(report.completed_requests, 3);
         assert_eq!(report.errors, 0);
