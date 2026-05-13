@@ -188,6 +188,7 @@ impl Hysteria2Server {
         let _session = self.acquire_user_session(&auth.user, Some(client_ip))?;
         let bandwidth = self.connection_limiters(
             self.bandwidth.limiter_for(Some(&auth.user)),
+            self.bandwidth.limiter_for_limited(Some(&auth.user)),
             auth.client_rx_bps,
         );
         let udp_sessions = Arc::new(Mutex::new(HashMap::new()));
@@ -639,11 +640,16 @@ impl Hysteria2Server {
 
     fn connection_limiters(
         &self,
+        user_revocation: Option<Arc<BandwidthLimiter>>,
         user_limiter: Option<Arc<BandwidthLimiter>>,
         client_rx_bps: Option<u64>,
     ) -> DirectionalLimiters {
+        let mut revoke = Vec::new();
         let mut upload = Vec::new();
         let mut download = Vec::new();
+        if let Some(limiter) = user_revocation {
+            revoke.push(limiter);
+        }
         if let Some(limiter) = user_limiter {
             upload.push(limiter.clone());
             download.push(limiter);
@@ -657,7 +663,11 @@ impl Hysteria2Server {
                 download.push(Arc::new(BandwidthLimiter::new(download_bps)));
             }
         }
-        DirectionalLimiters { upload, download }
+        DirectionalLimiters {
+            revoke,
+            upload,
+            download,
+        }
     }
 
     fn acquire_user_session(
@@ -687,18 +697,24 @@ struct Hysteria2Auth {
 
 #[derive(Clone, Debug, Default)]
 struct DirectionalLimiters {
+    revoke: Vec<Arc<BandwidthLimiter>>,
     upload: Vec<Arc<BandwidthLimiter>>,
     download: Vec<Arc<BandwidthLimiter>>,
 }
 
 impl DirectionalLimiters {
     fn is_empty(&self) -> bool {
-        self.upload.is_empty() && self.download.is_empty()
+        self.revoke.is_empty() && self.upload.is_empty() && self.download.is_empty()
+    }
+
+    fn has_data_limits(&self) -> bool {
+        !self.upload.is_empty() || !self.download.is_empty()
     }
 
     fn is_revoked(&self) -> bool {
-        self.upload
+        self.revoke
             .iter()
+            .chain(self.upload.iter())
             .chain(self.download.iter())
             .any(|limiter| limiter.is_revoked())
     }
@@ -1079,6 +1095,10 @@ async fn relay_streams(
     mut on_upload: impl FnMut(u64),
     mut on_download: impl FnMut(u64),
 ) -> io::Result<(u64, u64)> {
+    if !bandwidth.has_data_limits() {
+        return relay_streams_unlimited(recv, send, remote, on_upload, on_download).await;
+    }
+
     let (mut remote_read, mut remote_write) = remote.into_split();
     let upload = async {
         let bandwidth = bandwidth.clone();
@@ -1124,6 +1144,44 @@ async fn relay_streams(
                 return Ok::<u64, io::Error>(total);
             }
             if !bandwidth.wait_download(read).await {
+                let _ = send.finish();
+                return Ok::<u64, io::Error>(total);
+            }
+            send.write_all(&buffer[..read]).await.map_err(io_other)?;
+            on_download(read as u64);
+            total = total.saturating_add(read as u64);
+        }
+    };
+    tokio::try_join!(upload, download)
+}
+
+async fn relay_streams_unlimited(
+    recv: &mut quinn::RecvStream,
+    send: &mut quinn::SendStream,
+    remote: tokio::net::TcpStream,
+    mut on_upload: impl FnMut(u64),
+    mut on_download: impl FnMut(u64),
+) -> io::Result<(u64, u64)> {
+    let (mut remote_read, mut remote_write) = remote.into_split();
+    let upload = async {
+        let mut total = 0u64;
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            let Some(read) = recv.read(&mut buffer).await.map_err(io_other)? else {
+                let _ = remote_write.shutdown().await;
+                return Ok::<u64, io::Error>(total);
+            };
+            remote_write.write_all(&buffer[..read]).await?;
+            on_upload(read as u64);
+            total = total.saturating_add(read as u64);
+        }
+    };
+    let download = async {
+        let mut total = 0u64;
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            let read = remote_read.read(&mut buffer).await?;
+            if read == 0 {
                 let _ = send.finish();
                 return Ok::<u64, io::Error>(total);
             }
@@ -1396,7 +1454,8 @@ mod tests {
         runtime.block_on(async {
             let limiter = Arc::new(BandwidthLimiter::unlimited());
             let limits = DirectionalLimiters {
-                upload: vec![limiter.clone()],
+                revoke: vec![limiter.clone()],
+                upload: Vec::new(),
                 download: Vec::new(),
             };
             tokio::spawn(async move {
@@ -1408,6 +1467,23 @@ mod tests {
                 .await
                 .expect("revocation should wake waiter");
         });
+    }
+
+    #[test]
+    fn unlimited_hysteria2_user_keeps_revoke_out_of_data_limiters() {
+        let cert = test_cert("hy2-unlimited-fast-path");
+        let server = server(&cert, "127.0.0.1:0".parse().expect("addr"));
+        let user = user();
+
+        let limits = server.connection_limiters(
+            server.bandwidth.limiter_for(Some(&user)),
+            server.bandwidth.limiter_for_limited(Some(&user)),
+            None,
+        );
+
+        assert_eq!(limits.revoke.len(), 1);
+        assert!(limits.upload.is_empty());
+        assert!(limits.download.is_empty());
     }
 
     #[test]
