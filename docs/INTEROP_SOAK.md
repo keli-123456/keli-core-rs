@@ -122,6 +122,19 @@ Use `tuic-tcp-stream` for steady-state TUIC relay benchmarking on Windows. The o
 command intentionally opens one proxied TCP connection per request, which can exhaust local
 ephemeral ports under very high loopback request counts before it measures core throughput.
 
+Large-payload stream smoke (`16` streams, `1000` requests per stream, `65536` byte payload,
+single repeat) shows the current data-plane split more clearly:
+
+| Command | Roundtrip Mbps | p99 | Errors | Retries |
+| --- | ---: | ---: | ---: | ---: |
+| `vless-tcp-stream` | 19194.43 | 1561 us | 0 | 0 |
+| `hy2-tcp-stream` | 2141.52 | 32021 us | 0 | 0 |
+| `tuic-tcp-stream` | 2674.95 | 33059 us | 0 | 0 |
+
+Treat these as local loopback throughput indicators, not internet p99 latency promises. They show
+that the next large performance target is the QUIC stream relay path, while VLESS TCP relay already
+has enough headroom for 10Gbps-class local relay smoke.
+
 Record the JSON output and compare `runtime_workers` where present, `completed_requests`, `errors`, `error_rate`, `roundtrip_mbps`, p95/p99 latency, and `retries` across commits on the same host.
 
 Small local smoke sample from a Windows loopback release build on `v0.1.32` after the active
