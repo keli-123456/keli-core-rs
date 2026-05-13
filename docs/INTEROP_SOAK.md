@@ -82,14 +82,19 @@ one-off command output:
 ```bash
 cargo run --release -- bench suite --streams 16 --requests 5000 --payload 1024 --repeats 3 --label rust-native --out runtime/bench/rust-suite.json
 cargo run --release -- bench suite --commands hy2-tcp,hy2-tcp-stream,hy2-udp --streams 16 --requests 5000 --payload 1024 --repeats 3 --label rust-hy2 --out runtime/bench/rust-hy2-suite.json
+cargo run --release -- bench external-suite --vless-core 127.0.0.1:19080 --commands vless-tcp-stream --streams 16 --requests 5000 --payload 1024 --repeats 3 --label go-xray-vless --out runtime/bench/go-suite.json
 cargo run --release -- bench compare --baseline runtime/bench/go-suite.json --candidate runtime/bench/rust-suite.json --out runtime/bench/go-vs-rust.json
 ```
 
-The Go/Xray baseline must be produced on the same host with the same release/debug mode,
-stream count, request count, payload size, repeat count, and report schema
-(`keli-core-bench-suite-v1`). Until the Go baseline harness emits that schema, treat
-`bench compare` as a Rust-regression and harness-validation tool, not proof that Rust has
-already beaten the production Go stack.
+The Go/Xray VLESS baseline can be collected by running the old core with a VLESS TCP inbound
+using benchmark user UUID `11111111-1111-1111-1111-111111111111` and normal direct/freedom
+outbound routing. `external-suite` starts the local echo target itself and sends that target
+inside the VLESS request. HY2/TUIC external Go baselines still need dedicated harness support.
+All baselines must be produced on the same host with the same release/debug mode, stream count,
+request count, payload size, repeat count, and report schema (`keli-core-bench-suite-v1`).
+Until every target protocol has a baseline in this schema, treat `bench compare` as a focused
+VLESS/Rust-regression tool rather than proof that Rust has already beaten the whole production
+Go stack.
 
 Record the JSON output and compare `runtime_workers` where present, `completed_requests`, `errors`, `error_rate`, `roundtrip_mbps`, p95/p99 latency, and `retries` across commits on the same host.
 

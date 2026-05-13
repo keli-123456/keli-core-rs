@@ -130,6 +130,7 @@ cargo run -- bench hy2-udp --streams 8 --requests 1000 --payload 1024
 cargo run -- bench tuic-tcp --streams 8 --requests 1000 --payload 1024
 cargo run -- bench tuic-udp --streams 8 --requests 1000 --payload 1024
 cargo run -- bench suite --streams 8 --requests 1000 --payload 1024 --repeats 3 --out runtime/bench/rust-suite.json
+cargo run -- bench external-suite --vless-core 127.0.0.1:19080 --commands vless-tcp-stream --streams 8 --requests 1000 --payload 1024 --repeats 3 --label go-xray --out runtime/bench/go-suite.json
 cargo run -- bench compare --baseline runtime/bench/go-suite.json --candidate runtime/bench/rust-suite.json
 ```
 
@@ -161,6 +162,19 @@ Use `bench suite` when collecting comparable protocol results:
 cargo run --release -- bench suite --streams 16 --requests 5000 --payload 1024 --repeats 3 --label rust-native --out runtime/bench/rust-suite.json
 cargo run --release -- bench suite --commands hy2-tcp,hy2-tcp-stream,hy2-udp --streams 16 --requests 5000 --payload 1024 --repeats 3 --label rust-hy2 --out runtime/bench/rust-hy2-suite.json
 ```
+
+To collect an old Go/Xray VLESS baseline, start the Go core with a VLESS TCP inbound
+using benchmark user UUID `11111111-1111-1111-1111-111111111111` and a `freedom`
+outbound, then run:
+
+```bash
+cargo run --release -- bench external-suite --vless-core 127.0.0.1:19080 --commands vless-tcp-stream --streams 16 --requests 5000 --payload 1024 --repeats 3 --label go-xray-vless --out runtime/bench/go-suite.json
+```
+
+`external-suite` starts its own local echo target and sends the target address inside
+the VLESS request, so the external Go core should not need a special outbound beyond
+normal direct/freedom routing. External HY2/TUIC baselines still need dedicated harness
+support before they can be compared with the same command.
 
 Use `bench compare` only with reports generated from the same host, release mode,
 stream count, request count, payload size, and repeat count:
