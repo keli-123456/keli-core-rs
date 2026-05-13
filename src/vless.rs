@@ -50,6 +50,7 @@ const ATYP_DOMAIN: u8 = 0x02;
 const ATYP_IPV6: u8 = 0x03;
 const FLOW_XTLS_RPRX_VISION: &str = "xtls-rprx-vision";
 const MAX_UDP_PACKET_SIZE: usize = 65_535;
+const ASYNC_TRAFFIC_FLUSH_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct VlessServerConfig {
@@ -594,37 +595,27 @@ impl VlessServer {
         let upload_node_tag = self.config.node_tag.clone();
         let upload_user_uuid = request.user_uuid.clone();
         let upload_user_id = request.user_numeric_id;
-        let mut upload_client_ip = request.client_ip;
         let download_traffic = self.traffic.clone();
         let download_node_tag = self.config.node_tag.clone();
         let download_user_uuid = request.user_uuid;
         let download_user_id = request.user_numeric_id;
-        relay_tcp_streams_async(
-            client,
-            remote,
-            bandwidth,
-            move |bytes| {
-                upload_traffic.add_with_user_id(
-                    upload_node_tag.clone(),
-                    upload_user_uuid.clone(),
-                    Some(upload_user_id),
-                    bytes,
-                    0,
-                    upload_client_ip.take(),
-                );
-            },
-            move |bytes| {
-                download_traffic.add_with_user_id(
-                    download_node_tag.clone(),
-                    download_user_uuid.clone(),
-                    Some(download_user_id),
-                    0,
-                    bytes,
-                    None,
-                );
-            },
-        )
-        .await?;
+        let upload_flush = traffic_flush_callback(
+            upload_traffic,
+            upload_node_tag,
+            upload_user_uuid,
+            Some(upload_user_id),
+            true,
+            request.client_ip,
+        );
+        let download_flush = traffic_flush_callback(
+            download_traffic,
+            download_node_tag,
+            download_user_uuid,
+            Some(download_user_id),
+            false,
+            None,
+        );
+        relay_tcp_streams_async(client, remote, bandwidth, upload_flush, download_flush).await?;
         Ok(())
     }
 
@@ -1038,6 +1029,48 @@ impl VlessServer {
                 error.to_string(),
             )),
         }
+    }
+}
+
+fn traffic_flush_callback(
+    traffic: SharedTrafficRegistry,
+    node_tag: String,
+    user_uuid: String,
+    user_id: Option<u64>,
+    upload: bool,
+    mut client_ip: Option<IpAddr>,
+) -> impl FnMut(u64) {
+    let mut pending = 0u64;
+    let mut flushed_once = false;
+    move |bytes| {
+        pending = pending.saturating_add(bytes);
+        if pending == 0 {
+            return;
+        }
+        if flushed_once && bytes != 0 && pending < ASYNC_TRAFFIC_FLUSH_BYTES {
+            return;
+        }
+        if upload {
+            traffic.add_with_user_id(
+                node_tag.clone(),
+                user_uuid.clone(),
+                user_id,
+                pending,
+                0,
+                client_ip.take(),
+            );
+        } else {
+            traffic.add_with_user_id(
+                node_tag.clone(),
+                user_uuid.clone(),
+                user_id,
+                0,
+                pending,
+                None,
+            );
+        }
+        pending = 0;
+        flushed_once = true;
     }
 }
 
@@ -2128,28 +2161,41 @@ async fn relay_tcp_streams_async(
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
-            let read = if let Some(limiter) = upload_limiter.as_deref() {
+            let read_result = if let Some(limiter) = upload_limiter.as_deref() {
                 tokio::select! {
-                    read = client_read.read(&mut buffer) => read?,
+                    read = client_read.read(&mut buffer) => read,
                     _ = wait_limiter_revoke(limiter) => {
+                        on_upload(0);
                         let _ = remote_write.shutdown().await;
                         return Ok::<u64, io::Error>(total);
                     }
                 }
             } else {
-                client_read.read(&mut buffer).await?
+                client_read.read(&mut buffer).await
+            };
+            let read = match read_result {
+                Ok(read) => read,
+                Err(error) => {
+                    on_upload(0);
+                    return Err(error);
+                }
             };
             if read == 0 {
+                on_upload(0);
                 let _ = remote_write.shutdown().await;
                 return Ok::<u64, io::Error>(total);
             }
             if let Some(limiter) = upload_limiter.as_deref() {
                 if !limiter.wait_for_async(read).await {
+                    on_upload(0);
                     let _ = remote_write.shutdown().await;
                     return Ok::<u64, io::Error>(total);
                 }
             }
-            remote_write.write_all(&buffer[..read]).await?;
+            if let Err(error) = remote_write.write_all(&buffer[..read]).await {
+                on_upload(0);
+                return Err(error);
+            }
             on_upload(read as u64);
             total = total.saturating_add(read as u64);
         }
@@ -2158,28 +2204,41 @@ async fn relay_tcp_streams_async(
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
-            let read = if let Some(limiter) = limiter.as_deref() {
+            let read_result = if let Some(limiter) = limiter.as_deref() {
                 tokio::select! {
-                    read = remote_read.read(&mut buffer) => read?,
+                    read = remote_read.read(&mut buffer) => read,
                     _ = wait_limiter_revoke(limiter) => {
+                        on_download(0);
                         let _ = client_write.shutdown().await;
                         return Ok::<u64, io::Error>(total);
                     }
                 }
             } else {
-                remote_read.read(&mut buffer).await?
+                remote_read.read(&mut buffer).await
+            };
+            let read = match read_result {
+                Ok(read) => read,
+                Err(error) => {
+                    on_download(0);
+                    return Err(error);
+                }
             };
             if read == 0 {
+                on_download(0);
                 let _ = client_write.shutdown().await;
                 return Ok::<u64, io::Error>(total);
             }
             if let Some(limiter) = limiter.as_deref() {
                 if !limiter.wait_for_async(read).await {
+                    on_download(0);
                     let _ = client_write.shutdown().await;
                     return Ok::<u64, io::Error>(total);
                 }
             }
-            client_write.write_all(&buffer[..read]).await?;
+            if let Err(error) = client_write.write_all(&buffer[..read]).await {
+                on_download(0);
+                return Err(error);
+            }
             on_download(read as u64);
             total = total.saturating_add(read as u64);
         }
