@@ -1561,8 +1561,8 @@ fn run_one_vless_tcp_request(
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     stream.write_all(&vless_tcp_request(echo_addr))?;
-    read_vless_response_header(&mut stream)?;
     stream.write_all(payload)?;
+    read_vless_response_header(&mut stream)?;
     let mut response = vec![0u8; payload.len()];
     stream.read_exact(&mut response)?;
     if response != payload {
@@ -1588,7 +1588,7 @@ fn run_vless_tcp_stream_client(
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     stream.write_all(&vless_tcp_request(echo_addr))?;
-    read_vless_response_header(&mut stream)?;
+    let mut response_header_read = false;
 
     for request_index in 0..options.requests {
         let started = Instant::now();
@@ -1601,6 +1601,10 @@ fn run_vless_tcp_stream_client(
                 ),
             )
         })?;
+        if !response_header_read {
+            read_vless_response_header(&mut stream)?;
+            response_header_read = true;
+        }
         stream.read_exact(&mut response).map_err(|error| {
             io::Error::new(
                 error.kind(),
