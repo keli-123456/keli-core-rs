@@ -237,7 +237,13 @@ impl NativeRelayPool {
     fn spawn_extra_worker_if_needed(&'static self) {
         let pending = self.pending_count.load(Ordering::Relaxed);
         let idle = self.idle_count.load(Ordering::Relaxed);
-        if pending > idle {
+        let deficit = pending.saturating_sub(idle);
+        if deficit == 0 {
+            return;
+        }
+        let workers = self.worker_count.load(Ordering::Acquire);
+        let capacity = self.max_workers.saturating_sub(workers);
+        for _ in 0..deficit.min(capacity).min(8) {
             let _ = self.spawn_worker();
         }
     }
