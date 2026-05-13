@@ -2151,13 +2151,13 @@ async fn relay_tcp_streams_async(
     client: tokio::net::TcpStream,
     remote: tokio::net::TcpStream,
     limiter: Option<Arc<BandwidthLimiter>>,
-    mut on_upload: impl FnMut(u64),
-    mut on_download: impl FnMut(u64),
+    mut on_upload: impl FnMut(u64) + Send + 'static,
+    mut on_download: impl FnMut(u64) + Send + 'static,
 ) -> io::Result<(u64, u64)> {
     let (mut client_read, mut client_write) = client.into_split();
     let (mut remote_read, mut remote_write) = remote.into_split();
     let upload_limiter = limiter.clone();
-    let upload = async {
+    let upload = tokio::spawn(async move {
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
@@ -2199,8 +2199,8 @@ async fn relay_tcp_streams_async(
             on_upload(read as u64);
             total = total.saturating_add(read as u64);
         }
-    };
-    let download = async {
+    });
+    let download = tokio::spawn(async move {
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
@@ -2242,8 +2242,11 @@ async fn relay_tcp_streams_async(
             on_download(read as u64);
             total = total.saturating_add(read as u64);
         }
-    };
-    tokio::try_join!(upload, download)
+    });
+    let (upload, download) = tokio::try_join!(upload, download).map_err(|error| {
+        io::Error::new(io::ErrorKind::Other, format!("relay task failed: {error}"))
+    })?;
+    Ok((upload?, download?))
 }
 
 async fn wait_limiter_revoke(limiter: &BandwidthLimiter) {
