@@ -1500,8 +1500,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc,
-        Arc,
+        mpsc, Arc,
     };
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};

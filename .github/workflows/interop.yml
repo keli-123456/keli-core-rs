@@ -1,0 +1,85 @@
+name: Native Interop Matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      case_filter:
+        description: Optional case substring, for example vless, hy2, tuic, httpupgrade
+        required: false
+        default: ""
+      keep_artifacts:
+        description: Upload generated configs and logs
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.case_filter }}
+  cancel-in-progress: false
+
+jobs:
+  sing-box:
+    name: sing-box real-client loopback
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-interop-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-interop-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Download sing-box
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="1.12.22"
+          mkdir -p tools/sing-box
+          curl -fsSL \
+            "https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-amd64.tar.gz" \
+            -o /tmp/sing-box.tar.gz
+          tar -xzf /tmp/sing-box.tar.gz -C tools/sing-box --strip-components=1
+          chmod +x tools/sing-box/sing-box
+          tools/sing-box/sing-box version
+
+      - name: Build release core
+        run: cargo build --release --locked
+
+      - name: Run interop matrix
+        shell: bash
+        env:
+          CASE_FILTER: ${{ inputs.case_filter }}
+          KEEP_ARTIFACTS: ${{ inputs.keep_artifacts }}
+        run: |
+          set -euo pipefail
+          args=(--core target/release/keli-core-rs --sing-box tools/sing-box/sing-box)
+          if [[ -n "${CASE_FILTER}" ]]; then
+            args+=(--only "${CASE_FILTER}")
+          fi
+          if [[ "${KEEP_ARTIFACTS}" == "true" ]]; then
+            args+=(--keep)
+          fi
+          cargo run --locked --example interop_matrix -- "${args[@]}"
+
+      - name: Upload interop artifacts
+        if: ${{ always() && inputs.keep_artifacts }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: keli-core-rs-interop-${{ github.run_id }}
+          path: runtime/interop-matrix
+          if-no-files-found: ignore

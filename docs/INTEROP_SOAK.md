@@ -144,3 +144,7 @@ SKIP mieru: no official mieru client is bundled with this matrix
 SKIP naive: native core intentionally treats Naive as a sidecar
 SKIP vless-reality: requires a deterministic REALITY destination fixture
 ```
+
+The same matrix is available from GitHub Actions as the manual `Native Interop Matrix`
+workflow. Use the optional `case_filter` input to run one protocol family before a focused
+gray release, or leave it empty to run all supported sing-box cases.
