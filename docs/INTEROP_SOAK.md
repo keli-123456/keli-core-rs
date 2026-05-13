@@ -104,3 +104,43 @@ A soak pass requires:
 - Error bursts are attributable to client/network conditions and recover without manual core restart.
 
 Keep the protocol marked as `Partial` in `docs/PARITY.md` until the real-client matrix and soak notes are attached to the release candidate.
+
+## Local Real-Client Matrix
+
+For repeatable protocol smoke testing with a real client, run the local sing-box matrix. It
+starts temporary loopback `keli-core-rs` listeners, a local HTTP echo server, a local UDP echo
+server, and one sing-box client config per case:
+
+```bash
+cargo build --release
+cargo run --example interop_matrix -- --sing-box /path/to/sing-box
+```
+
+On the Windows development workspace used for Keli, the bundled client path is usually:
+
+```powershell
+cargo run --example interop_matrix -- --sing-box ..\tools\sing-box\sing-box-1.12.22-windows-amd64\sing-box.exe
+```
+
+Useful filters:
+
+```bash
+cargo run --example interop_matrix -- --sing-box /path/to/sing-box --only vless
+cargo run --example interop_matrix -- --sing-box /path/to/sing-box --only hy2 --keep
+```
+
+The matrix currently verifies TCP forwarding through sing-box for SOCKS, HTTP proxy,
+Shadowsocks, VLESS, VMess, Trojan, AnyTLS, Hysteria2, and TUIC combinations, plus UDP relay
+through Shadowsocks, Hysteria2, and TUIC. It intentionally skips Naive because the native core
+treats it as a sidecar, skips Mieru until an official client is installed in the test
+environment, and skips VLESS REALITY until there is a deterministic local REALITY destination
+fixture.
+
+Latest local Windows loopback sample:
+
+```text
+interop matrix summary: 33 passed, 0 failed
+SKIP mieru: no official mieru client is bundled with this matrix
+SKIP naive: native core intentionally treats Naive as a sidecar
+SKIP vless-reality: requires a deterministic REALITY destination fixture
+```
