@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -42,7 +42,7 @@ pub fn relay_tcp_streams(client: TcpStream, remote: TcpStream) -> io::Result<(u6
 }
 
 pub fn relay_tcp_fast_unlimited(client: TcpStream, remote: TcpStream) -> io::Result<(u64, u64)> {
-    relay_tcp_streams_unlimited_async(client, remote)
+    relay_tcp_streams_unlimited_native(client, remote)
 }
 
 pub fn relay_tcp_limited(
@@ -119,7 +119,7 @@ fn relay_tcp_streams_async(
     limiter: Option<Arc<BandwidthLimiter>>,
 ) -> io::Result<(u64, u64)> {
     if limiter.is_none() {
-        return relay_tcp_streams_unlimited_async(client, remote);
+        return relay_tcp_streams_unlimited_native(client, remote);
     }
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
@@ -144,21 +144,23 @@ fn relay_tcp_streams_async(
     })
 }
 
-fn relay_tcp_streams_unlimited_async(
+fn relay_tcp_streams_unlimited_native(
     client: TcpStream,
     remote: TcpStream,
 ) -> io::Result<(u64, u64)> {
-    client.set_nonblocking(true)?;
-    remote.set_nonblocking(true)?;
-    tcp_relay_runtime()?.block_on(async move {
-        let client = tokio::net::TcpStream::from_std(client)?;
-        let remote = tokio::net::TcpStream::from_std(remote)?;
-        let (mut client_read, mut client_write) = client.into_split();
-        let (mut remote_read, mut remote_write) = remote.into_split();
-        let upload = copy_count_best_effort_async(&mut client_read, &mut remote_write);
-        let download = copy_count_best_effort_async(&mut remote_read, &mut client_write);
-        Ok(tokio::join!(upload, download))
-    })
+    let mut client_read = client.try_clone()?;
+    let mut client_write = client;
+    let mut remote_read = remote.try_clone()?;
+    let mut remote_write = remote;
+    let upload_task = spawn_native_blocking_relay(move || {
+        let copied = copy_count_best_effort(&mut client_read, &mut remote_write);
+        let _ = remote_write.shutdown(Shutdown::Write);
+        copied
+    })?;
+    let download = copy_count_best_effort(&mut remote_read, &mut client_write);
+    let _ = client_write.shutdown(Shutdown::Write);
+    let upload = join_native_blocking_relay(upload_task, "tcp upload relay task panicked")?;
+    Ok((upload, download))
 }
 
 fn tcp_relay_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
@@ -327,28 +329,6 @@ fn native_relay_stack_size() -> usize {
 
 fn native_relay_idle_timeout() -> Duration {
     Duration::from_secs(30)
-}
-
-async fn copy_count_best_effort_async<R, W>(reader: &mut R, writer: &mut W) -> u64
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut total = 0u64;
-    let mut buffer = [0u8; 16 * 1024];
-    loop {
-        let read = match reader.read(&mut buffer).await {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(_) => break,
-        };
-        if writer.write_all(&buffer[..read]).await.is_err() {
-            break;
-        }
-        total = total.saturating_add(read as u64);
-    }
-    let _ = writer.shutdown().await;
-    total
 }
 
 async fn copy_count_best_effort_limited_async<R, W>(
