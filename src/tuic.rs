@@ -165,13 +165,15 @@ impl TuicServer {
         let mut auth_stream = connection.accept_uni().await.map_err(io_other)?;
         let user = self.authenticate(&connection, &mut auth_stream).await?;
         let _session = self.acquire_user_session(&user, Some(client_ip))?;
-        let bandwidth = self.bandwidth.limiter_for(Some(&user));
+        let revocation = self.bandwidth.limiter_for(Some(&user));
+        let bandwidth = self.bandwidth.limiter_for_limited(Some(&user));
         let udp_sessions = Arc::new(Mutex::new(HashMap::new()));
 
         let datagram_server = self.clone();
         let datagram_connection = connection.clone();
         let datagram_user_uuid = user.uuid.clone();
         let datagram_user_id = user.id;
+        let datagram_revocation = revocation.clone();
         let datagram_bandwidth = bandwidth.clone();
         let datagram_sessions = udp_sessions.clone();
         tokio::spawn(async move {
@@ -180,6 +182,7 @@ impl TuicServer {
                     datagram_connection,
                     datagram_user_uuid,
                     datagram_user_id,
+                    datagram_revocation,
                     datagram_bandwidth,
                     datagram_sessions,
                     client_ip,
@@ -191,6 +194,7 @@ impl TuicServer {
         let uni_connection = connection.clone();
         let uni_user_uuid = user.uuid.clone();
         let uni_user_id = user.id;
+        let uni_revocation = revocation.clone();
         let uni_bandwidth = bandwidth.clone();
         let uni_sessions = udp_sessions.clone();
         tokio::spawn(async move {
@@ -199,6 +203,7 @@ impl TuicServer {
                     uni_connection,
                     uni_user_uuid,
                     uni_user_id,
+                    uni_revocation,
                     uni_bandwidth,
                     uni_sessions,
                     client_ip,
@@ -207,7 +212,7 @@ impl TuicServer {
         });
 
         loop {
-            let stream = if let Some(limiter) = bandwidth.as_deref() {
+            let stream = if let Some(limiter) = revocation.as_deref() {
                 tokio::select! {
                     stream = connection.accept_bi() => stream,
                     _ = wait_limiter_revoke(limiter) => {
@@ -327,13 +332,14 @@ impl TuicServer {
         connection: quinn::Connection,
         user_uuid: String,
         user_id: u64,
+        revocation: Option<Arc<BandwidthLimiter>>,
         bandwidth: Option<Arc<BandwidthLimiter>>,
         sessions: Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
         client_ip: IpAddr,
     ) -> io::Result<()> {
         let mut fragments = UdpFragmentStore::default();
         loop {
-            let datagram = if let Some(limiter) = bandwidth.as_deref() {
+            let datagram = if let Some(limiter) = revocation.as_deref() {
                 tokio::select! {
                     datagram = connection.read_datagram() => datagram,
                     _ = wait_limiter_revoke(limiter) => return Ok(()),
@@ -355,6 +361,7 @@ impl TuicServer {
                 &connection,
                 &user_uuid,
                 user_id,
+                revocation.clone(),
                 bandwidth.clone(),
                 &sessions,
                 &mut fragments,
@@ -371,13 +378,14 @@ impl TuicServer {
         connection: quinn::Connection,
         user_uuid: String,
         user_id: u64,
+        revocation: Option<Arc<BandwidthLimiter>>,
         bandwidth: Option<Arc<BandwidthLimiter>>,
         sessions: Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
         client_ip: IpAddr,
     ) -> io::Result<()> {
         let mut fragments = UdpFragmentStore::default();
         loop {
-            let stream = if let Some(limiter) = bandwidth.as_deref() {
+            let stream = if let Some(limiter) = revocation.as_deref() {
                 tokio::select! {
                     stream = connection.accept_uni() => stream,
                     _ = wait_limiter_revoke(limiter) => return Ok(()),
@@ -403,6 +411,7 @@ impl TuicServer {
                 &connection,
                 &user_uuid,
                 user_id,
+                revocation.clone(),
                 bandwidth.clone(),
                 &sessions,
                 &mut fragments,
@@ -419,6 +428,7 @@ impl TuicServer {
         connection: &quinn::Connection,
         user_uuid: &str,
         user_id: u64,
+        revocation: Option<Arc<BandwidthLimiter>>,
         bandwidth: Option<Arc<BandwidthLimiter>>,
         sessions: &Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
         fragments: &mut UdpFragmentStore,
@@ -430,8 +440,8 @@ impl TuicServer {
             UdpCommand::Packet(packet) => match fragments.push(packet)? {
                 Some(packet) => {
                     self.handle_udp_packet(
-                        connection, user_uuid, user_id, bandwidth, sessions, reply_mode, client_ip,
-                        packet,
+                        connection, user_uuid, user_id, revocation, bandwidth, sessions,
+                        reply_mode, client_ip, packet,
                     )
                     .await
                 }
@@ -456,6 +466,7 @@ impl TuicServer {
         connection: &quinn::Connection,
         user_uuid: &str,
         user_id: u64,
+        revocation: Option<Arc<BandwidthLimiter>>,
         bandwidth: Option<Arc<BandwidthLimiter>>,
         sessions: &Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
         reply_mode: UdpReplyMode,
@@ -563,6 +574,7 @@ impl TuicServer {
                 sessions,
                 packet.assoc_id,
                 target_addr,
+                revocation.clone(),
                 bandwidth.clone(),
                 reply_mode,
                 client_ip,
@@ -596,6 +608,7 @@ impl TuicServer {
         sessions: &Arc<Mutex<HashMap<u16, Arc<UdpRelaySession>>>>,
         assoc_id: u16,
         target_addr: SocketAddr,
+        revocation: Option<Arc<BandwidthLimiter>>,
         bandwidth: Option<Arc<BandwidthLimiter>>,
         reply_mode: UdpReplyMode,
         client_ip: IpAddr,
@@ -633,11 +646,12 @@ impl TuicServer {
         let node_tag = self.config.node_tag.clone();
         let user_uuid = user_uuid.to_string();
         let traffic = self.traffic.clone();
+        let revocation = revocation.clone();
         let bandwidth = bandwidth.clone();
         tokio::spawn(async move {
             let _ = receive_udp_replies(
-                assoc_id, receiver, connection, node_tag, user_uuid, user_id, traffic, bandwidth,
-                client_ip,
+                assoc_id, receiver, connection, node_tag, user_uuid, user_id, traffic, revocation,
+                bandwidth, client_ip,
             )
             .await;
         });
@@ -796,6 +810,7 @@ async fn receive_udp_replies(
     user_uuid: String,
     user_id: u64,
     traffic: SharedTrafficRegistry,
+    revocation: Option<Arc<BandwidthLimiter>>,
     bandwidth: Option<Arc<BandwidthLimiter>>,
     client_ip: IpAddr,
 ) -> io::Result<()> {
@@ -808,7 +823,7 @@ async fn receive_udp_replies(
             result = session.socket.recv_from(&mut buffer) => result,
             _ = connection.closed() => return Ok(()),
             _ = async {
-                if let Some(limiter) = bandwidth.as_deref() {
+                if let Some(limiter) = revocation.as_deref() {
                     wait_limiter_revoke(limiter).await;
                 } else {
                     std::future::pending::<()>().await;
@@ -1468,6 +1483,40 @@ mod tests {
                 .await
                 .expect("revocation should wake waiter");
         });
+    }
+
+    #[test]
+    fn unlimited_tuic_user_keeps_revoke_out_of_data_limiter() {
+        let cert = test_cert("tuic-unlimited-fast-path");
+        let server = tuic_server(&cert, "127.0.0.1:0".parse().expect("addr"));
+        let user = user();
+
+        let revocation = server.bandwidth.limiter_for(Some(&user));
+        let bandwidth = server.bandwidth.limiter_for_limited(Some(&user));
+
+        assert!(revocation.is_some());
+        assert!(bandwidth.is_none());
+        assert!(server.bandwidth.has_limiter_for(&user.uuid));
+    }
+
+    #[test]
+    fn limited_tuic_user_uses_data_limiter() {
+        let cert = test_cert("tuic-limited-path");
+        let server = tuic_server(&cert, "127.0.0.1:0".parse().expect("addr"));
+        let mut user = user();
+        user.speed_limit = 10;
+
+        let revocation = server
+            .bandwidth
+            .limiter_for(Some(&user))
+            .expect("revocation limiter");
+        let bandwidth = server
+            .bandwidth
+            .limiter_for_limited(Some(&user))
+            .expect("data limiter");
+
+        assert!(Arc::ptr_eq(&revocation, &bandwidth));
+        assert!(bandwidth.bytes_per_second() > 0);
     }
 
     #[test]
