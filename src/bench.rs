@@ -4,6 +4,7 @@ use std::future::poll_fn;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -53,6 +54,7 @@ const MAX_UDP_PAYLOAD_SIZE: usize = 65_507;
 const MAX_REQUEST_RETRIES: usize = 3;
 const UDP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const UDP_ECHO_SOCKET_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+const BENCH_IN_PROCESS_ENV: &str = "KELI_CORE_BENCH_IN_PROCESS";
 const DEFAULT_SUITE_COMMANDS: &[&str] = &[
     "direct-tcp-stream",
     "direct-tcp-proxy-stream",
@@ -728,7 +730,7 @@ fn run_bench_suite(options: &BenchSuiteOptions) -> io::Result<BenchSuiteReport> 
     let mut runs = Vec::new();
     for command in &options.commands {
         for repeat in 1..=options.repeats {
-            let report = run_named_bench(command, &options.bench)?;
+            let report = run_named_bench_isolated(command, &options.bench)?;
             runs.push(BenchSuiteRun {
                 command: command.clone(),
                 repeat,
@@ -749,6 +751,39 @@ fn run_bench_suite(options: &BenchSuiteOptions) -> io::Result<BenchSuiteReport> 
         repeats: options.repeats,
         runs,
         summaries,
+    })
+}
+
+fn run_named_bench_isolated(command: &str, options: &BenchOptions) -> io::Result<BenchReport> {
+    if std::env::var_os(BENCH_IN_PROCESS_ENV).is_some() {
+        return run_named_bench(command, options);
+    }
+
+    let output = Command::new(std::env::current_exe()?)
+        .env(BENCH_IN_PROCESS_ENV, "1")
+        .arg("bench")
+        .arg(command)
+        .arg("--streams")
+        .arg(options.streams.to_string())
+        .arg("--requests")
+        .arg(options.requests.to_string())
+        .arg("--payload")
+        .arg(options.payload_size.to_string())
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("bench {command} subprocess failed: {stderr}"),
+        ));
+    }
+
+    serde_json::from_slice(&output.stdout).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bench {command} subprocess returned invalid JSON: {error}"),
+        )
     })
 }
 
