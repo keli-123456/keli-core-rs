@@ -34,6 +34,9 @@ const UDP_DATAGRAM_BUFFER_SIZE: usize = 1024 * 1024;
 const UDP_PACKET_BUFFER_SIZE: usize = 64 * 1024;
 const STREAM_TRAFFIC_FLUSH_BYTES: u64 = 1024 * 1024;
 const UDP_TRAFFIC_FLUSH_BYTES: u64 = 64 * 1024;
+const UDP_FRAGMENT_IDLE_TIMEOUT_MS: u64 = 10_000;
+const UDP_MAX_FRAGMENT_SETS: usize = 4096;
+const UDP_MAX_REASSEMBLED_BYTES: usize = UDP_PACKET_BUFFER_SIZE;
 const UDP_SESSION_IDLE_TIMEOUT_MS: u64 = 60_000;
 const UDP_SESSION_CLEANUP_INTERVAL_MS: u64 = 10_000;
 
@@ -451,7 +454,9 @@ impl Hysteria2Server {
                 },
                 _ = bandwidth.wait_revoked() => return Ok(()),
                 _ = cleanup.tick() => {
-                    prune_udp_sessions(&sessions, now_millis());
+                    let now_ms = now_millis();
+                    fragments.prune_expired(now_ms);
+                    prune_udp_sessions(&sessions, now_ms);
                     continue;
                 },
             };
@@ -914,10 +919,20 @@ struct UdpFragmentStore {
 struct UdpFragmentSet {
     target: SocksTarget,
     parts: Vec<Option<Vec<u8>>>,
+    created_ms: u64,
+    received_bytes: usize,
 }
 
 impl UdpFragmentStore {
     fn push(&mut self, message: UdpDatagram) -> io::Result<Option<UdpDatagram>> {
+        self.push_with_now(message, None)
+    }
+
+    fn push_with_now(
+        &mut self,
+        message: UdpDatagram,
+        now_ms: Option<u64>,
+    ) -> io::Result<Option<UdpDatagram>> {
         if message.fragment_count == 0 || message.fragment_id >= message.fragment_count {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -928,12 +943,22 @@ impl UdpFragmentStore {
             return Ok(Some(message));
         }
 
+        let now_ms = now_ms.unwrap_or_else(now_millis);
+        self.prune_expired(now_ms);
         let key = (message.session_id, message.packet_id);
         let count = message.fragment_count as usize;
         let index = message.fragment_id as usize;
+        if !self.fragments.contains_key(&key) && self.fragments.len() >= UDP_MAX_FRAGMENT_SETS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "too many incomplete hysteria2 udp fragment groups",
+            ));
+        }
         let set = self.fragments.entry(key).or_insert_with(|| UdpFragmentSet {
             target: message.target.clone(),
             parts: vec![None; count],
+            created_ms: now_ms,
+            received_bytes: 0,
         });
         if set.parts.len() != count || set.target != message.target {
             self.fragments.remove(&key);
@@ -942,13 +967,24 @@ impl UdpFragmentStore {
                 "mismatched hysteria2 udp fragment group",
             ));
         }
+        if let Some(previous) = set.parts[index].take() {
+            set.received_bytes = set.received_bytes.saturating_sub(previous.len());
+        }
+        if set.received_bytes.saturating_add(message.data.len()) > UDP_MAX_REASSEMBLED_BYTES {
+            self.fragments.remove(&key);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "hysteria2 udp fragment group is too large",
+            ));
+        }
+        set.received_bytes = set.received_bytes.saturating_add(message.data.len());
         set.parts[index] = Some(message.data);
         if !set.parts.iter().all(Option::is_some) {
             return Ok(None);
         }
 
         let set = self.fragments.remove(&key).expect("fragment set exists");
-        let mut data = Vec::new();
+        let mut data = Vec::with_capacity(set.received_bytes);
         for part in set.parts {
             data.extend_from_slice(&part.expect("all fragments present"));
         }
@@ -960,6 +996,13 @@ impl UdpFragmentStore {
             target: set.target,
             data,
         }))
+    }
+
+    fn prune_expired(&mut self, now_ms: u64) -> usize {
+        let before = self.fragments.len();
+        self.fragments
+            .retain(|_, set| now_ms.saturating_sub(set.created_ms) < UDP_FRAGMENT_IDLE_TIMEOUT_MS);
+        before.saturating_sub(self.fragments.len())
     }
 }
 
@@ -2061,9 +2104,9 @@ mod tests {
             parse_udp_datagram(&encode_udp_datagram(7, 12, 1, 2, "127.0.0.1:53", b"llo").unwrap())
                 .unwrap();
 
-        assert!(fragments.push(first).unwrap().is_none());
+        assert!(fragments.push_with_now(first, Some(100)).unwrap().is_none());
         let message = fragments
-            .push(second)
+            .push_with_now(second, Some(101))
             .unwrap()
             .expect("complete fragmented message");
 
@@ -2072,6 +2115,49 @@ mod tests {
         assert_eq!(message.fragment_id, 0);
         assert_eq!(message.fragment_count, 1);
         assert_eq!(message.data, b"hello");
+    }
+
+    #[test]
+    fn expires_stale_hysteria2_udp_fragments() {
+        let mut fragments = UdpFragmentStore::default();
+        let first =
+            parse_udp_datagram(&encode_udp_datagram(7, 12, 0, 2, "127.0.0.1:53", b"he").unwrap())
+                .unwrap();
+
+        assert!(fragments.push_with_now(first, Some(100)).unwrap().is_none());
+        assert_eq!(
+            fragments.prune_expired(100 + UDP_FRAGMENT_IDLE_TIMEOUT_MS + 1),
+            1
+        );
+        assert!(fragments.fragments.is_empty());
+    }
+
+    #[test]
+    fn rejects_oversized_hysteria2_udp_fragment_group() {
+        let mut fragments = UdpFragmentStore::default();
+        let first = UdpDatagram {
+            session_id: 7,
+            packet_id: 12,
+            fragment_id: 0,
+            fragment_count: 2,
+            target: SocksTarget {
+                host: "127.0.0.1".to_string(),
+                port: 53,
+            },
+            data: vec![0u8; UDP_MAX_REASSEMBLED_BYTES],
+        };
+        let second = UdpDatagram {
+            fragment_id: 1,
+            data: vec![0u8; 1],
+            ..first.clone()
+        };
+
+        assert!(fragments.push_with_now(first, Some(100)).unwrap().is_none());
+        let error = fragments
+            .push_with_now(second, Some(101))
+            .expect_err("oversized fragment group should fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(fragments.fragments.is_empty());
     }
 
     #[test]
