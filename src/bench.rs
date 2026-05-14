@@ -47,7 +47,6 @@ const TUIC_ATYP_DOMAIN: u8 = 0x00;
 const TUIC_ATYP_IPV4: u8 = 0x01;
 const TUIC_ATYP_IPV6: u8 = 0x02;
 const TUIC_ATYP_NONE: u8 = 0xff;
-const ANYTLS_CMD_SYN: u8 = 1;
 const ANYTLS_CMD_PSH: u8 = 2;
 const ANYTLS_CMD_FIN: u8 = 3;
 const ANYTLS_CMD_UPDATE_PADDING_SCHEME: u8 = 6;
@@ -3328,7 +3327,7 @@ fn run_anytls_tcp_stream_client(
     write_anytls_auth(&mut stream)?;
     write_anytls_frame(
         &mut stream,
-        ANYTLS_CMD_SYN,
+        ANYTLS_CMD_PSH,
         ANYTLS_STREAM_ID,
         &socks_target_bytes(echo_addr),
     )?;
@@ -3654,9 +3653,20 @@ fn read_anytls_frame<R: Read>(reader: &mut R) -> io::Result<(u8, u32, Vec<u8>)> 
 
 fn read_anytls_synack<R: Read>(reader: &mut R) -> io::Result<()> {
     loop {
-        let (command, stream_id, _) = read_anytls_frame(reader)?;
+        let (command, stream_id, payload) = read_anytls_frame(reader)?;
         match command {
-            ANYTLS_CMD_SYNACK if stream_id == ANYTLS_STREAM_ID => return Ok(()),
+            ANYTLS_CMD_SYNACK if stream_id == ANYTLS_STREAM_ID => {
+                if payload.is_empty() {
+                    return Ok(());
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "anytls bench SYN rejected: {}",
+                        String::from_utf8_lossy(&payload)
+                    ),
+                ));
+            }
             ANYTLS_CMD_SERVER_SETTINGS | ANYTLS_CMD_UPDATE_PADDING_SCHEME => {}
             other => {
                 return Err(io::Error::new(
