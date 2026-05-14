@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +33,7 @@ const RESPONSE_ERROR: u8 = 0x01;
 const UDP_DATAGRAM_BUFFER_SIZE: usize = 1024 * 1024;
 const UDP_PACKET_BUFFER_SIZE: usize = 64 * 1024;
 const STREAM_TRAFFIC_FLUSH_BYTES: u64 = 1024 * 1024;
+const UDP_TRAFFIC_FLUSH_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Hysteria2ServerConfig {
@@ -565,14 +566,7 @@ impl Hysteria2Server {
             return Ok(());
         }
         session.socket.send_to(&message.data, target_addr).await?;
-        self.traffic.add_with_user_id(
-            self.config.node_tag.clone(),
-            user_uuid.to_string(),
-            Some(user_id),
-            message.data.len() as u64,
-            0,
-            Some(client_ip),
-        );
+        session.add_upload(message.data.len() as u64);
         Ok(())
     }
 
@@ -609,6 +603,13 @@ impl Hysteria2Server {
             target: target.clone(),
             target_addr,
             next_packet_id: AtomicU16::new(0),
+            traffic: self.traffic.clone(),
+            node_tag: self.config.node_tag.clone(),
+            user_uuid: user_uuid.to_string(),
+            user_id,
+            client_ip,
+            pending_upload: AtomicU64::new(0),
+            pending_download: AtomicU64::new(0),
         });
         {
             let mut sessions = sessions
@@ -625,15 +626,8 @@ impl Hysteria2Server {
 
         let receiver = session.clone();
         let connection = connection.clone();
-        let node_tag = self.config.node_tag.clone();
-        let user_uuid = user_uuid.to_string();
-        let traffic = self.traffic.clone();
         tokio::spawn(async move {
-            let _ = receive_udp_replies(
-                session_id, receiver, connection, node_tag, user_uuid, user_id, traffic, bandwidth,
-                client_ip,
-            )
-            .await;
+            let _ = receive_udp_replies(session_id, receiver, connection, bandwidth).await;
         });
         Ok((session, target_addr))
     }
@@ -784,6 +778,57 @@ struct UdpRelaySession {
     target: SocksTarget,
     target_addr: SocketAddr,
     next_packet_id: AtomicU16,
+    traffic: SharedTrafficRegistry,
+    node_tag: String,
+    user_uuid: String,
+    user_id: u64,
+    client_ip: IpAddr,
+    pending_upload: AtomicU64,
+    pending_download: AtomicU64,
+}
+
+impl UdpRelaySession {
+    fn add_upload(&self, bytes: u64) {
+        self.add_pending(&self.pending_upload, bytes);
+    }
+
+    fn add_download(&self, bytes: u64) {
+        self.add_pending(&self.pending_download, bytes);
+    }
+
+    fn add_pending(&self, counter: &AtomicU64, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let pending = counter
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
+        if pending >= UDP_TRAFFIC_FLUSH_BYTES {
+            self.flush_traffic();
+        }
+    }
+
+    fn flush_traffic(&self) {
+        let upload = self.pending_upload.swap(0, Ordering::AcqRel);
+        let download = self.pending_download.swap(0, Ordering::AcqRel);
+        if upload == 0 && download == 0 {
+            return;
+        }
+        self.traffic.add_with_user_id(
+            self.node_tag.clone(),
+            self.user_uuid.clone(),
+            Some(self.user_id),
+            upload,
+            download,
+            Some(self.client_ip),
+        );
+    }
+}
+
+impl Drop for UdpRelaySession {
+    fn drop(&mut self) {
+        self.flush_traffic();
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -876,12 +921,7 @@ async fn receive_udp_replies(
     session_id: u32,
     session: Arc<UdpRelaySession>,
     connection: quinn::Connection,
-    node_tag: String,
-    user_uuid: String,
-    user_id: u64,
-    traffic: SharedTrafficRegistry,
     bandwidth: DirectionalLimiters,
-    client_ip: IpAddr,
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; UDP_PACKET_BUFFER_SIZE];
     loop {
@@ -907,14 +947,7 @@ async fn receive_udp_replies(
         {
             continue;
         }
-        traffic.add_with_user_id(
-            node_tag.clone(),
-            user_uuid.clone(),
-            Some(user_id),
-            0,
-            read as u64,
-            Some(client_ip),
-        );
+        session.add_download(read as u64);
     }
 }
 
@@ -1394,7 +1427,7 @@ mod tests {
     use std::fs;
     use std::future::poll_fn;
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use quinn::crypto::rustls::QuicClientConfig;
@@ -2225,6 +2258,61 @@ mod tests {
 
             stop.store(true, Ordering::SeqCst);
             server_task.await.expect("server task");
+        });
+    }
+
+    #[test]
+    fn hysteria2_udp_session_batches_traffic_and_flushes_tail() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let traffic = TrafficRegistry::shared();
+            let socket = Arc::new(
+                UdpSocket::bind("127.0.0.1:0")
+                    .await
+                    .expect("udp bind"),
+            );
+            let session = Arc::new(UdpRelaySession {
+                socket,
+                target: SocksTarget {
+                    host: "127.0.0.1".to_string(),
+                    port: 53,
+                },
+                target_addr: "127.0.0.1:53".parse().expect("target addr"),
+                next_packet_id: AtomicU16::new(0),
+                traffic: traffic.clone(),
+                node_tag: "node-a".to_string(),
+                user_uuid: "user-a".to_string(),
+                user_id: 42,
+                client_ip: "127.0.0.2".parse().expect("client ip"),
+                pending_upload: AtomicU64::new(0),
+                pending_download: AtomicU64::new(0),
+            });
+
+            session.add_upload(UDP_TRAFFIC_FLUSH_BYTES - 1);
+            assert!(traffic.drain_all().is_empty());
+
+            session.add_upload(1);
+            let records = traffic.drain_all();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].node_tag, "node-a");
+            assert_eq!(records[0].user_uuid, "user-a");
+            assert_eq!(records[0].user_id, Some(42));
+            assert_eq!(records[0].upload, UDP_TRAFFIC_FLUSH_BYTES);
+            assert_eq!(records[0].download, 0);
+            assert_eq!(records[0].online_ips, vec!["127.0.0.2"]);
+
+            session.add_download(7);
+            assert!(traffic.drain_all().is_empty());
+
+            drop(session);
+            let records = traffic.drain_all();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].upload, 0);
+            assert_eq!(records[0].download, 7);
+            assert_eq!(records[0].user_id, Some(42));
         });
     }
 }
