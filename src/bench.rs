@@ -734,6 +734,7 @@ fn run_bench_suite(options: &BenchSuiteOptions) -> io::Result<BenchSuiteReport> 
                 repeat,
                 report,
             });
+            settle_bench_resources();
         }
     }
     let summaries = summarize_bench_runs(&runs);
@@ -767,6 +768,7 @@ fn run_external_bench_suite(options: &ExternalBenchSuiteOptions) -> io::Result<B
                 repeat,
                 report,
             });
+            settle_bench_resources();
         }
     }
     let summaries = summarize_bench_runs(&runs);
@@ -782,6 +784,10 @@ fn run_external_bench_suite(options: &ExternalBenchSuiteOptions) -> io::Result<B
         runs,
         summaries,
     })
+}
+
+fn settle_bench_resources() {
+    thread::sleep(Duration::from_millis(500));
 }
 
 fn run_external_named_bench(
