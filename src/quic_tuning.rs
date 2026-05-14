@@ -2,7 +2,7 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 
-use quinn::VarInt;
+use quinn::{AckFrequencyConfig, VarInt};
 use socket2::SockRef;
 
 const PROXY_STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
@@ -10,6 +10,8 @@ const PROXY_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 const PROXY_SEND_WINDOW: u64 = 32 * 1024 * 1024;
 const PROXY_MAX_CONCURRENT_STREAMS: u32 = 1024;
 const PROXY_UDP_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const PROXY_ACK_ELICITING_THRESHOLD: u32 = 8;
+const PROXY_ACK_MAX_DELAY_MS: u64 = 5;
 
 pub(crate) fn server_endpoint_with_tuned_udp_socket(
     server_config: quinn::ServerConfig,
@@ -32,10 +34,19 @@ pub(crate) fn tune_quic_udp_socket(socket: &UdpSocket) {
 }
 
 pub(crate) fn apply_proxy_quic_transport_defaults(transport: &mut quinn::TransportConfig) {
+    let mut ack_frequency = AckFrequencyConfig::default();
+    ack_frequency
+        .ack_eliciting_threshold(VarInt::from_u32(PROXY_ACK_ELICITING_THRESHOLD))
+        .max_ack_delay(Some(std::time::Duration::from_millis(
+            PROXY_ACK_MAX_DELAY_MS,
+        )));
+
     transport
         .stream_receive_window(VarInt::from_u32(PROXY_STREAM_RECEIVE_WINDOW))
         .receive_window(VarInt::from_u32(PROXY_RECEIVE_WINDOW))
         .send_window(PROXY_SEND_WINDOW)
+        .send_fairness(false)
+        .ack_frequency_config(Some(ack_frequency))
         .max_concurrent_bidi_streams(VarInt::from_u32(PROXY_MAX_CONCURRENT_STREAMS))
         .max_concurrent_uni_streams(VarInt::from_u32(PROXY_MAX_CONCURRENT_STREAMS));
 }
