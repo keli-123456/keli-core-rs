@@ -437,9 +437,8 @@ impl Hysteria2Server {
         client_ip: IpAddr,
     ) -> io::Result<()> {
         let mut fragments = UdpFragmentStore::default();
-        let mut cleanup = tokio::time::interval(Duration::from_millis(
-            UDP_SESSION_CLEANUP_INTERVAL_MS,
-        ));
+        let mut cleanup =
+            tokio::time::interval(Duration::from_millis(UDP_SESSION_CLEANUP_INTERVAL_MS));
         cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let datagram = tokio::select! {
@@ -505,8 +504,9 @@ impl Hysteria2Server {
             }
         };
 
+        let has_data_limits = bandwidth.has_data_limits();
         if let Some(outbound) = outbound {
-            if !bandwidth.wait_upload(message.data.len()).await {
+            if has_data_limits && !bandwidth.wait_upload(message.data.len()).await {
                 return Ok(());
             }
             match send_udp_outbound_tokio(
@@ -518,7 +518,7 @@ impl Hysteria2Server {
             .await
             {
                 Ok((source, response)) => {
-                    if !bandwidth.wait_download(response.len()).await {
+                    if has_data_limits && !bandwidth.wait_download(response.len()).await {
                         return Ok(());
                     }
                     let address = format_socket_addr(&source);
@@ -574,7 +574,7 @@ impl Hysteria2Server {
                 client_ip,
             )
             .await?;
-        if !bandwidth.wait_upload(message.data.len()).await {
+        if has_data_limits && !bandwidth.wait_upload(message.data.len()).await {
             return Ok(());
         }
         session.socket.send_to(&message.data, target_addr).await?;
@@ -982,6 +982,7 @@ async fn receive_udp_replies(
     bandwidth: DirectionalLimiters,
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; UDP_PACKET_BUFFER_SIZE];
+    let has_data_limits = bandwidth.has_data_limits();
     loop {
         if session.is_closed() {
             return Ok(());
@@ -998,7 +999,7 @@ async fn receive_udp_replies(
                 continue;
             }
         };
-        if !bandwidth.wait_download(read).await {
+        if has_data_limits && !bandwidth.wait_download(read).await {
             return Ok(());
         }
         let packet_id = session.next_packet_id.fetch_add(1, Ordering::Relaxed);
@@ -2343,11 +2344,7 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             let traffic = TrafficRegistry::shared();
-            let socket = Arc::new(
-                UdpSocket::bind("127.0.0.1:0")
-                    .await
-                    .expect("udp bind"),
-            );
+            let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("udp bind"));
             let session = Arc::new(UdpRelaySession {
                 socket,
                 target: SocksTarget {
@@ -2400,11 +2397,7 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             let traffic = TrafficRegistry::shared();
-            let socket = Arc::new(
-                UdpSocket::bind("127.0.0.1:0")
-                    .await
-                    .expect("udp bind"),
-            );
+            let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("udp bind"));
             let session = Arc::new(UdpRelaySession {
                 socket,
                 target: SocksTarget {
@@ -2428,10 +2421,7 @@ mod tests {
             let sessions = Arc::new(Mutex::new(HashMap::from([(9, session.clone())])));
 
             assert_eq!(prune_udp_sessions(&sessions, now_millis()), 1);
-            assert!(sessions
-                .lock()
-                .expect("sessions lock")
-                .is_empty());
+            assert!(sessions.lock().expect("sessions lock").is_empty());
             assert!(session.is_closed());
             let records = traffic.drain_all();
             assert_eq!(records.len(), 1);
