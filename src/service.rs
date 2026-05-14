@@ -581,6 +581,7 @@ fn start_hysteria2_listener(
             up_mbps: inbound.transport.up_mbps,
             down_mbps: inbound.transport.down_mbps,
             ignore_client_bandwidth: inbound.transport.ignore_client_bandwidth,
+            congestion_control: inbound.transport.congestion_control.clone(),
             obfs: hysteria2_obfs_config(&inbound.transport),
         },
         traffic,

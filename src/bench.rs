@@ -2049,6 +2049,7 @@ async fn run_hy2_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
         up_mbps: 0,
         down_mbps: 0,
         ignore_client_bandwidth: false,
+        congestion_control: String::new(),
         obfs: None,
     });
     let endpoint = server.bind()?;
@@ -2129,6 +2130,7 @@ async fn run_hy2_tcp_stream_bench_async(options: &BenchOptions) -> io::Result<Be
         up_mbps: 0,
         down_mbps: 0,
         ignore_client_bandwidth: false,
+        congestion_control: String::new(),
         obfs: None,
     });
     let endpoint = server.bind()?;
@@ -2231,6 +2233,7 @@ async fn run_hy2_udp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
         up_mbps: 0,
         down_mbps: 0,
         ignore_client_bandwidth: false,
+        congestion_control: String::new(),
         obfs: None,
     });
     let endpoint = server.bind()?;

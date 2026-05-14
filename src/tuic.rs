@@ -14,6 +14,7 @@ use crate::limits::{
     sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard,
     UserSessionTracker,
 };
+use crate::quic_tuning::{apply_proxy_quic_transport_defaults, apply_quic_congestion_control};
 use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
@@ -103,6 +104,7 @@ impl TuicServer {
             QuicServerConfig::try_from(server_crypto).map_err(io_other)?,
         ));
         let mut transport = quinn::TransportConfig::default();
+        apply_proxy_quic_transport_defaults(&mut transport);
         transport
             .datagram_receive_buffer_size(Some(UDP_DATAGRAM_BUFFER_SIZE))
             .datagram_send_buffer_size(UDP_DATAGRAM_BUFFER_SIZE);
@@ -1301,32 +1303,7 @@ fn apply_tuic_congestion_control(
     transport: &mut quinn::TransportConfig,
     value: &str,
 ) -> io::Result<()> {
-    match normalize_tuic_congestion_control(value).as_str() {
-        "" | "cubic" => {
-            transport
-                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
-            Ok(())
-        }
-        "bbr" => {
-            transport
-                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
-            Ok(())
-        }
-        "new_reno" | "newreno" | "reno" => {
-            transport.congestion_controller_factory(Arc::new(
-                quinn::congestion::NewRenoConfig::default(),
-            ));
-            Ok(())
-        }
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unsupported tuic congestion_control {other}"),
-        )),
-    }
-}
-
-fn normalize_tuic_congestion_control(value: &str) -> String {
-    value.trim().to_ascii_lowercase().replace(['-', ' '], "_")
+    apply_quic_congestion_control(transport, value, "cubic", "tuic")
 }
 
 #[cfg(test)]

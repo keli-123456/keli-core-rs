@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::RouteAction::{Block, Direct, Outbound};
 use crate::protocol::Protocol;
+use crate::quic_tuning::is_supported_quic_congestion_control;
 use crate::reality::{decode_reality_private_key, decode_short_id};
 use crate::shadowsocks::is_supported_shadowsocks_cipher;
 use crate::user::CoreUser;
@@ -998,7 +999,7 @@ impl InboundConfig {
                     self.tag
                 )));
             }
-            validate_hysteria2_obfs(&self.tag, &self.transport)?;
+            validate_hysteria2_transport_options(&self.tag, &self.transport)?;
         }
 
         Ok(())
@@ -1091,8 +1092,15 @@ fn validate_protocol_transport_fields(inbound: &InboundConfig) -> Result<(), Val
         )));
     }
 
-    let has_tuic_options =
-        !transport.congestion_control.trim().is_empty() || transport.zero_rtt_handshake;
+    let has_congestion = !transport.congestion_control.trim().is_empty();
+    if has_congestion && !matches!(inbound.protocol, Protocol::Tuic | Protocol::Hysteria2) {
+        return Err(ValidationError::new(format!(
+            "{} {protocol} does not support quic congestion_control",
+            inbound.tag
+        )));
+    }
+
+    let has_tuic_options = transport.zero_rtt_handshake;
     if inbound.protocol != Protocol::Tuic && has_tuic_options {
         return Err(ValidationError::new(format!(
             "{} {protocol} does not support tuic transport options",
@@ -1321,7 +1329,7 @@ fn validate_tuic_transport_options(
     transport: &TransportConfig,
 ) -> Result<(), ValidationError> {
     let congestion = transport.congestion_control.trim();
-    if !congestion.is_empty() && !is_supported_tuic_congestion_control(congestion) {
+    if !congestion.is_empty() && !is_supported_quic_congestion_control(congestion) {
         return Err(ValidationError::new(format!(
             "{tag} tuic congestion_control {congestion} is not supported"
         )));
@@ -1334,18 +1342,17 @@ fn validate_tuic_transport_options(
     Ok(())
 }
 
-fn is_supported_tuic_congestion_control(value: &str) -> bool {
-    matches!(
-        value
-            .trim()
-            .to_ascii_lowercase()
-            .replace(['-', ' '], "_")
-            .as_str(),
-        "" | "cubic" | "bbr" | "new_reno" | "newreno" | "reno"
-    )
-}
+fn validate_hysteria2_transport_options(
+    tag: &str,
+    transport: &TransportConfig,
+) -> Result<(), ValidationError> {
+    let congestion = transport.congestion_control.trim();
+    if !congestion.is_empty() && !is_supported_quic_congestion_control(congestion) {
+        return Err(ValidationError::new(format!(
+            "{tag} hysteria2 congestion_control {congestion} is not supported"
+        )));
+    }
 
-fn validate_hysteria2_obfs(tag: &str, transport: &TransportConfig) -> Result<(), ValidationError> {
     let obfs = transport.obfs.as_deref().unwrap_or("").trim();
     let password = transport.obfs_password.as_deref().unwrap_or("").trim();
     if obfs.is_empty() && password.is_empty() {
@@ -2195,8 +2202,8 @@ mod tests {
         inbound.transport.congestion_control = "bbr".to_string();
         let error = inbound
             .validate()
-            .expect_err("non-tuic congestion should be rejected");
-        assert!(error.to_string().contains("tuic transport options"));
+            .expect_err("non-quic congestion should be rejected");
+        assert!(error.to_string().contains("quic congestion_control"));
     }
 
     #[test]
@@ -2656,6 +2663,76 @@ mod tests {
 
             inbound.validate().expect("tuic congestion should validate");
         }
+    }
+
+    #[test]
+    fn validates_hysteria2_supported_congestion_controls() {
+        for congestion in ["cubic", "bbr", "new-reno"] {
+            let inbound = InboundConfig {
+                tag: "panel|hysteria2|1".to_string(),
+                protocol: Protocol::Hysteria2,
+                listen: "0.0.0.0".to_string(),
+                port: 443,
+                users: vec![user()],
+                cipher: None,
+                flow: String::new(),
+                padding_scheme: Vec::new(),
+                transport: TransportConfig {
+                    network: "hysteria2".to_string(),
+                    congestion_control: congestion.to_string(),
+                    ..TransportConfig::default()
+                },
+                tls: Some(TlsConfig {
+                    server_name: "hy2.example.test".to_string(),
+                    cert_file: Some("/tmp/hy2.crt".to_string()),
+                    key_file: Some("/tmp/hy2.key".to_string()),
+                    alpn: vec!["h3".to_string()],
+                    reject_unknown_sni: false,
+                    reality: None,
+                }),
+                sniffing: SniffingConfig::default(),
+                routes: Vec::new(),
+            };
+
+            inbound
+                .validate()
+                .expect("hysteria2 congestion should validate");
+        }
+    }
+
+    #[test]
+    fn rejects_hysteria2_unsupported_congestion_control() {
+        let inbound = InboundConfig {
+            tag: "panel|hysteria2|1".to_string(),
+            protocol: Protocol::Hysteria2,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![user()],
+            cipher: None,
+            flow: String::new(),
+            padding_scheme: Vec::new(),
+            transport: TransportConfig {
+                network: "hysteria2".to_string(),
+                congestion_control: "brutal".to_string(),
+                ..TransportConfig::default()
+            },
+            tls: Some(TlsConfig {
+                server_name: "hy2.example.test".to_string(),
+                cert_file: Some("/tmp/hy2.crt".to_string()),
+                key_file: Some("/tmp/hy2.key".to_string()),
+                alpn: vec!["h3".to_string()],
+                reject_unknown_sni: false,
+                reality: None,
+            }),
+            sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
+        };
+
+        let error = inbound
+            .validate()
+            .expect_err("unsupported hysteria2 congestion should fail");
+
+        assert!(error.to_string().contains("congestion_control brutal"));
     }
 
     #[test]

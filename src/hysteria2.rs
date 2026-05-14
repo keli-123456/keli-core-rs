@@ -15,6 +15,7 @@ use crate::limits::{
     sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard,
     UserSessionTracker,
 };
+use crate::quic_tuning::{apply_proxy_quic_transport_defaults, apply_quic_congestion_control};
 use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 use crate::salamander::SalamanderUdpSocket;
 use crate::socks5::SocksTarget;
@@ -28,6 +29,7 @@ const RESPONSE_OK: u8 = 0x00;
 const RESPONSE_ERROR: u8 = 0x01;
 const UDP_DATAGRAM_BUFFER_SIZE: usize = 1024 * 1024;
 const UDP_PACKET_BUFFER_SIZE: usize = 64 * 1024;
+const STREAM_TRAFFIC_FLUSH_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Hysteria2ServerConfig {
@@ -44,6 +46,7 @@ pub struct Hysteria2ServerConfig {
     pub up_mbps: u32,
     pub down_mbps: u32,
     pub ignore_client_bandwidth: bool,
+    pub congestion_control: String,
     pub obfs: Option<Hysteria2ObfsConfig>,
 }
 
@@ -108,6 +111,13 @@ impl Hysteria2Server {
             QuicServerConfig::try_from(server_crypto).map_err(io_other)?,
         ));
         let mut transport = quinn::TransportConfig::default();
+        apply_proxy_quic_transport_defaults(&mut transport);
+        apply_quic_congestion_control(
+            &mut transport,
+            &self.config.congestion_control,
+            "cubic",
+            "hysteria2",
+        )?;
         transport
             .datagram_receive_buffer_size(Some(UDP_DATAGRAM_BUFFER_SIZE))
             .datagram_send_buffer_size(UDP_DATAGRAM_BUFFER_SIZE);
@@ -1159,53 +1169,81 @@ async fn relay_streams(
     let upload = async {
         let bandwidth = bandwidth.clone();
         let mut total = 0u64;
+        let mut pending = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
             let revoke_watch = bandwidth.clone();
             let read = tokio::select! {
                 read = recv.read(&mut buffer) => read.map_err(io_other)?,
                 _ = revoke_watch.wait_revoked() => {
+                    if pending != 0 {
+                        on_upload(pending);
+                    }
                     let _ = remote_write.shutdown().await;
                     return Ok::<u64, io::Error>(total);
                 }
             };
             let Some(read) = read else {
+                if pending != 0 {
+                    on_upload(pending);
+                }
                 let _ = remote_write.shutdown().await;
                 return Ok::<u64, io::Error>(total);
             };
             if !bandwidth.wait_upload(read).await {
+                if pending != 0 {
+                    on_upload(pending);
+                }
                 let _ = remote_write.shutdown().await;
                 return Ok::<u64, io::Error>(total);
             }
             remote_write.write_all(&buffer[..read]).await?;
-            on_upload(read as u64);
             total = total.saturating_add(read as u64);
+            pending = pending.saturating_add(read as u64);
+            if pending >= STREAM_TRAFFIC_FLUSH_BYTES {
+                on_upload(pending);
+                pending = 0;
+            }
         }
     };
     let download = async {
         let bandwidth = bandwidth.clone();
         let mut total = 0u64;
+        let mut pending = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
             let revoke_watch = bandwidth.clone();
             let read = tokio::select! {
                 read = remote_read.read(&mut buffer) => read?,
                 _ = revoke_watch.wait_revoked() => {
+                    if pending != 0 {
+                        on_download(pending);
+                    }
                     let _ = send.finish();
                     return Ok::<u64, io::Error>(total);
                 }
             };
             if read == 0 {
+                if pending != 0 {
+                    on_download(pending);
+                }
                 let _ = send.finish();
                 return Ok::<u64, io::Error>(total);
             }
             if !bandwidth.wait_download(read).await {
+                if pending != 0 {
+                    on_download(pending);
+                }
                 let _ = send.finish();
                 return Ok::<u64, io::Error>(total);
             }
             send.write_all(&buffer[..read]).await.map_err(io_other)?;
-            on_download(read as u64);
             total = total.saturating_add(read as u64);
+            pending = pending.saturating_add(read as u64);
+            if pending >= STREAM_TRAFFIC_FLUSH_BYTES {
+                on_download(pending);
+                pending = 0;
+            }
         }
     };
     tokio::try_join!(upload, download)
@@ -1221,29 +1259,45 @@ async fn relay_streams_unlimited(
     let (mut remote_read, mut remote_write) = remote.into_split();
     let upload = async {
         let mut total = 0u64;
+        let mut pending = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
             let Some(read) = recv.read(&mut buffer).await.map_err(io_other)? else {
+                if pending != 0 {
+                    on_upload(pending);
+                }
                 let _ = remote_write.shutdown().await;
                 return Ok::<u64, io::Error>(total);
             };
             remote_write.write_all(&buffer[..read]).await?;
-            on_upload(read as u64);
             total = total.saturating_add(read as u64);
+            pending = pending.saturating_add(read as u64);
+            if pending >= STREAM_TRAFFIC_FLUSH_BYTES {
+                on_upload(pending);
+                pending = 0;
+            }
         }
     };
     let download = async {
         let mut total = 0u64;
+        let mut pending = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
             let read = remote_read.read(&mut buffer).await?;
             if read == 0 {
+                if pending != 0 {
+                    on_download(pending);
+                }
                 let _ = send.finish();
                 return Ok::<u64, io::Error>(total);
             }
             send.write_all(&buffer[..read]).await.map_err(io_other)?;
-            on_download(read as u64);
             total = total.saturating_add(read as u64);
+            pending = pending.saturating_add(read as u64);
+            if pending >= STREAM_TRAFFIC_FLUSH_BYTES {
+                on_download(pending);
+                pending = 0;
+            }
         }
     };
     tokio::try_join!(upload, download)
@@ -1432,6 +1486,7 @@ mod tests {
             up_mbps: 0,
             down_mbps: 0,
             ignore_client_bandwidth: false,
+            congestion_control: String::new(),
             obfs: None,
         })
     }
@@ -2017,6 +2072,7 @@ mod tests {
             recv.read_exact(&mut echoed).await.expect("echoed payload");
             assert_eq!(&echoed, b"ping");
 
+            send.finish().expect("finish payload");
             tokio::time::sleep(Duration::from_millis(50)).await;
             let records = server.drain_traffic(1);
             assert_eq!(records.len(), 1);
@@ -2026,7 +2082,6 @@ mod tests {
             assert_eq!(records[0].upload, 4);
             assert_eq!(records[0].download, 4);
 
-            send.finish().expect("finish payload");
             connection.close(0u32.into(), b"done");
             echo_task.await.expect("echo task");
 
