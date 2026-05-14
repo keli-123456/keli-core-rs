@@ -436,7 +436,6 @@ impl Hysteria2Server {
     ) -> io::Result<()> {
         let mut fragments = UdpFragmentStore::default();
         loop {
-            let revoke_watch = bandwidth.clone();
             let datagram = tokio::select! {
                 datagram = connection.read_datagram() => match datagram {
                     Ok(datagram) => datagram,
@@ -445,7 +444,7 @@ impl Hysteria2Server {
                     | Err(quinn::ConnectionError::ConnectionClosed(_)) => return Ok(()),
                     Err(error) => return Err(io_other(error)),
                 },
-                _ = revoke_watch.wait_revoked() => return Ok(()),
+                _ = bandwidth.wait_revoked() => return Ok(()),
             };
             let Ok(message) = parse_udp_datagram(&datagram) else {
                 continue;
@@ -928,11 +927,10 @@ async fn receive_udp_replies(
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; UDP_PACKET_BUFFER_SIZE];
     loop {
-        let revoke_watch = bandwidth.clone();
         let (read, peer) = tokio::select! {
             result = session.socket.recv_from(&mut buffer) => result?,
             _ = connection.closed() => return Ok(()),
-            _ = revoke_watch.wait_revoked() => return Ok(()),
+            _ = bandwidth.wait_revoked() => return Ok(()),
         };
         if !bandwidth.wait_download(read).await {
             return Ok(());
