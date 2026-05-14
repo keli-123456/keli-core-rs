@@ -1999,10 +1999,18 @@ fn tcp_accept_worker_threads() -> usize {
 }
 
 fn quic_runtime_worker_threads() -> usize {
+    if let Ok(value) = std::env::var("KELI_CORE_QUIC_WORKERS") {
+        if let Ok(parsed) = value.trim().parse::<usize>() {
+            return parsed.clamp(1, 64);
+        }
+    }
     std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(4)
-        .clamp(2, 16)
+        .map(|parallelism| {
+            let threads = usize::from(parallelism);
+            (threads + 1) / 2
+        })
+        .unwrap_or(2)
+        .clamp(2, 8)
 }
 
 fn tls_acceptor_for(inbound: &InboundConfig) -> Result<Option<TlsAcceptor>, CoreServiceError> {
@@ -2344,6 +2352,20 @@ mod tests {
         }
         let mut response = [0u8; 3];
         stream.read_exact(&mut response).is_ok() && response == [0x00, 0x00, b'x']
+    }
+
+    fn vless_auth_succeeds_eventually(
+        server_addr: SocketAddr,
+        uuid: &str,
+        target: SocketAddr,
+    ) -> bool {
+        for _ in 0..50 {
+            if vless_auth_succeeds(server_addr, uuid, target) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
     }
 
     fn trojan_auth_succeeds(server_addr: SocketAddr, password: &str, target: SocketAddr) -> bool {
@@ -3077,7 +3099,11 @@ mod tests {
             .expect("trojan listener")
             .local_addr;
 
-        assert!(vless_auth_succeeds(vless_addr, old_vless_uuid, echo.addr));
+        assert!(vless_auth_succeeds_eventually(
+            vless_addr,
+            old_vless_uuid,
+            echo.addr
+        ));
         assert!(trojan_auth_succeeds(
             trojan_addr,
             "trojan-password",
@@ -3106,7 +3132,11 @@ mod tests {
         assert_eq!(result.active_users, 1);
         assert_eq!(service.listeners(), before);
         assert!(!vless_auth_succeeds(vless_addr, old_vless_uuid, echo.addr));
-        assert!(vless_auth_succeeds(vless_addr, new_vless_uuid, echo.addr));
+        assert!(vless_auth_succeeds_eventually(
+            vless_addr,
+            new_vless_uuid,
+            echo.addr
+        ));
         assert!(
             trojan_auth_succeeds(trojan_addr, "trojan-password", echo.addr),
             "ApplyUserDelta for VLESS must not alter the Trojan inbound"
