@@ -3,7 +3,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use quinn::crypto::rustls::QuicServerConfig;
@@ -34,6 +34,8 @@ const UDP_DATAGRAM_BUFFER_SIZE: usize = 1024 * 1024;
 const UDP_PACKET_BUFFER_SIZE: usize = 64 * 1024;
 const STREAM_TRAFFIC_FLUSH_BYTES: u64 = 1024 * 1024;
 const UDP_TRAFFIC_FLUSH_BYTES: u64 = 64 * 1024;
+const UDP_SESSION_IDLE_TIMEOUT_MS: u64 = 60_000;
+const UDP_SESSION_CLEANUP_INTERVAL_MS: u64 = 10_000;
 
 #[derive(Clone, Debug)]
 pub struct Hysteria2ServerConfig {
@@ -435,6 +437,10 @@ impl Hysteria2Server {
         client_ip: IpAddr,
     ) -> io::Result<()> {
         let mut fragments = UdpFragmentStore::default();
+        let mut cleanup = tokio::time::interval(Duration::from_millis(
+            UDP_SESSION_CLEANUP_INTERVAL_MS,
+        ));
+        cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let datagram = tokio::select! {
                 datagram = connection.read_datagram() => match datagram {
@@ -445,6 +451,10 @@ impl Hysteria2Server {
                     Err(error) => return Err(io_other(error)),
                 },
                 _ = bandwidth.wait_revoked() => return Ok(()),
+                _ = cleanup.tick() => {
+                    prune_udp_sessions(&sessions, now_millis());
+                    continue;
+                },
             };
             let Ok(message) = parse_udp_datagram(&datagram) else {
                 continue;
@@ -591,6 +601,7 @@ impl Hysteria2Server {
                 .cloned()
         };
         if let Some(session) = existing {
+            session.touch();
             if session.target == *target {
                 return Ok((session.clone(), session.target_addr));
             }
@@ -610,6 +621,8 @@ impl Hysteria2Server {
             user_uuid: user_uuid.to_string(),
             user_id,
             client_ip,
+            closed: AtomicBool::new(false),
+            last_active_ms: AtomicU64::new(now_millis()),
             pending_upload: AtomicU64::new(0),
             pending_download: AtomicU64::new(0),
         });
@@ -618,6 +631,7 @@ impl Hysteria2Server {
                 .lock()
                 .expect("hysteria2 udp session lock poisoned");
             if let Some(existing) = sessions.get(&session_id) {
+                existing.touch();
                 if existing.target == *target {
                     return Ok((existing.clone(), existing.target_addr));
                 }
@@ -785,16 +799,38 @@ struct UdpRelaySession {
     user_uuid: String,
     user_id: u64,
     client_ip: IpAddr,
+    closed: AtomicBool,
+    last_active_ms: AtomicU64,
     pending_upload: AtomicU64,
     pending_download: AtomicU64,
 }
 
 impl UdpRelaySession {
+    fn touch(&self) {
+        self.last_active_ms.store(now_millis(), Ordering::Relaxed);
+    }
+
+    fn is_idle(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.last_active_ms.load(Ordering::Relaxed))
+            >= UDP_SESSION_IDLE_TIMEOUT_MS
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.flush_traffic();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     fn add_upload(&self, bytes: u64) {
+        self.touch();
         self.add_pending(&self.pending_upload, bytes);
     }
 
     fn add_download(&self, bytes: u64) {
+        self.touch();
         self.add_pending(&self.pending_download, bytes);
     }
 
@@ -831,6 +867,26 @@ impl Drop for UdpRelaySession {
     fn drop(&mut self) {
         self.flush_traffic();
     }
+}
+
+fn prune_udp_sessions(
+    sessions: &Arc<Mutex<HashMap<u32, Arc<UdpRelaySession>>>>,
+    now_ms: u64,
+) -> usize {
+    let mut removed = 0usize;
+    let mut sessions = sessions
+        .lock()
+        .expect("hysteria2 udp session lock poisoned");
+    sessions.retain(|_, session| {
+        if session.is_idle(now_ms) {
+            session.close();
+            removed = removed.saturating_add(1);
+            false
+        } else {
+            true
+        }
+    });
+    removed
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -927,10 +983,20 @@ async fn receive_udp_replies(
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; UDP_PACKET_BUFFER_SIZE];
     loop {
+        if session.is_closed() {
+            return Ok(());
+        }
         let (read, peer) = tokio::select! {
             result = session.socket.recv_from(&mut buffer) => result?,
             _ = connection.closed() => return Ok(()),
             _ = bandwidth.wait_revoked() => return Ok(()),
+            _ = tokio::time::sleep(Duration::from_millis(UDP_SESSION_CLEANUP_INTERVAL_MS)) => {
+                if session.is_closed() || session.is_idle(now_millis()) {
+                    session.close();
+                    return Ok(());
+                }
+                continue;
+            }
         };
         if !bandwidth.wait_download(read).await {
             return Ok(());
@@ -1421,6 +1487,13 @@ async fn read_exact(stream: &mut quinn::RecvStream, output: &mut [u8]) -> io::Re
 
 fn io_other(error: impl std::fmt::Debug) -> io::Error {
     io::Error::new(io::ErrorKind::Other, format!("{error:?}"))
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -2288,6 +2361,8 @@ mod tests {
                 user_uuid: "user-a".to_string(),
                 user_id: 42,
                 client_ip: "127.0.0.2".parse().expect("client ip"),
+                closed: AtomicBool::new(false),
+                last_active_ms: AtomicU64::new(now_millis()),
                 pending_upload: AtomicU64::new(0),
                 pending_download: AtomicU64::new(0),
             });
@@ -2313,6 +2388,55 @@ mod tests {
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].upload, 0);
             assert_eq!(records[0].download, 7);
+            assert_eq!(records[0].user_id, Some(42));
+        });
+    }
+
+    #[test]
+    fn prunes_idle_hysteria2_udp_sessions_and_flushes_tail() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let traffic = TrafficRegistry::shared();
+            let socket = Arc::new(
+                UdpSocket::bind("127.0.0.1:0")
+                    .await
+                    .expect("udp bind"),
+            );
+            let session = Arc::new(UdpRelaySession {
+                socket,
+                target: SocksTarget {
+                    host: "127.0.0.1".to_string(),
+                    port: 53,
+                },
+                target_addr: "127.0.0.1:53".parse().expect("target addr"),
+                next_packet_id: AtomicU16::new(0),
+                traffic: traffic.clone(),
+                node_tag: "node-a".to_string(),
+                user_uuid: "user-a".to_string(),
+                user_id: 42,
+                client_ip: "127.0.0.2".parse().expect("client ip"),
+                closed: AtomicBool::new(false),
+                last_active_ms: AtomicU64::new(
+                    now_millis().saturating_sub(UDP_SESSION_IDLE_TIMEOUT_MS + 1),
+                ),
+                pending_upload: AtomicU64::new(7),
+                pending_download: AtomicU64::new(11),
+            });
+            let sessions = Arc::new(Mutex::new(HashMap::from([(9, session.clone())])));
+
+            assert_eq!(prune_udp_sessions(&sessions, now_millis()), 1);
+            assert!(sessions
+                .lock()
+                .expect("sessions lock")
+                .is_empty());
+            assert!(session.is_closed());
+            let records = traffic.drain_all();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].upload, 7);
+            assert_eq!(records[0].download, 11);
             assert_eq!(records[0].user_id, Some(42));
         });
     }
