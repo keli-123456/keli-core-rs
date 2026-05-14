@@ -517,7 +517,7 @@ fn write_too_many_requests_response(writer: &mut impl Write) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
+    use std::io::{self, Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::thread;
@@ -639,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_http_user_stops_existing_connect_relay_on_next_payload_and_reports_tail() {
+    fn deleting_http_user_closes_existing_connect_relay_and_reports_tail() {
         let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
         let echo_addr = echo.local_addr().expect("echo addr");
         let (second_payload_tx, second_payload_rx) = mpsc::channel();
@@ -696,7 +696,10 @@ mod tests {
             .expect_err("deleted user should fail new authentication");
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 
-        let _ = client.write_all(b"y");
+        assert!(
+            tcp_connection_closed_eventually(&client),
+            "deleted user's existing HTTP CONNECT relay should close"
+        );
         assert!(
             !second_payload_rx
                 .recv_timeout(Duration::from_secs(2))
@@ -717,6 +720,40 @@ mod tests {
         assert_eq!(records[0].user_id, Some(1));
         assert_eq!(records[0].upload, 1);
         assert_eq!(records[0].download, 1);
+    }
+
+    fn tcp_connection_closed_eventually(stream: &TcpStream) -> bool {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
+        for _ in 0..50 {
+            let mut probe = [0u8; 1];
+            match stream.peek(&mut probe) {
+                Ok(0) => return true,
+                Ok(_) => return false,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::NotConnected
+                            | io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    return true;
+                }
+                Err(_) => return true,
+            }
+        }
+        false
     }
 
     #[test]

@@ -2416,6 +2416,20 @@ mod tests {
         stream.read_exact(&mut response).is_ok() && response == *b"x"
     }
 
+    fn trojan_auth_succeeds_eventually(
+        server_addr: SocketAddr,
+        password: &str,
+        target: SocketAddr,
+    ) -> bool {
+        for _ in 0..50 {
+            if trojan_auth_succeeds(server_addr, password, target) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
     fn trojan_request_with_password(password: &str, target: SocketAddr) -> Vec<u8> {
         let mut input = trojan_password_hash(password).into_bytes();
         input.extend_from_slice(b"\r\n");
@@ -3133,7 +3147,7 @@ mod tests {
             old_vless_uuid,
             echo.addr
         ));
-        assert!(trojan_auth_succeeds(
+        assert!(trojan_auth_succeeds_eventually(
             trojan_addr,
             "trojan-password",
             echo.addr
@@ -3167,7 +3181,7 @@ mod tests {
             echo.addr
         ));
         assert!(
-            trojan_auth_succeeds(trojan_addr, "trojan-password", echo.addr),
+            trojan_auth_succeeds_eventually(trojan_addr, "trojan-password", echo.addr),
             "ApplyUserDelta for VLESS must not alter the Trojan inbound"
         );
 

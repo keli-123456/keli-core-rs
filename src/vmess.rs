@@ -2040,7 +2040,7 @@ fn send_vmess_udp_over_stream<S: Read + Write>(
         request.security,
     );
     request_body.write_packet(stream, payload)?;
-    request_body.finish(stream)?;
+    stream.flush()?;
     let mut response_body = VmessBodyDecoder::new_with_length_seed(
         request.response_body_key,
         request.response_body_iv,
@@ -2055,6 +2055,7 @@ fn send_vmess_udp_over_stream<S: Read + Write>(
             "vmess udp outbound returned no response packet",
         )
     })?;
+    let _ = request_body.finish(stream);
     let source = resolve_udp_target(target)
         .or_else(|_| crate::dns::resolve_socket_addr(&target.host, target.port, timeout))?;
     Ok((source, response))
@@ -3080,10 +3081,10 @@ mod tests {
     use super::{
         connect_vmess_tcp_outbound, create_auth_id, fnv1a, kdf, parse_uuid_bytes,
         send_vmess_udp_outbound, vmess_cmd_key, vmess_user_key, write_response_header,
-        VmessBodyReader, VmessBodyWriter, VmessCommand, VmessHeaderMode, VmessRequest,
-        VmessSecurity, VmessServer, VmessServerConfig, ATYP_IPV4, COMMAND_TCP, COMMAND_UDP,
-        OPTION_AUTHENTICATED_LENGTH, OPTION_CHUNK_MASKING, OPTION_CHUNK_STREAM,
-        OPTION_GLOBAL_PADDING, SECURITY_AES128_GCM, VERSION,
+        VmessBodyDecoder, VmessBodyEncoder, VmessBodyReader, VmessBodyWriter, VmessCommand,
+        VmessHeaderMode, VmessRequest, VmessSecurity, VmessServer, VmessServerConfig, ATYP_IPV4,
+        COMMAND_TCP, COMMAND_UDP, OPTION_AUTHENTICATED_LENGTH, OPTION_CHUNK_MASKING,
+        OPTION_CHUNK_STREAM, OPTION_GLOBAL_PADDING, SECURITY_AES128_GCM, VERSION,
     };
     use crate::config::{OutboundConfig, OutboundTransportConfig};
     use crate::grpc::{run_grpc_listener, GrpcStreamHandler};
@@ -4267,11 +4268,12 @@ mod tests {
             server_clone.handle_tcp_client(stream)
         });
 
-        let (request_bytes, request) = vmess_request_with_command(
+        let (request_bytes, request) = vmess_request_header_for_user_with_auth_random(
+            &user(),
             echo_addr,
-            b"ping",
             OPTION_CHUNK_STREAM | OPTION_CHUNK_MASKING | OPTION_GLOBAL_PADDING,
             COMMAND_UDP,
+            [1, 2, 3, 4],
         );
         let mut client = TcpStream::connect(vmess_addr).expect("client connect");
         client
@@ -4279,20 +4281,29 @@ mod tests {
             .expect("client timeout");
         client.write_all(&request_bytes).expect("client request");
         decode_response_header(&mut client, &request);
-        let mut body = VmessBodyReader::new(
-            client,
+        let mut request_body = VmessBodyEncoder::new(
+            request.request_body_key,
+            request.request_body_iv,
+            request.options,
+            request.security,
+        );
+        request_body
+            .write_packet(&mut client, b"ping")
+            .expect("udp request write");
+        client.flush().expect("udp request flush");
+        let mut response_body = VmessBodyDecoder::new(
             request.response_body_key,
             request.response_body_iv,
             request.options,
             request.security,
-        )
-        .expect("response body");
-        let response = body
-            .read_packet()
+        );
+        let response = response_body
+            .read_packet(&mut client)
             .expect("udp response read")
             .expect("udp response packet");
+        let _ = request_body.finish(&mut client);
         assert_eq!(response, b"pong");
-        drop(body);
+        drop(client);
 
         server_thread
             .join()
@@ -4328,31 +4339,50 @@ mod tests {
             server_clone.handle_tcp_client(stream)
         });
 
-        let (request_bytes, request) = vmess_request_with_options(
+        let options = OPTION_CHUNK_STREAM
+            | OPTION_CHUNK_MASKING
+            | OPTION_GLOBAL_PADDING
+            | OPTION_AUTHENTICATED_LENGTH;
+        let (request_bytes, request) = vmess_request_header_for_user_with_auth_random(
+            &user(),
             echo_addr,
-            b"ping",
-            OPTION_CHUNK_STREAM
-                | OPTION_CHUNK_MASKING
-                | OPTION_GLOBAL_PADDING
-                | OPTION_AUTHENTICATED_LENGTH,
+            options,
+            COMMAND_TCP,
+            [1, 2, 3, 4],
         );
         let mut client = TcpStream::connect(vmess_addr).expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("client timeout");
         client.write_all(&request_bytes).expect("client request");
         decode_response_header(&mut client, &request);
-        let mut body = VmessBodyReader::new_with_length_seed(
-            client,
+        let mut request_body = VmessBodyEncoder::new_with_length_seed(
+            request.request_body_key,
+            request.request_body_iv,
+            request.request_body_key,
+            request.request_body_iv,
+            request.options,
+            request.security,
+        );
+        request_body
+            .write_plain(&mut client, b"ping")
+            .expect("client request payload");
+        client.flush().expect("client request flush");
+        let mut response_body = VmessBodyDecoder::new_with_length_seed(
             request.response_body_key,
             request.response_body_iv,
             request.request_body_key,
             request.request_body_iv,
             request.options,
             request.security,
-        )
-        .expect("response body");
+        );
         let mut echoed = [0u8; 4];
-        body.read_exact(&mut echoed).expect("client read payload");
+        response_body
+            .read_plain(&mut client, &mut echoed)
+            .expect("client read payload");
         assert_eq!(&echoed, b"ping");
-        drop(body);
+        let _ = request_body.finish(&mut client);
+        drop(client);
 
         server_thread
             .join()
