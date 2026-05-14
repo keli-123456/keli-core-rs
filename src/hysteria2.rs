@@ -16,7 +16,7 @@ use crate::limits::{
     UserSessionTracker,
 };
 use crate::quic_tuning::{
-    apply_proxy_quic_transport_defaults, apply_quic_congestion_control,
+    apply_proxy_quic_transport_defaults, apply_quic_congestion_control, bind_quic_udp_socket,
     server_endpoint_with_tuned_udp_socket, tune_quic_udp_socket,
 };
 use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
@@ -141,7 +141,7 @@ impl Hysteria2Server {
             ));
         }
 
-        let socket = std::net::UdpSocket::bind(self.config.listen)?;
+        let socket = bind_quic_udp_socket(self.config.listen)?;
         tune_quic_udp_socket(&socket);
         let runtime = Arc::new(quinn::TokioRuntime);
         let socket = runtime.wrap_udp_socket(socket)?;

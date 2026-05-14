@@ -25,6 +25,7 @@ pub mod runtime;
 mod salamander;
 pub mod service;
 pub mod shadowsocks;
+mod socket_bind;
 pub mod socks5;
 pub mod stream;
 pub mod tls;

@@ -10,6 +10,7 @@ use crate::limits::{
     sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard,
     UserSessionTracker,
 };
+use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, relay_tcp_fast_unlimited,
     relay_tcp_limited,
@@ -89,7 +90,7 @@ impl HttpProxyServer {
     }
 
     pub fn bind(&self) -> io::Result<TcpListener> {
-        TcpListener::bind(self.config.listen)
+        bind_dual_stack_tcp_listener(self.config.listen)
     }
 
     pub fn serve_tcp_once(&self, listener: &TcpListener) -> io::Result<()> {

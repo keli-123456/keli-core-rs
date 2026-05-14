@@ -15,6 +15,7 @@ use crate::limits::{
     UserSessionTracker,
 };
 use crate::outbound::recv_udp_response;
+use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::SocksTarget;
 use crate::stream::{join_native_blocking_relay, spawn_native_blocking_relay, NativeRelayHandle};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
@@ -168,7 +169,7 @@ impl AnyTlsServer {
     }
 
     pub fn bind(&self) -> io::Result<TcpListener> {
-        TcpListener::bind(self.config.listen)
+        bind_dual_stack_tcp_listener(self.config.listen)
     }
 
     pub fn handle_tcp_client(&self, mut client: TcpStream) -> io::Result<()> {

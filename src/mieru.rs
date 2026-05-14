@@ -17,6 +17,7 @@ use crate::limits::{
     sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionTracker,
 };
 use crate::outbound::recv_udp_response;
+use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
@@ -214,7 +215,7 @@ impl MieruServer {
     }
 
     pub fn bind(&self) -> io::Result<TcpListener> {
-        TcpListener::bind(self.config.listen)
+        bind_dual_stack_tcp_listener(self.config.listen)
     }
 
     pub fn handle_tcp_client(&self, client: TcpStream) -> io::Result<()> {

@@ -10,6 +10,7 @@ use crate::limits::{
     UserSessionTracker,
 };
 use crate::outbound::recv_udp_response;
+use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::stream::{relay_tcp_fast_unlimited, relay_tcp_limited};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
@@ -106,7 +107,7 @@ impl Socks5Server {
     }
 
     pub fn bind(&self) -> io::Result<TcpListener> {
-        TcpListener::bind(self.config.listen)
+        bind_dual_stack_tcp_listener(self.config.listen)
     }
 
     pub fn serve_tcp_once(&self, listener: &TcpListener) -> io::Result<()> {

@@ -27,6 +27,7 @@ use crate::reality::{
     handle_reality_preface, RealityAuthConfig, RealityGatewayConfig, RealityGatewayResult,
 };
 use crate::shadowsocks::{ShadowsocksServer, ShadowsocksServerConfig};
+use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::{Socks5Server, Socks5ServerConfig};
 use crate::tls::{relay_tls_stream, TlsAcceptor, TlsConnection};
 use crate::traffic::{SharedTrafficRegistry, TrafficDelta, TrafficRegistry};
@@ -362,7 +363,7 @@ fn start_grpc_transport_listener(
         }
     })?;
     let listener =
-        std::net::TcpListener::bind(listen).map_err(|source| CoreServiceError::Bind {
+        bind_dual_stack_tcp_listener(listen).map_err(|source| CoreServiceError::Bind {
             tag: inbound.tag.clone(),
             source,
         })?;
@@ -470,10 +471,11 @@ fn start_vmess_listener(
             ListenerRuntime::Vmess(server),
         );
     }
-    let listener = server.bind().map_err(|source| CoreServiceError::Bind {
-        tag: inbound.tag.clone(),
-        source,
-    })?;
+    let listener =
+        bind_dual_stack_tcp_listener(listen).map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
     listener
         .set_nonblocking(true)
         .map_err(|source| CoreServiceError::Bind {
@@ -749,10 +751,11 @@ fn start_anytls_listener(
         sessions,
         bandwidth,
     );
-    let listener = server.bind().map_err(|source| CoreServiceError::Bind {
-        tag: inbound.tag.clone(),
-        source,
-    })?;
+    let listener =
+        bind_dual_stack_tcp_listener(listen).map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
     listener
         .set_nonblocking(true)
         .map_err(|source| CoreServiceError::Bind {
@@ -842,10 +845,11 @@ fn start_shadowsocks_listener(
         sessions,
         bandwidth,
     );
-    let listener = server.bind().map_err(|source| CoreServiceError::Bind {
-        tag: inbound.tag.clone(),
-        source,
-    })?;
+    let listener =
+        bind_dual_stack_tcp_listener(listen).map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
     listener
         .set_nonblocking(true)
         .map_err(|source| CoreServiceError::Bind {
@@ -964,10 +968,11 @@ fn start_trojan_listener(
             ListenerRuntime::Trojan(server),
         );
     }
-    let listener = server.bind().map_err(|source| CoreServiceError::Bind {
-        tag: inbound.tag.clone(),
-        source,
-    })?;
+    let listener =
+        bind_dual_stack_tcp_listener(listen).map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
     listener
         .set_nonblocking(true)
         .map_err(|source| CoreServiceError::Bind {
@@ -1091,10 +1096,11 @@ fn start_vless_listener(
     {
         return start_vless_reality_listener(inbound, listen, server);
     }
-    let listener = server.bind().map_err(|source| CoreServiceError::Bind {
-        tag: inbound.tag.clone(),
-        source,
-    })?;
+    let listener =
+        bind_dual_stack_tcp_listener(listen).map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
     listener
         .set_nonblocking(true)
         .map_err(|source| CoreServiceError::Bind {
@@ -1222,10 +1228,11 @@ fn start_socks_listener(
         sessions,
         bandwidth,
     );
-    let listener = server.bind().map_err(|source| CoreServiceError::Bind {
-        tag: inbound.tag.clone(),
-        source,
-    })?;
+    let listener =
+        bind_dual_stack_tcp_listener(listen).map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
     listener
         .set_nonblocking(true)
         .map_err(|source| CoreServiceError::Bind {
@@ -1292,10 +1299,11 @@ fn start_mieru_listener(
         sessions,
         bandwidth,
     );
-    let listener = server.bind().map_err(|source| CoreServiceError::Bind {
-        tag: inbound.tag.clone(),
-        source,
-    })?;
+    let listener =
+        bind_dual_stack_tcp_listener(listen).map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
     listener
         .set_nonblocking(true)
         .map_err(|source| CoreServiceError::Bind {
@@ -1362,10 +1370,11 @@ fn start_http_listener(
         sessions,
         bandwidth,
     );
-    let listener = server.bind().map_err(|source| CoreServiceError::Bind {
-        tag: inbound.tag.clone(),
-        source,
-    })?;
+    let listener =
+        bind_dual_stack_tcp_listener(listen).map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
     listener
         .set_nonblocking(true)
         .map_err(|source| CoreServiceError::Bind {
@@ -1413,10 +1422,11 @@ fn start_vless_reality_listener(
     server: VlessServer,
 ) -> Result<ListenerHandle, CoreServiceError> {
     let gateway = reality_gateway_config(inbound)?;
-    let listener = TcpListener::bind(listen).map_err(|source| CoreServiceError::Bind {
-        tag: inbound.tag.clone(),
-        source,
-    })?;
+    let listener =
+        bind_dual_stack_tcp_listener(listen).map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
     listener
         .set_nonblocking(true)
         .map_err(|source| CoreServiceError::Bind {
@@ -2035,8 +2045,7 @@ fn tls_acceptor_for(inbound: &InboundConfig) -> Result<Option<TlsAcceptor>, Core
 
 fn resolve_listen_addr(listen: &str, port: u16) -> io::Result<SocketAddr> {
     let listen = match listen.trim() {
-        "" => "0.0.0.0",
-        "::" => "::",
+        "" | "0.0.0.0" | "::" | "[::]" => "::",
         value => value,
     };
     (listen, port).to_socket_addrs()?.next().ok_or_else(|| {
@@ -2057,7 +2066,7 @@ mod tests {
     use std::fs;
     use std::future::poll_fn;
     use std::io::{self, Read, Write};
-    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
@@ -2074,6 +2083,26 @@ mod tests {
     use crate::user::{CoreUser, CoreUserDelta};
 
     use super::reality_tls_acceptor;
+
+    #[test]
+    fn wildcard_listen_defaults_to_dual_stack_ipv6_unspecified() {
+        assert_eq!(
+            super::resolve_listen_addr("", 443).expect("empty listen"),
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 443))
+        );
+        assert_eq!(
+            super::resolve_listen_addr("0.0.0.0", 443).expect("ipv4 wildcard"),
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 443))
+        );
+        assert_eq!(
+            super::resolve_listen_addr("[::]", 443).expect("bracketed ipv6 wildcard"),
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 443))
+        );
+        assert_eq!(
+            super::resolve_listen_addr("127.0.0.1", 443).expect("explicit ipv4"),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 443))
+        );
+    }
 
     #[test]
     fn connection_worker_group_waits_for_submitted_jobs() {

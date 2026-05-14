@@ -6,6 +6,8 @@ use std::time::Duration;
 use quinn::{AckFrequencyConfig, VarInt};
 use socket2::SockRef;
 
+use crate::socket_bind::bind_dual_stack_udp_socket;
+
 const PROXY_STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 const PROXY_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 const PROXY_SEND_WINDOW: u64 = 32 * 1024 * 1024;
@@ -19,7 +21,7 @@ pub(crate) fn server_endpoint_with_tuned_udp_socket(
     server_config: quinn::ServerConfig,
     listen: SocketAddr,
 ) -> io::Result<quinn::Endpoint> {
-    let socket = UdpSocket::bind(listen)?;
+    let socket = bind_quic_udp_socket(listen)?;
     tune_quic_udp_socket(&socket);
     quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
@@ -27,6 +29,10 @@ pub(crate) fn server_endpoint_with_tuned_udp_socket(
         socket,
         Arc::new(quinn::TokioRuntime),
     )
+}
+
+pub(crate) fn bind_quic_udp_socket(listen: SocketAddr) -> io::Result<UdpSocket> {
+    bind_dual_stack_udp_socket(listen)
 }
 
 pub(crate) fn tune_quic_udp_socket(socket: &UdpSocket) {

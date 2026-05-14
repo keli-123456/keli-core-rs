@@ -24,6 +24,7 @@ use crate::limits::{
 };
 use crate::outbound::recv_udp_response;
 use crate::quic::connect_quic_client_stream;
+use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
@@ -125,7 +126,7 @@ impl TrojanServer {
     }
 
     pub fn bind(&self) -> io::Result<TcpListener> {
-        TcpListener::bind(self.config.listen)
+        bind_dual_stack_tcp_listener(self.config.listen)
     }
 
     pub fn handle_tcp_client(&self, mut client: TcpStream) -> io::Result<()> {
