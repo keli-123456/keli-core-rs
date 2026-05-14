@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -77,9 +78,41 @@ struct AnyTlsSession {
     writer: Arc<Mutex<TcpStream>>,
     remotes: HashMap<u32, AnyTlsRemote>,
     workers: Vec<NativeRelayHandle<()>>,
-    traffic: Arc<Mutex<(u64, u64)>>,
+    traffic: Arc<AnyTlsTrafficCounters>,
     bandwidth: Option<Arc<BandwidthLimiter>>,
     settings_done: bool,
+}
+
+#[derive(Debug, Default)]
+struct AnyTlsTrafficCounters {
+    upload: AtomicU64,
+    download: AtomicU64,
+}
+
+impl AnyTlsTrafficCounters {
+    fn add_upload(&self, bytes: u64) {
+        self.upload.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn add_download(&self, bytes: u64) {
+        self.download.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn add(&self, upload: u64, download: u64) {
+        if upload > 0 {
+            self.add_upload(upload);
+        }
+        if download > 0 {
+            self.add_download(download);
+        }
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.upload.load(Ordering::Relaxed),
+            self.download.load(Ordering::Relaxed),
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -153,7 +186,7 @@ impl AnyTlsServer {
             writer,
             remotes: HashMap::new(),
             workers: Vec::new(),
-            traffic: Arc::new(Mutex::new((0, 0))),
+            traffic: Arc::new(AnyTlsTrafficCounters::default()),
             settings_done: false,
         };
 
@@ -166,7 +199,7 @@ impl AnyTlsServer {
         for worker in session.workers {
             let _ = join_native_blocking_relay(worker, "anytls downlink worker panicked");
         }
-        let (upload, download) = *session.traffic.lock().expect("traffic lock poisoned");
+        let (upload, download) = session.traffic.snapshot();
         if upload > 0 || download > 0 {
             self.traffic.add_with_user_id(
                 self.config.node_tag.clone(),
@@ -319,7 +352,7 @@ impl AnyTlsServer {
                         }
                     }
                     remote.write_all(&body)?;
-                    session.traffic.lock().expect("traffic lock poisoned").0 += body.len() as u64;
+                    session.traffic.add_upload(body.len() as u64);
                     session.remotes.insert(stream_id, AnyTlsRemote::Tcp(remote));
                 }
                 AnyTlsRemote::Udp(mut udp) => {
@@ -424,8 +457,7 @@ impl AnyTlsServer {
             }
             if let Some(AnyTlsRemote::Tcp(remote)) = session.remotes.get_mut(&stream_id) {
                 remote.write_all(initial_payload)?;
-                session.traffic.lock().expect("traffic lock poisoned").0 +=
-                    initial_payload.len() as u64;
+                session.traffic.add_upload(initial_payload.len() as u64);
             }
         }
 
@@ -457,11 +489,7 @@ impl AnyTlsServer {
             };
             let (upload, download) =
                 self.forward_udp_packet(session, stream_id, udp, &target, &payload)?;
-            {
-                let mut traffic = session.traffic.lock().expect("traffic lock poisoned");
-                traffic.0 = traffic.0.saturating_add(upload);
-                traffic.1 = traffic.1.saturating_add(download);
-            }
+            session.traffic.add(upload, download);
             udp.pending.drain(..consumed);
         }
 
@@ -568,7 +596,7 @@ fn pump_downlink(
     stream_id: u32,
     remote: &mut TcpStream,
     writer: Arc<Mutex<TcpStream>>,
-    traffic: Arc<Mutex<(u64, u64)>>,
+    traffic: Arc<AnyTlsTrafficCounters>,
 ) {
     let mut buffer = [0u8; 16 * 1024];
     loop {
@@ -577,7 +605,7 @@ fn pump_downlink(
             Ok(read) => read,
             Err(_) => break,
         };
-        traffic.lock().expect("traffic lock poisoned").1 += read as u64;
+        traffic.add_download(read as u64);
         if write_frame(&writer, CMD_PSH, stream_id, &buffer[..read]).is_err() {
             return;
         }
@@ -861,7 +889,7 @@ fn write_frame(
         ));
     }
     let mut stream = writer.lock().expect("anytls writer lock poisoned");
-    stream.write_all(&[
+    let header = [
         command,
         (stream_id >> 24) as u8,
         (stream_id >> 16) as u8,
@@ -869,9 +897,43 @@ fn write_frame(
         stream_id as u8,
         (payload.len() >> 8) as u8,
         payload.len() as u8,
-    ])?;
-    stream.write_all(payload)?;
+    ];
+    write_all_vectored(&mut *stream, &header, payload)?;
     stream.flush()
+}
+
+fn write_all_vectored<W: Write>(writer: &mut W, header: &[u8], payload: &[u8]) -> io::Result<()> {
+    let mut header_written = 0usize;
+    let mut payload_written = 0usize;
+    while header_written < header.len() || payload_written < payload.len() {
+        let written = if header_written < header.len() {
+            let bufs = [
+                IoSlice::new(&header[header_written..]),
+                IoSlice::new(&payload[payload_written..]),
+            ];
+            writer.write_vectored(&bufs)?
+        } else {
+            writer.write(&payload[payload_written..])?
+        };
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write anytls frame",
+            ));
+        }
+        if header_written < header.len() {
+            let header_remaining = header.len() - header_written;
+            if written < header_remaining {
+                header_written += written;
+            } else {
+                header_written = header.len();
+                payload_written += written - header_remaining;
+            }
+        } else {
+            payload_written += written;
+        }
+    }
+    Ok(())
 }
 
 fn parse_socks_addr(bytes: &[u8]) -> io::Result<(SocksTarget, usize)> {

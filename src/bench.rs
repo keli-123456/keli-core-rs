@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::future::poll_fn;
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,9 +15,11 @@ use bytes::Bytes;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::AsyncReadExt;
 
+use crate::anytls::{AnyTlsServer, AnyTlsServerConfig};
 use crate::config::OutboundConfig;
 use crate::http_proxy::{HttpProxyServer, HttpProxyServerConfig};
 use crate::hysteria2::{Hysteria2Server, Hysteria2ServerConfig};
@@ -45,6 +47,16 @@ const TUIC_ATYP_DOMAIN: u8 = 0x00;
 const TUIC_ATYP_IPV4: u8 = 0x01;
 const TUIC_ATYP_IPV6: u8 = 0x02;
 const TUIC_ATYP_NONE: u8 = 0xff;
+const ANYTLS_CMD_SYN: u8 = 1;
+const ANYTLS_CMD_PSH: u8 = 2;
+const ANYTLS_CMD_FIN: u8 = 3;
+const ANYTLS_CMD_UPDATE_PADDING_SCHEME: u8 = 6;
+const ANYTLS_CMD_SYNACK: u8 = 7;
+const ANYTLS_CMD_HEART_RESPONSE: u8 = 9;
+const ANYTLS_CMD_SERVER_SETTINGS: u8 = 10;
+const ANYTLS_STREAM_ID: u32 = 1;
+const ANYTLS_FRAME_HEADER_LEN: usize = 7;
+const ANYTLS_MAX_FRAME_PAYLOAD: usize = 0xffff;
 const DEFAULT_STREAMS: usize = 4;
 const DEFAULT_REQUESTS: usize = 200;
 const DEFAULT_PAYLOAD_SIZE: usize = 1_024;
@@ -62,6 +74,7 @@ const DEFAULT_SUITE_COMMANDS: &[&str] = &[
     "shadowsocks-tcp-stream",
     "socks-tcp-stream",
     "trojan-tcp-stream",
+    "anytls-tcp-stream",
     "vless-tcp-stream",
     "vmess-tcp-stream",
     "hy2-tcp",
@@ -496,6 +509,7 @@ fn parse_external_bench_suite_options(
                             .ok_or_else(|| format!("unknown bench command {value}"))
                             .and_then(|command| match command {
                                 "http-connect-stream"
+                                | "anytls-tcp-stream"
                                 | "shadowsocks-tcp-stream"
                                 | "socks-tcp-stream"
                                 | "trojan-tcp-stream"
@@ -618,6 +632,7 @@ fn parse_external_core_mapping(value: &str) -> Result<(String, SocketAddr), Stri
         .ok_or_else(|| format!("unknown external bench command {}", command.trim()))?;
     let command = match command {
         "http-connect-stream"
+        | "anytls-tcp-stream"
         | "hy2-tcp"
         | "hy2-tcp-stream"
         | "hy2-udp"
@@ -675,7 +690,7 @@ fn bench_quic_runtime_workers() -> usize {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench direct-tcp-proxy-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --core command=HOST:PORT [--core other=HOST:PORT] [--cert CERT.pem] [--cert command=CERT.pem] [--server-name NAME] [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
+        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench direct-tcp-proxy-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench anytls-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --core command=HOST:PORT [--core other=HOST:PORT] [--cert CERT.pem] [--cert command=CERT.pem] [--server-name NAME] [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
     );
 }
 
@@ -689,6 +704,7 @@ fn canonical_bench_command(command: &str) -> Option<&'static str> {
         "shadowsocks-tcp-stream" | "ss-tcp-stream" | "ss-stream" => Some("shadowsocks-tcp-stream"),
         "socks-tcp-stream" | "socks5-tcp-stream" | "socks-stream" => Some("socks-tcp-stream"),
         "trojan-tcp-stream" | "trojan-stream" => Some("trojan-tcp-stream"),
+        "anytls-tcp-stream" | "anytls-stream" => Some("anytls-tcp-stream"),
         "vless-tcp" => Some("vless-tcp"),
         "vless-tcp-stream" | "vless-stream" => Some("vless-tcp-stream"),
         "vmess-tcp-stream" | "vmess-stream" => Some("vmess-tcp-stream"),
@@ -710,6 +726,7 @@ fn run_named_bench(command: &str, options: &BenchOptions) -> io::Result<BenchRep
         Some("shadowsocks-tcp-stream") => run_shadowsocks_tcp_stream_bench(options),
         Some("socks-tcp-stream") => run_socks_tcp_stream_bench(options),
         Some("trojan-tcp-stream") => run_trojan_tcp_stream_bench(options),
+        Some("anytls-tcp-stream") => run_anytls_tcp_stream_bench(options),
         Some("vless-tcp") => run_vless_tcp_bench(options),
         Some("vless-tcp-stream") => run_vless_tcp_stream_bench(options),
         Some("vmess-tcp-stream") => run_vmess_tcp_stream_bench(options),
@@ -877,6 +894,13 @@ fn run_external_named_bench(
             "trojan-tcp",
             "connection-per-stream",
             run_trojan_tcp_stream_client,
+        ),
+        Some("anytls-tcp-stream") => run_external_stream_bench(
+            options,
+            core_addr,
+            "anytls-tcp",
+            "connection-per-stream",
+            run_anytls_tcp_stream_client,
         ),
         Some("tuic-tcp") => run_external_tuic_tcp_bench(
             options,
@@ -1369,6 +1393,56 @@ fn run_trojan_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport
     let download_bytes = upload_bytes;
     Ok(BenchReport::completed(
         "trojan-tcp",
+        "connection-per-stream",
+        options,
+        None,
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+    ))
+}
+
+fn run_anytls_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let core_stop = Arc::new(AtomicBool::new(false));
+    let (core_addr, core_thread) = start_anytls_server(core_stop.clone())?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        workers.push(thread::spawn(move || {
+            run_anytls_tcp_stream_client(core_addr, echo_addr, stream_id, &options)
+        }));
+    }
+
+    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+    }
+    let elapsed = started.elapsed();
+
+    core_stop.store(true, Ordering::SeqCst);
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(core_addr);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(core_thread)?;
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed(
+        "anytls-tcp",
         "connection-per-stream",
         options,
         None,
@@ -2927,6 +3001,46 @@ fn start_trojan_server(
     Ok((addr, handle))
 }
 
+fn start_anytls_server(
+    stop: Arc<AtomicBool>,
+) -> io::Result<(SocketAddr, thread::JoinHandle<io::Result<()>>)> {
+    let server = AnyTlsServer::new(AnyTlsServerConfig {
+        node_tag: "bench|anytls|tcp".to_string(),
+        listen: "127.0.0.1:0".parse().expect("valid listen addr"),
+        users: vec![bench_user()],
+        routes: Vec::new(),
+        connect_timeout: Duration::from_secs(3),
+        padding_scheme: Vec::new(),
+    });
+    let listener = server.bind()?;
+    listener.set_nonblocking(true)?;
+    let addr = listener.local_addr()?;
+    let handle = thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_nodelay(true);
+                    let server = server.clone();
+                    thread::spawn(move || {
+                        if let Err(error) = server.handle_tcp_client(stream) {
+                            if !is_expected_bench_disconnect(&error) {
+                                eprintln!("bench anytls server connection error: {error}");
+                            }
+                        }
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    });
+    Ok((addr, handle))
+}
+
 fn start_vmess_server(
     stop: Arc<AtomicBool>,
 ) -> io::Result<(SocketAddr, thread::JoinHandle<io::Result<()>>)> {
@@ -3198,6 +3312,66 @@ fn run_trojan_tcp_stream_client(
     })
 }
 
+fn run_anytls_tcp_stream_client(
+    core_addr: SocketAddr,
+    echo_addr: SocketAddr,
+    stream_id: usize,
+    options: &BenchOptions,
+) -> io::Result<ClientStats> {
+    let payload = bench_payload(stream_id, options.payload_size);
+    let mut response = vec![0u8; payload.len()];
+    let mut latencies = Vec::with_capacity(options.requests);
+    let mut stream = TcpStream::connect(core_addr)?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    write_anytls_auth(&mut stream)?;
+    write_anytls_frame(
+        &mut stream,
+        ANYTLS_CMD_SYN,
+        ANYTLS_STREAM_ID,
+        &socks_target_bytes(echo_addr),
+    )?;
+    read_anytls_synack(&mut stream)?;
+
+    for request_index in 0..options.requests {
+        let started = Instant::now();
+        write_anytls_payload(&mut stream, ANYTLS_STREAM_ID, &payload).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "anytls stream {stream_id} request {} write failed: {error}",
+                    request_index + 1
+                ),
+            )
+        })?;
+        read_anytls_payload_exact(&mut stream, ANYTLS_STREAM_ID, &mut response).map_err(
+            |error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "anytls stream {stream_id} request {} read failed: {error}",
+                        request_index + 1
+                    ),
+                )
+            },
+        )?;
+        if response != payload {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "anytls bench echo payload mismatch",
+            ));
+        }
+        latencies.push(started.elapsed().as_micros());
+    }
+    let _ = write_anytls_frame(&mut stream, ANYTLS_CMD_FIN, ANYTLS_STREAM_ID, &[]);
+
+    Ok(ClientStats {
+        latencies,
+        retries: 0,
+    })
+}
+
 fn run_plain_stream_echo_client(
     stream: &mut TcpStream,
     label: &str,
@@ -3385,6 +3559,152 @@ fn read_vless_response_header(stream: &mut TcpStream) -> io::Result<()> {
     if header[1] > 0 {
         let mut addon = vec![0u8; usize::from(header[1])];
         stream.read_exact(&mut addon)?;
+    }
+    Ok(())
+}
+
+fn write_anytls_auth<W: Write>(writer: &mut W) -> io::Result<()> {
+    let password_hash = Sha256::digest(BENCH_USER_UUID.as_bytes());
+    writer.write_all(&password_hash)?;
+    writer.write_all(&0u16.to_be_bytes())
+}
+
+fn write_anytls_payload<W: Write>(
+    writer: &mut W,
+    stream_id: u32,
+    payload: &[u8],
+) -> io::Result<()> {
+    for chunk in payload.chunks(ANYTLS_MAX_FRAME_PAYLOAD) {
+        write_anytls_frame(writer, ANYTLS_CMD_PSH, stream_id, chunk)?;
+    }
+    Ok(())
+}
+
+fn write_anytls_frame<W: Write>(
+    writer: &mut W,
+    command: u8,
+    stream_id: u32,
+    payload: &[u8],
+) -> io::Result<()> {
+    if payload.len() > ANYTLS_MAX_FRAME_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "anytls bench frame payload too large",
+        ));
+    }
+    let header = [
+        command,
+        (stream_id >> 24) as u8,
+        (stream_id >> 16) as u8,
+        (stream_id >> 8) as u8,
+        stream_id as u8,
+        (payload.len() >> 8) as u8,
+        payload.len() as u8,
+    ];
+    write_all_vectored(writer, &header, payload)?;
+    writer.flush()
+}
+
+fn write_all_vectored<W: Write>(writer: &mut W, header: &[u8], payload: &[u8]) -> io::Result<()> {
+    let mut header_written = 0usize;
+    let mut payload_written = 0usize;
+    while header_written < header.len() || payload_written < payload.len() {
+        let written = if header_written < header.len() {
+            let bufs = [
+                IoSlice::new(&header[header_written..]),
+                IoSlice::new(&payload[payload_written..]),
+            ];
+            writer.write_vectored(&bufs)?
+        } else {
+            writer.write(&payload[payload_written..])?
+        };
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write anytls bench frame",
+            ));
+        }
+        if header_written < header.len() {
+            let header_remaining = header.len() - header_written;
+            if written < header_remaining {
+                header_written += written;
+            } else {
+                header_written = header.len();
+                payload_written += written - header_remaining;
+            }
+        } else {
+            payload_written += written;
+        }
+    }
+    Ok(())
+}
+
+fn read_anytls_frame<R: Read>(reader: &mut R) -> io::Result<(u8, u32, Vec<u8>)> {
+    let mut header = [0u8; ANYTLS_FRAME_HEADER_LEN];
+    reader.read_exact(&mut header)?;
+    let len = u16::from_be_bytes([header[5], header[6]]) as usize;
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload)?;
+    Ok((
+        header[0],
+        u32::from_be_bytes([header[1], header[2], header[3], header[4]]),
+        payload,
+    ))
+}
+
+fn read_anytls_synack<R: Read>(reader: &mut R) -> io::Result<()> {
+    loop {
+        let (command, stream_id, _) = read_anytls_frame(reader)?;
+        match command {
+            ANYTLS_CMD_SYNACK if stream_id == ANYTLS_STREAM_ID => return Ok(()),
+            ANYTLS_CMD_SERVER_SETTINGS | ANYTLS_CMD_UPDATE_PADDING_SCHEME => {}
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected anytls bench frame before SYNACK: {other}"),
+                ));
+            }
+        }
+    }
+}
+
+fn read_anytls_payload_exact<R: Read>(
+    reader: &mut R,
+    stream_id: u32,
+    output: &mut [u8],
+) -> io::Result<()> {
+    let mut offset = 0usize;
+    while offset < output.len() {
+        let (command, frame_stream_id, payload) = read_anytls_frame(reader)?;
+        if frame_stream_id != stream_id {
+            continue;
+        }
+        match command {
+            ANYTLS_CMD_PSH => {
+                let end = offset.saturating_add(payload.len());
+                if end > output.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "anytls bench response exceeded expected payload size",
+                    ));
+                }
+                output[offset..end].copy_from_slice(&payload);
+                offset = end;
+            }
+            ANYTLS_CMD_FIN => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "anytls stream finished before echo response",
+                ));
+            }
+            ANYTLS_CMD_HEART_RESPONSE | ANYTLS_CMD_SERVER_SETTINGS => {}
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected anytls bench frame while reading payload: {other}"),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -4650,11 +4970,11 @@ fn join_server(handle: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
 mod tests {
     use super::{
         canonical_bench_command, parse_bench_options, parse_bench_suite_options,
-        parse_external_bench_suite_options, percent_change, run_direct_tcp_proxy_stream_bench,
-        run_direct_tcp_stream_bench, run_external_vless_tcp_stream_bench,
-        run_http_connect_stream_bench, run_hy2_udp_bench, run_shadowsocks_tcp_stream_bench,
-        run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench, run_tuic_tcp_bench,
-        run_tuic_tcp_stream_bench, run_tuic_udp_bench, run_vless_tcp_bench,
+        parse_external_bench_suite_options, percent_change, run_anytls_tcp_stream_bench,
+        run_direct_tcp_proxy_stream_bench, run_direct_tcp_stream_bench,
+        run_external_vless_tcp_stream_bench, run_http_connect_stream_bench, run_hy2_udp_bench,
+        run_shadowsocks_tcp_stream_bench, run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench,
+        run_tuic_tcp_bench, run_tuic_tcp_stream_bench, run_tuic_udp_bench, run_vless_tcp_bench,
         run_vless_tcp_stream_bench, run_vmess_tcp_stream_bench, summarize_bench_runs,
         validate_udp_bench_payload, BenchCert, BenchOptions, BenchReport, BenchSuiteRun,
         LatencyReport,
@@ -4881,6 +5201,10 @@ mod tests {
             Some("trojan-tcp-stream")
         );
         assert_eq!(
+            canonical_bench_command("anytls-stream"),
+            Some("anytls-tcp-stream")
+        );
+        assert_eq!(
             canonical_bench_command("http-stream"),
             Some("http-connect-stream")
         );
@@ -5076,6 +5400,25 @@ mod tests {
         .expect("bench");
 
         assert_eq!(report.protocol, "trojan-tcp");
+        assert_eq!(report.mode, "connection-per-stream");
+        assert_eq!(report.total_requests, 3);
+        assert_eq!(report.completed_requests, 3);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert_eq!(report.runtime_workers, None);
+        assert!(report.download_bytes > 0);
+    }
+
+    #[test]
+    fn runs_anytls_tcp_stream_bench_smoke() {
+        let report = run_anytls_tcp_stream_bench(&BenchOptions {
+            streams: 1,
+            requests: 3,
+            payload_size: 16,
+        })
+        .expect("bench");
+
+        assert_eq!(report.protocol, "anytls-tcp");
         assert_eq!(report.mode, "connection-per-stream");
         assert_eq!(report.total_requests, 3);
         assert_eq!(report.completed_requests, 3);
