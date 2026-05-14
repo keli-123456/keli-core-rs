@@ -21,7 +21,7 @@ pub fn connect_tcp(host: &str, port: u16, timeout: Duration) -> io::Result<TcpSt
     for addr in addrs {
         match TcpStream::connect_timeout(&addr, timeout) {
             Ok(stream) => {
-                let _ = stream.set_nodelay(true);
+                tune_tcp_stream(&stream);
                 return Ok(stream);
             }
             Err(error) => last_error = Some(error),
@@ -45,7 +45,7 @@ pub async fn connect_tcp_tokio(
     for addr in addrs {
         match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
             Ok(Ok(stream)) => {
-                let _ = stream.set_nodelay(true);
+                tune_tokio_tcp_stream(&stream);
                 return Ok(stream);
             }
             Ok(Err(error)) => last_error = Some(error),
@@ -63,6 +63,22 @@ pub async fn connect_tcp_tokio(
             "target did not resolve to any socket address",
         )
     }))
+}
+
+fn tune_tcp_stream(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        let _ = socket2::SockRef::from(stream).set_tcp_quickack(true);
+    }
+}
+
+fn tune_tokio_tcp_stream(stream: &tokio::net::TcpStream) {
+    let _ = stream.set_nodelay(true);
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        let _ = stream.set_quickack(true);
+    }
 }
 
 pub fn resolve_socket_addr(host: &str, port: u16, timeout: Duration) -> io::Result<SocketAddr> {
