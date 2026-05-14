@@ -1,12 +1,35 @@
 use std::io;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 
 use quinn::VarInt;
+use socket2::SockRef;
 
 const PROXY_STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 const PROXY_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 const PROXY_SEND_WINDOW: u64 = 32 * 1024 * 1024;
 const PROXY_MAX_CONCURRENT_STREAMS: u32 = 1024;
+const PROXY_UDP_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+pub(crate) fn server_endpoint_with_tuned_udp_socket(
+    server_config: quinn::ServerConfig,
+    listen: SocketAddr,
+) -> io::Result<quinn::Endpoint> {
+    let socket = UdpSocket::bind(listen)?;
+    tune_quic_udp_socket(&socket);
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+}
+
+pub(crate) fn tune_quic_udp_socket(socket: &UdpSocket) {
+    let socket = SockRef::from(socket);
+    let _ = socket.set_recv_buffer_size(PROXY_UDP_SOCKET_BUFFER_SIZE);
+    let _ = socket.set_send_buffer_size(PROXY_UDP_SOCKET_BUFFER_SIZE);
+}
 
 pub(crate) fn apply_proxy_quic_transport_defaults(transport: &mut quinn::TransportConfig) {
     transport

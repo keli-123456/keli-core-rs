@@ -14,7 +14,10 @@ use crate::limits::{
     sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard,
     UserSessionTracker,
 };
-use crate::quic_tuning::{apply_proxy_quic_transport_defaults, apply_quic_congestion_control};
+use crate::quic_tuning::{
+    apply_proxy_quic_transport_defaults, apply_quic_congestion_control,
+    server_endpoint_with_tuned_udp_socket,
+};
 use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
@@ -110,7 +113,7 @@ impl TuicServer {
             .datagram_send_buffer_size(UDP_DATAGRAM_BUFFER_SIZE);
         apply_tuic_congestion_control(&mut transport, &self.config.congestion_control)?;
         server_config.transport_config(Arc::new(transport));
-        quinn::Endpoint::server(server_config, self.config.listen)
+        server_endpoint_with_tuned_udp_socket(server_config, self.config.listen)
     }
 
     pub async fn run(self, endpoint: quinn::Endpoint, stop: Arc<AtomicBool>) {

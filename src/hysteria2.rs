@@ -15,7 +15,10 @@ use crate::limits::{
     sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard,
     UserSessionTracker,
 };
-use crate::quic_tuning::{apply_proxy_quic_transport_defaults, apply_quic_congestion_control};
+use crate::quic_tuning::{
+    apply_proxy_quic_transport_defaults, apply_quic_congestion_control,
+    server_endpoint_with_tuned_udp_socket, tune_quic_udp_socket,
+};
 use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 use crate::salamander::SalamanderUdpSocket;
 use crate::socks5::SocksTarget;
@@ -123,7 +126,7 @@ impl Hysteria2Server {
             .datagram_send_buffer_size(UDP_DATAGRAM_BUFFER_SIZE);
         server_config.transport_config(Arc::new(transport));
         let Some(obfs) = self.config.obfs.as_ref() else {
-            return quinn::Endpoint::server(server_config, self.config.listen);
+            return server_endpoint_with_tuned_udp_socket(server_config, self.config.listen);
         };
         if !obfs.kind.eq_ignore_ascii_case("salamander") {
             return Err(io::Error::new(
@@ -133,6 +136,7 @@ impl Hysteria2Server {
         }
 
         let socket = std::net::UdpSocket::bind(self.config.listen)?;
+        tune_quic_udp_socket(&socket);
         let runtime = Arc::new(quinn::TokioRuntime);
         let socket = runtime.wrap_udp_socket(socket)?;
         let socket = Arc::new(SalamanderUdpSocket::new(
