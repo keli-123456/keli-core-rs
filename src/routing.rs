@@ -29,6 +29,10 @@ impl RouteMatcher {
         Self { routes }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+
     pub fn decide(&self, host: &str) -> RouteDecision {
         self.decide_target(host, 0, "")
     }

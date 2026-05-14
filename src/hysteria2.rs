@@ -477,10 +477,13 @@ impl Hysteria2Server {
         client_ip: IpAddr,
         message: UdpDatagram,
     ) -> io::Result<()> {
-        let protocol_labels = route_protocol_labels("udp", &message.data);
-        let decision =
+        let decision = if self.router.is_empty() {
+            RouteDecision::Direct
+        } else {
+            let protocol_labels = route_protocol_labels("udp", &message.data);
             self.router
-                .decide_target(&message.target.host, message.target.port, &protocol_labels);
+                .decide_target(&message.target.host, message.target.port, &protocol_labels)
+        };
         let outbound = match &decision {
             RouteDecision::Direct => None,
             RouteDecision::Outbound(outbound) => Some(outbound),
