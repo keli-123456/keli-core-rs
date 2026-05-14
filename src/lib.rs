@@ -59,7 +59,9 @@ pub use config::{
 };
 pub use config_io::load_core_config_json;
 pub use control::{CoreCommand, CoreController, CoreResponse};
-pub use control_server::{start_control_server, ControlServerError, ControlServerHandle};
+pub use control_server::{
+    start_control_server, start_control_server_with_token, ControlServerError, ControlServerHandle,
+};
 pub use http_proxy::{HttpProxyServer, HttpProxyServerConfig};
 pub use hysteria2::{Hysteria2Server, Hysteria2ServerConfig};
 pub use limits::{

@@ -77,7 +77,7 @@ pub fn start_control_server(
     start_control_server_with_token(addr, controller, control_token_from_env())
 }
 
-fn start_control_server_with_token(
+pub fn start_control_server_with_token(
     addr: &str,
     controller: Arc<Mutex<CoreController>>,
     token: Option<String>,
