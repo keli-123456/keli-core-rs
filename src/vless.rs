@@ -12,6 +12,7 @@ use rustls::{
     ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
     StreamOwned,
 };
+use socket2::SockRef;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::config::{outbound_transport_network, OutboundConfig, OutboundTlsConfig};
@@ -635,13 +636,7 @@ impl VlessServer {
             false,
             None,
         );
-        if bandwidth.is_none() {
-            relay_tcp_streams_async_native_unlimited(client, remote, upload_flush, download_flush)
-                .await?;
-        } else {
-            relay_tcp_streams_async(client, remote, bandwidth, upload_flush, download_flush)
-                .await?;
-        }
+        relay_tcp_streams_async(client, remote, bandwidth, upload_flush, download_flush).await?;
         Ok(())
     }
 
@@ -1062,82 +1057,6 @@ impl VlessServer {
             )),
         }
     }
-}
-
-async fn relay_tcp_streams_async_native_unlimited(
-    client: tokio::net::TcpStream,
-    remote: tokio::net::TcpStream,
-    on_upload: impl FnMut(u64) + Send + 'static,
-    on_download: impl FnMut(u64) + Send + 'static,
-) -> io::Result<(u64, u64)> {
-    let client = client.into_std()?;
-    client.set_nonblocking(false)?;
-    let remote = remote.into_std()?;
-    remote.set_nonblocking(false)?;
-    tokio::task::spawn_blocking(move || {
-        relay_tcp_streams_native_unlimited_with_flush(client, remote, on_upload, on_download)
-    })
-    .await
-    .map_err(|error| io::Error::new(io::ErrorKind::Other, format!("relay task failed: {error}")))?
-}
-
-fn relay_tcp_streams_native_unlimited_with_flush<U, D>(
-    client: TcpStream,
-    remote: TcpStream,
-    mut on_upload: U,
-    mut on_download: D,
-) -> io::Result<(u64, u64)>
-where
-    U: FnMut(u64) + Send + 'static,
-    D: FnMut(u64) + Send + 'static,
-{
-    let mut client_read = client.try_clone()?;
-    let client_read_shutdown = client_read.try_clone()?;
-    let mut client_write = client;
-    let mut remote_read = remote.try_clone()?;
-    let remote_read_shutdown = remote_read.try_clone()?;
-    let mut remote_write = remote;
-    let upload_task = spawn_native_blocking_relay(move || {
-        let copied =
-            copy_count_best_effort_with_flush(&mut client_read, &mut remote_write, &mut on_upload);
-        let _ = remote_write.shutdown(Shutdown::Write);
-        let _ = remote_read_shutdown.shutdown(Shutdown::Read);
-        copied
-    })?;
-    let download =
-        copy_count_best_effort_with_flush(&mut remote_read, &mut client_write, &mut on_download);
-    let _ = client_write.shutdown(Shutdown::Write);
-    let _ = client_read_shutdown.shutdown(Shutdown::Read);
-    let upload = join_native_blocking_relay(upload_task, "vless upload relay task panicked")?;
-    Ok((upload, download))
-}
-
-fn copy_count_best_effort_with_flush<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    on_chunk: &mut impl FnMut(u64),
-) -> u64
-where
-    R: Read,
-    W: Write,
-{
-    let mut total = 0u64;
-    let mut buffer = [0u8; 16 * 1024];
-    loop {
-        let read = match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(_) => break,
-        };
-        if writer.write_all(&buffer[..read]).is_err() {
-            break;
-        }
-        let read = read as u64;
-        on_chunk(read);
-        total = total.saturating_add(read);
-    }
-    on_chunk(0);
-    total
 }
 
 fn sync_delta_bandwidth(
@@ -2262,6 +2181,8 @@ async fn relay_tcp_streams_async(
     mut on_upload: impl FnMut(u64) + Send + 'static,
     mut on_download: impl FnMut(u64) + Send + 'static,
 ) -> io::Result<(u64, u64)> {
+    let client_read_shutdown = clone_tokio_tcp_stream_for_shutdown(&client)?;
+    let remote_read_shutdown = clone_tokio_tcp_stream_for_shutdown(&remote)?;
     let (mut client_read, mut client_write) = client.into_split();
     let (mut remote_read, mut remote_write) = remote.into_split();
     let upload_limiter = limiter.clone();
@@ -2275,6 +2196,7 @@ async fn relay_tcp_streams_async(
                     _ = wait_limiter_revoke(limiter) => {
                         on_upload(0);
                         let _ = remote_write.shutdown().await;
+                        let _ = remote_read_shutdown.shutdown(Shutdown::Read);
                         return Ok::<u64, io::Error>(total);
                     }
                 }
@@ -2285,23 +2207,29 @@ async fn relay_tcp_streams_async(
                 Ok(read) => read,
                 Err(error) => {
                     on_upload(0);
+                    let _ = remote_write.shutdown().await;
+                    let _ = remote_read_shutdown.shutdown(Shutdown::Read);
                     return Err(error);
                 }
             };
             if read == 0 {
                 on_upload(0);
                 let _ = remote_write.shutdown().await;
+                let _ = remote_read_shutdown.shutdown(Shutdown::Read);
                 return Ok::<u64, io::Error>(total);
             }
             if let Some(limiter) = upload_limiter.as_deref() {
                 if !limiter.wait_for_async(read).await {
                     on_upload(0);
                     let _ = remote_write.shutdown().await;
+                    let _ = remote_read_shutdown.shutdown(Shutdown::Read);
                     return Ok::<u64, io::Error>(total);
                 }
             }
             if let Err(error) = remote_write.write_all(&buffer[..read]).await {
                 on_upload(0);
+                let _ = remote_write.shutdown().await;
+                let _ = remote_read_shutdown.shutdown(Shutdown::Read);
                 return Err(error);
             }
             on_upload(read as u64);
@@ -2318,6 +2246,7 @@ async fn relay_tcp_streams_async(
                     _ = wait_limiter_revoke(limiter) => {
                         on_download(0);
                         let _ = client_write.shutdown().await;
+                        let _ = client_read_shutdown.shutdown(Shutdown::Read);
                         return Ok::<u64, io::Error>(total);
                     }
                 }
@@ -2328,23 +2257,29 @@ async fn relay_tcp_streams_async(
                 Ok(read) => read,
                 Err(error) => {
                     on_download(0);
+                    let _ = client_write.shutdown().await;
+                    let _ = client_read_shutdown.shutdown(Shutdown::Read);
                     return Err(error);
                 }
             };
             if read == 0 {
                 on_download(0);
                 let _ = client_write.shutdown().await;
+                let _ = client_read_shutdown.shutdown(Shutdown::Read);
                 return Ok::<u64, io::Error>(total);
             }
             if let Some(limiter) = limiter.as_deref() {
                 if !limiter.wait_for_async(read).await {
                     on_download(0);
                     let _ = client_write.shutdown().await;
+                    let _ = client_read_shutdown.shutdown(Shutdown::Read);
                     return Ok::<u64, io::Error>(total);
                 }
             }
             if let Err(error) = client_write.write_all(&buffer[..read]).await {
                 on_download(0);
+                let _ = client_write.shutdown().await;
+                let _ = client_read_shutdown.shutdown(Shutdown::Read);
                 return Err(error);
             }
             on_download(read as u64);
@@ -2355,6 +2290,10 @@ async fn relay_tcp_streams_async(
         io::Error::new(io::ErrorKind::Other, format!("relay task failed: {error}"))
     })?;
     Ok((upload?, download?))
+}
+
+fn clone_tokio_tcp_stream_for_shutdown(socket: &tokio::net::TcpStream) -> io::Result<TcpStream> {
+    Ok(TcpStream::from(SockRef::from(socket).try_clone()?))
 }
 
 async fn wait_limiter_revoke(limiter: &BandwidthLimiter) {
