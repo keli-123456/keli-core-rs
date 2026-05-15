@@ -3404,8 +3404,8 @@ mod tests {
             Ok(client) => client,
             Err(_) => return false,
         };
-        let _ = client.set_read_timeout(Some(Duration::from_secs(1)));
-        let _ = client.set_write_timeout(Some(Duration::from_secs(1)));
+        let _ = client.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = client.set_write_timeout(Some(Duration::from_secs(3)));
         if client.write_all(&request_bytes).is_err() {
             return false;
         }

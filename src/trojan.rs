@@ -1518,7 +1518,7 @@ fn hex_digit(value: u8) -> char {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::{Cursor, Read, Write};
+    use std::io::{self, Cursor, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
     use std::path::PathBuf;
     use std::sync::{
@@ -1763,7 +1763,11 @@ mod tests {
         });
         assert_eq!(result.deleted, 1);
 
-        let _ = client.write_all(b"y");
+        assert!(
+            tcp_connection_closed_eventually(&client),
+            "deleted user's existing Trojan relay should close"
+        );
+
         assert!(
             !second_payload_rx
                 .recv_timeout(Duration::from_secs(2))
@@ -1784,6 +1788,40 @@ mod tests {
         assert_eq!(records[0].user_id, Some(1));
         assert_eq!(records[0].upload, 1);
         assert_eq!(records[0].download, 1);
+    }
+
+    fn tcp_connection_closed_eventually(stream: &TcpStream) -> bool {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
+        for _ in 0..50 {
+            let mut probe = [0u8; 1];
+            match stream.peek(&mut probe) {
+                Ok(0) => return true,
+                Ok(_) => return false,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::NotConnected
+                            | io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    return true;
+                }
+                Err(_) => return true,
+            }
+        }
+        false
     }
 
     fn trojan_request(target: std::net::SocketAddr) -> Vec<u8> {
@@ -2266,7 +2304,7 @@ mod tests {
         let proxy_addr = listener.local_addr().expect("proxy addr");
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = stop.clone();
-        let handler_stop = stop.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
         let proxy_thread = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2288,7 +2326,7 @@ mod tests {
                 reader.read_exact(&mut payload).expect("payload");
                 assert_eq!(&payload, b"ping");
                 writer.write_all(b"pong").expect("response");
-                handler_stop.store(true, Ordering::SeqCst);
+                handled_tx.send(()).expect("handler notification");
             });
             runtime
                 .block_on(run_http2_listener(
@@ -2332,6 +2370,10 @@ mod tests {
         let mut response = [0u8; 4];
         stream.read_exact(&mut response).expect("read response");
         assert_eq!(&response, b"pong");
+        handled_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handler completed");
+        stop.store(true, Ordering::SeqCst);
         proxy_thread.join().expect("proxy thread");
     }
 
@@ -2344,7 +2386,7 @@ mod tests {
         let proxy_addr = listener.local_addr().expect("proxy addr");
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = stop.clone();
-        let handler_stop = stop.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
         let proxy_thread = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2366,7 +2408,7 @@ mod tests {
                 reader.read_exact(&mut payload).expect("payload");
                 assert_eq!(&payload, b"ping");
                 writer.write_all(b"pong").expect("response");
-                handler_stop.store(true, Ordering::SeqCst);
+                handled_tx.send(()).expect("handler notification");
             });
             runtime
                 .block_on(run_grpc_listener(
@@ -2409,6 +2451,10 @@ mod tests {
         let mut response = [0u8; 4];
         stream.read_exact(&mut response).expect("read response");
         assert_eq!(&response, b"pong");
+        handled_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handler completed");
+        stop.store(true, Ordering::SeqCst);
         proxy_thread.join().expect("proxy thread");
     }
 
