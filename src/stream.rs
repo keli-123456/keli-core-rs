@@ -219,9 +219,9 @@ fn tcp_relay_worker_threads() -> usize {
 
 fn tcp_relay_blocking_threads() -> usize {
     std::thread::available_parallelism()
-        .map(|threads| usize::from(threads).saturating_mul(64))
-        .unwrap_or(128)
-        .clamp(64, 512)
+        .map(|threads| usize::from(threads).saturating_mul(32))
+        .unwrap_or(64)
+        .clamp(32, 256)
 }
 
 impl NativeRelayPool {
@@ -342,10 +342,15 @@ fn native_relay_pool() -> &'static NativeRelayPool {
 }
 
 fn native_relay_worker_threads() -> usize {
+    if let Ok(value) = std::env::var("KELI_CORE_NATIVE_RELAY_WORKERS") {
+        if let Ok(parsed) = value.trim().parse::<usize>() {
+            return parsed.clamp(16, 4096);
+        }
+    }
     std::thread::available_parallelism()
-        .map(|threads| usize::from(threads).saturating_mul(128))
-        .unwrap_or(256)
-        .clamp(256, 4096)
+        .map(|threads| usize::from(threads).saturating_mul(32))
+        .unwrap_or(64)
+        .clamp(64, 1024)
 }
 
 fn native_relay_stack_size() -> usize {

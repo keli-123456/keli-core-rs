@@ -248,6 +248,7 @@ where
     let mut download_done = false;
     let mut client_buffer = [0u8; 16 * 1024];
     let mut remote_buffer = [0u8; 16 * 1024];
+    let mut idle_rounds = 0u8;
 
     while !upload_done || !download_done {
         if limiter
@@ -255,6 +256,8 @@ where
             .map(BandwidthLimiter::is_revoked)
             .unwrap_or(false)
         {
+            let _ = client.shutdown(Shutdown::Both);
+            let _ = remote.shutdown(Shutdown::Both);
             break;
         }
         let mut progressed = false;
@@ -291,14 +294,18 @@ where
             match remote.read(&mut remote_buffer) {
                 Ok(0) => {
                     download_done = true;
-                    let _ = client.close_notify_wait();
+                    upload_done = true;
+                    let _ = client.shutdown(Shutdown::Both);
+                    let _ = remote.shutdown(Shutdown::Both);
                     progressed = true;
                 }
                 Ok(read) => {
                     if let Some(limiter) = limiter.as_deref() {
                         if !limiter.wait_for(read) {
                             download_done = true;
-                            let _ = client.close_notify_wait();
+                            upload_done = true;
+                            let _ = client.shutdown(Shutdown::Both);
+                            let _ = remote.shutdown(Shutdown::Both);
                             continue;
                         }
                     }
@@ -309,20 +316,33 @@ where
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => {
                     download_done = true;
-                    let _ = client.close_notify_wait();
+                    upload_done = true;
+                    let _ = client.shutdown(Shutdown::Both);
+                    let _ = remote.shutdown(Shutdown::Both);
                     progressed = true;
                 }
             }
         }
 
         if !progressed {
-            thread::sleep(Duration::from_millis(1));
+            relay_idle_sleep(&mut idle_rounds);
+        } else {
+            idle_rounds = 0;
         }
     }
 
     let _ = client.shutdown(Shutdown::Both);
     let _ = remote.shutdown(Shutdown::Both);
     Ok((upload, download))
+}
+
+fn relay_idle_sleep(idle_rounds: &mut u8) {
+    const BACKOFF_MS: [u64; 5] = [1, 2, 4, 8, 16];
+    let idx = usize::from((*idle_rounds).min((BACKOFF_MS.len() - 1) as u8));
+    thread::sleep(Duration::from_millis(BACKOFF_MS[idx]));
+    *idle_rounds = idle_rounds
+        .saturating_add(1)
+        .min((BACKOFF_MS.len() - 1) as u8);
 }
 
 fn reality_ed25519_certified_key(

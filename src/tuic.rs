@@ -74,12 +74,13 @@ impl TuicServer {
     }
 
     pub fn with_shared_limits(
-        config: TuicServerConfig,
+        mut config: TuicServerConfig,
         traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
         let users = tuic_user_map(&config.users);
+        config.users.clear();
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,

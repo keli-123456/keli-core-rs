@@ -123,12 +123,13 @@ impl VlessServer {
     }
 
     pub fn with_shared_limits(
-        config: VlessServerConfig,
+        mut config: VlessServerConfig,
         traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
         let users = UserStore::from_keyed_users(&config.users, |user| compact_uuid(&user.uuid));
+        config.users.clear();
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,
@@ -145,7 +146,13 @@ impl VlessServer {
 
     pub fn handle_tcp_client(&self, mut client: TcpStream) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
-        let mut request = self.read_request(&mut client)?;
+        let mut request = match self.read_request(&mut client) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = client.shutdown(Shutdown::Both);
+                return Err(error);
+            }
+        };
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
@@ -161,25 +168,46 @@ impl VlessServer {
                 .decide_target(&request.target.host, request.target.port, "tcp")
             {
                 RouteDecision::Direct => {
-                    connect_target(&request.target, self.config.connect_timeout)?
+                    match connect_target(&request.target, self.config.connect_timeout) {
+                        Ok(remote) => remote,
+                        Err(error) => {
+                            let _ = client.shutdown(Shutdown::Both);
+                            return Err(error);
+                        }
+                    }
                 }
                 RouteDecision::Outbound(outbound) => {
-                    connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
+                    match connect_tcp_outbound(
+                        &outbound,
+                        &request.target,
+                        self.config.connect_timeout,
+                    ) {
+                        Ok(remote) => remote,
+                        Err(error) => {
+                            let _ = client.shutdown(Shutdown::Both);
+                            return Err(error);
+                        }
+                    }
                 }
                 RouteDecision::Block => {
+                    let _ = client.shutdown(Shutdown::Both);
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "target blocked by route",
                     ));
                 }
                 RouteDecision::UnsupportedOutbound(tag) => {
+                    let _ = client.shutdown(Shutdown::Both);
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
                         format!("outbound route {tag} is not implemented"),
                     ));
                 }
             };
-        client.write_all(&[VERSION, 0x00])?;
+        if let Err(error) = client.write_all(&[VERSION, 0x00]) {
+            let _ = client.shutdown(Shutdown::Both);
+            return Err(error);
+        }
         self.relay(client, remote, request, bandwidth)
     }
 
@@ -187,8 +215,17 @@ impl VlessServer {
         &self,
         mut client: tokio::net::TcpStream,
     ) -> io::Result<()> {
+        let client_shutdown = clone_tokio_tcp_stream_for_shutdown(&client).ok();
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
-        let mut request = self.read_request_async(&mut client).await?;
+        let mut request = match self.read_request_async(&mut client).await {
+            Ok(request) => request,
+            Err(error) => {
+                if let Some(socket) = &client_shutdown {
+                    let _ = socket.shutdown(Shutdown::Both);
+                }
+                return Err(error);
+            }
+        };
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
@@ -212,30 +249,58 @@ impl VlessServer {
                 .decide_target(&request.target.host, request.target.port, "tcp")
             {
                 RouteDecision::Direct => {
-                    connect_target_async(&request.target, self.config.connect_timeout).await?
+                    match connect_target_async(&request.target, self.config.connect_timeout).await {
+                        Ok(remote) => remote,
+                        Err(error) => {
+                            if let Some(socket) = &client_shutdown {
+                                let _ = socket.shutdown(Shutdown::Both);
+                            }
+                            return Err(error);
+                        }
+                    }
                 }
                 RouteDecision::Outbound(outbound) => {
-                    connect_tcp_outbound_tokio(
+                    match connect_tcp_outbound_tokio(
                         &outbound,
                         &request.target,
                         self.config.connect_timeout,
                     )
-                    .await?
+                    .await
+                    {
+                        Ok(remote) => remote,
+                        Err(error) => {
+                            if let Some(socket) = &client_shutdown {
+                                let _ = socket.shutdown(Shutdown::Both);
+                            }
+                            return Err(error);
+                        }
+                    }
                 }
                 RouteDecision::Block => {
+                    if let Some(socket) = &client_shutdown {
+                        let _ = socket.shutdown(Shutdown::Both);
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "target blocked by route",
                     ));
                 }
                 RouteDecision::UnsupportedOutbound(tag) => {
+                    if let Some(socket) = &client_shutdown {
+                        let _ = socket.shutdown(Shutdown::Both);
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
                         format!("outbound route {tag} is not implemented"),
                     ));
                 }
             };
-        client.write_all(&[VERSION, 0x00]).await?;
+        if let Err(error) = client.write_all(&[VERSION, 0x00]).await {
+            if let Some(socket) = &client_shutdown {
+                let _ = socket.shutdown(Shutdown::Both);
+            }
+            return Err(error);
+        }
         self.relay_async(client, remote, request, bandwidth).await
     }
 
@@ -2181,8 +2246,10 @@ async fn relay_tcp_streams_async(
     mut on_upload: impl FnMut(u64) + Send + 'static,
     mut on_download: impl FnMut(u64) + Send + 'static,
 ) -> io::Result<(u64, u64)> {
-    let client_read_shutdown = clone_tokio_tcp_stream_for_shutdown(&client)?;
-    let remote_read_shutdown = clone_tokio_tcp_stream_for_shutdown(&remote)?;
+    let upload_client_shutdown = clone_tokio_tcp_stream_for_shutdown(&client)?;
+    let upload_remote_shutdown = clone_tokio_tcp_stream_for_shutdown(&remote)?;
+    let download_client_shutdown = clone_tokio_tcp_stream_for_shutdown(&client)?;
+    let download_remote_shutdown = clone_tokio_tcp_stream_for_shutdown(&remote)?;
     let (mut client_read, mut client_write) = client.into_split();
     let (mut remote_read, mut remote_write) = remote.into_split();
     let upload_limiter = limiter.clone();
@@ -2196,7 +2263,7 @@ async fn relay_tcp_streams_async(
                     _ = wait_limiter_revoke(limiter) => {
                         on_upload(0);
                         let _ = remote_write.shutdown().await;
-                        let _ = remote_read_shutdown.shutdown(Shutdown::Read);
+                        close_tcp_pair(&upload_client_shutdown, &upload_remote_shutdown);
                         return Ok::<u64, io::Error>(total);
                     }
                 }
@@ -2208,28 +2275,28 @@ async fn relay_tcp_streams_async(
                 Err(error) => {
                     on_upload(0);
                     let _ = remote_write.shutdown().await;
-                    let _ = remote_read_shutdown.shutdown(Shutdown::Read);
+                    close_tcp_pair(&upload_client_shutdown, &upload_remote_shutdown);
                     return Err(error);
                 }
             };
             if read == 0 {
                 on_upload(0);
                 let _ = remote_write.shutdown().await;
-                let _ = remote_read_shutdown.shutdown(Shutdown::Read);
+                close_tcp_pair(&upload_client_shutdown, &upload_remote_shutdown);
                 return Ok::<u64, io::Error>(total);
             }
             if let Some(limiter) = upload_limiter.as_deref() {
                 if !limiter.wait_for_async(read).await {
                     on_upload(0);
                     let _ = remote_write.shutdown().await;
-                    let _ = remote_read_shutdown.shutdown(Shutdown::Read);
+                    close_tcp_pair(&upload_client_shutdown, &upload_remote_shutdown);
                     return Ok::<u64, io::Error>(total);
                 }
             }
             if let Err(error) = remote_write.write_all(&buffer[..read]).await {
                 on_upload(0);
                 let _ = remote_write.shutdown().await;
-                let _ = remote_read_shutdown.shutdown(Shutdown::Read);
+                close_tcp_pair(&upload_client_shutdown, &upload_remote_shutdown);
                 return Err(error);
             }
             on_upload(read as u64);
@@ -2246,7 +2313,7 @@ async fn relay_tcp_streams_async(
                     _ = wait_limiter_revoke(limiter) => {
                         on_download(0);
                         let _ = client_write.shutdown().await;
-                        let _ = client_read_shutdown.shutdown(Shutdown::Read);
+                        close_tcp_pair(&download_client_shutdown, &download_remote_shutdown);
                         return Ok::<u64, io::Error>(total);
                     }
                 }
@@ -2258,28 +2325,28 @@ async fn relay_tcp_streams_async(
                 Err(error) => {
                     on_download(0);
                     let _ = client_write.shutdown().await;
-                    let _ = client_read_shutdown.shutdown(Shutdown::Read);
+                    close_tcp_pair(&download_client_shutdown, &download_remote_shutdown);
                     return Err(error);
                 }
             };
             if read == 0 {
                 on_download(0);
                 let _ = client_write.shutdown().await;
-                let _ = client_read_shutdown.shutdown(Shutdown::Read);
+                close_tcp_pair(&download_client_shutdown, &download_remote_shutdown);
                 return Ok::<u64, io::Error>(total);
             }
             if let Some(limiter) = limiter.as_deref() {
                 if !limiter.wait_for_async(read).await {
                     on_download(0);
                     let _ = client_write.shutdown().await;
-                    let _ = client_read_shutdown.shutdown(Shutdown::Read);
+                    close_tcp_pair(&download_client_shutdown, &download_remote_shutdown);
                     return Ok::<u64, io::Error>(total);
                 }
             }
             if let Err(error) = client_write.write_all(&buffer[..read]).await {
                 on_download(0);
                 let _ = client_write.shutdown().await;
-                let _ = client_read_shutdown.shutdown(Shutdown::Read);
+                close_tcp_pair(&download_client_shutdown, &download_remote_shutdown);
                 return Err(error);
             }
             on_download(read as u64);
@@ -2294,6 +2361,11 @@ async fn relay_tcp_streams_async(
 
 fn clone_tokio_tcp_stream_for_shutdown(socket: &tokio::net::TcpStream) -> io::Result<TcpStream> {
     Ok(TcpStream::from(SockRef::from(socket).try_clone()?))
+}
+
+fn close_tcp_pair(left: &TcpStream, right: &TcpStream) {
+    let _ = left.shutdown(Shutdown::Both);
+    let _ = right.shutdown(Shutdown::Both);
 }
 
 async fn wait_limiter_revoke(limiter: &BandwidthLimiter) {
@@ -2372,6 +2444,7 @@ where
     let mut vision_decoder = VisionDecoder::new(user_id);
     let mut vision_encoder = VisionEncoder::new(user_id);
     let mut encode_download = true;
+    let mut idle_rounds = 0u8;
 
     while !upload_done || !download_done {
         if limiter
@@ -2379,6 +2452,8 @@ where
             .map(BandwidthLimiter::is_revoked)
             .unwrap_or(false)
         {
+            let _ = client.shutdown(Shutdown::Both);
+            let _ = remote.shutdown(Shutdown::Both);
             break;
         }
         let mut progressed = false;
@@ -2425,14 +2500,18 @@ where
             match remote.read(&mut remote_buffer) {
                 Ok(0) => {
                     download_done = true;
-                    let _ = client.close_notify_wait();
+                    upload_done = true;
+                    let _ = client.shutdown(Shutdown::Both);
+                    let _ = remote.shutdown(Shutdown::Both);
                     progressed = true;
                 }
                 Ok(read) => {
                     if let Some(limiter) = limiter.as_deref() {
                         if !limiter.wait_for(read) {
                             download_done = true;
-                            let _ = client.close_notify_wait();
+                            upload_done = true;
+                            let _ = client.shutdown(Shutdown::Both);
+                            let _ = remote.shutdown(Shutdown::Both);
                             continue;
                         }
                     }
@@ -2448,20 +2527,33 @@ where
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => {
                     download_done = true;
-                    let _ = client.close_notify_wait();
+                    upload_done = true;
+                    let _ = client.shutdown(Shutdown::Both);
+                    let _ = remote.shutdown(Shutdown::Both);
                     progressed = true;
                 }
             }
         }
 
         if !progressed {
-            thread::sleep(Duration::from_millis(1));
+            relay_idle_sleep(&mut idle_rounds);
+        } else {
+            idle_rounds = 0;
         }
     }
 
     let _ = client.shutdown(Shutdown::Both);
     let _ = remote.shutdown(Shutdown::Both);
     Ok((upload, download))
+}
+
+fn relay_idle_sleep(idle_rounds: &mut u8) {
+    const BACKOFF_MS: [u64; 5] = [1, 2, 4, 8, 16];
+    let idx = usize::from((*idle_rounds).min((BACKOFF_MS.len() - 1) as u8));
+    thread::sleep(Duration::from_millis(BACKOFF_MS[idx]));
+    *idle_rounds = idle_rounds
+        .saturating_add(1)
+        .min((BACKOFF_MS.len() - 1) as u8);
 }
 
 fn write_all_wait(writer: &mut TcpStream, mut input: &[u8]) -> io::Result<()> {
@@ -2720,6 +2812,15 @@ mod tests {
             flow: flow.to_string(),
             connect_timeout: Duration::from_secs(3),
         })
+    }
+
+    #[test]
+    fn server_clone_does_not_duplicate_full_user_list() {
+        let server = server_with_user(user());
+
+        assert_eq!(server.users.len(), 1);
+        assert!(server.config.users.is_empty());
+        assert!(server.clone().config.users.is_empty());
     }
 
     #[test]

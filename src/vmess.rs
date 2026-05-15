@@ -178,13 +178,14 @@ impl VmessServer {
     }
 
     pub fn with_shared_limits(
-        config: VmessServerConfig,
+        mut config: VmessServerConfig,
         traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
         let users = valid_vmess_users(&config.users);
         let auth_users = vmess_auth_users(&users);
+        config.users.clear();
 
         Self {
             router: RouteMatcher::new(config.routes.clone()),

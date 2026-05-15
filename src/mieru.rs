@@ -198,12 +198,13 @@ impl MieruServer {
     }
 
     pub fn with_shared_limits(
-        config: MieruServerConfig,
+        mut config: MieruServerConfig,
         traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
         let users = active_user_list(&config.users);
+        config.users.clear();
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,

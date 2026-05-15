@@ -89,13 +89,14 @@ impl Hysteria2Server {
     }
 
     pub fn with_shared_limits(
-        config: Hysteria2ServerConfig,
+        mut config: Hysteria2ServerConfig,
         traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
         let users =
             UserStore::from_keyed_users(&config.users, |user| user.credential().to_string());
+        config.users.clear();
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,
@@ -1569,42 +1570,82 @@ fn io_other(error: impl std::fmt::Debug) -> io::Error {
 }
 
 fn log_hysteria2_error(scope: &'static str, error: &io::Error) {
-    if is_expected_hysteria2_close(error) {
+    let class = classify_hysteria2_error(error);
+    if class == Hysteria2ErrorClass::ExpectedClose {
         return;
     }
-    if is_hysteria2_timeout(error) && !should_log_hysteria2_timeout(scope) {
+    if !should_log_hysteria2_error(scope, class) {
         return;
     }
-    let level = if is_hysteria2_timeout(error) {
-        "WARN"
-    } else {
-        "ERROR"
-    };
-    eprintln!("{level} core   hysteria2 {scope} error: {error}");
+    let level = class.log_level();
+    let label = class.label();
+    eprintln!("{level} core   hysteria2 {scope} {label}: {error}");
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum Hysteria2ErrorClass {
+    ExpectedClose,
+    InvalidAuth,
+    InvalidRequest,
+    Timeout,
+    Transport,
+    Other,
+}
+
+impl Hysteria2ErrorClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ExpectedClose => "closed",
+            Self::InvalidAuth => "invalid-auth",
+            Self::InvalidRequest => "invalid-request",
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::Other => "error",
+        }
+    }
+
+    fn log_level(self) -> &'static str {
+        match self {
+            Self::InvalidAuth | Self::InvalidRequest | Self::Timeout | Self::Transport => "WARN",
+            Self::ExpectedClose | Self::Other => "ERROR",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct Hysteria2ErrorLogKey {
+    scope: &'static str,
+    class: Hysteria2ErrorClass,
 }
 
 #[derive(Default)]
-struct Hysteria2TimeoutLogState {
-    last_connection_ms: u64,
-    last_tcp_relay_ms: u64,
+struct Hysteria2ErrorLogState {
+    last_ms: u64,
+    suppressed: u64,
 }
 
-fn should_log_hysteria2_timeout(scope: &'static str) -> bool {
-    static STATE: OnceLock<Mutex<Hysteria2TimeoutLogState>> = OnceLock::new();
+fn should_log_hysteria2_error(scope: &'static str, class: Hysteria2ErrorClass) -> bool {
+    static STATE: OnceLock<Mutex<HashMap<Hysteria2ErrorLogKey, Hysteria2ErrorLogState>>> =
+        OnceLock::new();
     let now = now_millis();
-    let mut state = STATE
-        .get_or_init(|| Mutex::new(Hysteria2TimeoutLogState::default()))
+    let key = Hysteria2ErrorLogKey { scope, class };
+    let mut states = STATE
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .expect("hysteria2 timeout log state poisoned");
-    let last = if scope == "tcp relay" {
-        &mut state.last_tcp_relay_ms
-    } else {
-        &mut state.last_connection_ms
-    };
-    if now.saturating_sub(*last) < HY2_ERROR_LOG_INTERVAL_MS {
+        .expect("hysteria2 error log state poisoned");
+    let state = states.entry(key).or_default();
+    if now.saturating_sub(state.last_ms) < HY2_ERROR_LOG_INTERVAL_MS {
+        state.suppressed = state.suppressed.saturating_add(1);
         return false;
     }
-    *last = now;
+    let suppressed = std::mem::take(&mut state.suppressed);
+    state.last_ms = now;
+    if suppressed != 0 {
+        eprintln!(
+            "WARN  core   hysteria2 {scope} {} suppressed={suppressed}",
+            class.label()
+        );
+    }
     true
 }
 
@@ -1636,7 +1677,42 @@ fn is_hysteria2_timeout(error: &io::Error) -> bool {
         return true;
     }
     let text = error.to_string();
-    text.contains("TimedOut") || text.contains("timed out")
+    text == "Timeout"
+        || text.contains("TimedOut")
+        || text.contains("ConnectionError(Timeout)")
+        || text.contains("timed out")
+}
+
+fn classify_hysteria2_error(error: &io::Error) -> Hysteria2ErrorClass {
+    let text = error.to_string();
+    if is_expected_hysteria2_close(error) {
+        return Hysteria2ErrorClass::ExpectedClose;
+    }
+    if text.contains("invalid hysteria2 authentication") {
+        return Hysteria2ErrorClass::InvalidAuth;
+    }
+    if text.contains("invalid hysteria2 tcp request id")
+        || text.contains("invalid hysteria2 udp")
+        || text.contains("invalid hysteria2 address")
+        || text.contains("invalid hysteria2 padding")
+    {
+        return Hysteria2ErrorClass::InvalidRequest;
+    }
+    if is_hysteria2_timeout(error) {
+        return Hysteria2ErrorClass::Timeout;
+    }
+    if text.contains("Connection reset")
+        || text.contains("ConnectionReset")
+        || text.contains("Reset")
+        || text.contains("Broken pipe")
+        || text.contains("FinishedEarly")
+        || text.contains("RemoteTerminate")
+        || text.contains("H3_REQUEST_CANCELLED")
+        || text.contains("got two control streams")
+    {
+        return Hysteria2ErrorClass::Transport;
+    }
+    Hysteria2ErrorClass::Other
 }
 
 fn now_millis() -> u64 {
@@ -1764,6 +1840,16 @@ mod tests {
         server.config.down_mbps = down_mbps;
         server.config.ignore_client_bandwidth = ignore_client_bandwidth;
         server
+    }
+
+    #[test]
+    fn server_clone_does_not_duplicate_full_user_list() {
+        let cert = test_cert("clone-users");
+        let server = server(&cert, "127.0.0.1:0".parse().expect("addr"));
+
+        assert_eq!(server.users.len(), 1);
+        assert!(server.config.users.is_empty());
+        assert!(server.clone().config.users.is_empty());
     }
 
     #[test]
@@ -2648,5 +2734,36 @@ mod tests {
 
         let quinn_timeout = io::Error::new(io::ErrorKind::Other, "TimedOut");
         assert!(is_hysteria2_timeout(&quinn_timeout));
+
+        assert_eq!(
+            classify_hysteria2_error(&io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "invalid hysteria2 authentication",
+            )),
+            Hysteria2ErrorClass::InvalidAuth
+        );
+        assert_eq!(
+            classify_hysteria2_error(&io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid hysteria2 tcp request id",
+            )),
+            Hysteria2ErrorClass::InvalidRequest
+        );
+        assert_eq!(
+            classify_hysteria2_error(&quinn_timeout),
+            Hysteria2ErrorClass::Timeout
+        );
+        assert_eq!(
+            classify_hysteria2_error(&io::Error::new(io::ErrorKind::Other, "Timeout")),
+            Hysteria2ErrorClass::Timeout
+        );
+        assert_eq!(
+            classify_hysteria2_error(&io::Error::new(io::ErrorKind::BrokenPipe, "Broken pipe")),
+            Hysteria2ErrorClass::Transport
+        );
+        assert_eq!(
+            classify_hysteria2_error(&io::Error::new(io::ErrorKind::Other, "FinishedEarly(0)")),
+            Hysteria2ErrorClass::Transport
+        );
     }
 }

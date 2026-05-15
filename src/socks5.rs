@@ -88,13 +88,14 @@ impl Socks5Server {
     }
 
     pub fn with_shared_limits(
-        config: Socks5ServerConfig,
+        mut config: Socks5ServerConfig,
         traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
         let auth_required = !config.users.is_empty();
         let users = UserStore::from_uuid_users(&config.users);
+        config.users.clear();
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,

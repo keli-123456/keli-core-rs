@@ -107,7 +107,7 @@ impl TrojanServer {
     }
 
     pub fn with_shared_limits(
-        config: TrojanServerConfig,
+        mut config: TrojanServerConfig,
         traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
@@ -115,6 +115,7 @@ impl TrojanServer {
         let users = UserStore::from_keyed_users(&config.users, |user| {
             trojan_password_hash(user.credential())
         });
+        config.users.clear();
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,

@@ -33,7 +33,7 @@ use crate::tls::{relay_tls_stream, TlsAcceptor, TlsConnection};
 use crate::traffic::{SharedTrafficRegistry, TrafficDelta, TrafficRegistry};
 use crate::trojan::{TrojanServer, TrojanServerConfig};
 use crate::tuic::{TuicServer, TuicServerConfig};
-use crate::user::{apply_user_delta_to_vec, CoreUser, CoreUserDelta, CoreUserDeltaResult};
+use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult};
 use crate::vless::{VlessServer, VlessServerConfig};
 use crate::vmess::{VmessServer, VmessServerConfig};
 
@@ -150,7 +150,7 @@ impl CoreService {
         validate_unique_listener_binds(&config.inbounds)
             .map_err(CoreServiceError::InvalidConfig)?;
         crate::dns::configure(config.dns.clone());
-        let active_config = config.clone();
+        let active_config = config_without_users(&config);
 
         let traffic = TrafficRegistry::shared();
         let sessions = UserSessionTracker::default();
@@ -277,7 +277,7 @@ impl CoreService {
             }
         }
         self.user_revisions.clear();
-        self.config = config;
+        self.config = config_without_users(&config);
     }
 
     pub fn apply_user_delta(
@@ -306,14 +306,6 @@ impl CoreService {
             }
         }
         let result = handle.runtime.apply_user_delta(delta);
-        if let Some(inbound) = self
-            .config
-            .inbounds
-            .iter_mut()
-            .find(|inbound| inbound.tag == node_tag)
-        {
-            apply_user_delta_to_vec(&mut inbound.users, delta);
-        }
         if let Some(revision) = delta.revision.as_ref() {
             self.user_revisions
                 .insert(node_tag.to_string(), revision.clone());
@@ -1876,14 +1868,14 @@ fn connection_worker_pool() -> &'static ConnectionWorkerPool {
 fn connection_worker_threads() -> usize {
     if let Ok(value) = std::env::var("KELI_CORE_CONNECTION_WORKERS") {
         if let Ok(parsed) = value.trim().parse::<usize>() {
-            return parsed.clamp(8, MAX_CONNECTION_WORKERS_PER_LISTENER);
+            return parsed.clamp(4, MAX_CONNECTION_WORKERS_PER_LISTENER);
         }
     }
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(4)
-        .saturating_mul(16)
-        .clamp(32, 512)
+        .saturating_mul(8)
+        .clamp(16, 256)
 }
 
 fn connection_worker_stack_size() -> usize {
@@ -2390,6 +2382,47 @@ mod tests {
             routes: Vec::new(),
             stats: StatsConfig::default(),
         }
+    }
+
+    #[test]
+    fn service_does_not_retain_full_users_in_static_config() {
+        let mut config = config(free_port());
+        config.inbounds[0].users = (0..1024)
+            .map(|index| CoreUser {
+                id: index,
+                uuid: format!("user-{index:04}"),
+                password: None,
+                email: Some(format!("user-{index:04}@example.test")),
+                speed_limit: 0,
+                device_limit: 0,
+            })
+            .collect();
+
+        let mut service = CoreService::start(config).expect("service start");
+
+        assert!(service.config.inbounds[0].users.is_empty());
+        let result = service
+            .apply_user_delta(
+                "panel|socks|1",
+                &CoreUserDelta {
+                    added: vec![CoreUser {
+                        id: 2048,
+                        uuid: "new-user".to_string(),
+                        password: None,
+                        email: Some("new-user@example.test".to_string()),
+                        speed_limit: 0,
+                        device_limit: 0,
+                    }],
+                    revision: Some("rev-2".to_string()),
+                    ..CoreUserDelta::default()
+                },
+            )
+            .expect("delta apply");
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.active_users, 1025);
+        assert!(service.config.inbounds[0].users.is_empty());
+        service.stop();
     }
 
     fn bind_validation_inbound(

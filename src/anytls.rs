@@ -152,12 +152,13 @@ impl AnyTlsServer {
     }
 
     pub fn with_shared_limits(
-        config: AnyTlsServerConfig,
+        mut config: AnyTlsServerConfig,
         traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
         let users = anytls_user_map(&config.users);
+        config.users.clear();
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,

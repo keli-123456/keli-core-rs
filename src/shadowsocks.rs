@@ -132,12 +132,13 @@ impl ShadowsocksServer {
     }
 
     pub fn with_shared_limits(
-        config: ShadowsocksServerConfig,
+        mut config: ShadowsocksServerConfig,
         traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
         let users = active_user_list(&config.users);
+        config.users.clear();
         Self {
             router: RouteMatcher::new(config.routes.clone()),
             config,

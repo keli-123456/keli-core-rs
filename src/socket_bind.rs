@@ -6,14 +6,14 @@ use socket2::{Domain, Protocol, Socket, Type};
 pub(crate) fn bind_dual_stack_tcp_listener(listen: SocketAddr) -> io::Result<TcpListener> {
     let listen = dual_stack_wildcard_addr(listen);
     if !is_ipv6_unspecified(listen) {
-        return TcpListener::bind(listen).map_err(|error| bind_addr_error(listen, error));
+        return bind_tcp_listener(listen).map_err(|error| bind_addr_error(listen, error));
     }
 
     match bind_ipv6_tcp_listener(listen) {
         Ok(listener) => Ok(listener),
         Err(error) if should_fallback_to_ipv4(&error) => {
             let fallback = SocketAddr::from((Ipv4Addr::UNSPECIFIED, listen.port()));
-            TcpListener::bind(fallback).map_err(|error| bind_addr_error(fallback, error))
+            bind_tcp_listener(fallback).map_err(|error| bind_addr_error(fallback, error))
         }
         Err(error) => Err(bind_addr_error(listen, error)),
     }
@@ -22,14 +22,14 @@ pub(crate) fn bind_dual_stack_tcp_listener(listen: SocketAddr) -> io::Result<Tcp
 pub(crate) fn bind_dual_stack_udp_socket(listen: SocketAddr) -> io::Result<UdpSocket> {
     let listen = dual_stack_wildcard_addr(listen);
     if !is_ipv6_unspecified(listen) {
-        return UdpSocket::bind(listen).map_err(|error| bind_addr_error(listen, error));
+        return bind_udp_socket(listen).map_err(|error| bind_addr_error(listen, error));
     }
 
     match bind_ipv6_udp_socket(listen) {
         Ok(socket) => Ok(socket),
         Err(error) if should_fallback_to_ipv4(&error) => {
             let fallback = SocketAddr::from((Ipv4Addr::UNSPECIFIED, listen.port()));
-            UdpSocket::bind(fallback).map_err(|error| bind_addr_error(fallback, error))
+            bind_udp_socket(fallback).map_err(|error| bind_addr_error(fallback, error))
         }
         Err(error) => Err(bind_addr_error(listen, error)),
     }
@@ -45,6 +45,7 @@ fn dual_stack_wildcard_addr(listen: SocketAddr) -> SocketAddr {
 
 fn bind_ipv6_tcp_listener(listen: SocketAddr) -> io::Result<TcpListener> {
     let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
     socket.set_only_v6(false)?;
     socket.bind(&listen.into())?;
     socket.listen(1024)?;
@@ -53,7 +54,31 @@ fn bind_ipv6_tcp_listener(listen: SocketAddr) -> io::Result<TcpListener> {
 
 fn bind_ipv6_udp_socket(listen: SocketAddr) -> io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
     socket.set_only_v6(false)?;
+    socket.bind(&listen.into())?;
+    Ok(socket.into())
+}
+
+fn bind_tcp_listener(listen: SocketAddr) -> io::Result<TcpListener> {
+    let socket = Socket::new(
+        Domain::for_address(listen),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&listen.into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
+}
+
+fn bind_udp_socket(listen: SocketAddr) -> io::Result<UdpSocket> {
+    let socket = Socket::new(
+        Domain::for_address(listen),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
+    socket.set_reuse_address(true)?;
     socket.bind(&listen.into())?;
     Ok(socket.into())
 }
@@ -121,5 +146,19 @@ mod tests {
         let (read, _) = socket.recv_from(&mut buf).expect("recv datagram");
         assert_eq!(read, 1);
         assert_eq!(buf[0], 9);
+    }
+
+    #[test]
+    fn tcp_listener_rebinds_same_port_after_close() {
+        let _guard = crate::test_support::network_test_lock();
+        let listener = bind_dual_stack_tcp_listener(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))
+            .expect("bind first listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        drop(listener);
+
+        let listener =
+            bind_dual_stack_tcp_listener(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)))
+                .expect("rebind listener");
+        assert_eq!(listener.local_addr().expect("listener addr").port(), port);
     }
 }
