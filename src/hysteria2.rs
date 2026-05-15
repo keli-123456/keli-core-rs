@@ -97,9 +97,11 @@ impl Hysteria2Server {
     ) -> Self {
         let users =
             UserStore::from_keyed_users(&config.users, |user| user.credential().to_string());
+        let router = RouteMatcher::new(config.routes.clone());
         config.users.clear();
+        config.routes.clear();
         Self {
-            router: RouteMatcher::new(config.routes.clone()),
+            router,
             config,
             users,
             traffic,
@@ -1734,6 +1736,8 @@ mod tests {
     use quinn::crypto::rustls::QuicClientConfig;
     use rustls::pki_types::CertificateDer;
 
+    use crate::config::{RouteAction, RouteRule};
+
     use super::*;
 
     struct TestCert {
@@ -1846,11 +1850,37 @@ mod tests {
     #[test]
     fn server_clone_does_not_duplicate_full_user_list() {
         let cert = test_cert("clone-users");
-        let server = server(&cert, "127.0.0.1:0".parse().expect("addr"));
+        let server = Hysteria2Server::new(Hysteria2ServerConfig {
+            node_tag: "panel|hysteria|1".to_string(),
+            listen: "127.0.0.1:0".parse().expect("addr"),
+            users: vec![user()],
+            routes: vec![RouteRule {
+                action: RouteAction::Block,
+                targets: vec!["domain:blocked.example".to_string()],
+                outbound: None,
+            }],
+            cert_file: cert.cert_path.to_string_lossy().to_string(),
+            key_file: cert.key_path.to_string_lossy().to_string(),
+            server_name: "localhost".to_string(),
+            alpn: vec!["h3".to_string()],
+            reject_unknown_sni: false,
+            connect_timeout: Duration::from_secs(3),
+            up_mbps: 0,
+            down_mbps: 0,
+            ignore_client_bandwidth: false,
+            congestion_control: String::new(),
+            obfs: None,
+        });
 
         assert_eq!(server.users.len(), 1);
         assert!(server.config.users.is_empty());
+        assert!(server.config.routes.is_empty());
         assert!(server.clone().config.users.is_empty());
+        assert!(server.clone().config.routes.is_empty());
+        assert!(matches!(
+            server.router.decide("blocked.example"),
+            RouteDecision::Block
+        ));
     }
 
     #[test]

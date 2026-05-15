@@ -129,9 +129,11 @@ impl VlessServer {
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
         let users = UserStore::from_keyed_users(&config.users, |user| compact_uuid(&user.uuid));
+        let router = RouteMatcher::new(config.routes.clone());
         config.users.clear();
+        config.routes.clear();
         Self {
-            router: RouteMatcher::new(config.routes.clone()),
+            router,
             config,
             users,
             traffic,
@@ -2736,7 +2738,9 @@ mod tests {
     use rustls::pki_types::{CertificateDer, ServerName};
     use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
-    use crate::config::{OutboundConfig, OutboundTlsConfig, OutboundTransportConfig};
+    use crate::config::{
+        OutboundConfig, OutboundTlsConfig, OutboundTransportConfig, RouteAction, RouteRule,
+    };
     use crate::grpc::{run_grpc_listener, GrpcStreamHandler};
     use crate::http2::{run_http2_listener, Http2StreamHandler};
     use crate::httpupgrade::accept_httpupgrade;
@@ -2816,11 +2820,28 @@ mod tests {
 
     #[test]
     fn server_clone_does_not_duplicate_full_user_list() {
-        let server = server_with_user(user());
+        let server = VlessServer::new(VlessServerConfig {
+            node_tag: "panel|vless|1".to_string(),
+            listen: "127.0.0.1:0".parse().expect("listen addr"),
+            users: vec![user()],
+            routes: vec![RouteRule {
+                action: RouteAction::Block,
+                targets: vec!["domain:blocked.example".to_string()],
+                outbound: None,
+            }],
+            flow: String::new(),
+            connect_timeout: Duration::from_secs(3),
+        });
 
         assert_eq!(server.users.len(), 1);
         assert!(server.config.users.is_empty());
+        assert!(server.config.routes.is_empty());
         assert!(server.clone().config.users.is_empty());
+        assert!(server.clone().config.routes.is_empty());
+        assert!(matches!(
+            server.router.decide("blocked.example"),
+            crate::RouteDecision::Block
+        ));
     }
 
     #[test]

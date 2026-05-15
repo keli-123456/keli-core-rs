@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::config::{OutboundConfig, RouteAction, RouteRule};
 
@@ -22,12 +23,14 @@ pub struct RoutedTarget {
 
 #[derive(Clone, Debug, Default)]
 pub struct RouteMatcher {
-    routes: Vec<RouteRule>,
+    routes: Arc<Vec<RouteRule>>,
 }
 
 impl RouteMatcher {
     pub fn new(routes: Vec<RouteRule>) -> Self {
-        Self { routes }
+        Self {
+            routes: Arc::new(routes),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -39,7 +42,7 @@ impl RouteMatcher {
     }
 
     pub fn decide_target(&self, host: &str, port: u16, protocol_labels: &str) -> RouteDecision {
-        for route in &self.routes {
+        for route in self.routes.iter() {
             if route_targets_match(&route.targets, host, port, protocol_labels) {
                 return match &route.action {
                     RouteAction::Direct => RouteDecision::Direct,

@@ -138,9 +138,11 @@ impl ShadowsocksServer {
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
         let users = active_user_list(&config.users);
+        let router = RouteMatcher::new(config.routes.clone());
         config.users.clear();
+        config.routes.clear();
         Self {
-            router: RouteMatcher::new(config.routes.clone()),
+            router,
             config,
             users: Arc::new(RwLock::new(users)),
             traffic,

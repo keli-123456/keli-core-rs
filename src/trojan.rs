@@ -115,9 +115,11 @@ impl TrojanServer {
         let users = UserStore::from_keyed_users(&config.users, |user| {
             trojan_password_hash(user.credential())
         });
+        let router = RouteMatcher::new(config.routes.clone());
         config.users.clear();
+        config.routes.clear();
         Self {
-            router: RouteMatcher::new(config.routes.clone()),
+            router,
             config,
             users,
             traffic,

@@ -185,10 +185,12 @@ impl VmessServer {
     ) -> Self {
         let users = valid_vmess_users(&config.users);
         let auth_users = vmess_auth_users(&users);
+        let router = RouteMatcher::new(config.routes.clone());
         config.users.clear();
+        config.routes.clear();
 
         Self {
-            router: RouteMatcher::new(config.routes.clone()),
+            router,
             config,
             users: UserStore::from_keyed_users(&users, |user| {
                 vmess_user_key(user).expect("valid vmess user")

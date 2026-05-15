@@ -81,9 +81,11 @@ impl TuicServer {
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
         let users = tuic_user_map(&config.users);
+        let router = RouteMatcher::new(config.routes.clone());
         config.users.clear();
+        config.routes.clear();
         Self {
-            router: RouteMatcher::new(config.routes.clone()),
+            router,
             config,
             users: Arc::new(RwLock::new(users)),
             traffic,

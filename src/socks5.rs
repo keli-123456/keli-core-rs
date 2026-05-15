@@ -95,9 +95,11 @@ impl Socks5Server {
     ) -> Self {
         let auth_required = !config.users.is_empty();
         let users = UserStore::from_uuid_users(&config.users);
+        let router = RouteMatcher::new(config.routes.clone());
         config.users.clear();
+        config.routes.clear();
         Self {
-            router: RouteMatcher::new(config.routes.clone()),
+            router,
             config,
             users,
             auth_required,
