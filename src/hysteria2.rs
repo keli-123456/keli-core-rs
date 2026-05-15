@@ -171,7 +171,7 @@ impl Hysteria2Server {
                     let server = self.clone();
                     tokio::spawn(async move {
                         if let Err(error) = server.handle_incoming(incoming).await {
-                            eprintln!("hysteria2 connection error: {error}");
+                            log_hysteria2_error("connection", &error);
                         }
                     });
                 }
@@ -244,7 +244,7 @@ impl Hysteria2Server {
                                 .handle_tcp_stream(stream, user_uuid, user_id, bandwidth, client_ip)
                                 .await
                             {
-                                eprintln!("hysteria2 tcp stream error: {error}");
+                                log_hysteria2_error("tcp relay", &error);
                             }
                         });
                     }
@@ -355,12 +355,24 @@ impl Hysteria2Server {
                     Err(error) if error.kind() == io::ErrorKind::TimedOut => {
                         write_tcp_response(&mut send, RESPONSE_ERROR, "connect timed out").await?;
                         let _ = send.finish();
-                        return Err(error);
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "tcp connect timed out target={}:{}",
+                                target.host, target.port
+                            ),
+                        ));
                     }
                     Err(error) => {
                         write_tcp_response(&mut send, RESPONSE_ERROR, "connect failed").await?;
                         let _ = send.finish();
-                        return Err(error);
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!(
+                                "tcp connect failed target={}:{} error={error}",
+                                target.host, target.port
+                            ),
+                        ));
                     }
                 }
             }
@@ -370,9 +382,20 @@ impl Hysteria2Server {
                 {
                     Ok(stream) => stream,
                     Err(error) => {
-                        write_tcp_response(&mut send, RESPONSE_ERROR, "connect failed").await?;
+                        let response = if error.kind() == io::ErrorKind::TimedOut {
+                            "connect timed out"
+                        } else {
+                            "connect failed"
+                        };
+                        write_tcp_response(&mut send, RESPONSE_ERROR, response).await?;
                         let _ = send.finish();
-                        return Err(error);
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!(
+                                "tcp outbound connect failed target={}:{} error={error}",
+                                target.host, target.port
+                            ),
+                        ));
                     }
                 }
             }
@@ -1533,6 +1556,28 @@ fn io_other(error: impl std::fmt::Debug) -> io::Error {
     io::Error::new(io::ErrorKind::Other, format!("{error:?}"))
 }
 
+fn log_hysteria2_error(scope: &str, error: &io::Error) {
+    if is_expected_hysteria2_close(error) {
+        return;
+    }
+    let level = if error.kind() == io::ErrorKind::TimedOut {
+        "WARN"
+    } else {
+        "ERROR"
+    };
+    eprintln!("{level} core   hysteria2 {scope} error: {error}");
+}
+
+fn is_expected_hysteria2_close(error: &io::Error) -> bool {
+    let text = error.to_string();
+    text.contains("Stopped(0)")
+        || text.contains("LocallyClosed")
+        || text.contains("ApplicationClose(0x0)")
+        || text.contains("ApplicationClosed")
+        || text.contains("ConnectionClosed(ConnectionClose")
+        || text.contains("connection closed before authentication")
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2515,5 +2560,28 @@ mod tests {
             assert_eq!(records[0].download, 11);
             assert_eq!(records[0].user_id, Some(42));
         });
+    }
+
+    #[test]
+    fn hysteria2_log_filter_treats_client_closes_as_expected() {
+        for message in [
+            "Stopped(0)",
+            "LocallyClosed",
+            "ApplicationClose(0x0)",
+            "ConnectionClosed(ConnectionClose { error_code: APPLICATION_ERROR, frame_type: None, reason: b\"\" })",
+            "hysteria2 connection closed before authentication",
+        ] {
+            let error = io::Error::new(io::ErrorKind::Other, message);
+            assert!(
+                is_expected_hysteria2_close(&error),
+                "message should be treated as expected close: {message}"
+            );
+        }
+
+        let timeout = io::Error::new(
+            io::ErrorKind::TimedOut,
+            "tcp connect timed out target=example.com:443",
+        );
+        assert!(!is_expected_hysteria2_close(&timeout));
     }
 }
