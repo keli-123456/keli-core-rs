@@ -40,7 +40,7 @@ use crate::vmess::{VmessServer, VmessServerConfig};
 const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 1024;
 const CONNECTION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS: u64 = 3;
 const QUIC_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 static TCP_ACCEPT_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static CONNECTION_WORKER_POOL: OnceLock<ConnectionWorkerPool> = OnceLock::new();
