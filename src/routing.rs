@@ -1,4 +1,5 @@
 ﻿use std::env;
+use std::collections::HashSet;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::PathBuf;
@@ -260,22 +261,35 @@ fn matches_geosite_rule(host: &str, rule: &str) -> bool {
     if rule.is_empty() {
         return false;
     }
+    matches_geosite_rule_inner(host, &rule, &mut HashSet::new())
+}
+
+fn matches_geosite_rule_inner(host: &str, rule: &str, visited: &mut HashSet<String>) -> bool {
     if builtin_geosite_domains(&rule)
         .iter()
         .any(|domain| matches_domain_suffix(host, domain))
     {
         return true;
     }
+    if !visited.insert(rule.to_string()) {
+        return false;
+    }
     load_geosite_rules(&rule)
         .iter()
-        .any(|domain| matches_geosite_domain(host, domain))
+        .any(|domain| match normalize_geosite_line(domain) {
+            Some(include) if include.starts_with("include:") => include
+                .strip_prefix("include:")
+                .map(str::trim)
+                .is_some_and(|rule| matches_geosite_rule_inner(host, rule, visited)),
+            Some(domain) => matches_geosite_domain(host, &domain),
+            None => false,
+        })
 }
 
 fn matches_geosite_domain(host: &str, rule: &str) -> bool {
-    let rule = rule.trim().to_ascii_lowercase();
-    if rule.is_empty() || rule.starts_with('#') {
+    let Some(rule) = normalize_geosite_line(rule) else {
         return false;
-    }
+    };
     if let Some(rule) = rule.strip_prefix("regexp:") {
         return regex::Regex::new(rule).is_ok_and(|regex| regex.is_match(host));
     }
@@ -290,6 +304,19 @@ fn matches_geosite_domain(host: &str, rule: &str) -> bool {
         return !rule.is_empty() && host.contains(rule);
     }
     matches_domain_suffix(host, &rule)
+}
+
+fn normalize_geosite_line(rule: &str) -> Option<String> {
+    let without_comment = rule.split('#').next().unwrap_or_default().trim();
+    if without_comment.is_empty() {
+        return None;
+    }
+    without_comment
+        .split_whitespace()
+        .next()
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+        .map(str::to_ascii_lowercase)
 }
 
 fn matches_protocol_rule(protocol_labels: &str, rule: &str) -> bool {
@@ -379,6 +406,14 @@ fn builtin_geosite_domains(rule: &str) -> &'static [&'static str] {
             "oaistatic.com",
             "oaiusercontent.com",
             "openaiapi-site.azureedge.net",
+        ],
+        "apple" => &[
+            "apple.com",
+            "icloud.com",
+            "mzstatic.com",
+            "aaplimg.com",
+            "cdn-apple.com",
+            "apple-cloudkit.com",
         ],
         "google" => &[
             "google.com",
@@ -477,10 +512,14 @@ fn ipv6_mask(prefix: u8) -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use crate::config::{OutboundConfig, RouteAction, RouteRule};
     use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 
-    use super::matches_geosite_domain;
+    use super::{matches_geosite_domain, matches_geosite_rule};
 
     #[test]
     fn matches_exact_and_suffix_block_rules() {
@@ -617,6 +656,37 @@ mod tests {
             "badexample.com",
             "domain:example.com"
         ));
+    }
+
+    #[test]
+    fn geosite_file_rules_accept_v2fly_include_and_attributes() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("keli-geosite-test-{suffix}"));
+        fs::create_dir_all(&dir).expect("create geosite dir");
+        fs::write(
+            dir.join("apple-test.txt"),
+            "include:icloud-test # swift inside\napple.com @cn\n",
+        )
+        .expect("write apple rule");
+        fs::write(dir.join("icloud-test.txt"), "domain:icloud.com @cn\n")
+            .expect("write icloud rule");
+
+        let previous = env::var("KELI_CORE_GEOSITE_DIR").ok();
+        env::set_var("KELI_CORE_GEOSITE_DIR", &dir);
+
+        assert!(matches_geosite_rule("www.apple.com", "apple-test"));
+        assert!(matches_geosite_rule("photos.icloud.com", "apple-test"));
+        assert!(!matches_geosite_rule("example.com", "apple-test"));
+
+        if let Some(previous) = previous {
+            env::set_var("KELI_CORE_GEOSITE_DIR", previous);
+        } else {
+            env::remove_var("KELI_CORE_GEOSITE_DIR");
+        }
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
