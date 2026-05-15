@@ -40,6 +40,7 @@ use crate::vmess::{VmessServer, VmessServerConfig};
 const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 1024;
 const CONNECTION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS: u64 = 5;
+const QUIC_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 static TCP_ACCEPT_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static CONNECTION_WORKER_POOL: OnceLock<ConnectionWorkerPool> = OnceLock::new();
 
@@ -630,6 +631,7 @@ fn start_hysteria2_listener(
     let runtime_server = server.clone();
     let join = thread::spawn(move || {
         runtime.block_on(server.run(endpoint, stop_for_thread));
+        runtime.shutdown_timeout(QUIC_RUNTIME_SHUTDOWN_TIMEOUT);
     });
 
     Ok(ListenerHandle {
@@ -721,6 +723,7 @@ fn start_tuic_listener(
     let runtime_server = server.clone();
     let join = thread::spawn(move || {
         runtime.block_on(server.run(endpoint, stop_for_thread));
+        runtime.shutdown_timeout(QUIC_RUNTIME_SHUTDOWN_TIMEOUT);
     });
 
     Ok(ListenerHandle {
