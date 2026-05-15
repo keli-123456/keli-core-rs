@@ -37,8 +37,8 @@ use crate::user::{apply_user_delta_to_vec, CoreUser, CoreUserDelta, CoreUserDelt
 use crate::vless::{VlessServer, VlessServerConfig};
 use crate::vmess::{VmessServer, VmessServerConfig};
 
-const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 4096;
-const CONNECTION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 1024;
+const CONNECTION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 static TCP_ACCEPT_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static CONNECTION_WORKER_POOL: OnceLock<ConnectionWorkerPool> = OnceLock::new();
 
@@ -1874,11 +1874,16 @@ fn connection_worker_pool() -> &'static ConnectionWorkerPool {
 }
 
 fn connection_worker_threads() -> usize {
+    if let Ok(value) = std::env::var("KELI_CORE_CONNECTION_WORKERS") {
+        if let Ok(parsed) = value.trim().parse::<usize>() {
+            return parsed.clamp(8, MAX_CONNECTION_WORKERS_PER_LISTENER);
+        }
+    }
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(4)
-        .saturating_mul(128)
-        .clamp(256, MAX_CONNECTION_WORKERS_PER_LISTENER)
+        .saturating_mul(16)
+        .clamp(32, 512)
 }
 
 fn connection_worker_stack_size() -> usize {

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -10,6 +10,7 @@ use quinn::crypto::rustls::QuicServerConfig;
 use quinn::Runtime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::limits::{
     sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard,
@@ -39,6 +40,7 @@ const UDP_MAX_FRAGMENT_SETS: usize = 4096;
 const UDP_MAX_REASSEMBLED_BYTES: usize = UDP_PACKET_BUFFER_SIZE;
 const UDP_SESSION_IDLE_TIMEOUT_MS: u64 = 60_000;
 const UDP_SESSION_CLEANUP_INTERVAL_MS: u64 = 10_000;
+const HY2_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
 
 #[derive(Clone, Debug)]
 pub struct Hysteria2ServerConfig {
@@ -73,6 +75,7 @@ pub struct Hysteria2Server {
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
+    connection_slots: Arc<Semaphore>,
 }
 
 impl Hysteria2Server {
@@ -100,6 +103,7 @@ impl Hysteria2Server {
             traffic,
             sessions,
             bandwidth,
+            connection_slots: Arc::new(Semaphore::new(hysteria2_connection_limit())),
         }
     }
 
@@ -168,8 +172,12 @@ impl Hysteria2Server {
                     let Some(incoming) = incoming else {
                         break;
                     };
+                    let Some(connection_slot) = self.try_acquire_connection_slot() else {
+                        continue;
+                    };
                     let server = self.clone();
                     tokio::spawn(async move {
+                        let _connection_slot = connection_slot;
                         if let Err(error) = server.handle_incoming(incoming).await {
                             log_hysteria2_error("connection", &error);
                         }
@@ -199,6 +207,10 @@ impl Hysteria2Server {
 
     fn user_for_auth(&self, auth: &str) -> Option<CoreUser> {
         self.users.get(auth)
+    }
+
+    fn try_acquire_connection_slot(&self) -> Option<OwnedSemaphorePermit> {
+        self.connection_slots.clone().try_acquire_owned().ok()
     }
 
     async fn handle_incoming(&self, incoming: quinn::Incoming) -> io::Result<()> {
@@ -1556,8 +1568,11 @@ fn io_other(error: impl std::fmt::Debug) -> io::Error {
     io::Error::new(io::ErrorKind::Other, format!("{error:?}"))
 }
 
-fn log_hysteria2_error(scope: &str, error: &io::Error) {
+fn log_hysteria2_error(scope: &'static str, error: &io::Error) {
     if is_expected_hysteria2_close(error) {
+        return;
+    }
+    if error.kind() == io::ErrorKind::TimedOut && !should_log_hysteria2_timeout(scope) {
         return;
     }
     let level = if error.kind() == io::ErrorKind::TimedOut {
@@ -1566,6 +1581,44 @@ fn log_hysteria2_error(scope: &str, error: &io::Error) {
         "ERROR"
     };
     eprintln!("{level} core   hysteria2 {scope} error: {error}");
+}
+
+#[derive(Default)]
+struct Hysteria2TimeoutLogState {
+    last_connection_ms: u64,
+    last_tcp_relay_ms: u64,
+}
+
+fn should_log_hysteria2_timeout(scope: &'static str) -> bool {
+    static STATE: OnceLock<Mutex<Hysteria2TimeoutLogState>> = OnceLock::new();
+    let now = now_millis();
+    let mut state = STATE
+        .get_or_init(|| Mutex::new(Hysteria2TimeoutLogState::default()))
+        .lock()
+        .expect("hysteria2 timeout log state poisoned");
+    let last = if scope == "tcp relay" {
+        &mut state.last_tcp_relay_ms
+    } else {
+        &mut state.last_connection_ms
+    };
+    if now.saturating_sub(*last) < HY2_ERROR_LOG_INTERVAL_MS {
+        return false;
+    }
+    *last = now;
+    true
+}
+
+fn hysteria2_connection_limit() -> usize {
+    if let Ok(value) = std::env::var("KELI_CORE_HY2_MAX_CONNECTIONS") {
+        if let Ok(parsed) = value.trim().parse::<usize>() {
+            return parsed.clamp(64, 16_384);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .saturating_mul(256)
+        .clamp(512, 4096)
 }
 
 fn is_expected_hysteria2_close(error: &io::Error) -> bool {
