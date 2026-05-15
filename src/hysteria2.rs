@@ -1572,10 +1572,10 @@ fn log_hysteria2_error(scope: &'static str, error: &io::Error) {
     if is_expected_hysteria2_close(error) {
         return;
     }
-    if error.kind() == io::ErrorKind::TimedOut && !should_log_hysteria2_timeout(scope) {
+    if is_hysteria2_timeout(error) && !should_log_hysteria2_timeout(scope) {
         return;
     }
-    let level = if error.kind() == io::ErrorKind::TimedOut {
+    let level = if is_hysteria2_timeout(error) {
         "WARN"
     } else {
         "ERROR"
@@ -1629,6 +1629,14 @@ fn is_expected_hysteria2_close(error: &io::Error) -> bool {
         || text.contains("ApplicationClosed")
         || text.contains("ConnectionClosed(ConnectionClose")
         || text.contains("connection closed before authentication")
+}
+
+fn is_hysteria2_timeout(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::TimedOut {
+        return true;
+    }
+    let text = error.to_string();
+    text.contains("TimedOut") || text.contains("timed out")
 }
 
 fn now_millis() -> u64 {
@@ -2636,5 +2644,9 @@ mod tests {
             "tcp connect timed out target=example.com:443",
         );
         assert!(!is_expected_hysteria2_close(&timeout));
+        assert!(is_hysteria2_timeout(&timeout));
+
+        let quinn_timeout = io::Error::new(io::ErrorKind::Other, "TimedOut");
+        assert!(is_hysteria2_timeout(&quinn_timeout));
     }
 }
