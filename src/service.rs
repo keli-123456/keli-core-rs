@@ -1742,10 +1742,6 @@ impl ConnectionWorkerGroup {
         true
     }
 
-    fn join(&self) {
-        self.state.wait_until_idle();
-    }
-
     fn join_timeout(&self, timeout: Duration) -> bool {
         self.state.wait_until_idle_timeout(timeout)
     }
@@ -1776,16 +1772,6 @@ impl ConnectionWorkerGroupState {
         *active = active.saturating_sub(1);
         if *active == 0 {
             self.finished.notify_all();
-        }
-    }
-
-    fn wait_until_idle(&self) {
-        let mut active = self.active.lock().expect("worker group lock poisoned");
-        while *active > 0 {
-            active = self
-                .finished
-                .wait(active)
-                .expect("worker group lock poisoned");
         }
     }
 
@@ -2357,7 +2343,7 @@ mod tests {
         let group_for_waiter = group.clone();
         let (joined_tx, joined_rx) = mpsc::channel();
         let waiter = thread::spawn(move || {
-            group_for_waiter.join();
+            assert!(group_for_waiter.join_timeout(Duration::from_secs(2)));
             joined_tx.send(()).expect("send joined");
         });
 
@@ -2391,14 +2377,14 @@ mod tests {
     fn connection_worker_group_releases_panicking_jobs() {
         let group = super::ConnectionWorkerGroup::new();
         assert!(group.spawn(|| panic!("worker panic should be contained")));
-        group.join();
+        assert!(group.join_timeout(Duration::from_secs(2)));
 
         let completed = Arc::new(AtomicBool::new(false));
         let completed_for_worker = completed.clone();
         assert!(group.spawn(move || {
             completed_for_worker.store(true, Ordering::SeqCst);
         }));
-        group.join();
+        assert!(group.join_timeout(Duration::from_secs(2)));
         assert!(completed.load(Ordering::SeqCst));
     }
 
@@ -2415,7 +2401,7 @@ mod tests {
         }
         drop(completed_tx);
 
-        group.join();
+        assert!(group.join_timeout(Duration::from_secs(2)));
         let mut completed = completed_rx.try_iter().collect::<Vec<_>>();
         completed.sort_unstable();
 
