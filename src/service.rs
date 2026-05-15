@@ -6,7 +6,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,7 @@ use crate::vmess::{VmessServer, VmessServerConfig};
 
 const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 1024;
 const CONNECTION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECTION_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS: u64 = 5;
 const QUIC_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 static TCP_ACCEPT_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -90,6 +91,7 @@ pub struct CoreService {
     traffic: SharedTrafficRegistry,
     bandwidth: UserBandwidthLimiters,
     user_revisions: HashMap<String, String>,
+    stopped: bool,
 }
 
 #[derive(Debug)]
@@ -248,6 +250,7 @@ impl CoreService {
             traffic,
             bandwidth,
             user_revisions: HashMap::new(),
+            stopped: false,
         })
     }
 
@@ -320,6 +323,10 @@ impl CoreService {
     }
 
     pub fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
         for handle in &self.listeners {
             handle.stop.store(true, Ordering::SeqCst);
             let _ = TcpStream::connect(handle.status.local_addr);
@@ -330,7 +337,15 @@ impl CoreService {
             if let Some(join) = handle.join.take() {
                 let _ = join.join();
             }
-            handle.workers.join();
+            if !handle
+                .workers
+                .join_timeout(CONNECTION_WORKER_SHUTDOWN_TIMEOUT)
+            {
+                eprintln!(
+                    "WARN  core   listener worker shutdown timed out tag={} protocol={:?}",
+                    handle.status.tag, handle.status.protocol
+                );
+            }
         }
     }
 }
@@ -1730,6 +1745,10 @@ impl ConnectionWorkerGroup {
     fn join(&self) {
         self.state.wait_until_idle();
     }
+
+    fn join_timeout(&self, timeout: Duration) -> bool {
+        self.state.wait_until_idle_timeout(timeout)
+    }
 }
 
 struct ConnectionWorkerAsyncGuard {
@@ -1768,6 +1787,27 @@ impl ConnectionWorkerGroupState {
                 .wait(active)
                 .expect("worker group lock poisoned");
         }
+    }
+
+    fn wait_until_idle_timeout(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut active = self.active.lock().expect("worker group lock poisoned");
+        while *active > 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_active, wait_result) = self
+                .finished
+                .wait_timeout(active, remaining)
+                .expect("worker group lock poisoned");
+            active = next_active;
+            if wait_result.timed_out() && *active > 0 {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -2173,7 +2213,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use crate::config::{
         CoreConfig, DnsConfig, InboundConfig, OutboundConfig, RealityConfig, SniffingConfig,
@@ -2328,6 +2368,23 @@ mod tests {
             .expect("worker group joined");
         waiter.join().expect("waiter thread");
         assert!(completed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn connection_worker_group_timeout_does_not_block_shutdown() {
+        let group = super::ConnectionWorkerGroup::new();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        assert!(group.spawn(move || {
+            release_rx.recv().expect("release worker");
+        }));
+
+        let start = Instant::now();
+        assert!(!group.join_timeout(Duration::from_millis(50)));
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        release_tx.send(()).expect("release");
+        assert!(group.join_timeout(Duration::from_secs(2)));
     }
 
     #[test]
