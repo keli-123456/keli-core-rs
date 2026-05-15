@@ -147,6 +147,8 @@ impl ListenerRuntime {
 impl CoreService {
     pub fn start(config: CoreConfig) -> Result<Self, CoreServiceError> {
         config.validate().map_err(CoreServiceError::InvalidConfig)?;
+        validate_unique_listener_binds(&config.inbounds)
+            .map_err(CoreServiceError::InvalidConfig)?;
         crate::dns::configure(config.dns.clone());
         let active_config = config.clone();
 
@@ -2043,6 +2045,89 @@ fn tls_acceptor_for(inbound: &InboundConfig) -> Result<Option<TlsAcceptor>, Core
     })
 }
 
+#[derive(Clone, Debug)]
+struct ListenerBindSpec {
+    tag: String,
+    protocol: Protocol,
+    network: &'static str,
+    addr: SocketAddr,
+}
+
+fn validate_unique_listener_binds(inbounds: &[InboundConfig]) -> Result<(), ValidationError> {
+    let mut seen = Vec::<ListenerBindSpec>::new();
+    for inbound in inbounds {
+        for spec in listener_bind_specs(inbound)? {
+            if let Some(existing) = seen.iter().find(|existing| {
+                existing.network == spec.network && listen_addrs_conflict(existing.addr, spec.addr)
+            }) {
+                return Err(ValidationError::new(format!(
+                    "duplicate {} listen {} for inbound {} ({:?}) conflicts with {} ({:?}); change one node server port or listen address",
+                    spec.network,
+                    spec.addr,
+                    spec.tag,
+                    spec.protocol,
+                    existing.tag,
+                    existing.protocol
+                )));
+            }
+            seen.push(spec);
+        }
+    }
+    Ok(())
+}
+
+fn listener_bind_specs(inbound: &InboundConfig) -> Result<Vec<ListenerBindSpec>, ValidationError> {
+    let addr = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|error| {
+        ValidationError::new(format!(
+            "inbound {} listen {}:{} did not resolve: {}",
+            inbound.tag, inbound.listen, inbound.port, error
+        ))
+    })?;
+    let mut specs = Vec::with_capacity(2);
+    if protocol_binds_tcp(inbound) {
+        specs.push(ListenerBindSpec {
+            tag: inbound.tag.clone(),
+            protocol: inbound.protocol.clone(),
+            network: "tcp",
+            addr,
+        });
+    }
+    if protocol_binds_udp(inbound) {
+        specs.push(ListenerBindSpec {
+            tag: inbound.tag.clone(),
+            protocol: inbound.protocol.clone(),
+            network: "udp",
+            addr,
+        });
+    }
+    Ok(specs)
+}
+
+fn protocol_binds_tcp(inbound: &InboundConfig) -> bool {
+    matches!(
+        inbound.protocol,
+        Protocol::Socks
+            | Protocol::Http
+            | Protocol::Vless
+            | Protocol::Vmess
+            | Protocol::Trojan
+            | Protocol::Shadowsocks
+            | Protocol::AnyTls
+            | Protocol::Mieru
+    )
+}
+
+fn protocol_binds_udp(inbound: &InboundConfig) -> bool {
+    matches!(inbound.protocol, Protocol::Hysteria2 | Protocol::Tuic)
+        || (inbound.protocol == Protocol::Shadowsocks
+            && shadowsocks_udp_enabled(&inbound.transport))
+}
+
+fn listen_addrs_conflict(left: SocketAddr, right: SocketAddr) -> bool {
+    left.port() == right.port()
+        && (left.ip() == right.ip() || left.ip().is_unspecified() || right.ip().is_unspecified())
+}
+
 fn resolve_listen_addr(listen: &str, port: u16) -> io::Result<SocketAddr> {
     let listen = match listen.trim() {
         "" | "0.0.0.0" | "::" | "[::]" => "::",
@@ -2102,6 +2187,82 @@ mod tests {
             super::resolve_listen_addr("127.0.0.1", 443).expect("explicit ipv4"),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 443))
         );
+    }
+
+    #[test]
+    fn listener_bind_validation_rejects_duplicate_tcp_port() {
+        let inbounds = vec![
+            bind_validation_inbound("node-a|vless", Protocol::Vless, "127.0.0.1", 25001, "tcp"),
+            bind_validation_inbound("node-b|trojan", Protocol::Trojan, "127.0.0.1", 25001, "tcp"),
+        ];
+
+        let error = super::validate_unique_listener_binds(&inbounds)
+            .expect_err("duplicate tcp bind should fail")
+            .to_string();
+
+        assert!(error.contains("duplicate tcp listen"));
+        assert!(error.contains("25001"));
+        assert!(error.contains("node-a|vless"));
+        assert!(error.contains("node-b|trojan"));
+    }
+
+    #[test]
+    fn listener_bind_validation_treats_wildcard_as_conflicting_with_explicit_ip() {
+        let inbounds = vec![
+            bind_validation_inbound("node-a|vless", Protocol::Vless, "0.0.0.0", 25002, "tcp"),
+            bind_validation_inbound("node-b|socks", Protocol::Socks, "127.0.0.1", 25002, "tcp"),
+        ];
+
+        let error = super::validate_unique_listener_binds(&inbounds)
+            .expect_err("wildcard and explicit tcp bind should conflict")
+            .to_string();
+
+        assert!(error.contains("duplicate tcp listen"));
+        assert!(error.contains("25002"));
+    }
+
+    #[test]
+    fn listener_bind_validation_allows_same_port_for_tcp_and_udp() {
+        let inbounds = vec![
+            bind_validation_inbound("node-a|vless", Protocol::Vless, "127.0.0.1", 25003, "tcp"),
+            bind_validation_inbound(
+                "node-a|hysteria2",
+                Protocol::Hysteria2,
+                "127.0.0.1",
+                25003,
+                "udp",
+            ),
+        ];
+
+        super::validate_unique_listener_binds(&inbounds)
+            .expect("tcp and udp listeners may share a numeric port");
+    }
+
+    #[test]
+    fn listener_bind_validation_rejects_duplicate_udp_port() {
+        let inbounds = vec![
+            bind_validation_inbound(
+                "node-a|shadowsocks",
+                Protocol::Shadowsocks,
+                "127.0.0.1",
+                25004,
+                "tcp,udp",
+            ),
+            bind_validation_inbound(
+                "node-b|hysteria2",
+                Protocol::Hysteria2,
+                "127.0.0.1",
+                25004,
+                "udp",
+            ),
+        ];
+
+        let error = super::validate_unique_listener_binds(&inbounds)
+            .expect_err("duplicate udp bind should fail")
+            .to_string();
+
+        assert!(error.contains("duplicate udp listen"));
+        assert!(error.contains("25004"));
     }
 
     #[test]
@@ -2223,6 +2384,32 @@ mod tests {
             }],
             routes: Vec::new(),
             stats: StatsConfig::default(),
+        }
+    }
+
+    fn bind_validation_inbound(
+        tag: &str,
+        protocol: Protocol,
+        listen: &str,
+        port: u16,
+        network: &str,
+    ) -> InboundConfig {
+        InboundConfig {
+            tag: tag.to_string(),
+            protocol,
+            listen: listen.to_string(),
+            port,
+            users: vec![user()],
+            cipher: None,
+            flow: String::new(),
+            padding_scheme: Vec::new(),
+            transport: TransportConfig {
+                network: network.to_string(),
+                ..TransportConfig::default()
+            },
+            tls: None,
+            sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
         }
     }
 

@@ -6,30 +6,32 @@ use socket2::{Domain, Protocol, Socket, Type};
 pub(crate) fn bind_dual_stack_tcp_listener(listen: SocketAddr) -> io::Result<TcpListener> {
     let listen = dual_stack_wildcard_addr(listen);
     if !is_ipv6_unspecified(listen) {
-        return TcpListener::bind(listen);
+        return TcpListener::bind(listen).map_err(|error| bind_addr_error(listen, error));
     }
 
     match bind_ipv6_tcp_listener(listen) {
         Ok(listener) => Ok(listener),
         Err(error) if should_fallback_to_ipv4(&error) => {
-            TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, listen.port())))
+            let fallback = SocketAddr::from((Ipv4Addr::UNSPECIFIED, listen.port()));
+            TcpListener::bind(fallback).map_err(|error| bind_addr_error(fallback, error))
         }
-        Err(error) => Err(error),
+        Err(error) => Err(bind_addr_error(listen, error)),
     }
 }
 
 pub(crate) fn bind_dual_stack_udp_socket(listen: SocketAddr) -> io::Result<UdpSocket> {
     let listen = dual_stack_wildcard_addr(listen);
     if !is_ipv6_unspecified(listen) {
-        return UdpSocket::bind(listen);
+        return UdpSocket::bind(listen).map_err(|error| bind_addr_error(listen, error));
     }
 
     match bind_ipv6_udp_socket(listen) {
         Ok(socket) => Ok(socket),
         Err(error) if should_fallback_to_ipv4(&error) => {
-            UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, listen.port())))
+            let fallback = SocketAddr::from((Ipv4Addr::UNSPECIFIED, listen.port()));
+            UdpSocket::bind(fallback).map_err(|error| bind_addr_error(fallback, error))
         }
-        Err(error) => Err(error),
+        Err(error) => Err(bind_addr_error(listen, error)),
     }
 }
 
@@ -65,6 +67,10 @@ fn should_fallback_to_ipv4(error: &io::Error) -> bool {
         error.kind(),
         io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
     ) || matches!(error.raw_os_error(), Some(47 | 49 | 97 | 10047 | 10049))
+}
+
+fn bind_addr_error(listen: SocketAddr, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("at {listen}: {error}"))
 }
 
 #[cfg(test)]
