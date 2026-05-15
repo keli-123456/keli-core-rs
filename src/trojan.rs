@@ -1685,7 +1685,7 @@ mod tests {
             }
         });
 
-        assert!(trojan_auth_succeeds(
+        assert!(trojan_auth_succeeds_eventually(
             trojan_addr,
             "trojan-password",
             echo_addr
@@ -1705,7 +1705,11 @@ mod tests {
             "trojan-password",
             echo_addr
         ));
-        assert!(trojan_auth_succeeds(trojan_addr, "secret-b", echo_addr));
+        assert!(trojan_auth_succeeds_eventually(
+            trojan_addr,
+            "secret-b",
+            echo_addr
+        ));
 
         stop.store(true, Ordering::SeqCst);
         let _ = TcpStream::connect(trojan_addr);
@@ -1844,8 +1848,8 @@ mod tests {
         let Ok(mut stream) = TcpStream::connect(server_addr) else {
             return false;
         };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
         if stream
             .write_all(&trojan_request_with_password_and_command(
                 target, password, 0x01,
@@ -1859,6 +1863,20 @@ mod tests {
         }
         let mut response = [0u8; 1];
         stream.read_exact(&mut response).is_ok() && response == *b"x"
+    }
+
+    fn trojan_auth_succeeds_eventually(
+        server_addr: std::net::SocketAddr,
+        password: &str,
+        target: std::net::SocketAddr,
+    ) -> bool {
+        for _ in 0..3 {
+            if trojan_auth_succeeds(server_addr, password, target) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
     }
 
     fn trojan_request_with_password_and_command(

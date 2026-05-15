@@ -150,16 +150,20 @@ fn relay_tcp_streams_unlimited_native(
     remote: TcpStream,
 ) -> io::Result<(u64, u64)> {
     let mut client_read = client.try_clone()?;
+    let client_read_shutdown = client_read.try_clone()?;
     let mut client_write = client;
     let mut remote_read = remote.try_clone()?;
+    let remote_read_shutdown = remote_read.try_clone()?;
     let mut remote_write = remote;
     let upload_task = spawn_native_blocking_relay(move || {
         let copied = copy_count_best_effort(&mut client_read, &mut remote_write);
         let _ = remote_write.shutdown(Shutdown::Write);
+        let _ = remote_read_shutdown.shutdown(Shutdown::Read);
         copied
     })?;
     let download = copy_count_best_effort(&mut remote_read, &mut client_write);
     let _ = client_write.shutdown(Shutdown::Write);
+    let _ = client_read_shutdown.shutdown(Shutdown::Read);
     let upload = join_native_blocking_relay(upload_task, "tcp upload relay task panicked")?;
     Ok((upload, download))
 }
@@ -423,12 +427,16 @@ where
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read, Write};
+    #[cfg(unix)]
+    use std::net::Shutdown;
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
     use crate::limits::{BandwidthLimiter, UserBandwidthLimiters};
+    #[cfg(unix)]
+    use crate::stream::relay_tcp_fast_unlimited;
     use crate::stream::{
         copy_count_best_effort_limited, join_native_blocking_relay, relay_tcp_streams_limited,
         spawn_native_blocking_relay,
@@ -507,6 +515,42 @@ mod tests {
         remote_peer
             .set_read_timeout(Some(Duration::from_millis(200)))
             .expect("remote timeout");
+        assert!(matches!(remote_peer.read(&mut byte), Ok(0) | Err(_)));
+        relay.join().expect("relay thread");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlimited_tcp_relay_closes_both_sides_when_client_disconnects() {
+        let client_listener = TcpListener::bind("127.0.0.1:0").expect("client bind");
+        let remote_listener = TcpListener::bind("127.0.0.1:0").expect("remote bind");
+        let client_addr = client_listener.local_addr().expect("client addr");
+        let remote_addr = remote_listener.local_addr().expect("remote addr");
+        let client_peer = thread::spawn(move || TcpStream::connect(client_addr).expect("client"));
+        let remote_peer = thread::spawn(move || TcpStream::connect(remote_addr).expect("remote"));
+        let (client, _) = client_listener.accept().expect("client accept");
+        let (remote, _) = remote_listener.accept().expect("remote accept");
+        let client_peer = client_peer.join().expect("client thread");
+        let mut remote_peer = remote_peer.join().expect("remote thread");
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let relay = thread::spawn(move || {
+            let result = relay_tcp_fast_unlimited(client, remote);
+            done_tx.send(result).expect("send relay result");
+        });
+
+        client_peer
+            .shutdown(Shutdown::Both)
+            .expect("client disconnect");
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("relay should exit after client disconnect")
+            .expect("relay result");
+        assert_eq!(result, (0, 0));
+        remote_peer
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("remote timeout");
+        let mut byte = [0u8; 1];
         assert!(matches!(remote_peer.read(&mut byte), Ok(0) | Err(_)));
         relay.join().expect("relay thread");
     }

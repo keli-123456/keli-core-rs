@@ -1092,18 +1092,22 @@ where
     D: FnMut(u64) + Send + 'static,
 {
     let mut client_read = client.try_clone()?;
+    let client_read_shutdown = client_read.try_clone()?;
     let mut client_write = client;
     let mut remote_read = remote.try_clone()?;
+    let remote_read_shutdown = remote_read.try_clone()?;
     let mut remote_write = remote;
     let upload_task = spawn_native_blocking_relay(move || {
         let copied =
             copy_count_best_effort_with_flush(&mut client_read, &mut remote_write, &mut on_upload);
         let _ = remote_write.shutdown(Shutdown::Write);
+        let _ = remote_read_shutdown.shutdown(Shutdown::Read);
         copied
     })?;
     let download =
         copy_count_best_effort_with_flush(&mut remote_read, &mut client_write, &mut on_download);
     let _ = client_write.shutdown(Shutdown::Write);
+    let _ = client_read_shutdown.shutdown(Shutdown::Read);
     let upload = join_native_blocking_relay(upload_task, "vless upload relay task panicked")?;
     Ok((upload, download))
 }
