@@ -28,7 +28,7 @@ use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
-    relay_tcp_fast_unlimited, relay_tcp_limited, spawn_native_blocking_relay,
+    relay_tcp_fast_unlimited_close_on_eof, relay_tcp_limited, spawn_native_blocking_relay,
 };
 use crate::tls::{relay_tls_stream, TlsConnection, TlsSocket};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
@@ -588,7 +588,7 @@ impl VlessServer {
         } else if let Some(limiter) = bandwidth {
             relay_tcp_limited(client, remote, limiter)?
         } else {
-            relay_tcp_fast_unlimited(client, remote)?
+            relay_tcp_fast_unlimited_close_on_eof(client, remote)?
         };
         self.traffic.add_with_user_id(
             self.config.node_tag.clone(),

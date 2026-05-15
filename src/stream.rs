@@ -43,7 +43,14 @@ pub fn relay_tcp_streams(client: TcpStream, remote: TcpStream) -> io::Result<(u6
 }
 
 pub fn relay_tcp_fast_unlimited(client: TcpStream, remote: TcpStream) -> io::Result<(u64, u64)> {
-    relay_tcp_streams_unlimited_native(client, remote)
+    relay_tcp_streams_unlimited_native(client, remote, false)
+}
+
+pub fn relay_tcp_fast_unlimited_close_on_eof(
+    client: TcpStream,
+    remote: TcpStream,
+) -> io::Result<(u64, u64)> {
+    relay_tcp_streams_unlimited_native(client, remote, true)
 }
 
 pub fn relay_tcp_limited(
@@ -120,7 +127,7 @@ fn relay_tcp_streams_async(
     limiter: Option<Arc<BandwidthLimiter>>,
 ) -> io::Result<(u64, u64)> {
     if limiter.is_none() {
-        return relay_tcp_streams_unlimited_native(client, remote);
+        return relay_tcp_streams_unlimited_native(client, remote, false);
     }
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
@@ -148,22 +155,35 @@ fn relay_tcp_streams_async(
 fn relay_tcp_streams_unlimited_native(
     client: TcpStream,
     remote: TcpStream,
+    close_peer_on_eof: bool,
 ) -> io::Result<(u64, u64)> {
     let mut client_read = client.try_clone()?;
-    let client_read_shutdown = client_read.try_clone()?;
+    let client_read_shutdown = if close_peer_on_eof {
+        Some(client_read.try_clone()?)
+    } else {
+        None
+    };
     let mut client_write = client;
     let mut remote_read = remote.try_clone()?;
-    let remote_read_shutdown = remote_read.try_clone()?;
+    let remote_read_shutdown = if close_peer_on_eof {
+        Some(remote_read.try_clone()?)
+    } else {
+        None
+    };
     let mut remote_write = remote;
     let upload_task = spawn_native_blocking_relay(move || {
         let copied = copy_count_best_effort(&mut client_read, &mut remote_write);
         let _ = remote_write.shutdown(Shutdown::Write);
-        let _ = remote_read_shutdown.shutdown(Shutdown::Read);
+        if let Some(remote_read_shutdown) = remote_read_shutdown {
+            let _ = remote_read_shutdown.shutdown(Shutdown::Read);
+        }
         copied
     })?;
     let download = copy_count_best_effort(&mut remote_read, &mut client_write);
     let _ = client_write.shutdown(Shutdown::Write);
-    let _ = client_read_shutdown.shutdown(Shutdown::Read);
+    if let Some(client_read_shutdown) = client_read_shutdown {
+        let _ = client_read_shutdown.shutdown(Shutdown::Read);
+    }
     let upload = join_native_blocking_relay(upload_task, "tcp upload relay task panicked")?;
     Ok((upload, download))
 }
@@ -427,19 +447,17 @@ where
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read, Write};
-    #[cfg(unix)]
-    use std::net::Shutdown;
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{Shutdown, TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
     use crate::limits::{BandwidthLimiter, UserBandwidthLimiters};
     #[cfg(unix)]
-    use crate::stream::relay_tcp_fast_unlimited;
+    use crate::stream::relay_tcp_fast_unlimited_close_on_eof;
     use crate::stream::{
-        copy_count_best_effort_limited, join_native_blocking_relay, relay_tcp_streams_limited,
-        spawn_native_blocking_relay,
+        copy_count_best_effort_limited, join_native_blocking_relay, relay_tcp_fast_unlimited,
+        relay_tcp_streams_limited, spawn_native_blocking_relay,
     };
     use crate::user::CoreUser;
 
@@ -519,6 +537,42 @@ mod tests {
         relay.join().expect("relay thread");
     }
 
+    #[test]
+    fn unlimited_tcp_relay_preserves_half_close_response() {
+        let client_listener = TcpListener::bind("127.0.0.1:0").expect("client bind");
+        let remote_listener = TcpListener::bind("127.0.0.1:0").expect("remote bind");
+        let client_addr = client_listener.local_addr().expect("client addr");
+        let remote_addr = remote_listener.local_addr().expect("remote addr");
+        let client_peer = thread::spawn(move || TcpStream::connect(client_addr).expect("client"));
+        let remote_peer = thread::spawn(move || {
+            let mut stream = TcpStream::connect(remote_addr).expect("remote");
+            let mut captured = Vec::new();
+            stream.read_to_end(&mut captured).expect("remote read");
+            assert_eq!(captured, b"request");
+            stream.write_all(b"response").expect("remote write");
+        });
+        let (client, _) = client_listener.accept().expect("client accept");
+        let (remote, _) = remote_listener.accept().expect("remote accept");
+        let mut client_peer = client_peer.join().expect("client thread");
+        let relay = thread::spawn(move || relay_tcp_fast_unlimited(client, remote));
+
+        client_peer.write_all(b"request").expect("client write");
+        client_peer
+            .shutdown(Shutdown::Write)
+            .expect("client half close");
+        let mut response = Vec::new();
+        client_peer.read_to_end(&mut response).expect("client read");
+        assert_eq!(response, b"response");
+
+        let (upload, download) = relay
+            .join()
+            .expect("relay thread")
+            .expect("relay should finish");
+        assert_eq!(upload, b"request".len() as u64);
+        assert_eq!(download, b"response".len() as u64);
+        remote_peer.join().expect("remote thread");
+    }
+
     #[cfg(unix)]
     #[test]
     fn unlimited_tcp_relay_closes_both_sides_when_client_disconnects() {
@@ -535,7 +589,7 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
 
         let relay = thread::spawn(move || {
-            let result = relay_tcp_fast_unlimited(client, remote);
+            let result = relay_tcp_fast_unlimited_close_on_eof(client, remote);
             done_tx.send(result).expect("send relay result");
         });
 
