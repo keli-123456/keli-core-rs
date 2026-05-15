@@ -374,6 +374,21 @@ impl UserBandwidthLimiters {
         }
     }
 
+    pub fn close_all_connections(&self) {
+        let mut handles = Vec::new();
+        for shard in self.connections.iter() {
+            let active = shard.lock().expect("user connection lock poisoned");
+            handles.extend(
+                active
+                    .values()
+                    .flat_map(|handles| handles.iter().filter_map(Weak::upgrade)),
+            );
+        }
+        for handle in handles {
+            handle.close();
+        }
+    }
+
     pub fn active_connection_count(&self, user_uuid: &str) -> usize {
         let mut active = user_connection_shard(&self.connections, user_uuid)
             .lock()
@@ -887,6 +902,57 @@ mod tests {
         assert!(closed, "registered connection should close on revoke");
         drop(guard);
         assert_eq!(limiters.active_connection_count(&user.uuid), 0);
+    }
+
+    #[test]
+    fn close_all_connections_closes_registered_tcp_connections() {
+        let limiters = UserBandwidthLimiters::default();
+        let user_a = user(0);
+        let mut user_b = user(0);
+        user_b.uuid = "user-b".to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let client_a = TcpStream::connect(listener.local_addr().expect("addr")).expect("client a");
+        let (server_a, _) = listener.accept().expect("server a");
+        let client_b = TcpStream::connect(listener.local_addr().expect("addr")).expect("client b");
+        let (server_b, _) = listener.accept().expect("server b");
+        client_a
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("client a timeout");
+        client_b
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("client b timeout");
+
+        let guard_a = limiters
+            .register_tcp_connection(Some(&user_a.uuid), &[&client_a, &server_a])
+            .expect("register a")
+            .expect("guard a");
+        let guard_b = limiters
+            .register_tcp_connection(Some(&user_b.uuid), &[&client_b, &server_b])
+            .expect("register b")
+            .expect("guard b");
+        assert_eq!(limiters.active_connection_count(&user_a.uuid), 1);
+        assert_eq!(limiters.active_connection_count(&user_b.uuid), 1);
+
+        limiters.close_all_connections();
+
+        let mut buffer = [0u8; 1];
+        let a_closed = matches!(client_a.peek(&mut buffer), Ok(0) | Err(_))
+            || matches!(
+                client_a.try_clone().unwrap().read(&mut buffer),
+                Ok(0) | Err(_)
+            );
+        let b_closed = matches!(client_b.peek(&mut buffer), Ok(0) | Err(_))
+            || matches!(
+                client_b.try_clone().unwrap().read(&mut buffer),
+                Ok(0) | Err(_)
+            );
+        assert!(a_closed, "first registered connection should close");
+        assert!(b_closed, "second registered connection should close");
+
+        drop(guard_a);
+        drop(guard_b);
+        assert_eq!(limiters.active_connection_count(&user_a.uuid), 0);
+        assert_eq!(limiters.active_connection_count(&user_b.uuid), 0);
     }
 
     #[test]

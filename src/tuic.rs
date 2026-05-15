@@ -37,6 +37,7 @@ const ATYP_IPV6: u8 = 0x02;
 const ATYP_NONE: u8 = 0xff;
 const UDP_DATAGRAM_BUFFER_SIZE: usize = 1024 * 1024;
 const UDP_PACKET_BUFFER_SIZE: usize = 64 * 1024;
+const QUIC_ENDPOINT_STOP_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug)]
 pub struct TuicServerConfig {
@@ -136,7 +137,7 @@ impl TuicServer {
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {}
             }
         }
-        endpoint.wait_idle().await;
+        let _ = tokio::time::timeout(QUIC_ENDPOINT_STOP_WAIT, endpoint.wait_idle()).await;
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {

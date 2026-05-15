@@ -39,6 +39,7 @@ use crate::vmess::{VmessServer, VmessServerConfig};
 
 const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 1024;
 const CONNECTION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS: u64 = 5;
 static TCP_ACCEPT_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static CONNECTION_WORKER_POOL: OnceLock<ConnectionWorkerPool> = OnceLock::new();
 
@@ -86,6 +87,7 @@ pub struct CoreService {
     config: CoreConfig,
     listeners: Vec<ListenerHandle>,
     traffic: SharedTrafficRegistry,
+    bandwidth: UserBandwidthLimiters,
     user_revisions: HashMap<String, String>,
 }
 
@@ -243,6 +245,7 @@ impl CoreService {
             config: active_config,
             listeners,
             traffic,
+            bandwidth,
             user_revisions: HashMap::new(),
         })
     }
@@ -320,6 +323,7 @@ impl CoreService {
             handle.stop.store(true, Ordering::SeqCst);
             let _ = TcpStream::connect(handle.status.local_addr);
         }
+        self.bandwidth.close_all_connections();
 
         for handle in &mut self.listeners {
             if let Some(join) = handle.join.take() {
@@ -342,6 +346,19 @@ fn config_without_users(config: &CoreConfig) -> CoreConfig {
         inbound.users.clear();
     }
     config
+}
+
+fn outbound_connect_timeout() -> Duration {
+    outbound_connect_timeout_from_env(std::env::var("KELI_CORE_OUTBOUND_CONNECT_TIMEOUT_SECS").ok())
+}
+
+fn outbound_connect_timeout_from_env(value: Option<String>) -> Duration {
+    value
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| Duration::from_secs(seconds.clamp(1, 60)))
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS))
 }
 
 fn start_grpc_transport_listener(
@@ -446,7 +463,7 @@ fn start_vmess_listener(
             listen,
             users: inbound.users.clone(),
             routes,
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: outbound_connect_timeout(),
         },
         traffic,
         sessions,
@@ -573,7 +590,7 @@ fn start_hysteria2_listener(
             server_name: tls.server_name.clone(),
             alpn: tls.alpn.clone(),
             reject_unknown_sni: tls.reject_unknown_sni,
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: outbound_connect_timeout(),
             up_mbps: inbound.transport.up_mbps,
             down_mbps: inbound.transport.down_mbps,
             ignore_client_bandwidth: inbound.transport.ignore_client_bandwidth,
@@ -669,7 +686,7 @@ fn start_tuic_listener(
             alpn: tls.alpn.clone(),
             reject_unknown_sni: tls.reject_unknown_sni,
             congestion_control: inbound.transport.congestion_control.clone(),
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: outbound_connect_timeout(),
         },
         traffic,
         sessions,
@@ -738,7 +755,7 @@ fn start_anytls_listener(
             listen,
             users: inbound.users.clone(),
             routes,
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: outbound_connect_timeout(),
             padding_scheme: inbound.padding_scheme.clone(),
         },
         traffic,
@@ -833,7 +850,7 @@ fn start_shadowsocks_listener(
             method: inbound.cipher.clone().unwrap_or_default(),
             users: inbound.users.clone(),
             routes,
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: outbound_connect_timeout(),
         },
         traffic,
         sessions,
@@ -943,7 +960,7 @@ fn start_trojan_listener(
             listen,
             users: inbound.users.clone(),
             routes,
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: outbound_connect_timeout(),
         },
         traffic,
         sessions,
@@ -1063,7 +1080,7 @@ fn start_vless_listener(
             users: inbound.users.clone(),
             routes,
             flow: inbound.flow.clone(),
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: outbound_connect_timeout(),
         },
         traffic,
         sessions,
@@ -1216,7 +1233,7 @@ fn start_socks_listener(
             listen,
             users: inbound.users.clone(),
             routes,
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: outbound_connect_timeout(),
         },
         traffic,
         sessions,
@@ -1287,7 +1304,7 @@ fn start_mieru_listener(
             listen,
             users: inbound.users.clone(),
             routes,
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: outbound_connect_timeout(),
         },
         traffic,
         sessions,
@@ -1358,7 +1375,7 @@ fn start_http_listener(
             listen,
             users: inbound.users.clone(),
             routes,
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: outbound_connect_timeout(),
         },
         traffic,
         sessions,
@@ -1590,7 +1607,7 @@ fn reality_gateway_config(
             now: SystemTime::now(),
         },
         dest,
-        connect_timeout: Duration::from_secs(10),
+        connect_timeout: outbound_connect_timeout(),
         probe_dest_on_auth: false,
     })
 }
@@ -2183,6 +2200,26 @@ mod tests {
         assert_eq!(
             super::resolve_listen_addr("127.0.0.1", 443).expect("explicit ipv4"),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 443))
+        );
+    }
+
+    #[test]
+    fn outbound_connect_timeout_defaults_and_clamps_env_value() {
+        assert_eq!(
+            super::outbound_connect_timeout_from_env(None),
+            Duration::from_secs(super::DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            super::outbound_connect_timeout_from_env(Some("0".to_string())),
+            Duration::from_secs(super::DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            super::outbound_connect_timeout_from_env(Some("2".to_string())),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            super::outbound_connect_timeout_from_env(Some("999".to_string())),
+            Duration::from_secs(60)
         );
     }
 

@@ -41,6 +41,7 @@ const UDP_MAX_REASSEMBLED_BYTES: usize = UDP_PACKET_BUFFER_SIZE;
 const UDP_SESSION_IDLE_TIMEOUT_MS: u64 = 60_000;
 const UDP_SESSION_CLEANUP_INTERVAL_MS: u64 = 10_000;
 const HY2_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
+const QUIC_ENDPOINT_STOP_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug)]
 pub struct Hysteria2ServerConfig {
@@ -187,7 +188,7 @@ impl Hysteria2Server {
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {}
             }
         }
-        endpoint.wait_idle().await;
+        let _ = tokio::time::timeout(QUIC_ENDPOINT_STOP_WAIT, endpoint.wait_idle()).await;
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
