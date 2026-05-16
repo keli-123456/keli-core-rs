@@ -3,7 +3,7 @@ use std::io;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use quinn::crypto::rustls::QuicServerConfig;
@@ -43,6 +43,10 @@ const UDP_SESSION_IDLE_TIMEOUT_MS: u64 = 60_000;
 const UDP_SESSION_CLEANUP_INTERVAL_MS: u64 = 10_000;
 const HY2_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
 const HY2_STOP_POLL_INTERVAL_MS: u64 = 250;
+const HY2_INVALID_AUTH_BACKOFF_THRESHOLD: u32 = 16;
+const HY2_INVALID_AUTH_BACKOFF_WINDOW: Duration = Duration::from_secs(30);
+const HY2_INVALID_AUTH_BACKOFF_DURATION: Duration = Duration::from_secs(15);
+const HY2_INVALID_AUTH_BACKOFF_MAX_ENTRIES: usize = 4096;
 const QUIC_ENDPOINT_STOP_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug)]
@@ -79,6 +83,7 @@ pub struct Hysteria2Server {
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
     quic_connections: SharedQuicConnectionLimiter,
+    auth_backoff: Arc<Hysteria2AuthBackoff>,
 }
 
 impl Hysteria2Server {
@@ -126,6 +131,7 @@ impl Hysteria2Server {
             sessions,
             bandwidth,
             quic_connections,
+            auth_backoff: Arc::new(Hysteria2AuthBackoff::default()),
         }
     }
 
@@ -250,7 +256,22 @@ impl Hysteria2Server {
     async fn handle_incoming(&self, incoming: quinn::Incoming) -> io::Result<()> {
         let connection = incoming.await.map_err(io_other)?;
         let client_ip = connection.remote_address().ip();
-        let auth = self.authenticate_http3(&connection).await?;
+        if self.auth_backoff.is_blocked(client_ip) {
+            connection.close(0u32.into(), b"auth backoff");
+            return Ok(());
+        }
+        let auth = match self.authenticate_http3(&connection).await {
+            Ok(auth) => {
+                self.auth_backoff.record_success(client_ip);
+                auth
+            }
+            Err(error) => {
+                if is_hysteria2_invalid_auth_error(&error) {
+                    self.auth_backoff.record_invalid(client_ip);
+                }
+                return Err(error);
+            }
+        };
         let _session = self.acquire_user_session(auth.user.as_ref(), Some(client_ip))?;
         let bandwidth = self.connection_limiters(
             self.bandwidth.limiter_for(Some(auth.user.as_ref())),
@@ -1667,6 +1688,99 @@ fn io_other(error: impl std::fmt::Debug) -> io::Error {
     io::Error::new(io::ErrorKind::Other, format!("{error:?}"))
 }
 
+#[derive(Debug, Default)]
+struct Hysteria2AuthBackoff {
+    entries: Mutex<HashMap<IpAddr, Hysteria2AuthBackoffEntry>>,
+}
+
+#[derive(Debug)]
+struct Hysteria2AuthBackoffEntry {
+    failures: u32,
+    window_started: Instant,
+    blocked_until: Option<Instant>,
+}
+
+impl Hysteria2AuthBackoff {
+    fn is_blocked(&self, ip: IpAddr) -> bool {
+        self.is_blocked_at(ip, Instant::now())
+    }
+
+    fn record_invalid(&self, ip: IpAddr) {
+        self.record_invalid_at(ip, Instant::now());
+    }
+
+    fn record_success(&self, ip: IpAddr) {
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("hysteria2 auth backoff state poisoned");
+        entries.remove(&ip);
+    }
+
+    fn is_blocked_at(&self, ip: IpAddr, now: Instant) -> bool {
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("hysteria2 auth backoff state poisoned");
+        let Some(entry) = entries.get_mut(&ip) else {
+            return false;
+        };
+        let Some(blocked_until) = entry.blocked_until else {
+            return false;
+        };
+        if now < blocked_until {
+            return true;
+        }
+        entry.failures = 0;
+        entry.window_started = now;
+        entry.blocked_until = None;
+        false
+    }
+
+    fn record_invalid_at(&self, ip: IpAddr, now: Instant) {
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("hysteria2 auth backoff state poisoned");
+        if entries.len() > HY2_INVALID_AUTH_BACKOFF_MAX_ENTRIES {
+            entries.retain(|_, entry| !entry.is_expired(now));
+        }
+        let entry = entries.entry(ip).or_insert(Hysteria2AuthBackoffEntry {
+            failures: 0,
+            window_started: now,
+            blocked_until: None,
+        });
+        let in_window = now
+            .checked_duration_since(entry.window_started)
+            .map(|elapsed| elapsed <= HY2_INVALID_AUTH_BACKOFF_WINDOW)
+            .unwrap_or(false);
+        if !in_window {
+            entry.failures = 0;
+            entry.window_started = now;
+            entry.blocked_until = None;
+        }
+        entry.failures = entry.failures.saturating_add(1);
+        if entry.failures >= HY2_INVALID_AUTH_BACKOFF_THRESHOLD {
+            entry.blocked_until = Some(now + HY2_INVALID_AUTH_BACKOFF_DURATION);
+        }
+    }
+}
+
+impl Hysteria2AuthBackoffEntry {
+    fn is_expired(&self, now: Instant) -> bool {
+        if let Some(blocked_until) = self.blocked_until {
+            return now >= blocked_until
+                && now
+                    .checked_duration_since(blocked_until)
+                    .map(|elapsed| elapsed > HY2_INVALID_AUTH_BACKOFF_WINDOW)
+                    .unwrap_or(false);
+        }
+        now.checked_duration_since(self.window_started)
+            .map(|elapsed| elapsed > HY2_INVALID_AUTH_BACKOFF_WINDOW * 2)
+            .unwrap_or(false)
+    }
+}
+
 fn log_hysteria2_error(scope: &'static str, error: &io::Error) {
     let text = error.to_string();
     let class = classify_hysteria2_error_text(error, &text);
@@ -1763,6 +1877,8 @@ fn is_expected_hysteria2_close_text(text: &str) -> bool {
         || text.contains("Broken pipe")
         || text.contains("Connection reset by peer")
         || text.contains("Reset(0)")
+        || text.contains("Reset(")
+        || text.contains("got two control streams")
 }
 
 fn is_hysteria2_timeout(error: &io::Error) -> bool {
@@ -1812,6 +1928,11 @@ fn classify_hysteria2_error_text(error: &io::Error, text: &str) -> Hysteria2Erro
         return Hysteria2ErrorClass::Transport;
     }
     Hysteria2ErrorClass::Other
+}
+
+fn is_hysteria2_invalid_auth_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied
+        && error.to_string().contains("invalid hysteria2 authentication")
 }
 
 fn now_millis() -> u64 {
@@ -2844,6 +2965,8 @@ mod tests {
             "ApplicationClose(0x0)",
             "ConnectionClosed(ConnectionClose { error_code: APPLICATION_ERROR, frame_type: None, reason: b\"\" })",
             "hysteria2 connection closed before authentication",
+            "Reset(268)",
+            "Local { error: Application { code: H3_STREAM_CREATION_ERROR, reason: \"got two control streams\" } }",
         ] {
             let error = io::Error::new(io::ErrorKind::Other, message);
             assert!(
@@ -2892,5 +3015,46 @@ mod tests {
             classify_hysteria2_error(&io::Error::new(io::ErrorKind::Other, "FinishedEarly(0)")),
             Hysteria2ErrorClass::ExpectedClose
         );
+        assert_eq!(
+            classify_hysteria2_error(&io::Error::new(io::ErrorKind::Other, "Reset(268)")),
+            Hysteria2ErrorClass::ExpectedClose
+        );
+    }
+
+    #[test]
+    fn hysteria2_invalid_auth_backoff_blocks_repeated_bad_auth() {
+        let backoff = Hysteria2AuthBackoff::default();
+        let ip: IpAddr = "203.0.113.8".parse().expect("ip");
+        let start = Instant::now();
+
+        for offset in 0..HY2_INVALID_AUTH_BACKOFF_THRESHOLD - 1 {
+            backoff.record_invalid_at(ip, start + Duration::from_millis(u64::from(offset)));
+            assert!(
+                !backoff.is_blocked_at(ip, start + Duration::from_millis(u64::from(offset) + 1)),
+                "backoff should not trigger before threshold"
+            );
+        }
+
+        backoff.record_invalid_at(ip, start + Duration::from_secs(1));
+        assert!(backoff.is_blocked_at(ip, start + Duration::from_secs(2)));
+        assert!(!backoff.is_blocked_at(
+            ip,
+            start + Duration::from_secs(2) + HY2_INVALID_AUTH_BACKOFF_DURATION
+        ));
+    }
+
+    #[test]
+    fn hysteria2_invalid_auth_backoff_clears_after_success() {
+        let backoff = Hysteria2AuthBackoff::default();
+        let ip: IpAddr = "203.0.113.9".parse().expect("ip");
+        let start = Instant::now();
+
+        for offset in 0..HY2_INVALID_AUTH_BACKOFF_THRESHOLD {
+            backoff.record_invalid_at(ip, start + Duration::from_millis(u64::from(offset)));
+        }
+        assert!(backoff.is_blocked_at(ip, start + Duration::from_secs(2)));
+
+        backoff.record_success(ip);
+        assert!(!backoff.is_blocked_at(ip, start + Duration::from_secs(3)));
     }
 }
