@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::Runtime;
+use socket2::SockRef;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
@@ -41,6 +42,7 @@ const UDP_MAX_REASSEMBLED_BYTES: usize = UDP_PACKET_BUFFER_SIZE;
 const UDP_SESSION_IDLE_TIMEOUT_MS: u64 = 60_000;
 const UDP_SESSION_CLEANUP_INTERVAL_MS: u64 = 10_000;
 const HY2_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
+const HY2_STOP_POLL_INTERVAL_MS: u64 = 250;
 const QUIC_ENDPOINT_STOP_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug)]
@@ -215,7 +217,7 @@ impl Hysteria2Server {
                         }
                     });
                 }
-                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(HY2_STOP_POLL_INTERVAL_MS)) => {}
             }
         }
         let _ = tokio::time::timeout(QUIC_ENDPOINT_STOP_WAIT, endpoint.wait_idle()).await;
@@ -237,8 +239,8 @@ impl Hysteria2Server {
             .apply_keyed_delta(delta, |user| user.credential().to_string())
     }
 
-    fn user_for_auth(&self, auth: &str) -> Option<CoreUser> {
-        self.users.get(auth)
+    fn user_for_auth(&self, auth: &str) -> Option<Arc<CoreUser>> {
+        self.users.get_arc(auth)
     }
 
     fn try_acquire_connection_slot(&self) -> Option<QuicConnectionPermit> {
@@ -249,10 +251,10 @@ impl Hysteria2Server {
         let connection = incoming.await.map_err(io_other)?;
         let client_ip = connection.remote_address().ip();
         let auth = self.authenticate_http3(&connection).await?;
-        let _session = self.acquire_user_session(&auth.user, Some(client_ip))?;
+        let _session = self.acquire_user_session(auth.user.as_ref(), Some(client_ip))?;
         let bandwidth = self.connection_limiters(
-            self.bandwidth.limiter_for(Some(&auth.user)),
-            self.bandwidth.limiter_for_limited(Some(&auth.user)),
+            self.bandwidth.limiter_for(Some(auth.user.as_ref())),
+            self.bandwidth.limiter_for_limited(Some(auth.user.as_ref())),
             auth.client_rx_bps,
         );
         let udp_sessions = Arc::new(Mutex::new(HashMap::new()));
@@ -782,7 +784,7 @@ fn sync_delta_bandwidth(
 
 #[derive(Clone, Debug)]
 struct Hysteria2Auth {
-    user: CoreUser,
+    user: Arc<CoreUser>,
     client_rx_bps: Option<u64>,
 }
 
@@ -1380,6 +1382,8 @@ async fn relay_streams(
         return relay_streams_unlimited(recv, send, remote, on_upload, on_download).await;
     }
 
+    let upload_remote_shutdown = clone_tokio_tcp_stream_for_shutdown(&remote)?;
+    let download_remote_shutdown = clone_tokio_tcp_stream_for_shutdown(&remote)?;
     let (mut remote_read, mut remote_write) = remote.into_split();
     let upload = async {
         let bandwidth = bandwidth.clone();
@@ -1388,31 +1392,41 @@ async fn relay_streams(
         let mut buffer = [0u8; 16 * 1024];
         loop {
             let revoke_watch = bandwidth.clone();
-            let read = tokio::select! {
-                read = recv.read(&mut buffer) => read.map_err(io_other)?,
+            let read_result = tokio::select! {
+                read = recv.read(&mut buffer) => read.map_err(io_other),
                 _ = revoke_watch.wait_revoked() => {
-                    if pending != 0 {
-                        on_upload(pending);
-                    }
+                    flush_pending_traffic(&mut pending, &mut on_upload);
                     let _ = remote_write.shutdown().await;
+                    close_tcp_socket(&upload_remote_shutdown);
                     return Ok::<u64, io::Error>(total);
                 }
             };
-            let Some(read) = read else {
-                if pending != 0 {
-                    on_upload(pending);
+            let read = match read_result {
+                Ok(read) => read,
+                Err(error) => {
+                    flush_pending_traffic(&mut pending, &mut on_upload);
+                    let _ = remote_write.shutdown().await;
+                    close_tcp_socket(&upload_remote_shutdown);
+                    return Err(error);
                 }
+            };
+            let Some(read) = read else {
+                flush_pending_traffic(&mut pending, &mut on_upload);
                 let _ = remote_write.shutdown().await;
                 return Ok::<u64, io::Error>(total);
             };
             if !bandwidth.wait_upload(read).await {
-                if pending != 0 {
-                    on_upload(pending);
-                }
+                flush_pending_traffic(&mut pending, &mut on_upload);
                 let _ = remote_write.shutdown().await;
+                close_tcp_socket(&upload_remote_shutdown);
                 return Ok::<u64, io::Error>(total);
             }
-            remote_write.write_all(&buffer[..read]).await?;
+            if let Err(error) = remote_write.write_all(&buffer[..read]).await {
+                flush_pending_traffic(&mut pending, &mut on_upload);
+                let _ = remote_write.shutdown().await;
+                close_tcp_socket(&upload_remote_shutdown);
+                return Err(error);
+            }
             total = total.saturating_add(read as u64);
             pending = pending.saturating_add(read as u64);
             if pending >= STREAM_TRAFFIC_FLUSH_BYTES {
@@ -1428,31 +1442,42 @@ async fn relay_streams(
         let mut buffer = [0u8; 16 * 1024];
         loop {
             let revoke_watch = bandwidth.clone();
-            let read = tokio::select! {
-                read = remote_read.read(&mut buffer) => read?,
+            let read_result = tokio::select! {
+                read = remote_read.read(&mut buffer) => read,
                 _ = revoke_watch.wait_revoked() => {
-                    if pending != 0 {
-                        on_download(pending);
-                    }
+                    flush_pending_traffic(&mut pending, &mut on_download);
                     let _ = send.finish();
+                    close_tcp_socket(&download_remote_shutdown);
                     return Ok::<u64, io::Error>(total);
                 }
             };
-            if read == 0 {
-                if pending != 0 {
-                    on_download(pending);
+            let read = match read_result {
+                Ok(read) => read,
+                Err(error) => {
+                    flush_pending_traffic(&mut pending, &mut on_download);
+                    let _ = send.finish();
+                    close_tcp_socket(&download_remote_shutdown);
+                    return Err(error);
                 }
+            };
+            if read == 0 {
+                flush_pending_traffic(&mut pending, &mut on_download);
                 let _ = send.finish();
+                close_tcp_socket(&download_remote_shutdown);
                 return Ok::<u64, io::Error>(total);
             }
             if !bandwidth.wait_download(read).await {
-                if pending != 0 {
-                    on_download(pending);
-                }
+                flush_pending_traffic(&mut pending, &mut on_download);
                 let _ = send.finish();
+                close_tcp_socket(&download_remote_shutdown);
                 return Ok::<u64, io::Error>(total);
             }
-            send.write_all(&buffer[..read]).await.map_err(io_other)?;
+            if let Err(error) = send.write_all(&buffer[..read]).await.map_err(io_other) {
+                flush_pending_traffic(&mut pending, &mut on_download);
+                let _ = send.finish();
+                close_tcp_socket(&download_remote_shutdown);
+                return Err(error);
+            }
             total = total.saturating_add(read as u64);
             pending = pending.saturating_add(read as u64);
             if pending >= STREAM_TRAFFIC_FLUSH_BYTES {
@@ -1471,20 +1496,34 @@ async fn relay_streams_unlimited(
     mut on_upload: impl FnMut(u64),
     mut on_download: impl FnMut(u64),
 ) -> io::Result<(u64, u64)> {
+    let upload_remote_shutdown = clone_tokio_tcp_stream_for_shutdown(&remote)?;
+    let download_remote_shutdown = clone_tokio_tcp_stream_for_shutdown(&remote)?;
     let (mut remote_read, mut remote_write) = remote.into_split();
     let upload = async {
         let mut total = 0u64;
         let mut pending = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
-            let Some(read) = recv.read(&mut buffer).await.map_err(io_other)? else {
-                if pending != 0 {
-                    on_upload(pending);
+            let read_result = recv.read(&mut buffer).await.map_err(io_other);
+            let Some(read) = (match read_result {
+                Ok(read) => read,
+                Err(error) => {
+                    flush_pending_traffic(&mut pending, &mut on_upload);
+                    let _ = remote_write.shutdown().await;
+                    close_tcp_socket(&upload_remote_shutdown);
+                    return Err(error);
                 }
+            }) else {
+                flush_pending_traffic(&mut pending, &mut on_upload);
                 let _ = remote_write.shutdown().await;
                 return Ok::<u64, io::Error>(total);
             };
-            remote_write.write_all(&buffer[..read]).await?;
+            if let Err(error) = remote_write.write_all(&buffer[..read]).await {
+                flush_pending_traffic(&mut pending, &mut on_upload);
+                let _ = remote_write.shutdown().await;
+                close_tcp_socket(&upload_remote_shutdown);
+                return Err(error);
+            }
             total = total.saturating_add(read as u64);
             pending = pending.saturating_add(read as u64);
             if pending >= STREAM_TRAFFIC_FLUSH_BYTES {
@@ -1498,15 +1537,27 @@ async fn relay_streams_unlimited(
         let mut pending = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
-            let read = remote_read.read(&mut buffer).await?;
-            if read == 0 {
-                if pending != 0 {
-                    on_download(pending);
+            let read = match remote_read.read(&mut buffer).await {
+                Ok(read) => read,
+                Err(error) => {
+                    flush_pending_traffic(&mut pending, &mut on_download);
+                    let _ = send.finish();
+                    close_tcp_socket(&download_remote_shutdown);
+                    return Err(error);
                 }
+            };
+            if read == 0 {
+                flush_pending_traffic(&mut pending, &mut on_download);
                 let _ = send.finish();
+                close_tcp_socket(&download_remote_shutdown);
                 return Ok::<u64, io::Error>(total);
             }
-            send.write_all(&buffer[..read]).await.map_err(io_other)?;
+            if let Err(error) = send.write_all(&buffer[..read]).await.map_err(io_other) {
+                flush_pending_traffic(&mut pending, &mut on_download);
+                let _ = send.finish();
+                close_tcp_socket(&download_remote_shutdown);
+                return Err(error);
+            }
             total = total.saturating_add(read as u64);
             pending = pending.saturating_add(read as u64);
             if pending >= STREAM_TRAFFIC_FLUSH_BYTES {
@@ -1516,6 +1567,22 @@ async fn relay_streams_unlimited(
         }
     };
     tokio::try_join!(upload, download)
+}
+
+fn flush_pending_traffic(pending: &mut u64, on_traffic: &mut impl FnMut(u64)) {
+    if *pending == 0 {
+        return;
+    }
+    on_traffic(*pending);
+    *pending = 0;
+}
+
+fn clone_tokio_tcp_stream_for_shutdown(socket: &tokio::net::TcpStream) -> io::Result<TcpStream> {
+    Ok(TcpStream::from(SockRef::from(socket).try_clone()?))
+}
+
+fn close_tcp_socket(socket: &TcpStream) {
+    let _ = socket.shutdown(Shutdown::Both);
 }
 
 async fn read_varint(stream: &mut quinn::RecvStream) -> io::Result<u64> {
@@ -1601,7 +1668,8 @@ fn io_other(error: impl std::fmt::Debug) -> io::Error {
 }
 
 fn log_hysteria2_error(scope: &'static str, error: &io::Error) {
-    let class = classify_hysteria2_error(error);
+    let text = error.to_string();
+    let class = classify_hysteria2_error_text(error, &text);
     if class == Hysteria2ErrorClass::ExpectedClose {
         return;
     }
@@ -1610,7 +1678,7 @@ fn log_hysteria2_error(scope: &'static str, error: &io::Error) {
     }
     let level = class.log_level();
     let label = class.label();
-    eprintln!("{level} core   hysteria2 {scope} {label}: {error}");
+    eprintln!("{level} core   hysteria2 {scope} {label}: {text}");
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1681,7 +1749,10 @@ fn should_log_hysteria2_error(scope: &'static str, class: Hysteria2ErrorClass) -
 }
 
 fn is_expected_hysteria2_close(error: &io::Error) -> bool {
-    let text = error.to_string();
+    is_expected_hysteria2_close_text(&error.to_string())
+}
+
+fn is_expected_hysteria2_close_text(text: &str) -> bool {
     text.contains("Stopped(0)")
         || text.contains("LocallyClosed")
         || text.contains("ApplicationClose(0x0)")
@@ -1691,10 +1762,13 @@ fn is_expected_hysteria2_close(error: &io::Error) -> bool {
 }
 
 fn is_hysteria2_timeout(error: &io::Error) -> bool {
+    is_hysteria2_timeout_text(error, &error.to_string())
+}
+
+fn is_hysteria2_timeout_text(error: &io::Error, text: &str) -> bool {
     if error.kind() == io::ErrorKind::TimedOut {
         return true;
     }
-    let text = error.to_string();
     text == "Timeout"
         || text.contains("TimedOut")
         || text.contains("ConnectionError(Timeout)")
@@ -1702,8 +1776,11 @@ fn is_hysteria2_timeout(error: &io::Error) -> bool {
 }
 
 fn classify_hysteria2_error(error: &io::Error) -> Hysteria2ErrorClass {
-    let text = error.to_string();
-    if is_expected_hysteria2_close(error) {
+    classify_hysteria2_error_text(error, &error.to_string())
+}
+
+fn classify_hysteria2_error_text(error: &io::Error, text: &str) -> Hysteria2ErrorClass {
+    if is_expected_hysteria2_close_text(text) {
         return Hysteria2ErrorClass::ExpectedClose;
     }
     if text.contains("invalid hysteria2 authentication") {
@@ -1716,7 +1793,7 @@ fn classify_hysteria2_error(error: &io::Error) -> Hysteria2ErrorClass {
     {
         return Hysteria2ErrorClass::InvalidRequest;
     }
-    if is_hysteria2_timeout(error) {
+    if is_hysteria2_timeout_text(error, text) {
         return Hysteria2ErrorClass::Timeout;
     }
     if text.contains("Connection reset")

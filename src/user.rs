@@ -62,7 +62,7 @@ pub struct UserStore {
 
 #[derive(Clone, Debug, Default)]
 struct UserStoreState {
-    users: HashMap<String, CoreUser>,
+    users: HashMap<String, Arc<CoreUser>>,
     uuid_keys: HashMap<String, String>,
 }
 
@@ -116,13 +116,17 @@ impl UserStore {
             .expect("user store lock poisoned")
             .users
             .values()
-            .cloned()
+            .map(|user| user.as_ref().clone())
             .collect::<Vec<_>>();
         users.sort_by(|left, right| left.uuid.cmp(&right.uuid));
         users
     }
 
     pub fn get(&self, uuid: &str) -> Option<CoreUser> {
+        self.get_arc(uuid).map(|user| user.as_ref().clone())
+    }
+
+    pub fn get_arc(&self, uuid: &str) -> Option<Arc<CoreUser>> {
         self.users
             .read()
             .expect("user store lock poisoned")
@@ -162,7 +166,7 @@ impl UserStore {
             } else {
                 result.added += 1;
             }
-            current.users.insert(key, user.clone());
+            current.users.insert(key, Arc::new(user.clone()));
         }
         for user in &delta.updated {
             if user.is_empty() {
@@ -171,7 +175,7 @@ impl UserStore {
             let key = key(user);
             if let Some(old_key) = current.uuid_keys.insert(user.uuid.clone(), key.clone()) {
                 current.users.remove(&old_key);
-                current.users.insert(key, user.clone());
+                current.users.insert(key, Arc::new(user.clone()));
                 result.updated += 1;
             } else {
                 current.uuid_keys.remove(&user.uuid);
@@ -346,7 +350,7 @@ where
         if !user.is_empty() {
             let key = key(user);
             state.uuid_keys.insert(user.uuid.clone(), key.clone());
-            state.users.insert(key, user.clone());
+            state.users.insert(key, Arc::new(user.clone()));
         }
     }
     state
