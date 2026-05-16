@@ -1759,6 +1759,10 @@ fn is_expected_hysteria2_close_text(text: &str) -> bool {
         || text.contains("ApplicationClosed")
         || text.contains("ConnectionClosed(ConnectionClose")
         || text.contains("connection closed before authentication")
+        || text.contains("FinishedEarly(0)")
+        || text.contains("Broken pipe")
+        || text.contains("Connection reset by peer")
+        || text.contains("Reset(0)")
 }
 
 fn is_hysteria2_timeout(error: &io::Error) -> bool {
@@ -2882,11 +2886,11 @@ mod tests {
         );
         assert_eq!(
             classify_hysteria2_error(&io::Error::new(io::ErrorKind::BrokenPipe, "Broken pipe")),
-            Hysteria2ErrorClass::Transport
+            Hysteria2ErrorClass::ExpectedClose
         );
         assert_eq!(
             classify_hysteria2_error(&io::Error::new(io::ErrorKind::Other, "FinishedEarly(0)")),
-            Hysteria2ErrorClass::Transport
+            Hysteria2ErrorClass::ExpectedClose
         );
     }
 }
