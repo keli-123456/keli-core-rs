@@ -38,6 +38,7 @@ const BENCH_USER_UUID: &str = "11111111-1111-1111-1111-111111111111";
 const BENCH_USER_BYTES: [u8; 16] = [0x11; 16];
 const HY2_PASSWORD: &str = "hy2-password";
 const TUIC_PASSWORD: &str = "tuic-password";
+const BENCH_HY2_PASSWORD_ENV: &str = "KELI_CORE_BENCH_HY2_PASSWORD";
 const HY2_TCP_REQUEST_ID: u64 = 0x401;
 const TUIC_VERSION: u8 = 0x05;
 const TUIC_COMMAND_AUTHENTICATE: u8 = 0x00;
@@ -76,6 +77,7 @@ const DEFAULT_SUITE_COMMANDS: &[&str] = &[
     "anytls-tcp-stream",
     "vless-tcp-stream",
     "vmess-tcp-stream",
+    "hy2-auth",
     "hy2-tcp",
     "hy2-tcp-stream",
     "hy2-udp",
@@ -512,6 +514,7 @@ fn parse_external_bench_suite_options(
                                 | "shadowsocks-tcp-stream"
                                 | "socks-tcp-stream"
                                 | "trojan-tcp-stream"
+                                | "hy2-auth"
                                 | "hy2-tcp"
                                 | "hy2-tcp-stream"
                                 | "hy2-udp"
@@ -632,6 +635,7 @@ fn parse_external_core_mapping(value: &str) -> Result<(String, SocketAddr), Stri
     let command = match command {
         "http-connect-stream"
         | "anytls-tcp-stream"
+        | "hy2-auth"
         | "hy2-tcp"
         | "hy2-tcp-stream"
         | "hy2-udp"
@@ -660,7 +664,13 @@ fn parse_external_core_mapping(value: &str) -> Result<(String, SocketAddr), Stri
 fn is_external_quic_command(command: &str) -> bool {
     matches!(
         command,
-        "hy2-tcp" | "hy2-tcp-stream" | "hy2-udp" | "tuic-tcp" | "tuic-tcp-stream" | "tuic-udp"
+        "hy2-auth"
+            | "hy2-tcp"
+            | "hy2-tcp-stream"
+            | "hy2-udp"
+            | "tuic-tcp"
+            | "tuic-tcp-stream"
+            | "tuic-udp"
     )
 }
 
@@ -689,7 +699,7 @@ fn bench_quic_runtime_workers() -> usize {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench direct-tcp-proxy-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench anytls-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --core command=HOST:PORT [--core other=HOST:PORT] [--cert CERT.pem] [--cert command=CERT.pem] [--server-name NAME] [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
+        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench direct-tcp-proxy-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench anytls-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-auth [--streams N] [--requests N]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --core command=HOST:PORT [--core other=HOST:PORT] [--cert CERT.pem] [--cert command=CERT.pem] [--server-name NAME] [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
     );
 }
 
@@ -707,6 +717,7 @@ fn canonical_bench_command(command: &str) -> Option<&'static str> {
         "vless-tcp" => Some("vless-tcp"),
         "vless-tcp-stream" | "vless-stream" => Some("vless-tcp-stream"),
         "vmess-tcp-stream" | "vmess-stream" => Some("vmess-tcp-stream"),
+        "hy2-auth" | "hysteria2-auth" => Some("hy2-auth"),
         "hy2-tcp" | "hysteria2-tcp" => Some("hy2-tcp"),
         "hy2-tcp-stream" | "hysteria2-tcp-stream" | "hy2-stream" => Some("hy2-tcp-stream"),
         "hy2-udp" | "hysteria2-udp" => Some("hy2-udp"),
@@ -848,6 +859,12 @@ fn run_external_named_bench(
 ) -> io::Result<BenchReport> {
     let options = &suite_options.bench;
     match canonical_bench_command(command) {
+        Some("hy2-auth") => run_external_hy2_auth_bench(
+            options,
+            core_addr,
+            external_cert_for(command, suite_options)?,
+            &suite_options.server_name,
+        ),
         Some("hy2-tcp") => run_external_hy2_tcp_bench(
             options,
             core_addr,
@@ -996,6 +1013,24 @@ fn run_external_stream_bench(
         elapsed,
         &latencies,
     ))
+}
+
+fn run_external_hy2_auth_bench(
+    options: &BenchOptions,
+    core_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    server_name: &str,
+) -> io::Result<BenchReport> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(bench_quic_runtime_workers())
+        .enable_all()
+        .build()?
+        .block_on(run_external_hy2_auth_bench_async(
+            options,
+            core_addr,
+            cert_der,
+            server_name,
+        ))
 }
 
 fn run_external_hy2_tcp_bench(
@@ -1877,6 +1912,73 @@ async fn run_external_hy2_tcp_bench_async(
         elapsed,
         &latencies,
     ))
+}
+
+async fn run_external_hy2_auth_bench_async(
+    options: &BenchOptions,
+    core_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    server_name: &str,
+) -> io::Result<BenchReport> {
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for _ in 0..options.streams {
+        let cert_der = cert_der.clone();
+        let server_name = server_name.to_string();
+        let options = options.clone();
+        workers.push(tokio::spawn(async move {
+            let mut latencies = Vec::with_capacity(options.requests);
+            let mut retries = 0usize;
+            for _ in 0..options.requests {
+                let began = Instant::now();
+                match authenticate_one_hy2_connection(core_addr, cert_der.clone(), &server_name)
+                    .await
+                {
+                    Ok(()) => latencies.push(began.elapsed().as_micros()),
+                    Err(error) => {
+                        eprintln!("WARN bench hy2 auth failed: {error}");
+                        retries = retries.saturating_add(1);
+                    }
+                }
+            }
+            Ok::<ClientStats, io::Error>(ClientStats { latencies, retries })
+        }));
+    }
+
+    let (mut latencies, retries) = collect_quic_workers(workers, "external hy2 auth").await?;
+    let elapsed = started.elapsed();
+    latencies.sort_unstable();
+    Ok(BenchReport::completed(
+        "hy2-auth",
+        "external-auth-connection-per-request",
+        options,
+        Some(bench_quic_runtime_workers()),
+        0,
+        0,
+        retries,
+        elapsed,
+        &latencies,
+    ))
+}
+
+async fn authenticate_one_hy2_connection(
+    core_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    server_name: &str,
+) -> io::Result<()> {
+    let client_endpoint = hy2_client_endpoint(cert_der)?;
+    let connection = tokio::time::timeout(
+        Duration::from_secs(10),
+        client_endpoint
+            .connect(core_addr, server_name)
+            .map_err(io_other)?,
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "hy2 connect timed out"))?
+    .map_err(io_other)?;
+    authenticate_hy2(&connection).await?;
+    connection.close(0u32.into(), b"auth bench done");
+    Ok(())
 }
 
 async fn run_external_hy2_tcp_stream_bench_async(
@@ -4612,7 +4714,7 @@ fn hy2_client_endpoint(cert_der: CertificateDer<'static>) -> io::Result<quinn::E
         .datagram_receive_buffer_size(Some(1024 * 1024))
         .datagram_send_buffer_size(1024 * 1024);
     client_config.transport_config(Arc::new(transport));
-    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("valid client addr"))?;
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().expect("valid client addr"))?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
 }
@@ -4629,10 +4731,11 @@ async fn authenticate_hy2(connection: &quinn::Connection) -> io::Result<()> {
             }
         }
     });
+    let password = bench_hy2_password();
     let request = http::Request::builder()
         .method(http::Method::POST)
         .uri("https://hysteria/auth")
-        .header("Hysteria-Auth", HY2_PASSWORD)
+        .header("Hysteria-Auth", password.as_str())
         .header("Hysteria-CC-RX", "0")
         .body(())
         .map_err(io_other)?;
@@ -4652,6 +4755,13 @@ async fn authenticate_hy2(connection: &quinn::Connection) -> io::Result<()> {
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "hy2 h3 driver panicked"))?;
     Ok(())
+}
+
+fn bench_hy2_password() -> String {
+    std::env::var(BENCH_HY2_PASSWORD_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| HY2_PASSWORD.to_string())
 }
 
 fn hy2_tcp_request(target: SocketAddr) -> Vec<u8> {

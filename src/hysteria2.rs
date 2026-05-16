@@ -42,6 +42,9 @@ const UDP_SESSION_IDLE_TIMEOUT_MS: u64 = 60_000;
 const UDP_SESSION_CLEANUP_INTERVAL_MS: u64 = 10_000;
 const HY2_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
 const QUIC_ENDPOINT_STOP_WAIT: Duration = Duration::from_secs(3);
+const MIN_HYSTERIA2_CONNECTION_LIMIT: usize = 1024;
+const MAX_HYSTERIA2_CONNECTION_LIMIT: usize = 32_768;
+const HYSTERIA2_CONNECTIONS_PER_CPU: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub struct Hysteria2ServerConfig {
@@ -77,6 +80,7 @@ pub struct Hysteria2Server {
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
     connection_slots: Arc<Semaphore>,
+    connection_limit: usize,
 }
 
 impl Hysteria2Server {
@@ -98,6 +102,7 @@ impl Hysteria2Server {
         let users =
             UserStore::from_keyed_users(&config.users, |user| user.credential().to_string());
         let router = RouteMatcher::new(config.routes.clone());
+        let connection_limit = hysteria2_connection_limit();
         config.users.clear();
         config.routes.clear();
         Self {
@@ -107,7 +112,8 @@ impl Hysteria2Server {
             traffic,
             sessions,
             bandwidth,
-            connection_slots: Arc::new(Semaphore::new(hysteria2_connection_limit())),
+            connection_slots: Arc::new(Semaphore::new(connection_limit)),
+            connection_limit,
         }
     }
 
@@ -135,6 +141,11 @@ impl Hysteria2Server {
             "cubic",
             "hysteria2",
         )?;
+        println!(
+            "INFO  core   hysteria2 connection limit max={} cpu={}",
+            self.connection_limit,
+            available_parallelism_count()
+        );
         transport
             .datagram_receive_buffer_size(Some(UDP_DATAGRAM_BUFFER_SIZE))
             .datagram_send_buffer_size(UDP_DATAGRAM_BUFFER_SIZE);
@@ -177,6 +188,10 @@ impl Hysteria2Server {
                         break;
                     };
                     let Some(connection_slot) = self.try_acquire_connection_slot() else {
+                        eprintln!(
+                            "WARN  core   hysteria2 connection limit reached max={}",
+                            self.connection_limit
+                        );
                         continue;
                     };
                     let server = self.clone();
@@ -1655,14 +1670,27 @@ fn should_log_hysteria2_error(scope: &'static str, class: Hysteria2ErrorClass) -
 fn hysteria2_connection_limit() -> usize {
     if let Ok(value) = std::env::var("KELI_CORE_HY2_MAX_CONNECTIONS") {
         if let Ok(parsed) = value.trim().parse::<usize>() {
-            return parsed.clamp(64, 16_384);
+            return parsed.clamp(64, MAX_HYSTERIA2_CONNECTION_LIMIT);
         }
     }
+    hysteria2_connection_limit_from_cpu(available_parallelism_count())
+}
+
+fn hysteria2_connection_limit_from_cpu(cpu_count: usize) -> usize {
+    cpu_count
+        .max(1)
+        .saturating_mul(HYSTERIA2_CONNECTIONS_PER_CPU)
+        .clamp(
+            MIN_HYSTERIA2_CONNECTION_LIMIT,
+            MAX_HYSTERIA2_CONNECTION_LIMIT,
+        )
+}
+
+fn available_parallelism_count() -> usize {
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(4)
-        .saturating_mul(256)
-        .clamp(512, 4096)
+        .max(1)
 }
 
 fn is_expected_hysteria2_close(error: &io::Error) -> bool {
@@ -2796,5 +2824,13 @@ mod tests {
             classify_hysteria2_error(&io::Error::new(io::ErrorKind::Other, "FinishedEarly(0)")),
             Hysteria2ErrorClass::Transport
         );
+    }
+
+    #[test]
+    fn hysteria2_connection_limit_scales_with_cpu() {
+        assert_eq!(hysteria2_connection_limit_from_cpu(1), 1024);
+        assert_eq!(hysteria2_connection_limit_from_cpu(4), 4096);
+        assert_eq!(hysteria2_connection_limit_from_cpu(16), 16_384);
+        assert_eq!(hysteria2_connection_limit_from_cpu(128), 32_768);
     }
 }
