@@ -356,7 +356,6 @@ impl Hysteria2Server {
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default();
             let Some(user) = self.user_for_auth(auth) else {
-                send_h3_status(&mut stream, 404).await?;
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "invalid hysteria2 authentication",
