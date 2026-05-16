@@ -156,7 +156,7 @@ impl Hysteria2Server {
         apply_quic_congestion_control(
             &mut transport,
             &self.config.congestion_control,
-            "cubic",
+            "bbr",
             "hysteria2",
         )?;
         let resource = self.quic_connections.snapshot();

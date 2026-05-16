@@ -1345,7 +1345,7 @@ fn apply_tuic_congestion_control(
     transport: &mut quinn::TransportConfig,
     value: &str,
 ) -> io::Result<()> {
-    apply_quic_congestion_control(transport, value, "cubic", "tuic")
+    apply_quic_congestion_control(transport, value, "bbr", "tuic")
 }
 
 #[cfg(test)]

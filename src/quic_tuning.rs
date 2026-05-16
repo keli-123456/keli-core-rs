@@ -3,19 +3,20 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
-use quinn::{AckFrequencyConfig, VarInt};
+use quinn::{AckFrequencyConfig, IdleTimeout, VarInt};
 use socket2::SockRef;
 
 use crate::socket_bind::bind_dual_stack_udp_socket;
 
 const PROXY_STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
-const PROXY_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
-const PROXY_SEND_WINDOW: u64 = 32 * 1024 * 1024;
+const PROXY_RECEIVE_WINDOW: u32 = 20 * 1024 * 1024;
+const PROXY_SEND_WINDOW: u64 = 20 * 1024 * 1024;
 const PROXY_MAX_CONCURRENT_STREAMS: u32 = 1024;
 const PROXY_UDP_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const PROXY_ACK_ELICITING_THRESHOLD: u32 = 8;
 const PROXY_ACK_MAX_DELAY_MS: u64 = 5;
 const PROXY_INITIAL_RTT_MS: u64 = 50;
+const PROXY_MAX_IDLE_TIMEOUT_SECS: u64 = 30;
 
 pub(crate) fn server_endpoint_with_tuned_udp_socket(
     server_config: quinn::ServerConfig,
@@ -55,6 +56,10 @@ pub(crate) fn apply_proxy_quic_transport_defaults(transport: &mut quinn::Transpo
         .send_window(PROXY_SEND_WINDOW)
         .send_fairness(false)
         .initial_rtt(Duration::from_millis(PROXY_INITIAL_RTT_MS))
+        .max_idle_timeout(Some(
+            IdleTimeout::try_from(Duration::from_secs(PROXY_MAX_IDLE_TIMEOUT_SECS))
+                .expect("proxy max idle timeout fits quic varint"),
+        ))
         .ack_frequency_config(Some(ack_frequency))
         .max_concurrent_bidi_streams(VarInt::from_u32(PROXY_MAX_CONCURRENT_STREAMS))
         .max_concurrent_uni_streams(VarInt::from_u32(PROXY_MAX_CONCURRENT_STREAMS));
@@ -66,12 +71,7 @@ pub(crate) fn apply_quic_congestion_control(
     default_value: &str,
     context: &str,
 ) -> io::Result<()> {
-    let normalized = normalize_quic_congestion_control(value);
-    let selected = if normalized.is_empty() {
-        normalize_quic_congestion_control(default_value)
-    } else {
-        normalized
-    };
+    let selected = select_quic_congestion_control(value, default_value);
     match selected.as_str() {
         "cubic" => {
             transport
@@ -107,6 +107,15 @@ pub(crate) fn normalize_quic_congestion_control(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace(['-', ' '], "_")
 }
 
+fn select_quic_congestion_control(value: &str, default_value: &str) -> String {
+    let normalized = normalize_quic_congestion_control(value);
+    if normalized.is_empty() {
+        normalize_quic_congestion_control(default_value)
+    } else {
+        normalized
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,8 +127,22 @@ mod tests {
         apply_proxy_quic_transport_defaults(&mut transport);
 
         let debug = format!("{transport:?}");
+        assert!(debug.contains("stream_receive_window: 8388608"));
+        assert!(debug.contains("receive_window: 20971520"));
+        assert!(debug.contains("send_window: 20971520"));
         assert!(debug.contains("initial_rtt: 50ms"));
+        assert!(debug.contains("max_idle_timeout: Some(30000)"));
+        assert!(debug.contains("mtu_discovery_config: Some"));
         assert!(debug.contains("send_fairness: false"));
         assert!(debug.contains("ack_frequency_config: Some"));
+        assert!(debug.contains("max_concurrent_bidi_streams: 1024"));
+        assert!(debug.contains("max_concurrent_uni_streams: 1024"));
+    }
+
+    #[test]
+    fn empty_quic_congestion_control_uses_normalized_default() {
+        assert_eq!(select_quic_congestion_control("", "bbr"), "bbr");
+        assert_eq!(select_quic_congestion_control(" ", "new-reno"), "new_reno");
+        assert_eq!(select_quic_congestion_control("reno", "bbr"), "reno");
     }
 }
