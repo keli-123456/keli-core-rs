@@ -16,7 +16,10 @@ use crate::limits::{
     sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard,
     UserSessionTracker,
 };
-use crate::quic_resources::{QuicConnectionPermit, SharedQuicConnectionLimiter};
+use crate::quic_resources::{
+    available_parallelism_count, memory_limit_mib, open_file_soft_limit, QuicConnectionPermit,
+    SharedQuicConnectionLimiter,
+};
 use crate::quic_tuning::{
     apply_proxy_quic_transport_defaults, apply_quic_congestion_control, bind_quic_udp_socket,
     server_endpoint_with_tuned_udp_socket, tune_quic_udp_socket,
@@ -42,9 +45,12 @@ const UDP_MAX_REASSEMBLED_BYTES: usize = UDP_PACKET_BUFFER_SIZE;
 const UDP_SESSION_IDLE_TIMEOUT_MS: u64 = 60_000;
 const UDP_SESSION_CLEANUP_INTERVAL_MS: u64 = 10_000;
 const UDP_MAX_SESSIONS_PER_CONNECTION: usize = 256;
-const UDP_GLOBAL_SESSIONS_PER_CPU: usize = 512;
-const UDP_GLOBAL_MIN_SESSIONS: usize = 512;
+const UDP_GLOBAL_SESSIONS_PER_CPU: usize = 256;
+const UDP_GLOBAL_MIN_SESSIONS: usize = 256;
 const UDP_GLOBAL_MAX_SESSIONS: usize = 8192;
+const UDP_GLOBAL_RESERVED_FDS: usize = 1024;
+const UDP_GLOBAL_FDS_PER_SESSION: usize = 1;
+const UDP_GLOBAL_MEMORY_MIB_PER_SESSION: usize = 2;
 const HY2_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
 const HY2_STOP_POLL_INTERVAL_MS: u64 = 250;
 const HY2_INVALID_AUTH_BACKOFF_THRESHOLD: u32 = 8;
@@ -1010,11 +1016,33 @@ fn hy2_udp_session_limit() -> usize {
                 return parsed.clamp(64, UDP_GLOBAL_MAX_SESSIONS);
             }
         }
-        std::thread::available_parallelism()
-            .map(|threads| usize::from(threads).saturating_mul(UDP_GLOBAL_SESSIONS_PER_CPU))
-            .unwrap_or(UDP_GLOBAL_MIN_SESSIONS)
-            .clamp(UDP_GLOBAL_MIN_SESSIONS, UDP_GLOBAL_MAX_SESSIONS)
+        hy2_udp_session_limit_from_resources(
+            available_parallelism_count(),
+            memory_limit_mib(),
+            open_file_soft_limit(),
+        )
     })
+}
+
+fn hy2_udp_session_limit_from_resources(
+    cpu_count: usize,
+    memory_limit_mib: Option<usize>,
+    fd_limit: Option<usize>,
+) -> usize {
+    let cpu_target = cpu_count.max(1).saturating_mul(UDP_GLOBAL_SESSIONS_PER_CPU);
+    let memory_target = memory_limit_mib
+        .map(|mib| mib / UDP_GLOBAL_MEMORY_MIB_PER_SESSION)
+        .filter(|target| *target > 0)
+        .unwrap_or(UDP_GLOBAL_MAX_SESSIONS);
+    let fd_target = fd_limit
+        .map(|limit| limit.saturating_sub(UDP_GLOBAL_RESERVED_FDS) / UDP_GLOBAL_FDS_PER_SESSION)
+        .filter(|target| *target > 0)
+        .unwrap_or(UDP_GLOBAL_MAX_SESSIONS);
+    cpu_target
+        .min(memory_target)
+        .min(fd_target)
+        .min(UDP_GLOBAL_MAX_SESSIONS)
+        .max(UDP_GLOBAL_MIN_SESSIONS)
 }
 
 fn prune_udp_sessions(
@@ -3079,6 +3107,30 @@ mod tests {
             assert!(!sessions.contains_key(&0));
             assert!(oldest.is_closed());
         });
+    }
+
+    #[test]
+    fn hysteria2_udp_session_limit_scales_with_machine_resources() {
+        assert_eq!(
+            super::hy2_udp_session_limit_from_resources(1, Some(64_000), Some(100_000)),
+            256
+        );
+        assert_eq!(
+            super::hy2_udp_session_limit_from_resources(4, Some(64_000), Some(100_000)),
+            1024
+        );
+        assert_eq!(
+            super::hy2_udp_session_limit_from_resources(64, Some(64_000), Some(100_000)),
+            8192
+        );
+        assert_eq!(
+            super::hy2_udp_session_limit_from_resources(16, Some(1024), Some(100_000)),
+            512
+        );
+        assert_eq!(
+            super::hy2_udp_session_limit_from_resources(16, Some(64_000), Some(1500)),
+            476
+        );
     }
 
     #[test]

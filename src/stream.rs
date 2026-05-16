@@ -9,10 +9,21 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::limits::BandwidthLimiter;
+use crate::quic_resources::{available_parallelism_count, memory_limit_mib, open_file_soft_limit};
 
 static TCP_RELAY_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static NATIVE_RELAY_POOL: OnceLock<NativeRelayPool> = OnceLock::new();
 const RELAY_COPY_BUFFER_SIZE: usize = 64 * 1024;
+const TCP_RELAY_BLOCKING_THREADS_MIN: usize = 16;
+const TCP_RELAY_BLOCKING_THREADS_MAX: usize = 128;
+const TCP_RELAY_BLOCKING_THREADS_PER_CPU: usize = 16;
+const TCP_RELAY_BLOCKING_THREAD_MEMORY_MIB: usize = 4;
+const NATIVE_RELAY_WORKERS_MIN: usize = 16;
+const NATIVE_RELAY_WORKERS_MAX: usize = 512;
+const NATIVE_RELAY_WORKERS_PER_CPU: usize = 16;
+const NATIVE_RELAY_WORKER_MEMORY_MIB: usize = 4;
+const NATIVE_RELAY_RESERVED_FDS: usize = 1024;
+const NATIVE_RELAY_FDS_PER_WORKER: usize = 4;
 
 pub type BlockingRelayHandle<T> = tokio::task::JoinHandle<T>;
 type NativeRelayJob = Box<dyn FnOnce() + Send + 'static>;
@@ -211,17 +222,11 @@ fn tcp_relay_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
 }
 
 fn tcp_relay_worker_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(4)
-        .clamp(2, 16)
+    available_parallelism_count().clamp(2, 16)
 }
 
 fn tcp_relay_blocking_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|threads| usize::from(threads).saturating_mul(32))
-        .unwrap_or(64)
-        .clamp(32, 256)
+    tcp_relay_blocking_threads_from_resources(available_parallelism_count(), memory_limit_mib())
 }
 
 impl NativeRelayPool {
@@ -347,10 +352,51 @@ fn native_relay_worker_threads() -> usize {
             return parsed.clamp(16, 1024);
         }
     }
-    std::thread::available_parallelism()
-        .map(|threads| usize::from(threads).saturating_mul(16))
-        .unwrap_or(32)
-        .clamp(32, 512)
+    native_relay_worker_threads_from_resources(
+        available_parallelism_count(),
+        memory_limit_mib(),
+        open_file_soft_limit(),
+    )
+}
+
+fn tcp_relay_blocking_threads_from_resources(
+    cpu_count: usize,
+    memory_limit_mib: Option<usize>,
+) -> usize {
+    let cpu_target = cpu_count
+        .max(1)
+        .saturating_mul(TCP_RELAY_BLOCKING_THREADS_PER_CPU);
+    let memory_target = memory_limit_mib
+        .map(|mib| mib / TCP_RELAY_BLOCKING_THREAD_MEMORY_MIB)
+        .filter(|target| *target > 0)
+        .unwrap_or(TCP_RELAY_BLOCKING_THREADS_MAX);
+    cpu_target
+        .min(memory_target)
+        .min(TCP_RELAY_BLOCKING_THREADS_MAX)
+        .max(TCP_RELAY_BLOCKING_THREADS_MIN)
+}
+
+fn native_relay_worker_threads_from_resources(
+    cpu_count: usize,
+    memory_limit_mib: Option<usize>,
+    fd_limit: Option<usize>,
+) -> usize {
+    let cpu_target = cpu_count
+        .max(1)
+        .saturating_mul(NATIVE_RELAY_WORKERS_PER_CPU);
+    let memory_target = memory_limit_mib
+        .map(|mib| mib / NATIVE_RELAY_WORKER_MEMORY_MIB)
+        .filter(|target| *target > 0)
+        .unwrap_or(NATIVE_RELAY_WORKERS_MAX);
+    let fd_target = fd_limit
+        .map(|limit| limit.saturating_sub(NATIVE_RELAY_RESERVED_FDS) / NATIVE_RELAY_FDS_PER_WORKER)
+        .filter(|target| *target > 0)
+        .unwrap_or(NATIVE_RELAY_WORKERS_MAX);
+    cpu_target
+        .min(memory_target)
+        .min(fd_target)
+        .min(NATIVE_RELAY_WORKERS_MAX)
+        .max(NATIVE_RELAY_WORKERS_MIN)
 }
 
 fn native_relay_stack_size() -> usize {
@@ -465,6 +511,39 @@ mod tests {
         relay_tcp_streams_limited, spawn_native_blocking_relay,
     };
     use crate::user::CoreUser;
+
+    #[test]
+    fn relay_thread_counts_scale_with_machine_resources() {
+        assert_eq!(
+            super::tcp_relay_blocking_threads_from_resources(1, None),
+            16
+        );
+        assert_eq!(
+            super::tcp_relay_blocking_threads_from_resources(16, Some(64_000)),
+            128
+        );
+        assert_eq!(
+            super::tcp_relay_blocking_threads_from_resources(16, Some(128)),
+            32
+        );
+
+        assert_eq!(
+            super::native_relay_worker_threads_from_resources(4, Some(4096), Some(100_000)),
+            64
+        );
+        assert_eq!(
+            super::native_relay_worker_threads_from_resources(32, Some(4096), Some(100_000)),
+            512
+        );
+        assert_eq!(
+            super::native_relay_worker_threads_from_resources(32, Some(512), Some(4096)),
+            128
+        );
+        assert_eq!(
+            super::native_relay_worker_threads_from_resources(4, Some(64), Some(100_000)),
+            16
+        );
+    }
 
     #[test]
     fn limited_copy_still_counts_transferred_bytes() {

@@ -123,14 +123,14 @@ fn quic_connection_limit_from_resources(
         .clamp(MIN_QUIC_CONNECTION_LIMIT, MAX_QUIC_CONNECTION_LIMIT)
 }
 
-fn available_parallelism_count() -> usize {
+pub(crate) fn available_parallelism_count() -> usize {
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(4)
         .max(1)
 }
 
-fn memory_limit_mib() -> Option<usize> {
+pub(crate) fn memory_limit_mib() -> Option<usize> {
     let host_memory = proc_meminfo_total_mib();
     match cgroup_memory_limit_mib() {
         Some(cgroup_limit) => Some(host_memory.map_or(cgroup_limit, |host| host.min(cgroup_limit))),
@@ -161,13 +161,13 @@ fn cgroup_memory_limit_mib() -> Option<usize> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_file_soft_limit() -> Option<usize> {
+pub(crate) fn open_file_soft_limit() -> Option<usize> {
     let content = std::fs::read_to_string("/proc/self/limits").ok()?;
     parse_proc_limits_open_files(&content)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_file_soft_limit() -> Option<usize> {
+pub(crate) fn open_file_soft_limit() -> Option<usize> {
     None
 }
 
