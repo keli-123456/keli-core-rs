@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Cursor, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
@@ -41,6 +41,8 @@ impl TlsSocket for TcpStream {
 pub struct TlsConnection<S = TcpStream> {
     socket: S,
     connection: ServerConnection,
+    tls_record_buf: Vec<u8>,
+    tls_record_target_len: Option<usize>,
 }
 
 impl TlsAcceptor {
@@ -108,6 +110,8 @@ impl TlsAcceptor {
         let mut connection = TlsConnection {
             socket,
             connection: ServerConnection::new(self.config.clone()).map_err(tls_error)?,
+            tls_record_buf: Vec::new(),
+            tls_record_target_len: None,
         };
         while connection.connection.is_handshaking() {
             connection
@@ -178,6 +182,89 @@ where
         Ok(())
     }
 
+    pub(crate) fn raw_read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        self.socket.read(output)
+    }
+
+    pub(crate) fn raw_write_all_wait(&mut self, mut input: &[u8]) -> io::Result<()> {
+        while !input.is_empty() {
+            match self.socket.write(input) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "raw tls socket write returned zero",
+                    ));
+                }
+                Ok(written) => input = &input[written..],
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn read_tls_record_limited(&mut self) -> io::Result<usize> {
+        const TLS_HEADER_LEN: usize = 5;
+        const MAX_TLS_RECORD_LEN: usize = 18 * 1024;
+
+        if self.tls_record_target_len.is_none() {
+            while self.tls_record_buf.len() < TLS_HEADER_LEN {
+                let mut chunk = [0u8; TLS_HEADER_LEN];
+                let want = TLS_HEADER_LEN - self.tls_record_buf.len();
+                match self.socket.read(&mut chunk[..want]) {
+                    Ok(0) if self.tls_record_buf.is_empty() => return Ok(0),
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "tls socket closed during record header",
+                        ));
+                    }
+                    Ok(read) => self.tls_record_buf.extend_from_slice(&chunk[..read]),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+
+            let content_len =
+                (usize::from(self.tls_record_buf[3]) << 8) | usize::from(self.tls_record_buf[4]);
+            if content_len > MAX_TLS_RECORD_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("tls record too large: {content_len}"),
+                ));
+            }
+            self.tls_record_target_len = Some(TLS_HEADER_LEN + content_len);
+        }
+
+        let target = self
+            .tls_record_target_len
+            .expect("target length initialized");
+        while self.tls_record_buf.len() < target {
+            let mut chunk = [0u8; 16 * 1024];
+            let want = (target - self.tls_record_buf.len()).min(chunk.len());
+            match self.socket.read(&mut chunk[..want]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "tls socket closed during record body",
+                    ));
+                }
+                Ok(read) => self.tls_record_buf.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(error),
+                Err(error) => return Err(error),
+            }
+        }
+
+        self.tls_record_target_len = None;
+        let record = std::mem::take(&mut self.tls_record_buf);
+        let mut cursor = Cursor::new(record);
+        self.connection.read_tls(&mut cursor)
+    }
+
     pub(crate) fn close_notify_wait(&mut self) -> io::Result<()> {
         self.connection.send_close_notify();
         self.flush_tls_wait()
@@ -201,7 +288,7 @@ where
                 Err(error) => return Err(error),
             }
 
-            match self.connection.read_tls(&mut self.socket) {
+            match self.read_tls_record_limited() {
                 Ok(0) => return Ok(0),
                 Ok(_) => {
                     self.connection.process_new_packets().map_err(tls_error)?;

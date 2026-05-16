@@ -37,7 +37,12 @@ use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult};
 use crate::vless::{VlessServer, VlessServerConfig};
 use crate::vmess::{VmessServer, VmessServerConfig};
 
-const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 1024;
+const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 4096;
+const MIN_AUTO_CONNECTION_WORKERS: usize = 64;
+const CONNECTION_WORKERS_PER_CPU: usize = 256;
+const CONNECTION_WORKER_MEMORY_MIB: usize = 2;
+const CONNECTION_WORKER_RESERVED_FDS: usize = 512;
+const CONNECTION_WORKER_FDS_PER_CONN: usize = 2;
 const CONNECTION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS: u64 = 3;
@@ -1621,7 +1626,7 @@ fn reality_gateway_config(
             private_key,
             server_names: std::collections::HashSet::from([server_name]),
             short_ids: std::collections::HashSet::from([short_id]),
-            max_time_diff: Some(Duration::from_secs(30)),
+            max_time_diff: None,
             now: SystemTime::now(),
         },
         dest,
@@ -1799,13 +1804,26 @@ impl ConnectionWorkerGroupState {
 
 impl ConnectionWorkerPool {
     fn new() -> Self {
+        let max_workers = connection_worker_threads();
+        println!(
+            "INFO  core   connection workers auto max={} stack_kib={} cpu={} mem_limit_mib={} fd_limit={}",
+            max_workers,
+            connection_worker_stack_size() / 1024,
+            available_parallelism_count(),
+            memory_limit_mib()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            open_file_soft_limit()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
         Self {
             queue: Mutex::new(VecDeque::new()),
             ready: Condvar::new(),
             worker_count: std::sync::atomic::AtomicUsize::new(0),
             idle_count: std::sync::atomic::AtomicUsize::new(0),
             pending_count: std::sync::atomic::AtomicUsize::new(0),
-            max_workers: connection_worker_threads(),
+            max_workers,
         }
     }
 
@@ -1917,15 +1935,130 @@ fn connection_worker_threads() -> usize {
             return parsed.clamp(4, MAX_CONNECTION_WORKERS_PER_LISTENER);
         }
     }
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(4)
-        .saturating_mul(8)
-        .clamp(16, 256)
+    connection_worker_threads_from_resources(
+        available_parallelism_count(),
+        memory_limit_mib(),
+        open_file_soft_limit(),
+    )
 }
 
 fn connection_worker_stack_size() -> usize {
-    512 * 1024
+    256 * 1024
+}
+
+fn available_parallelism_count() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .max(1)
+}
+
+fn connection_worker_threads_from_resources(
+    cpu_count: usize,
+    memory_limit_mib: Option<usize>,
+    open_file_soft_limit: Option<usize>,
+) -> usize {
+    let cpu_target = cpu_count
+        .max(1)
+        .saturating_mul(CONNECTION_WORKERS_PER_CPU)
+        .max(MIN_AUTO_CONNECTION_WORKERS);
+    let memory_target = memory_limit_mib
+        .map(|mib| mib / CONNECTION_WORKER_MEMORY_MIB)
+        .filter(|target| *target > 0)
+        .unwrap_or(MAX_CONNECTION_WORKERS_PER_LISTENER);
+    let fd_target = open_file_soft_limit
+        .map(|limit| {
+            limit.saturating_sub(CONNECTION_WORKER_RESERVED_FDS) / CONNECTION_WORKER_FDS_PER_CONN
+        })
+        .filter(|target| *target > 0)
+        .unwrap_or(MAX_CONNECTION_WORKERS_PER_LISTENER);
+    let resource_cap = cpu_target
+        .min(memory_target)
+        .min(fd_target)
+        .min(MAX_CONNECTION_WORKERS_PER_LISTENER);
+    resource_cap.clamp(
+        MIN_AUTO_CONNECTION_WORKERS.min(resource_cap),
+        MAX_CONNECTION_WORKERS_PER_LISTENER,
+    )
+}
+
+fn memory_limit_mib() -> Option<usize> {
+    let host_memory = proc_meminfo_total_mib();
+    match cgroup_memory_limit_mib() {
+        Some(cgroup_limit) => Some(host_memory.map_or(cgroup_limit, |host| host.min(cgroup_limit))),
+        None => host_memory,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn proc_meminfo_total_mib() -> Option<usize> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_proc_meminfo_total_mib(&content)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proc_meminfo_total_mib() -> Option<usize> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_memory_limit_mib() -> Option<usize> {
+    let value = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
+    parse_cgroup_memory_limit_mib(&value)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_memory_limit_mib() -> Option<usize> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn open_file_soft_limit() -> Option<usize> {
+    let content = std::fs::read_to_string("/proc/self/limits").ok()?;
+    parse_proc_limits_open_files(&content)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_file_soft_limit() -> Option<usize> {
+    None
+}
+
+fn parse_proc_meminfo_total_mib(content: &str) -> Option<usize> {
+    for line in content.lines() {
+        let Some(rest) = line.strip_prefix("MemTotal:") else {
+            continue;
+        };
+        let kb = rest.split_whitespace().next()?.parse::<usize>().ok()?;
+        return Some(kb / 1024);
+    }
+    None
+}
+
+fn parse_cgroup_memory_limit_mib(content: &str) -> Option<usize> {
+    let value = content.trim();
+    if value.is_empty() || value == "max" {
+        return None;
+    }
+    let bytes = value.parse::<usize>().ok()?;
+    Some(bytes / 1024 / 1024)
+}
+
+fn parse_proc_limits_open_files(content: &str) -> Option<usize> {
+    for line in content.lines() {
+        let Some(rest) = line.strip_prefix("Max open files") else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let soft = parts.next()?;
+        if soft == "unlimited" {
+            return Some(
+                MAX_CONNECTION_WORKERS_PER_LISTENER * CONNECTION_WORKER_FDS_PER_CONN
+                    + CONNECTION_WORKER_RESERVED_FDS,
+            );
+        }
+        return soft.parse::<usize>().ok();
+    }
+    None
 }
 
 fn spawn_connection_worker<F>(workers: &ConnectionWorkerGroup, task: F) -> bool
@@ -2249,6 +2382,63 @@ mod tests {
         assert_eq!(
             super::outbound_connect_timeout_from_env(Some("999".to_string())),
             Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn connection_worker_count_scales_with_cpu_when_resources_allow() {
+        assert_eq!(
+            super::connection_worker_threads_from_resources(4, Some(4096), Some(100_000)),
+            1024
+        );
+        assert_eq!(
+            super::connection_worker_threads_from_resources(32, Some(128_000), Some(1_000_000)),
+            super::MAX_CONNECTION_WORKERS_PER_LISTENER
+        );
+    }
+
+    #[test]
+    fn connection_worker_count_respects_memory_and_fd_caps() {
+        assert_eq!(
+            super::connection_worker_threads_from_resources(8, Some(512), Some(100_000)),
+            256
+        );
+        assert_eq!(
+            super::connection_worker_threads_from_resources(32, Some(8192), Some(4096)),
+            1792
+        );
+    }
+
+    #[test]
+    fn connection_worker_count_handles_small_resource_limits() {
+        assert_eq!(
+            super::connection_worker_threads_from_resources(4, Some(64), Some(100_000)),
+            32
+        );
+        assert_eq!(
+            super::connection_worker_threads_from_resources(4, Some(4096), Some(600)),
+            44
+        );
+    }
+
+    #[test]
+    fn parses_linux_memory_and_open_file_limits() {
+        assert_eq!(
+            super::parse_proc_meminfo_total_mib(
+                "MemTotal:        3984384 kB\nMemFree:          1000 kB\n"
+            ),
+            Some(3891)
+        );
+        assert_eq!(
+            super::parse_cgroup_memory_limit_mib("536870912\n"),
+            Some(512)
+        );
+        assert_eq!(super::parse_cgroup_memory_limit_mib("max\n"), None);
+        assert_eq!(
+            super::parse_proc_limits_open_files(
+                "Limit                     Soft Limit           Hard Limit           Units\nMax open files            1048576              1048576              files\n"
+            ),
+            Some(1_048_576)
         );
     }
 
@@ -3262,6 +3452,15 @@ mod tests {
         assert_eq!(refreshed.auth.private_key, gateway.auth.private_key);
         assert_eq!(refreshed.auth.short_ids, gateway.auth.short_ids);
         assert!(diff < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn vless_reality_uses_xray_default_without_time_diff_limit() {
+        let config = vless_reality_config(free_port());
+        let gateway =
+            super::reality_gateway_config(&config.inbounds[0]).expect("reality gateway config");
+
+        assert!(gateway.auth.max_time_diff.is_none());
     }
 
     #[test]

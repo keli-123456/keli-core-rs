@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Cursor as IoCursor, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -13,7 +13,6 @@ use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
 use sha2::{Sha256, Sha512};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::stream::relay_tcp_streams_limited;
 use crate::tls::TlsSocket;
 
 const TLS_RECORD_HANDSHAKE: u8 = 0x16;
@@ -699,13 +698,127 @@ fn is_tls_record_type(value: u8) -> bool {
 }
 
 fn fallback_to_dest(
-    client: TcpStream,
+    mut client: TcpStream,
     first_record: Vec<u8>,
-    remote: TcpStream,
+    mut remote: TcpStream,
 ) -> io::Result<(u64, u64)> {
-    let initial_upload = first_record.len() as u64;
-    let (upload, download) = relay_tcp_streams_limited(client, remote, None)?;
-    Ok((initial_upload.saturating_add(upload), download))
+    const FALLBACK_DRAIN_AFTER_CLIENT_EOF: Duration = Duration::from_secs(5);
+
+    client.set_nonblocking(true)?;
+    remote.set_nonblocking(true)?;
+
+    let mut upload = first_record.len() as u64;
+    let mut download = 0u64;
+    let mut upload_done = false;
+    let mut download_done = false;
+    let mut client_eof_at = None::<Instant>;
+    let mut client_buffer = [0u8; 32 * 1024];
+    let mut remote_buffer = [0u8; 32 * 1024];
+    let mut idle_rounds = 0u8;
+
+    while !download_done {
+        let mut progressed = false;
+
+        if !upload_done {
+            match client.read(&mut client_buffer) {
+                Ok(0) => {
+                    upload_done = true;
+                    client_eof_at = Some(Instant::now());
+                    let _ = remote.shutdown(Shutdown::Write);
+                    progressed = true;
+                }
+                Ok(read) => {
+                    if write_all_nonblocking(&mut remote, &client_buffer[..read]).is_err() {
+                        upload_done = true;
+                        client_eof_at = Some(Instant::now());
+                        let _ = remote.shutdown(Shutdown::Write);
+                    } else {
+                        upload = upload.saturating_add(read as u64);
+                    }
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    upload_done = true;
+                    client_eof_at = Some(Instant::now());
+                    let _ = remote.shutdown(Shutdown::Write);
+                    progressed = true;
+                }
+            }
+        }
+
+        match remote.read(&mut remote_buffer) {
+            Ok(0) => {
+                download_done = true;
+                let _ = client.shutdown(Shutdown::Write);
+                progressed = true;
+            }
+            Ok(read) => {
+                if write_all_nonblocking(&mut client, &remote_buffer[..read]).is_err() {
+                    download_done = true;
+                } else {
+                    download = download.saturating_add(read as u64);
+                }
+                progressed = true;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+                download_done = true;
+                progressed = true;
+            }
+        }
+
+        if client_eof_at
+            .map(|instant| instant.elapsed() >= FALLBACK_DRAIN_AFTER_CLIENT_EOF)
+            .unwrap_or(false)
+        {
+            let _ = client.shutdown(Shutdown::Both);
+            let _ = remote.shutdown(Shutdown::Both);
+            break;
+        }
+
+        if !progressed {
+            relay_idle_sleep(&mut idle_rounds);
+        } else {
+            idle_rounds = 0;
+        }
+    }
+
+    let _ = client.shutdown(Shutdown::Both);
+    let _ = remote.shutdown(Shutdown::Both);
+    Ok((upload, download))
+}
+
+fn write_all_nonblocking(writer: &mut TcpStream, mut input: &[u8]) -> io::Result<()> {
+    let mut idle_rounds = 0u8;
+    while !input.is_empty() {
+        match writer.write(input) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "socket write returned zero",
+                ));
+            }
+            Ok(written) => {
+                input = &input[written..];
+                idle_rounds = 0;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                relay_idle_sleep(&mut idle_rounds);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn relay_idle_sleep(idle_rounds: &mut u8) {
+    const BACKOFF_MS: [u64; 5] = [1, 2, 4, 8, 16];
+    let idx = usize::from((*idle_rounds).min((BACKOFF_MS.len() - 1) as u8));
+    std::thread::sleep(Duration::from_millis(BACKOFF_MS[idx]));
+    *idle_rounds = idle_rounds
+        .saturating_add(1)
+        .min((BACKOFF_MS.len() - 1) as u8);
 }
 
 fn connect_dest(dest: &str, timeout: Duration) -> io::Result<TcpStream> {
@@ -824,6 +937,7 @@ fn parse_key_share_extension(input: &[u8]) -> Result<Option<[u8; 32]>, RealityAu
     let client_shares_len = cursor.read_u16()? as usize;
     let shares = cursor.read_slice(client_shares_len)?;
     let mut shares = Cursor::new(shares);
+    let mut hybrid_x25519 = None;
     while shares.remaining() > 0 {
         let group = shares.read_u16()?;
         let len = shares.read_u16()? as usize;
@@ -836,7 +950,7 @@ fn parse_key_share_extension(input: &[u8]) -> Result<Option<[u8; 32]>, RealityAu
         if group == GROUP_X25519_MLKEM768 && value.len() >= 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&value[value.len() - 32..]);
-            return Ok(Some(key));
+            hybrid_x25519 = Some(key);
         }
         if (group == GROUP_X25519_KYBER768_DRAFT00
             || group == GROUP_FAKE_X25519_KYBER768_DRAFT00_OLD)
@@ -844,10 +958,10 @@ fn parse_key_share_extension(input: &[u8]) -> Result<Option<[u8; 32]>, RealityAu
         {
             let mut key = [0u8; 32];
             key.copy_from_slice(&value[..32]);
-            return Ok(Some(key));
+            hybrid_x25519 = Some(key);
         }
     }
-    Ok(None)
+    Ok(hybrid_x25519)
 }
 
 fn parse_server_key_share_extension(input: &[u8]) -> Result<RealityKeyShare, RealityAuthError> {

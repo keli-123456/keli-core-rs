@@ -1,10 +1,11 @@
+use std::env;
 use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -53,6 +54,7 @@ const ATYP_IPV6: u8 = 0x03;
 const FLOW_XTLS_RPRX_VISION: &str = "xtls-rprx-vision";
 const MAX_UDP_PACKET_SIZE: usize = 65_535;
 const ASYNC_TRAFFIC_FLUSH_BYTES: u64 = 4 * 1024 * 1024;
+const VLESS_TRACE_ENV: &str = "KELI_CORE_VLESS_TRACE";
 
 #[derive(Clone, Debug)]
 pub struct VlessServerConfig {
@@ -413,6 +415,12 @@ impl VlessServer {
                     ));
                 }
             };
+        trace_vless(|| {
+            format!(
+                "tls request target={}:{} flow={} user={}",
+                request.target.host, request.target.port, request.flow, request.user_key
+            )
+        });
         client.write_all(&[VERSION, 0x00])?;
         self.relay_tls(client, remote, request, bandwidth)
     }
@@ -2434,6 +2442,8 @@ fn relay_tls_vision_stream<S>(
 where
     S: TlsSocket,
 {
+    const TLS_VISION_DRAIN_AFTER_CLIENT_EOF: Duration = Duration::from_secs(30);
+
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
 
@@ -2441,12 +2451,19 @@ where
     let mut download = 0u64;
     let mut upload_done = false;
     let mut download_done = false;
+    let mut client_eof_at = None::<Instant>;
     let mut client_buffer = [0u8; 16 * 1024];
     let mut remote_buffer = [0u8; 16 * 1024];
     let mut vision_decoder = VisionDecoder::new(user_id);
     let mut vision_encoder = VisionEncoder::new(user_id);
-    let mut encode_download = true;
+    let mut uplink_direct = false;
+    let mut downlink_direct = false;
     let mut idle_rounds = 0u8;
+    let trace = vless_trace_enabled();
+
+    if trace {
+        eprintln!("keli-core-rs vless trace: vision relay start");
+    }
 
     while !upload_done || !download_done {
         if limiter
@@ -2461,38 +2478,106 @@ where
         let mut progressed = false;
 
         if !upload_done {
-            let decoded = vision_decoder.read_decoded(&mut client_buffer)?;
-            if vision_decoder.prefix_checked() {
-                encode_download = vision_decoder.saw_vision_prefix();
-            }
-            if decoded > 0 {
-                if let Some(limiter) = limiter.as_deref() {
-                    if !limiter.wait_for(decoded) {
-                        upload_done = true;
-                        let _ = remote.shutdown(Shutdown::Write);
-                        continue;
-                    }
-                }
-                write_all_wait(&mut remote, &client_buffer[..decoded])?;
-                upload = upload.saturating_add(decoded as u64);
-                progressed = true;
-            } else {
-                match client.read(&mut client_buffer) {
+            if uplink_direct {
+                match client.raw_read(&mut client_buffer) {
                     Ok(0) => {
                         upload_done = true;
-                        vision_decoder.finish();
+                        client_eof_at = Some(Instant::now());
                         let _ = remote.shutdown(Shutdown::Write);
                         progressed = true;
                     }
                     Ok(read) => {
-                        vision_decoder.push(&client_buffer[..read]);
+                        if trace {
+                            eprintln!(
+                                "keli-core-rs vless trace: vision upload raw={} first={:02x?}",
+                                read,
+                                &client_buffer[..read.min(8)]
+                            );
+                        }
+                        if let Some(limiter) = limiter.as_deref() {
+                            if !limiter.wait_for(read) {
+                                upload_done = true;
+                                download_done = true;
+                                let _ = client.shutdown(Shutdown::Both);
+                                let _ = remote.shutdown(Shutdown::Both);
+                                continue;
+                            }
+                        }
+                        write_all_wait(&mut remote, &client_buffer[..read])?;
+                        upload = upload.saturating_add(read as u64);
                         progressed = true;
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                     Err(_) => {
                         upload_done = true;
+                        client_eof_at = Some(Instant::now());
                         let _ = remote.shutdown(Shutdown::Write);
                         progressed = true;
+                    }
+                }
+            } else {
+                let decoded = vision_decoder.read_decoded(&mut client_buffer)?;
+                if decoded > 0 {
+                    if trace {
+                        eprintln!(
+                            "keli-core-rs vless trace: vision upload decoded={} first={:02x?}",
+                            decoded,
+                            &client_buffer[..decoded.min(8)]
+                        );
+                    }
+                    if let Some(limiter) = limiter.as_deref() {
+                        if !limiter.wait_for(decoded) {
+                            upload_done = true;
+                            download_done = true;
+                            let _ = client.shutdown(Shutdown::Both);
+                            let _ = remote.shutdown(Shutdown::Both);
+                            continue;
+                        }
+                    }
+                    write_all_wait(&mut remote, &client_buffer[..decoded])?;
+                    upload = upload.saturating_add(decoded as u64);
+                    progressed = true;
+                    if vision_decoder.is_direct_copy() {
+                        uplink_direct = true;
+                        if trace {
+                            eprintln!("keli-core-rs vless trace: vision upload switched direct");
+                        }
+                    }
+                } else {
+                    if vision_decoder.is_direct_copy() {
+                        uplink_direct = true;
+                        if trace {
+                            eprintln!("keli-core-rs vless trace: vision upload switched direct");
+                        }
+                        continue;
+                    }
+                    match client.read(&mut client_buffer) {
+                        Ok(0) => {
+                            upload_done = true;
+                            client_eof_at = Some(Instant::now());
+                            vision_decoder.finish();
+                            let _ = remote.shutdown(Shutdown::Write);
+                            progressed = true;
+                        }
+                        Ok(read) => {
+                            vision_decoder.push(&client_buffer[..read]);
+                            progressed = true;
+                            if vision_decoder.is_direct_copy() {
+                                uplink_direct = true;
+                                if trace {
+                                    eprintln!(
+                                        "keli-core-rs vless trace: vision upload switched direct"
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(_) => {
+                            upload_done = true;
+                            client_eof_at = Some(Instant::now());
+                            let _ = remote.shutdown(Shutdown::Write);
+                            progressed = true;
+                        }
                     }
                 }
             }
@@ -2508,6 +2593,13 @@ where
                     progressed = true;
                 }
                 Ok(read) => {
+                    if trace {
+                        eprintln!(
+                            "keli-core-rs vless trace: vision download read={} first={:02x?}",
+                            read,
+                            &remote_buffer[..read.min(8)]
+                        );
+                    }
                     if let Some(limiter) = limiter.as_deref() {
                         if !limiter.wait_for(read) {
                             download_done = true;
@@ -2517,11 +2609,19 @@ where
                             continue;
                         }
                     }
-                    if encode_download {
-                        let encoded = vision_encoder.encode(&remote_buffer[..read]);
-                        client.write_plain_all_wait(&encoded)?;
+                    if downlink_direct {
+                        client.raw_write_all_wait(&remote_buffer[..read])?;
                     } else {
-                        client.write_plain_all_wait(&remote_buffer[..read])?;
+                        let frame = vision_encoder.encode(&remote_buffer[..read]);
+                        client.write_plain_all_wait(&frame)?;
+                        if vision_encoder.is_direct_copy() {
+                            downlink_direct = true;
+                            if trace {
+                                eprintln!(
+                                    "keli-core-rs vless trace: vision download switched direct"
+                                );
+                            }
+                        }
                     }
                     download = download.saturating_add(read as u64);
                     progressed = true;
@@ -2537,6 +2637,15 @@ where
             }
         }
 
+        if client_eof_at
+            .map(|instant| instant.elapsed() >= TLS_VISION_DRAIN_AFTER_CLIENT_EOF)
+            .unwrap_or(false)
+        {
+            let _ = client.shutdown(Shutdown::Both);
+            let _ = remote.shutdown(Shutdown::Both);
+            break;
+        }
+
         if !progressed {
             relay_idle_sleep(&mut idle_rounds);
         } else {
@@ -2546,7 +2655,23 @@ where
 
     let _ = client.shutdown(Shutdown::Both);
     let _ = remote.shutdown(Shutdown::Both);
+    if trace {
+        eprintln!(
+            "keli-core-rs vless trace: vision relay finish upload={} download={}",
+            upload, download
+        );
+    }
     Ok((upload, download))
+}
+
+fn vless_trace_enabled() -> bool {
+    env::var_os(VLESS_TRACE_ENV).is_some()
+}
+
+fn trace_vless(message: impl FnOnce() -> String) {
+    if vless_trace_enabled() {
+        eprintln!("keli-core-rs vless trace: {}", message());
+    }
 }
 
 fn relay_idle_sleep(idle_rounds: &mut u8) {
@@ -4302,11 +4427,13 @@ mod tests {
             .expect("vision payload");
         client.write_all(&encoded).expect("client write payload");
 
+        let mut vision_reader = VisionReader::new(&mut client, [0x11; 16]);
         let mut echoed = [0u8; 4];
-        VisionReader::new(&mut client, [0x11; 16])
+        vision_reader
             .read_exact(&mut echoed)
             .expect("client read payload");
         assert_eq!(&echoed, b"ping");
+        drop(vision_reader);
         drop(client);
 
         server_thread
@@ -4321,6 +4448,49 @@ mod tests {
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn tls_vision_relay_exits_when_client_disconnects_while_remote_is_idle() {
+        let cert = test_cert("vless-vision-client-close");
+        let inbound = TcpListener::bind("127.0.0.1:0").expect("inbound bind");
+        let inbound_addr = inbound.local_addr().expect("inbound addr");
+        let remote = TcpListener::bind("127.0.0.1:0").expect("remote bind");
+        let remote_addr = remote.local_addr().expect("remote addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+
+        let (relay_tx, relay_rx) = mpsc::channel();
+        let relay_thread = thread::spawn(move || {
+            let (stream, _) = inbound.accept().expect("accept inbound");
+            let client = acceptor.accept(stream).expect("tls accept");
+            let remote_stream = TcpStream::connect(remote_addr).expect("connect remote");
+            let result = super::relay_tls_vision_stream(client, remote_stream, [0x11; 16], None);
+            relay_tx.send(result).expect("send relay result");
+        });
+
+        let remote_thread = thread::spawn(move || {
+            let (mut stream, _) = remote.accept().expect("accept remote");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("remote timeout");
+            let mut byte = [0u8; 1];
+            matches!(stream.read(&mut byte), Ok(0) | Err(_))
+        });
+
+        let mut client = tls_client(inbound_addr, cert.cert_der.clone());
+        client.write_all(b"bye").expect("client app data");
+        drop(client);
+
+        relay_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("relay must exit after client disconnect")
+            .expect("relay result");
+        assert!(
+            remote_thread.join().expect("remote thread"),
+            "remote side should be closed when VLESS Vision client disconnects"
+        );
+        relay_thread.join().expect("relay thread");
     }
 
     #[test]
@@ -4358,11 +4528,13 @@ mod tests {
         assert_eq!(response, [0x00, 0x00]);
 
         client.write_all(&payload).expect("plain payload");
+        let mut vision_reader = VisionReader::new(&mut client, [0x11; 16]);
         let mut echoed = vec![0u8; payload.len()];
-        client
+        vision_reader
             .read_exact(&mut echoed)
             .expect("plain echoed payload");
         assert_eq!(echoed, payload);
+        drop(vision_reader);
         drop(client);
 
         server_thread
