@@ -14,6 +14,7 @@ use crate::limits::{
     sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard,
     UserSessionTracker,
 };
+use crate::quic_resources::SharedQuicConnectionLimiter;
 use crate::quic_tuning::{
     apply_proxy_quic_transport_defaults, apply_quic_congestion_control,
     server_endpoint_with_tuned_udp_socket,
@@ -62,6 +63,7 @@ pub struct TuicServer {
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
+    quic_connections: SharedQuicConnectionLimiter,
 }
 
 impl TuicServer {
@@ -75,10 +77,26 @@ impl TuicServer {
     }
 
     pub fn with_shared_limits(
+        config: TuicServerConfig,
+        traffic: SharedTrafficRegistry,
+        sessions: UserSessionTracker,
+        bandwidth: UserBandwidthLimiters,
+    ) -> Self {
+        Self::with_shared_limits_and_quic(
+            config,
+            traffic,
+            sessions,
+            bandwidth,
+            SharedQuicConnectionLimiter::standalone(),
+        )
+    }
+
+    pub fn with_shared_limits_and_quic(
         mut config: TuicServerConfig,
         traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
+        quic_connections: SharedQuicConnectionLimiter,
     ) -> Self {
         let users = tuic_user_map(&config.users);
         let router = RouteMatcher::new(config.routes.clone());
@@ -91,6 +109,7 @@ impl TuicServer {
             traffic,
             sessions,
             bandwidth,
+            quic_connections,
         }
     }
 
@@ -116,6 +135,14 @@ impl TuicServer {
             .datagram_receive_buffer_size(Some(UDP_DATAGRAM_BUFFER_SIZE))
             .datagram_send_buffer_size(UDP_DATAGRAM_BUFFER_SIZE);
         apply_tuic_congestion_control(&mut transport, &self.config.congestion_control)?;
+        let resource = self.quic_connections.snapshot();
+        println!(
+            "INFO  core   tuic shared quic limit total={} active={} listeners={} per_listener_soft={}",
+            resource.total_limit,
+            resource.active_connections,
+            resource.listener_count,
+            resource.per_listener_soft_limit
+        );
         server_config.transport_config(Arc::new(transport));
         server_endpoint_with_tuned_udp_socket(server_config, self.config.listen)
     }
@@ -131,8 +158,16 @@ impl TuicServer {
                     let Some(incoming) = incoming else {
                         break;
                     };
+                    let Some(connection_slot) = self.quic_connections.try_acquire() else {
+                        eprintln!(
+                            "WARN  core   tuic shared quic limit reached total={}",
+                            self.quic_connections.total_limit()
+                        );
+                        continue;
+                    };
                     let server = self.clone();
                     tokio::spawn(async move {
+                        let _connection_slot = connection_slot;
                         let _ = server.handle_incoming(incoming).await;
                     });
                 }

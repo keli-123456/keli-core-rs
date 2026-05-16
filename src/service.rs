@@ -22,6 +22,7 @@ use crate::hysteria2::{Hysteria2ObfsConfig, Hysteria2Server, Hysteria2ServerConf
 use crate::limits::{UserBandwidthLimiters, UserSessionTracker};
 use crate::mieru::{MieruServer, MieruServerConfig};
 use crate::protocol::Protocol;
+use crate::quic_resources::{QuicResourceSnapshot, SharedQuicConnectionLimiter};
 use crate::reality::{
     decode_reality_private_key, decode_short_id, generate_reality_temporary_certificate,
     handle_reality_preface, RealityAuthConfig, RealityGatewayConfig, RealityGatewayResult,
@@ -95,6 +96,7 @@ pub struct CoreService {
     listeners: Vec<ListenerHandle>,
     traffic: SharedTrafficRegistry,
     bandwidth: UserBandwidthLimiters,
+    quic_connections: Option<SharedQuicConnectionLimiter>,
     user_revisions: HashMap<String, String>,
     stopped: bool,
 }
@@ -165,6 +167,31 @@ impl CoreService {
         let traffic = TrafficRegistry::shared();
         let sessions = UserSessionTracker::default();
         let bandwidth = UserBandwidthLimiters::default();
+        let quic_listener_count = config
+            .inbounds
+            .iter()
+            .filter(|inbound| is_quic_protocol(&inbound.protocol))
+            .count();
+        let quic_connections = (quic_listener_count > 0)
+            .then(|| SharedQuicConnectionLimiter::for_listener_count(quic_listener_count));
+        if let Some(limiter) = &quic_connections {
+            let snapshot = limiter.snapshot();
+            println!(
+                "INFO  core   quic resources auto total={} listeners={} per_listener_soft={} cpu={} mem_limit_mib={} fd_limit={}",
+                snapshot.total_limit,
+                snapshot.listener_count,
+                snapshot.per_listener_soft_limit,
+                snapshot.cpu_count,
+                snapshot
+                    .memory_limit_mib
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                snapshot
+                    .fd_limit
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+        }
         let mut listeners = Vec::new();
         for inbound in config.inbounds {
             let routes = active_config.resolved_inbound_routes(&inbound);
@@ -224,6 +251,10 @@ impl CoreService {
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
+                    quic_connections
+                        .as_ref()
+                        .expect("quic limiter should exist for tuic")
+                        .clone(),
                 )?,
                 Protocol::Hysteria2 => start_hysteria2_listener(
                     &inbound,
@@ -231,6 +262,10 @@ impl CoreService {
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
+                    quic_connections
+                        .as_ref()
+                        .expect("quic limiter should exist for hysteria2")
+                        .clone(),
                 )?,
                 Protocol::Mieru => start_mieru_listener(
                     &inbound,
@@ -254,6 +289,7 @@ impl CoreService {
             listeners,
             traffic,
             bandwidth,
+            quic_connections,
             user_revisions: HashMap::new(),
             stopped: false,
         })
@@ -264,6 +300,12 @@ impl CoreService {
             .iter()
             .map(|handle| handle.status.clone())
             .collect()
+    }
+
+    pub fn quic_resource_snapshot(&self) -> Option<QuicResourceSnapshot> {
+        self.quic_connections
+            .as_ref()
+            .map(SharedQuicConnectionLimiter::snapshot)
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<TrafficDelta> {
@@ -589,6 +631,7 @@ fn start_hysteria2_listener(
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
+    quic_connections: SharedQuicConnectionLimiter,
 ) -> Result<ListenerHandle, CoreServiceError> {
     let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
         CoreServiceError::Bind {
@@ -600,7 +643,7 @@ fn start_hysteria2_listener(
         tag: inbound.tag.clone(),
         source: io::Error::new(io::ErrorKind::InvalidInput, "hysteria2 requires tls config"),
     })?;
-    let server = Hysteria2Server::with_shared_limits(
+    let server = Hysteria2Server::with_shared_limits_and_quic(
         Hysteria2ServerConfig {
             node_tag: inbound.tag.clone(),
             listen,
@@ -621,6 +664,7 @@ fn start_hysteria2_listener(
         traffic,
         sessions,
         bandwidth,
+        quic_connections,
     );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(quic_runtime_worker_threads())
@@ -685,6 +729,7 @@ fn start_tuic_listener(
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
+    quic_connections: SharedQuicConnectionLimiter,
 ) -> Result<ListenerHandle, CoreServiceError> {
     let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
         CoreServiceError::Bind {
@@ -696,7 +741,7 @@ fn start_tuic_listener(
         tag: inbound.tag.clone(),
         source: io::Error::new(io::ErrorKind::InvalidInput, "tuic requires tls config"),
     })?;
-    let server = TuicServer::with_shared_limits(
+    let server = TuicServer::with_shared_limits_and_quic(
         TuicServerConfig {
             node_tag: inbound.tag.clone(),
             listen,
@@ -713,6 +758,7 @@ fn start_tuic_listener(
         traffic,
         sessions,
         bandwidth,
+        quic_connections,
     );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(quic_runtime_worker_threads())
@@ -1927,6 +1973,10 @@ impl ConnectionWorkerPool {
 
 fn connection_worker_pool() -> &'static ConnectionWorkerPool {
     CONNECTION_WORKER_POOL.get_or_init(ConnectionWorkerPool::new)
+}
+
+fn is_quic_protocol(protocol: &Protocol) -> bool {
+    matches!(protocol, Protocol::Hysteria2 | Protocol::Tuic)
 }
 
 fn connection_worker_threads() -> usize {

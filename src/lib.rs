@@ -18,6 +18,7 @@ pub mod outbound;
 pub mod protocol;
 pub mod quic;
 mod quic_packet;
+pub mod quic_resources;
 pub mod quic_tuning;
 pub mod reality;
 pub mod routing;
@@ -75,6 +76,7 @@ pub use outbound::{
     send_udp_outbound_tokio,
 };
 pub use protocol::{Protocol, ProtocolPlacement};
+pub use quic_resources::{QuicResourceSnapshot, SharedQuicConnectionLimiter};
 pub use routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 pub use runtime::{CorePlan, CoreStatus, ReloadDecision, RuntimeState};
 pub use service::{CoreService, CoreServiceError, ListenerStatus};

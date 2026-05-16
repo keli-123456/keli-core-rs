@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::quic_resources::QuicResourceSnapshot;
+
 const USER_DELTA_DURATION_BUCKETS_MS: [u64; 10] = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000];
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,6 +16,8 @@ pub struct CoreMetricsSnapshot {
     pub keli_core_user_delta_current_revision_missing_total: u64,
     pub keli_core_user_delta_apply_duration_ms: CoreDurationMetrics,
     pub keli_core_user_delta_active_users: BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keli_core_quic_resource: Option<QuicResourceSnapshot>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +37,15 @@ pub struct CoreMetrics {
 impl CoreMetrics {
     pub fn snapshot(&self) -> CoreMetricsSnapshot {
         self.snapshot.clone()
+    }
+
+    pub fn snapshot_with_quic_resource(
+        &self,
+        quic_resource: Option<QuicResourceSnapshot>,
+    ) -> CoreMetricsSnapshot {
+        let mut snapshot = self.snapshot();
+        snapshot.keli_core_quic_resource = quic_resource;
+        snapshot
     }
 
     pub fn record_user_delta_success(
@@ -123,6 +136,7 @@ fn is_current_revision_missing(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::metrics::CoreMetrics;
+    use crate::quic_resources::QuicResourceSnapshot;
 
     #[test]
     fn records_user_delta_success_without_user_labels() {
@@ -166,5 +180,28 @@ mod tests {
             snapshot.keli_core_user_delta_current_revision_missing_total,
             1
         );
+    }
+
+    #[test]
+    fn snapshots_include_quic_resource_without_user_labels() {
+        let metrics = CoreMetrics::default();
+
+        let snapshot = metrics.snapshot_with_quic_resource(Some(QuicResourceSnapshot {
+            total_limit: 4096,
+            active_connections: 12,
+            available_connections: 4084,
+            listener_count: 2,
+            per_listener_soft_limit: 2048,
+            cpu_count: 4,
+            memory_limit_mib: Some(4096),
+            fd_limit: Some(1_048_576),
+        }));
+
+        let quic = snapshot
+            .keli_core_quic_resource
+            .expect("quic resource metrics");
+        assert_eq!(quic.total_limit, 4096);
+        assert_eq!(quic.active_connections, 12);
+        assert_eq!(quic.listener_count, 2);
     }
 }

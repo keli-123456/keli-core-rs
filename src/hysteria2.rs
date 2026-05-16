@@ -10,12 +10,12 @@ use quinn::crypto::rustls::QuicServerConfig;
 use quinn::Runtime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::limits::{
     sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard,
     UserSessionTracker,
 };
+use crate::quic_resources::{QuicConnectionPermit, SharedQuicConnectionLimiter};
 use crate::quic_tuning::{
     apply_proxy_quic_transport_defaults, apply_quic_congestion_control, bind_quic_udp_socket,
     server_endpoint_with_tuned_udp_socket, tune_quic_udp_socket,
@@ -42,9 +42,6 @@ const UDP_SESSION_IDLE_TIMEOUT_MS: u64 = 60_000;
 const UDP_SESSION_CLEANUP_INTERVAL_MS: u64 = 10_000;
 const HY2_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
 const QUIC_ENDPOINT_STOP_WAIT: Duration = Duration::from_secs(3);
-const MIN_HYSTERIA2_CONNECTION_LIMIT: usize = 1024;
-const MAX_HYSTERIA2_CONNECTION_LIMIT: usize = 32_768;
-const HYSTERIA2_CONNECTIONS_PER_CPU: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub struct Hysteria2ServerConfig {
@@ -79,8 +76,7 @@ pub struct Hysteria2Server {
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
-    connection_slots: Arc<Semaphore>,
-    connection_limit: usize,
+    quic_connections: SharedQuicConnectionLimiter,
 }
 
 impl Hysteria2Server {
@@ -94,15 +90,30 @@ impl Hysteria2Server {
     }
 
     pub fn with_shared_limits(
-        mut config: Hysteria2ServerConfig,
+        config: Hysteria2ServerConfig,
         traffic: SharedTrafficRegistry,
         sessions: UserSessionTracker,
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
+        Self::with_shared_limits_and_quic(
+            config,
+            traffic,
+            sessions,
+            bandwidth,
+            SharedQuicConnectionLimiter::standalone(),
+        )
+    }
+
+    pub fn with_shared_limits_and_quic(
+        mut config: Hysteria2ServerConfig,
+        traffic: SharedTrafficRegistry,
+        sessions: UserSessionTracker,
+        bandwidth: UserBandwidthLimiters,
+        quic_connections: SharedQuicConnectionLimiter,
+    ) -> Self {
         let users =
             UserStore::from_keyed_users(&config.users, |user| user.credential().to_string());
         let router = RouteMatcher::new(config.routes.clone());
-        let connection_limit = hysteria2_connection_limit();
         config.users.clear();
         config.routes.clear();
         Self {
@@ -112,8 +123,7 @@ impl Hysteria2Server {
             traffic,
             sessions,
             bandwidth,
-            connection_slots: Arc::new(Semaphore::new(connection_limit)),
-            connection_limit,
+            quic_connections,
         }
     }
 
@@ -141,10 +151,13 @@ impl Hysteria2Server {
             "cubic",
             "hysteria2",
         )?;
+        let resource = self.quic_connections.snapshot();
         println!(
-            "INFO  core   hysteria2 connection limit max={} cpu={}",
-            self.connection_limit,
-            available_parallelism_count()
+            "INFO  core   hysteria2 shared quic limit total={} active={} listeners={} per_listener_soft={}",
+            resource.total_limit,
+            resource.active_connections,
+            resource.listener_count,
+            resource.per_listener_soft_limit
         );
         transport
             .datagram_receive_buffer_size(Some(UDP_DATAGRAM_BUFFER_SIZE))
@@ -189,8 +202,8 @@ impl Hysteria2Server {
                     };
                     let Some(connection_slot) = self.try_acquire_connection_slot() else {
                         eprintln!(
-                            "WARN  core   hysteria2 connection limit reached max={}",
-                            self.connection_limit
+                            "WARN  core   hysteria2 shared quic limit reached total={}",
+                            self.quic_connections.total_limit()
                         );
                         continue;
                     };
@@ -228,8 +241,8 @@ impl Hysteria2Server {
         self.users.get(auth)
     }
 
-    fn try_acquire_connection_slot(&self) -> Option<OwnedSemaphorePermit> {
-        self.connection_slots.clone().try_acquire_owned().ok()
+    fn try_acquire_connection_slot(&self) -> Option<QuicConnectionPermit> {
+        self.quic_connections.try_acquire()
     }
 
     async fn handle_incoming(&self, incoming: quinn::Incoming) -> io::Result<()> {
@@ -1667,32 +1680,6 @@ fn should_log_hysteria2_error(scope: &'static str, class: Hysteria2ErrorClass) -
     true
 }
 
-fn hysteria2_connection_limit() -> usize {
-    if let Ok(value) = std::env::var("KELI_CORE_HY2_MAX_CONNECTIONS") {
-        if let Ok(parsed) = value.trim().parse::<usize>() {
-            return parsed.clamp(64, MAX_HYSTERIA2_CONNECTION_LIMIT);
-        }
-    }
-    hysteria2_connection_limit_from_cpu(available_parallelism_count())
-}
-
-fn hysteria2_connection_limit_from_cpu(cpu_count: usize) -> usize {
-    cpu_count
-        .max(1)
-        .saturating_mul(HYSTERIA2_CONNECTIONS_PER_CPU)
-        .clamp(
-            MIN_HYSTERIA2_CONNECTION_LIMIT,
-            MAX_HYSTERIA2_CONNECTION_LIMIT,
-        )
-}
-
-fn available_parallelism_count() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(4)
-        .max(1)
-}
-
 fn is_expected_hysteria2_close(error: &io::Error) -> bool {
     let text = error.to_string();
     text.contains("Stopped(0)")
@@ -2824,13 +2811,5 @@ mod tests {
             classify_hysteria2_error(&io::Error::new(io::ErrorKind::Other, "FinishedEarly(0)")),
             Hysteria2ErrorClass::Transport
         );
-    }
-
-    #[test]
-    fn hysteria2_connection_limit_scales_with_cpu() {
-        assert_eq!(hysteria2_connection_limit_from_cpu(1), 1024);
-        assert_eq!(hysteria2_connection_limit_from_cpu(4), 4096);
-        assert_eq!(hysteria2_connection_limit_from_cpu(16), 16_384);
-        assert_eq!(hysteria2_connection_limit_from_cpu(128), 32_768);
     }
 }

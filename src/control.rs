@@ -97,7 +97,11 @@ impl CoreController {
                 listeners: self.listeners(),
             },
             CoreCommand::Metrics => CoreResponse::Metrics {
-                metrics: self.metrics.snapshot(),
+                metrics: self.metrics.snapshot_with_quic_resource(
+                    self.service
+                        .as_ref()
+                        .and_then(CoreService::quic_resource_snapshot),
+                ),
             },
             CoreCommand::Stop => {
                 if let Some(service) = &mut self.service {
