@@ -344,13 +344,13 @@ fn native_relay_pool() -> &'static NativeRelayPool {
 fn native_relay_worker_threads() -> usize {
     if let Ok(value) = std::env::var("KELI_CORE_NATIVE_RELAY_WORKERS") {
         if let Ok(parsed) = value.trim().parse::<usize>() {
-            return parsed.clamp(16, 4096);
+            return parsed.clamp(16, 1024);
         }
     }
     std::thread::available_parallelism()
-        .map(|threads| usize::from(threads).saturating_mul(32))
-        .unwrap_or(64)
-        .clamp(64, 1024)
+        .map(|threads| usize::from(threads).saturating_mul(16))
+        .unwrap_or(32)
+        .clamp(32, 512)
 }
 
 fn native_relay_stack_size() -> usize {
@@ -358,7 +358,7 @@ fn native_relay_stack_size() -> usize {
 }
 
 fn native_relay_idle_timeout() -> Duration {
-    Duration::from_secs(30)
+    Duration::from_secs(10)
 }
 
 async fn copy_count_best_effort_limited_async<R, W>(

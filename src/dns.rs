@@ -1,18 +1,37 @@
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{OnceLock, RwLock};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::config::{DnsConfig, DnsServerConfig};
 use crate::routing::route_targets_match;
 
 static DNS_CONFIG: OnceLock<RwLock<DnsConfig>> = OnceLock::new();
 static DNS_QUERY_ID: AtomicU16 = AtomicU16::new(1);
+static DNS_NEGATIVE_CACHE: OnceLock<Mutex<HashMap<DnsCacheKey, DnsNegativeCacheEntry>>> =
+    OnceLock::new();
+const DNS_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(15);
+const DNS_NEGATIVE_CACHE_MAX_ENTRIES: usize = 4096;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DnsCacheKey {
+    host: String,
+    port: u16,
+}
+
+#[derive(Clone, Debug)]
+struct DnsNegativeCacheEntry {
+    expires_at: Instant,
+    kind: io::ErrorKind,
+    message: String,
+}
 
 pub fn configure(config: DnsConfig) {
     let lock = DNS_CONFIG.get_or_init(|| RwLock::new(DnsConfig::default()));
     *lock.write().expect("dns config lock poisoned") = config;
+    clear_negative_cache();
 }
 
 pub fn connect_tcp(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
@@ -140,35 +159,115 @@ pub fn resolve_socket_addrs(
     }
 
     let host = host.trim().trim_matches(['[', ']']);
-    let config = current_config();
-    if config.servers.is_empty() {
-        return system_resolve(host, port);
+    let cache_key = DnsCacheKey {
+        host: host.to_ascii_lowercase(),
+        port,
+    };
+    if let Some(error) = cached_negative_error(&cache_key) {
+        return Err(error);
     }
-
-    let servers = select_servers(&config, host);
-    let query_types = query_types(&config.query_strategy);
-    let mut last_error = None;
-    for server in servers {
-        for qtype in &query_types {
-            match query_dns_server(&server, host, *qtype, timeout) {
-                Ok(ips) if !ips.is_empty() => {
-                    return Ok(ips
-                        .into_iter()
-                        .map(|ip| SocketAddr::new(ip, port))
-                        .collect());
+    let config = current_config();
+    let result = if config.servers.is_empty() {
+        system_resolve(host, port)
+    } else {
+        let servers = select_servers(&config, host);
+        let query_types = query_types(&config.query_strategy);
+        let mut last_error = None;
+        let mut resolved = None;
+        'outer: for server in servers {
+            for qtype in &query_types {
+                match query_dns_server(&server, host, *qtype, timeout) {
+                    Ok(ips) if !ips.is_empty() => {
+                        resolved = Some(
+                            ips.into_iter()
+                                .map(|ip| SocketAddr::new(ip, port))
+                                .collect::<Vec<_>>(),
+                        );
+                        break 'outer;
+                    }
+                    Ok(_) => {}
+                    Err(error) => last_error = Some(error),
                 }
-                Ok(_) => {}
-                Err(error) => last_error = Some(error),
+            }
+        }
+
+        resolved.map(Ok).unwrap_or_else(|| {
+            Err(last_error.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "configured dns servers returned no target address",
+                )
+            }))
+        })
+    };
+
+    match result {
+        Ok(addrs) => {
+            remove_negative_cache_entry(&cache_key);
+            Ok(addrs)
+        }
+        Err(error) => {
+            record_negative_cache(&cache_key, &error);
+            Err(error)
+        }
+    }
+}
+
+fn clear_negative_cache() {
+    if let Some(cache) = DNS_NEGATIVE_CACHE.get() {
+        cache.lock().expect("dns negative cache poisoned").clear();
+    }
+}
+
+fn negative_cache() -> &'static Mutex<HashMap<DnsCacheKey, DnsNegativeCacheEntry>> {
+    DNS_NEGATIVE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_negative_error(key: &DnsCacheKey) -> Option<io::Error> {
+    let now = Instant::now();
+    let mut cache = negative_cache()
+        .lock()
+        .expect("dns negative cache poisoned");
+    let Some(entry) = cache.get(key) else {
+        return None;
+    };
+    if now >= entry.expires_at {
+        cache.remove(key);
+        return None;
+    }
+    Some(io::Error::new(entry.kind, entry.message.clone()))
+}
+
+fn record_negative_cache(key: &DnsCacheKey, error: &io::Error) {
+    let mut cache = negative_cache()
+        .lock()
+        .expect("dns negative cache poisoned");
+    if cache.len() >= DNS_NEGATIVE_CACHE_MAX_ENTRIES {
+        let now = Instant::now();
+        cache.retain(|_, entry| entry.expires_at > now);
+        if cache.len() >= DNS_NEGATIVE_CACHE_MAX_ENTRIES {
+            if let Some(first) = cache.keys().next().cloned() {
+                cache.remove(&first);
             }
         }
     }
+    cache.insert(
+        key.clone(),
+        DnsNegativeCacheEntry {
+            expires_at: Instant::now() + DNS_NEGATIVE_CACHE_TTL,
+            kind: error.kind(),
+            message: error.to_string(),
+        },
+    );
+}
 
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            "configured dns servers returned no target address",
-        )
-    }))
+fn remove_negative_cache_entry(key: &DnsCacheKey) {
+    if let Some(cache) = DNS_NEGATIVE_CACHE.get() {
+        cache
+            .lock()
+            .expect("dns negative cache poisoned")
+            .remove(key);
+    }
 }
 
 fn current_config() -> DnsConfig {
@@ -588,5 +687,24 @@ mod tests {
         assert_eq!(ipv6, vec!["[::1]:443".parse().unwrap()]);
 
         configure(DnsConfig::default());
+    }
+
+    #[test]
+    fn negative_dns_cache_reuses_recent_failures_and_clears_on_configure() {
+        let key = DnsCacheKey {
+            host: "missing.example.test".to_string(),
+            port: 443,
+        };
+        record_negative_cache(
+            &key,
+            &io::Error::new(io::ErrorKind::AddrNotAvailable, "no answer"),
+        );
+
+        let cached = cached_negative_error(&key).expect("cached error");
+        assert_eq!(cached.kind(), io::ErrorKind::AddrNotAvailable);
+        assert_eq!(cached.to_string(), "no answer");
+
+        configure(DnsConfig::default());
+        assert!(cached_negative_error(&key).is_none());
     }
 }

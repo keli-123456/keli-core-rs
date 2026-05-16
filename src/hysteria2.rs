@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -41,6 +41,10 @@ const UDP_MAX_FRAGMENT_SETS: usize = 4096;
 const UDP_MAX_REASSEMBLED_BYTES: usize = UDP_PACKET_BUFFER_SIZE;
 const UDP_SESSION_IDLE_TIMEOUT_MS: u64 = 60_000;
 const UDP_SESSION_CLEANUP_INTERVAL_MS: u64 = 10_000;
+const UDP_MAX_SESSIONS_PER_CONNECTION: usize = 256;
+const UDP_GLOBAL_SESSIONS_PER_CPU: usize = 512;
+const UDP_GLOBAL_MIN_SESSIONS: usize = 512;
+const UDP_GLOBAL_MAX_SESSIONS: usize = 8192;
 const HY2_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
 const HY2_STOP_POLL_INTERVAL_MS: u64 = 250;
 const HY2_INVALID_AUTH_BACKOFF_THRESHOLD: u32 = 8;
@@ -48,6 +52,8 @@ const HY2_INVALID_AUTH_BACKOFF_WINDOW: Duration = Duration::from_secs(30);
 const HY2_INVALID_AUTH_BACKOFF_DURATION: Duration = Duration::from_secs(30);
 const HY2_INVALID_AUTH_BACKOFF_MAX_ENTRIES: usize = 4096;
 const QUIC_ENDPOINT_STOP_WAIT: Duration = Duration::from_secs(3);
+static HY2_ACTIVE_UDP_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+static HY2_UDP_SESSION_LIMIT: OnceLock<usize> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct Hysteria2ServerConfig {
@@ -703,12 +709,17 @@ impl Hysteria2Server {
             return Ok((session, target_addr));
         }
 
+        make_room_for_udp_session(sessions);
         let target_addr = resolve_udp_target(target, self.config.connect_timeout).await?;
+        let permit = UdpSessionPermit::try_acquire().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "hysteria2 udp session limit reached")
+        })?;
         let socket = Arc::new(bind_udp_socket(target_addr.ip()).await?);
         let session = Arc::new(UdpRelaySession {
             socket,
             target: target.clone(),
             target_addr,
+            _permit: permit,
             next_packet_id: AtomicU16::new(0),
             traffic: self.traffic.clone(),
             node_tag: self.config.node_tag.clone(),
@@ -725,6 +736,7 @@ impl Hysteria2Server {
                 .lock()
                 .expect("hysteria2 udp session lock poisoned");
             if let Some(existing) = sessions.get(&session_id) {
+                drop(session);
                 existing.touch();
                 if existing.target == *target {
                     return Ok((existing.clone(), existing.target_addr));
@@ -887,6 +899,7 @@ struct UdpRelaySession {
     socket: Arc<UdpSocket>,
     target: SocksTarget,
     target_addr: SocketAddr,
+    _permit: UdpSessionPermit,
     next_packet_id: AtomicU16,
     traffic: SharedTrafficRegistry,
     node_tag: String,
@@ -963,6 +976,47 @@ impl Drop for UdpRelaySession {
     }
 }
 
+#[derive(Debug)]
+struct UdpSessionPermit;
+
+impl UdpSessionPermit {
+    fn try_acquire() -> Option<Self> {
+        let limit = hy2_udp_session_limit();
+        loop {
+            let active = HY2_ACTIVE_UDP_SESSIONS.load(Ordering::Acquire);
+            if active >= limit {
+                return None;
+            }
+            if HY2_ACTIVE_UDP_SESSIONS
+                .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(Self);
+            }
+        }
+    }
+}
+
+impl Drop for UdpSessionPermit {
+    fn drop(&mut self) {
+        HY2_ACTIVE_UDP_SESSIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn hy2_udp_session_limit() -> usize {
+    *HY2_UDP_SESSION_LIMIT.get_or_init(|| {
+        if let Ok(value) = std::env::var("KELI_CORE_HY2_UDP_SESSIONS") {
+            if let Ok(parsed) = value.trim().parse::<usize>() {
+                return parsed.clamp(64, UDP_GLOBAL_MAX_SESSIONS);
+            }
+        }
+        std::thread::available_parallelism()
+            .map(|threads| usize::from(threads).saturating_mul(UDP_GLOBAL_SESSIONS_PER_CPU))
+            .unwrap_or(UDP_GLOBAL_MIN_SESSIONS)
+            .clamp(UDP_GLOBAL_MIN_SESSIONS, UDP_GLOBAL_MAX_SESSIONS)
+    })
+}
+
 fn prune_udp_sessions(
     sessions: &Arc<Mutex<HashMap<u32, Arc<UdpRelaySession>>>>,
     now_ms: u64,
@@ -981,6 +1035,26 @@ fn prune_udp_sessions(
         }
     });
     removed
+}
+
+fn make_room_for_udp_session(sessions: &Arc<Mutex<HashMap<u32, Arc<UdpRelaySession>>>>) {
+    let now_ms = now_millis();
+    let _ = prune_udp_sessions(sessions, now_ms);
+    let mut sessions = sessions
+        .lock()
+        .expect("hysteria2 udp session lock poisoned");
+    while sessions.len() >= UDP_MAX_SESSIONS_PER_CONNECTION {
+        let Some(oldest_id) = sessions
+            .iter()
+            .min_by_key(|(_, session)| session.last_active_ms.load(Ordering::Relaxed))
+            .map(|(id, _)| *id)
+        else {
+            break;
+        };
+        if let Some(session) = sessions.remove(&oldest_id) {
+            session.close();
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1931,7 +2005,9 @@ fn classify_hysteria2_error_text(error: &io::Error, text: &str) -> Hysteria2Erro
 
 fn is_hysteria2_invalid_auth_error(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::PermissionDenied
-        && error.to_string().contains("invalid hysteria2 authentication")
+        && error
+            .to_string()
+            .contains("invalid hysteria2 authentication")
 }
 
 fn now_millis() -> u64 {
@@ -2877,6 +2953,7 @@ mod tests {
                     port: 53,
                 },
                 target_addr: "127.0.0.1:53".parse().expect("target addr"),
+                _permit: UdpSessionPermit::try_acquire().expect("udp session permit"),
                 next_packet_id: AtomicU16::new(0),
                 traffic: traffic.clone(),
                 node_tag: "node-a".to_string(),
@@ -2930,6 +3007,7 @@ mod tests {
                     port: 53,
                 },
                 target_addr: "127.0.0.1:53".parse().expect("target addr"),
+                _permit: UdpSessionPermit::try_acquire().expect("udp session permit"),
                 next_packet_id: AtomicU16::new(0),
                 traffic: traffic.clone(),
                 node_tag: "node-a".to_string(),
@@ -2953,6 +3031,53 @@ mod tests {
             assert_eq!(records[0].upload, 7);
             assert_eq!(records[0].download, 11);
             assert_eq!(records[0].user_id, Some(42));
+        });
+    }
+
+    #[test]
+    fn hysteria2_udp_sessions_evict_oldest_when_per_connection_limit_is_full() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let traffic = TrafficRegistry::shared();
+            let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("udp bind"));
+            let now = now_millis();
+            let mut entries = HashMap::new();
+            for id in 0..UDP_MAX_SESSIONS_PER_CONNECTION as u32 {
+                entries.insert(
+                    id,
+                    Arc::new(UdpRelaySession {
+                        socket: socket.clone(),
+                        target: SocksTarget {
+                            host: "127.0.0.1".to_string(),
+                            port: 53,
+                        },
+                        target_addr: "127.0.0.1:53".parse().expect("target addr"),
+                        _permit: UdpSessionPermit::try_acquire().expect("udp session permit"),
+                        next_packet_id: AtomicU16::new(0),
+                        traffic: traffic.clone(),
+                        node_tag: "node-a".to_string(),
+                        user_uuid: "user-a".to_string(),
+                        user_id: 42,
+                        client_ip: "127.0.0.2".parse().expect("client ip"),
+                        closed: AtomicBool::new(false),
+                        last_active_ms: AtomicU64::new(now.saturating_add(id as u64)),
+                        pending_upload: AtomicU64::new(0),
+                        pending_download: AtomicU64::new(0),
+                    }),
+                );
+            }
+            let oldest = entries.get(&0).expect("oldest session").clone();
+            let sessions = Arc::new(Mutex::new(entries));
+
+            make_room_for_udp_session(&sessions);
+
+            let sessions = sessions.lock().expect("sessions lock");
+            assert_eq!(sessions.len(), UDP_MAX_SESSIONS_PER_CONNECTION - 1);
+            assert!(!sessions.contains_key(&0));
+            assert!(oldest.is_closed());
         });
     }
 
