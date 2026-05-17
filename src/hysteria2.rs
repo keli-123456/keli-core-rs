@@ -1973,6 +1973,7 @@ fn should_log_hysteria2_error(scope: &'static str, class: Hysteria2ErrorClass) -
     true
 }
 
+#[cfg(test)]
 fn is_expected_hysteria2_close(error: &io::Error) -> bool {
     is_expected_hysteria2_close_text(&error.to_string())
 }
@@ -1992,6 +1993,7 @@ fn is_expected_hysteria2_close_text(text: &str) -> bool {
         || text.contains("got two control streams")
 }
 
+#[cfg(test)]
 fn is_hysteria2_timeout(error: &io::Error) -> bool {
     is_hysteria2_timeout_text(error, &error.to_string())
 }
@@ -2006,6 +2008,7 @@ fn is_hysteria2_timeout_text(error: &io::Error, text: &str) -> bool {
         || text.contains("timed out")
 }
 
+#[cfg(test)]
 fn classify_hysteria2_error(error: &io::Error) -> Hysteria2ErrorClass {
     classify_hysteria2_error_text(error, &error.to_string())
 }
