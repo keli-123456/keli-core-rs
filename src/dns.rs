@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use crate::config::{DnsConfig, DnsServerConfig};
 use crate::routing::{is_private_ip, route_targets_match};
@@ -14,10 +16,30 @@ static DNS_POSITIVE_CACHE: OnceLock<Mutex<HashMap<DnsCacheKey, DnsPositiveCacheE
     OnceLock::new();
 static DNS_NEGATIVE_CACHE: OnceLock<Mutex<HashMap<DnsCacheKey, DnsNegativeCacheEntry>>> =
     OnceLock::new();
+static DNS_RESOLVE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DNS_SYSTEM_QUERY_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DNS_CONFIGURED_QUERY_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DNS_POSITIVE_CACHE_HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DNS_NEGATIVE_CACHE_HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DNS_RESOLVE_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DNS_PRIVATE_IP_FILTER_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DNS_PRIVATE_IP_BLOCK_TOTAL: AtomicU64 = AtomicU64::new(0);
 const DNS_POSITIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const DNS_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(15);
 const DNS_POSITIVE_CACHE_MAX_ENTRIES: usize = 8192;
 const DNS_NEGATIVE_CACHE_MAX_ENTRIES: usize = 4096;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsMetricsSnapshot {
+    pub keli_core_dns_resolve_total: u64,
+    pub keli_core_dns_system_query_total: u64,
+    pub keli_core_dns_configured_query_total: u64,
+    pub keli_core_dns_positive_cache_hit_total: u64,
+    pub keli_core_dns_negative_cache_hit_total: u64,
+    pub keli_core_dns_resolve_error_total: u64,
+    pub keli_core_dns_private_ip_filter_total: u64,
+    pub keli_core_dns_private_ip_block_total: u64,
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct DnsCacheKey {
@@ -43,6 +65,21 @@ pub fn configure(config: DnsConfig) {
     *lock.write().expect("dns config lock poisoned") = config;
     clear_positive_cache();
     clear_negative_cache();
+}
+
+pub fn dns_metrics_snapshot() -> DnsMetricsSnapshot {
+    DnsMetricsSnapshot {
+        keli_core_dns_resolve_total: DNS_RESOLVE_TOTAL.load(Ordering::Relaxed),
+        keli_core_dns_system_query_total: DNS_SYSTEM_QUERY_TOTAL.load(Ordering::Relaxed),
+        keli_core_dns_configured_query_total: DNS_CONFIGURED_QUERY_TOTAL.load(Ordering::Relaxed),
+        keli_core_dns_positive_cache_hit_total: DNS_POSITIVE_CACHE_HIT_TOTAL
+            .load(Ordering::Relaxed),
+        keli_core_dns_negative_cache_hit_total: DNS_NEGATIVE_CACHE_HIT_TOTAL
+            .load(Ordering::Relaxed),
+        keli_core_dns_resolve_error_total: DNS_RESOLVE_ERROR_TOTAL.load(Ordering::Relaxed),
+        keli_core_dns_private_ip_filter_total: DNS_PRIVATE_IP_FILTER_TOTAL.load(Ordering::Relaxed),
+        keli_core_dns_private_ip_block_total: DNS_PRIVATE_IP_BLOCK_TOTAL.load(Ordering::Relaxed),
+    }
 }
 
 pub fn connect_tcp(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
@@ -146,7 +183,13 @@ pub async fn resolve_socket_addrs_tokio(
     timeout: Duration,
 ) -> io::Result<Vec<SocketAddr>> {
     if let Some(addr) = literal_socket_addr(host, port) {
-        return Ok(vec![addr]);
+        DNS_RESOLVE_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let config = current_config();
+        let result = filter_private_addrs(host, port, vec![addr], &config);
+        if result.is_err() {
+            DNS_RESOLVE_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        return result;
     }
 
     let host = host.to_string();
@@ -165,9 +208,14 @@ pub fn resolve_socket_addrs(
     port: u16,
     timeout: Duration,
 ) -> io::Result<Vec<SocketAddr>> {
+    DNS_RESOLVE_TOTAL.fetch_add(1, Ordering::Relaxed);
     if let Some(addr) = literal_socket_addr(host, port) {
         let config = current_config();
-        return filter_private_addrs(host, port, vec![addr], &config);
+        let result = filter_private_addrs(host, port, vec![addr], &config);
+        if result.is_err() {
+            DNS_RESOLVE_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        return result;
     }
 
     let host = host.trim().trim_matches(['[', ']']);
@@ -179,12 +227,15 @@ pub fn resolve_socket_addrs(
         return Ok(addrs);
     }
     if let Some(error) = cached_negative_error(&cache_key) {
+        DNS_RESOLVE_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
         return Err(error);
     }
     let config = current_config();
     let result = if config.servers.is_empty() {
+        DNS_SYSTEM_QUERY_TOTAL.fetch_add(1, Ordering::Relaxed);
         system_resolve(host, port)
     } else {
+        DNS_CONFIGURED_QUERY_TOTAL.fetch_add(1, Ordering::Relaxed);
         let servers = select_servers(&config, host);
         let query_types = query_types(&config.query_strategy);
         let mut last_error = None;
@@ -217,13 +268,20 @@ pub fn resolve_socket_addrs(
     };
 
     match result {
-        Ok(addrs) => {
-            let addrs = filter_private_addrs(host, port, addrs, &config)?;
-            remove_negative_cache_entry(&cache_key);
-            record_positive_cache(&cache_key, &addrs);
-            Ok(addrs)
-        }
+        Ok(addrs) => match filter_private_addrs(host, port, addrs, &config) {
+            Ok(addrs) => {
+                remove_negative_cache_entry(&cache_key);
+                record_positive_cache(&cache_key, &addrs);
+                Ok(addrs)
+            }
+            Err(error) => {
+                DNS_RESOLVE_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+                Err(error)
+            }
+        },
         Err(error) => {
+            DNS_RESOLVE_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+            remove_negative_cache_entry(&cache_key);
             remove_positive_cache_entry(&cache_key);
             record_negative_cache(&cache_key, &error);
             Err(error)
@@ -240,11 +298,16 @@ fn filter_private_addrs(
     if !config.block_private_ips || private_ip_target_allowed(host, port, config) {
         return Ok(addrs);
     }
+    let private_count = addrs.iter().filter(|addr| is_private_ip(addr.ip())).count();
     let public_addrs = addrs
         .into_iter()
         .filter(|addr| !is_private_ip(addr.ip()))
         .collect::<Vec<_>>();
+    if private_count > 0 {
+        DNS_PRIVATE_IP_FILTER_TOTAL.fetch_add(private_count as u64, Ordering::Relaxed);
+    }
     if public_addrs.is_empty() {
+        DNS_PRIVATE_IP_BLOCK_TOTAL.fetch_add(1, Ordering::Relaxed);
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("dns private ip blocked for {host}"),
@@ -290,6 +353,7 @@ fn cached_positive_addrs(key: &DnsCacheKey) -> Option<Vec<SocketAddr>> {
         cache.remove(key);
         return None;
     }
+    DNS_POSITIVE_CACHE_HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
     Some(entry.addrs.clone())
 }
 
@@ -305,6 +369,7 @@ fn cached_negative_error(key: &DnsCacheKey) -> Option<io::Error> {
         cache.remove(key);
         return None;
     }
+    DNS_NEGATIVE_CACHE_HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
     Some(io::Error::new(entry.kind, entry.message.clone()))
 }
 
@@ -774,6 +839,7 @@ mod tests {
 
     #[test]
     fn blocks_private_dns_answers_when_enabled() {
+        let before = dns_metrics_snapshot();
         let (dns_addr, server) = spawn_udp_a_dns([127, 0, 0, 1]);
         configure(DnsConfig {
             servers: vec![DnsServerConfig {
@@ -789,6 +855,20 @@ mod tests {
             .expect_err("private answer should be blocked");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("private ip blocked"));
+        let after = dns_metrics_snapshot();
+        assert!(
+            after.keli_core_dns_configured_query_total
+                > before.keli_core_dns_configured_query_total
+        );
+        assert!(
+            after.keli_core_dns_private_ip_filter_total
+                > before.keli_core_dns_private_ip_filter_total
+        );
+        assert!(
+            after.keli_core_dns_private_ip_block_total
+                > before.keli_core_dns_private_ip_block_total
+        );
+        assert!(after.keli_core_dns_resolve_error_total > before.keli_core_dns_resolve_error_total);
 
         server.join().expect("server");
         configure(DnsConfig::default());
@@ -817,6 +897,7 @@ mod tests {
 
     #[test]
     fn blocks_private_literal_targets_when_enabled() {
+        let before = dns_metrics_snapshot();
         configure(DnsConfig {
             block_private_ips: true,
             ..DnsConfig::default()
@@ -825,6 +906,32 @@ mod tests {
         let error = resolve_socket_addrs("127.0.0.1", 443, Duration::from_millis(1))
             .expect_err("private literal should be blocked");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let after = dns_metrics_snapshot();
+        assert!(
+            after.keli_core_dns_private_ip_block_total
+                > before.keli_core_dns_private_ip_block_total
+        );
+
+        configure(DnsConfig::default());
+    }
+
+    #[tokio::test]
+    async fn async_blocks_private_literal_targets_when_enabled() {
+        let before = dns_metrics_snapshot();
+        configure(DnsConfig {
+            block_private_ips: true,
+            ..DnsConfig::default()
+        });
+
+        let error = resolve_socket_addrs_tokio("127.0.0.1", 443, Duration::from_millis(1))
+            .await
+            .expect_err("private literal should be blocked");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let after = dns_metrics_snapshot();
+        assert!(
+            after.keli_core_dns_private_ip_block_total
+                > before.keli_core_dns_private_ip_block_total
+        );
 
         configure(DnsConfig::default());
     }
@@ -884,6 +991,7 @@ mod tests {
 
     #[test]
     fn negative_dns_cache_reuses_recent_failures_and_clears_on_configure() {
+        let before = dns_metrics_snapshot();
         let key = DnsCacheKey {
             host: "missing.example.test".to_string(),
             port: 443,
@@ -896,6 +1004,11 @@ mod tests {
         let cached = cached_negative_error(&key).expect("cached error");
         assert_eq!(cached.kind(), io::ErrorKind::AddrNotAvailable);
         assert_eq!(cached.to_string(), "no answer");
+        let after = dns_metrics_snapshot();
+        assert!(
+            after.keli_core_dns_negative_cache_hit_total
+                > before.keli_core_dns_negative_cache_hit_total
+        );
 
         configure(DnsConfig::default());
         assert!(cached_negative_error(&key).is_none());
@@ -903,6 +1016,7 @@ mod tests {
 
     #[test]
     fn positive_dns_cache_reuses_recent_answers_and_clears_on_configure() {
+        let before = dns_metrics_snapshot();
         let key = DnsCacheKey {
             host: "cached.example.test".to_string(),
             port: 443,
@@ -914,6 +1028,11 @@ mod tests {
         record_positive_cache(&key, &addrs);
 
         assert_eq!(cached_positive_addrs(&key), Some(addrs));
+        let after = dns_metrics_snapshot();
+        assert!(
+            after.keli_core_dns_positive_cache_hit_total
+                > before.keli_core_dns_positive_cache_hit_total
+        );
 
         configure(DnsConfig::default());
         assert!(cached_positive_addrs(&key).is_none());

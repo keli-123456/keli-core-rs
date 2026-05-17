@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::abuse::ClientFailureBackoffSnapshot;
+use crate::dns::{dns_metrics_snapshot, DnsMetricsSnapshot};
 use crate::quic_resources::QuicResourceSnapshot;
 
 const USER_DELTA_DURATION_BUCKETS_MS: [u64; 10] = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000];
@@ -25,6 +26,7 @@ pub struct CoreMetricsSnapshot {
     pub keli_core_tcp_auth_backoff_reject_total: u64,
     pub keli_core_tcp_auth_backoff_active_ips: usize,
     pub keli_core_tcp_auth_backoff_blocked_ips: usize,
+    pub keli_core_dns: DnsMetricsSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keli_core_quic_resource: Option<QuicResourceSnapshot>,
 }
@@ -62,6 +64,7 @@ impl CoreMetrics {
         tcp_auth: Option<ClientFailureBackoffSnapshot>,
     ) -> CoreMetricsSnapshot {
         let mut snapshot = self.snapshot();
+        snapshot.keli_core_dns = dns_metrics_snapshot();
         snapshot.keli_core_quic_resource = quic_resource;
         if let Some(tls_handshake) = tls_handshake {
             snapshot.keli_core_tls_handshake_failure_total = tls_handshake.failure_total;
@@ -265,5 +268,15 @@ mod tests {
         assert_eq!(snapshot.keli_core_tcp_auth_backoff_reject_total, 4);
         assert_eq!(snapshot.keli_core_tcp_auth_backoff_active_ips, 5);
         assert_eq!(snapshot.keli_core_tcp_auth_backoff_blocked_ips, 2);
+    }
+
+    #[test]
+    fn snapshots_include_dns_metrics_without_host_labels() {
+        let metrics = CoreMetrics::default();
+        let dns = crate::dns::dns_metrics_snapshot();
+
+        let snapshot = metrics.snapshot_with_runtime_metrics(None, None, None);
+
+        assert_eq!(snapshot.keli_core_dns, dns);
     }
 }

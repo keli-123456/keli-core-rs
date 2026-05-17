@@ -65,6 +65,7 @@ pub use control::{CoreCommand, CoreController, CoreResponse};
 pub use control_server::{
     start_control_server, start_control_server_with_token, ControlServerError, ControlServerHandle,
 };
+pub use dns::DnsMetricsSnapshot;
 pub use http_proxy::{HttpProxyServer, HttpProxyServerConfig};
 pub use hysteria2::{Hysteria2Server, Hysteria2ServerConfig};
 pub use limits::{
