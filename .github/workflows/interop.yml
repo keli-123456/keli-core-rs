@@ -25,6 +25,18 @@ on:
         description: Delay between probe rounds in milliseconds
         required: true
         default: "0"
+      naive_restart_every_rounds:
+        description: Restart official NaiveProxy every N probe rounds; 0 disables restarts
+        required: true
+        default: "0"
+      naive_netem:
+        description: Optional tc netem args for NaiveProxy job, for example "delay 80ms 20ms loss 1%"
+        required: false
+        default: ""
+      naive_netem_iface:
+        description: Interface for NaiveProxy tc netem
+        required: true
+        default: "lo"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.case_filter }}
@@ -104,7 +116,7 @@ jobs:
     name: NaiveProxy official-client loopback
     if: ${{ inputs.include_naive || contains(inputs.case_filter, 'naive') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 420
 
     steps:
       - name: Checkout
@@ -179,8 +191,22 @@ jobs:
           KEEP_ARTIFACTS: ${{ inputs.keep_artifacts }}
           PROBE_ROUNDS: ${{ inputs.probe_rounds }}
           PROBE_INTERVAL_MS: ${{ inputs.probe_interval_ms }}
+          RESTART_EVERY_ROUNDS: ${{ inputs.naive_restart_every_rounds }}
+          NETEM_ARGS: ${{ inputs.naive_netem }}
+          NETEM_IFACE: ${{ inputs.naive_netem_iface }}
         run: |
           set -euo pipefail
+          cleanup() {
+            if [[ -n "${NETEM_ARGS}" ]]; then
+              sudo tc qdisc del dev "${NETEM_IFACE}" root >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+          if [[ -n "${NETEM_ARGS}" ]]; then
+            sudo tc qdisc del dev "${NETEM_IFACE}" root >/dev/null 2>&1 || true
+            sudo tc qdisc add dev "${NETEM_IFACE}" root netem ${NETEM_ARGS}
+            echo "NaiveProxy netem enabled on ${NETEM_IFACE}: ${NETEM_ARGS}"
+          fi
           filter="${CASE_FILTER}"
           if [[ -z "${filter}" || "${filter}" != *naive* ]]; then
             filter="naive"
@@ -196,6 +222,9 @@ jobs:
             --probe-rounds "${PROBE_ROUNDS}"
             --probe-interval-ms "${PROBE_INTERVAL_MS}"
           )
+          if [[ "${RESTART_EVERY_ROUNDS}" != "0" ]]; then
+            args+=(--naive-restart-every-rounds "${RESTART_EVERY_ROUNDS}")
+          fi
           if [[ "${KEEP_ARTIFACTS}" == "true" ]]; then
             args+=(--keep)
           fi

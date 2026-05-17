@@ -400,5 +400,8 @@ workflow. Use the optional `case_filter` input to run one protocol family before
 gray release, or leave it empty to run all supported sing-box cases. Enable `include_naive` to
 download the pinned official NaiveProxy Linux client, install a temporary trusted local certificate,
 and run the `naive-h2-tls` case. Increase `probe_rounds` and set `probe_interval_ms` for a short
-CI soak before a gray release. Mihomo coverage is currently a local matrix until the CI image has a
-pinned mihomo binary.
+CI soak before a gray release. For reconnect and weak-network Naive coverage, set
+`naive_restart_every_rounds` and optionally `naive_netem`, for example `delay 80ms 20ms loss 1%`.
+The NaiveProxy job timeout is intentionally longer than the default so a 30 minute or 6 hour soak
+can run from the manual workflow. Mihomo coverage is currently a local matrix until the CI image has
+a pinned mihomo binary.
