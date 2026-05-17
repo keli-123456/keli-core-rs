@@ -295,6 +295,16 @@ impl CoreService {
                     sessions.clone(),
                     bandwidth.clone(),
                     tls_failures.clone(),
+                    if naive_uses_quic(&inbound) {
+                        Some(
+                            quic_connections
+                                .as_ref()
+                                .expect("quic limiter should exist for naive h3")
+                                .clone(),
+                        )
+                    } else {
+                        None
+                    },
                 )?,
             };
             listeners.push(handle);
@@ -1576,6 +1586,7 @@ fn start_naive_listener(
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
     tls_failures: ClientFailureBackoff,
+    quic_connections: Option<SharedQuicConnectionLimiter>,
 ) -> Result<ListenerHandle, CoreServiceError> {
     let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
         CoreServiceError::Bind {
@@ -1587,7 +1598,7 @@ fn start_naive_listener(
         tag: inbound.tag.clone(),
         source: io::Error::new(io::ErrorKind::InvalidInput, "naive requires tls config"),
     })?;
-    let server = NaiveServer::with_shared_limits_and_backoff(
+    let mut server = NaiveServer::with_shared_limits_and_backoff(
         NaiveServerConfig {
             node_tag: inbound.tag.clone(),
             listen,
@@ -1610,6 +1621,61 @@ fn start_naive_listener(
         tag: inbound.tag.clone(),
         source,
     })?;
+    if let Some(quic_connections) = quic_connections {
+        server = server.with_quic_connection_limiter(quic_connections);
+    }
+    if naive_uses_quic(inbound) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(quic_runtime_worker_threads())
+            .thread_name("keli-core-naive-quic")
+            .enable_all()
+            .build()
+            .map_err(|source| CoreServiceError::Bind {
+                tag: inbound.tag.clone(),
+                source,
+            })?;
+        let endpoint = {
+            let _guard = runtime.enter();
+            server
+                .bind_quic()
+                .map_err(|source| CoreServiceError::Bind {
+                    tag: inbound.tag.clone(),
+                    source,
+                })?
+        };
+        let local_addr = endpoint
+            .local_addr()
+            .map_err(|source| CoreServiceError::Bind {
+                tag: inbound.tag.clone(),
+                source,
+            })?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = stop.clone();
+        let workers = ConnectionWorkerGroup::new();
+        let runtime_server = server.clone();
+        let join = thread::Builder::new()
+            .name("keli-core-naive-quic".to_string())
+            .spawn(move || {
+                runtime.block_on(server.run_quic(endpoint, stop_for_thread));
+                runtime.shutdown_timeout(QUIC_RUNTIME_SHUTDOWN_TIMEOUT);
+            })
+            .map_err(|source| CoreServiceError::Bind {
+                tag: inbound.tag.clone(),
+                source,
+            })?;
+
+        return Ok(ListenerHandle {
+            status: ListenerStatus {
+                tag: inbound.tag.clone(),
+                protocol: Protocol::Naive,
+                local_addr,
+            },
+            runtime: ListenerRuntime::Naive(runtime_server),
+            stop,
+            workers,
+            join: Some(join),
+        });
+    }
     let listener = server.bind().map_err(|source| CoreServiceError::Bind {
         tag: inbound.tag.clone(),
         source,
@@ -2620,7 +2686,9 @@ fn resolve_listen_addr(listen: &str, port: u16) -> io::Result<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::Engine;
+    use bytes::{Buf, Bytes};
     use quinn::crypto::rustls::QuicClientConfig;
     use rustls::pki_types::{CertificateDer, ServerName};
     use rustls::{ClientConfig, RootCertStore};
@@ -3222,6 +3290,52 @@ mod tests {
         }
     }
 
+    struct GreetingServer {
+        addr: SocketAddr,
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl GreetingServer {
+        fn start(payload: &'static [u8]) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("greeting bind");
+            listener
+                .set_nonblocking(true)
+                .expect("greeting nonblocking");
+            let addr = listener.local_addr().expect("greeting addr");
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_for_thread = stop.clone();
+            let handle = thread::spawn(move || {
+                while !stop_for_thread.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.write_all(payload);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                addr,
+                stop,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for GreetingServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.addr);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
     fn vless_auth_succeeds(server_addr: SocketAddr, uuid: &str, target: SocketAddr) -> bool {
         let Ok(mut stream) = TcpStream::connect(server_addr) else {
             return false;
@@ -3391,6 +3505,54 @@ mod tests {
         drop(send_request);
         driver.abort();
         Ok(status)
+    }
+
+    async fn naive_h3_connect_round_trip(
+        server_addr: SocketAddr,
+        cert_der: CertificateDer<'static>,
+        target: SocketAddr,
+        username: &str,
+        password: &str,
+    ) -> io::Result<Vec<u8>> {
+        let client_endpoint = quic_client_endpoint(cert_der);
+        let connecting = client_endpoint
+            .connect(server_addr, "localhost")
+            .map_err(io_other)?;
+        let connection = connecting.await.map_err(io_other)?;
+        let quic = h3_quinn::Connection::new(connection.clone());
+        let (mut h3_connection, mut send_request) =
+            h3::client::new(quic).await.map_err(io_other)?;
+        let driver = tokio::spawn(async move {
+            let _ = poll_fn(|cx| h3_connection.poll_close(cx)).await;
+        });
+        let auth = BASE64_STANDARD.encode(format!("{username}:{password}"));
+        let request = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri(format!("https://{target}"))
+            .header("proxy-authorization", format!("Basic {auth}"))
+            .body(())
+            .expect("naive h3 request");
+        let mut stream = send_request.send_request(request).await.map_err(io_other)?;
+        stream.finish().await.map_err(io_other)?;
+        let response = stream.recv_response().await.map_err(io_other)?;
+        if response.status() != http::StatusCode::OK {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("naive h3 status {}", response.status()),
+            ));
+        }
+        let mut output = Vec::new();
+        while output.is_empty() {
+            let Some(mut chunk) = stream.recv_data().await.map_err(io_other)? else {
+                break;
+            };
+            let len = chunk.remaining();
+            output.extend_from_slice(&chunk.copy_to_bytes(len));
+        }
+        connection.close(0u32.into(), b"probe done");
+        drop(send_request);
+        driver.abort();
+        Ok(output)
     }
 
     fn tuic_auth_command_for(
@@ -4386,6 +4548,83 @@ mod tests {
 
         assert_eq!(listeners.len(), 1);
         assert_eq!(listeners[0].protocol, Protocol::Naive);
+        service.stop();
+    }
+
+    #[test]
+    fn starts_naive_h3_listener_from_core_config() {
+        let cert = test_cert("naive-h3");
+        let mut config = config(free_port());
+        config.inbounds[0].tag = "panel|naive-h3|1".to_string();
+        config.inbounds[0].protocol = Protocol::Naive;
+        config.inbounds[0].transport = TransportConfig {
+            network: "quic".to_string(),
+            ..TransportConfig::default()
+        };
+        config.inbounds[0].tls = Some(TlsConfig {
+            server_name: "localhost".to_string(),
+            cert_file: Some(cert.cert_path.to_string_lossy().to_string()),
+            key_file: Some(cert.key_path.to_string_lossy().to_string()),
+            alpn: vec!["h3".to_string()],
+            reject_unknown_sni: false,
+            reality: None,
+        });
+
+        let mut service = CoreService::start(config).expect("service start");
+        let listeners = service.listeners();
+
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].protocol, Protocol::Naive);
+        service.stop();
+    }
+
+    #[test]
+    fn naive_h3_listener_proxies_tcp_and_records_traffic() {
+        let cert = test_cert("naive-h3-proxy");
+        let greeting = GreetingServer::start(b"x");
+        let mut config = config(free_port());
+        config.inbounds[0].tag = "panel|naive-h3|1".to_string();
+        config.inbounds[0].protocol = Protocol::Naive;
+        config.inbounds[0].transport = TransportConfig {
+            network: "quic".to_string(),
+            ..TransportConfig::default()
+        };
+        config.inbounds[0].tls = Some(TlsConfig {
+            server_name: "localhost".to_string(),
+            cert_file: Some(cert.cert_path.to_string_lossy().to_string()),
+            key_file: Some(cert.key_path.to_string_lossy().to_string()),
+            alpn: vec!["h3".to_string()],
+            reject_unknown_sni: false,
+            reality: None,
+        });
+        let mut service = CoreService::start(config).expect("service start");
+        let server_addr = service.listeners()[0].local_addr;
+        thread::sleep(Duration::from_millis(50));
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let output = runtime
+            .block_on(naive_h3_connect_round_trip(
+                server_addr,
+                cert.cert_der.clone(),
+                greeting.addr,
+                "user-a",
+                "user-a",
+            ))
+            .expect("naive h3 proxy");
+
+        assert_eq!(output, b"x");
+        let mut traffic = Vec::new();
+        for _ in 0..50 {
+            traffic = service.drain_traffic(1);
+            if !traffic.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(traffic.len(), 1);
+        assert_eq!(traffic[0].user_id, Some(1));
+        assert_eq!(traffic[0].upload, 0);
+        assert_eq!(traffic[0].download, 1);
         service.stop();
     }
 

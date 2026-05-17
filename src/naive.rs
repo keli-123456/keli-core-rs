@@ -1,19 +1,26 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use http::{Request, Response, StatusCode, Uri};
+use quinn::crypto::rustls::QuicServerConfig;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_rustls::TlsAcceptor as TokioTlsAcceptor;
 
 use crate::abuse::ClientFailureBackoff;
 use crate::limits::{
     sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionTracker,
+};
+use crate::quic_resources::SharedQuicConnectionLimiter;
+use crate::quic_tuning::{
+    apply_proxy_quic_transport_defaults, apply_quic_congestion_control, proxy_quic_tuning_snapshot,
+    server_endpoint_with_tuned_udp_socket,
 };
 use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::stream::{
@@ -28,6 +35,15 @@ use crate::{connect_tcp_outbound_tokio, RouteDecision, RouteMatcher, SocksTarget
 const PADDING_FRAMES: u8 = 8;
 const MAX_PADDED_PAYLOAD: usize = u16::MAX as usize;
 const H2_BODY_CHANNEL_CAPACITY: usize = 64;
+const NAIVE_QUIC_STOP_POLL_INTERVAL_MS: u64 = 100;
+const NAIVE_QUIC_ENDPOINT_STOP_WAIT: Duration = Duration::from_secs(1);
+
+type H3BidiStream = h3_quinn::BidiStream<Bytes>;
+type H3SendStream = h3_quinn::SendStream<Bytes>;
+type H3RecvStream = h3_quinn::RecvStream;
+type H3ServerStream = h3::server::RequestStream<H3BidiStream, Bytes>;
+type H3ServerSendStream = h3::server::RequestStream<H3SendStream, Bytes>;
+type H3ServerRecvStream = h3::server::RequestStream<H3RecvStream, Bytes>;
 
 #[derive(Clone, Debug)]
 pub struct NaiveServerConfig {
@@ -54,6 +70,7 @@ pub struct NaiveServer {
     tls_failures: ClientFailureBackoff,
     auth_failures: ClientFailureBackoff,
     tls_acceptor: TokioTlsAcceptor,
+    quic_connections: SharedQuicConnectionLimiter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,11 +175,88 @@ impl NaiveServer {
             tls_failures,
             auth_failures,
             tls_acceptor,
+            quic_connections: SharedQuicConnectionLimiter::standalone(),
         })
+    }
+
+    pub fn with_quic_connection_limiter(
+        mut self,
+        quic_connections: SharedQuicConnectionLimiter,
+    ) -> Self {
+        self.quic_connections = quic_connections;
+        self
     }
 
     pub fn bind(&self) -> io::Result<TcpListener> {
         bind_dual_stack_tcp_listener(self.config.listen)
+    }
+
+    pub fn bind_quic(&self) -> io::Result<quinn::Endpoint> {
+        let server_crypto = server_config_from_files(
+            &self.config.cert_file,
+            &self.config.key_file,
+            &naive_quic_alpn(&self.config.alpn),
+            &self.config.server_name,
+            self.config.reject_unknown_sni,
+        )?;
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(server_crypto).map_err(io_other)?,
+        ));
+        let mut transport = quinn::TransportConfig::default();
+        apply_proxy_quic_transport_defaults(&mut transport);
+        apply_quic_congestion_control(&mut transport, "", "bbr", "naive")?;
+        let resource = self.quic_connections.snapshot();
+        println!(
+            "INFO  core   naive shared quic limit total={} active={} listeners={} per_listener_soft={}",
+            resource.total_limit,
+            resource.active_connections,
+            resource.listener_count,
+            resource.per_listener_soft_limit
+        );
+        let tuning = proxy_quic_tuning_snapshot();
+        println!(
+            "INFO  core   naive quic tuning stream_window_mib={} conn_window_mib={} max_streams={} udp_socket_buffer_mib={} initial_rtt_ms={} idle_timeout_secs={}",
+            tuning.stream_receive_window_mib,
+            tuning.receive_window_mib,
+            tuning.max_concurrent_streams,
+            tuning.udp_socket_buffer_mib,
+            tuning.initial_rtt_ms,
+            tuning.max_idle_timeout_secs
+        );
+        server_config.transport_config(Arc::new(transport));
+        server_endpoint_with_tuned_udp_socket(server_config, self.config.listen)
+    }
+
+    pub async fn run_quic(self, endpoint: quinn::Endpoint, stop: Arc<AtomicBool>) {
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                endpoint.close(0u32.into(), b"shutdown");
+                break;
+            }
+            tokio::select! {
+                incoming = endpoint.accept() => {
+                    let Some(incoming) = incoming else {
+                        break;
+                    };
+                    let Some(connection_slot) = self.quic_connections.try_acquire() else {
+                        eprintln!(
+                            "WARN  core   naive shared quic limit reached total={}",
+                            self.quic_connections.total_limit()
+                        );
+                        continue;
+                    };
+                    let server = self.clone();
+                    tokio::spawn(async move {
+                        let _connection_slot = connection_slot;
+                        if let Err(error) = server.handle_quic_incoming(incoming).await {
+                            log_naive_quic_error("connection", &error);
+                        }
+                    });
+                }
+                _ = tokio::time::sleep(Duration::from_millis(NAIVE_QUIC_STOP_POLL_INTERVAL_MS)) => {}
+            }
+        }
+        let _ = tokio::time::timeout(NAIVE_QUIC_ENDPOINT_STOP_WAIT, endpoint.wait_idle()).await;
     }
 
     pub async fn handle_tcp_client(&self, client: tokio::net::TcpStream) -> io::Result<()> {
@@ -206,6 +300,47 @@ impl NaiveServer {
             });
         }
         Ok(())
+    }
+
+    async fn handle_quic_incoming(&self, incoming: quinn::Incoming) -> io::Result<()> {
+        let peer_addr = incoming.remote_address();
+        let peer_ip = peer_addr.ip();
+        if self.tls_failures.is_blocked(peer_ip) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "naive quic tls handshake backoff active",
+            ));
+        }
+        let connection = match incoming.await {
+            Ok(connection) => {
+                self.tls_failures.record_success(peer_ip);
+                connection
+            }
+            Err(error) => {
+                self.tls_failures.record_failure(peer_ip);
+                return Err(io_other(error));
+            }
+        };
+        let mut h3_connection = h3::server::builder()
+            .build::<_, Bytes>(h3_quinn::Connection::new(connection.clone()))
+            .await
+            .map_err(io_other)?;
+
+        loop {
+            let Some(resolver) = h3_connection.accept().await.map_err(io_other)? else {
+                return Ok(());
+            };
+            let (request, stream) = resolver.resolve_request().await.map_err(io_other)?;
+            let server = self.clone();
+            tokio::spawn(async move {
+                if let Err(error) = server
+                    .handle_h3_request(request, stream, Some(peer_addr))
+                    .await
+                {
+                    log_naive_quic_error("request", &error);
+                }
+            });
+        }
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<TrafficDelta> {
@@ -311,9 +446,101 @@ impl NaiveServer {
         .map_err(io_other)
     }
 
-    fn parse_request(
+    async fn handle_h3_request(
         &self,
-        request: &Request<h2::RecvStream>,
+        h3_request: Request<()>,
+        mut stream: H3ServerStream,
+        peer_addr: Option<SocketAddr>,
+    ) -> io::Result<()> {
+        let wants_padding = h3_request.headers().get("padding").is_some();
+        if let Some(ip) = peer_addr.map(|addr| addr.ip()) {
+            if self.auth_failures.is_blocked(ip) {
+                let _ =
+                    send_h3_status(&mut stream, StatusCode::TOO_MANY_REQUESTS, wants_padding).await;
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "naive auth backoff active",
+                ));
+            }
+        }
+        let request = match self.parse_request(&h3_request, peer_addr.map(|addr| addr.ip())) {
+            Ok(request) => {
+                if let Some(ip) = peer_addr.map(|addr| addr.ip()) {
+                    self.auth_failures.record_success(ip);
+                }
+                request
+            }
+            Err((status, error)) => {
+                if should_record_naive_auth_failure(&error) {
+                    if let Some(ip) = peer_addr.map(|addr| addr.ip()) {
+                        self.auth_failures.record_failure(ip);
+                    }
+                }
+                let _ = send_h3_status(&mut stream, status, wants_padding).await;
+                return Err(error);
+            }
+        };
+
+        let user = self.users.get(&request.user_uuid).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::PermissionDenied, "naive user disappeared")
+        })?;
+        let _session = match self
+            .sessions
+            .try_acquire_for_ip(Some(&user), request.client_ip)
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                let _ = send_h3_status(&mut stream, StatusCode::TOO_MANY_REQUESTS, request.padding)
+                    .await;
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    error.to_string(),
+                ));
+            }
+        };
+
+        let decision = self
+            .router
+            .decide_target(&request.target.host, request.target.port, "tcp");
+        let remote = match self.connect_remote(&request.target, &decision).await {
+            Ok(remote) => remote,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                let _ = send_h3_status(&mut stream, StatusCode::FORBIDDEN, request.padding).await;
+                return Err(error);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                let _ = send_h3_status(&mut stream, StatusCode::BAD_GATEWAY, request.padding).await;
+                return Err(error);
+            }
+            Err(error) => {
+                let _ = send_h3_status(&mut stream, StatusCode::BAD_GATEWAY, request.padding).await;
+                return Err(error);
+            }
+        };
+
+        let mut response = Response::builder().status(StatusCode::OK);
+        if request.padding {
+            response = response.header("padding", generate_padding_header());
+        }
+        stream
+            .send_response(response.body(()).map_err(io_other)?)
+            .await
+            .map_err(io_other)?;
+        let (reader, writer) = h3_body_channels(stream);
+
+        let limiter = self.bandwidth.limiter_for_limited(Some(&user));
+        let server = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _session = _session;
+            let _ = server.relay_h2_tunnel(reader, writer, remote, request, limiter);
+        })
+        .await
+        .map_err(io_other)
+    }
+
+    fn parse_request<B>(
+        &self,
+        request: &Request<B>,
         client_ip: Option<IpAddr>,
     ) -> Result<NaiveRequest, (StatusCode, io::Error)> {
         if request.method() != http::Method::CONNECT {
@@ -635,6 +862,19 @@ fn h2_body_channels(
     (H2BodyReader::new(input_rx), H2BodyWriter::new(output_tx))
 }
 
+fn h3_body_channels(stream: H3ServerStream) -> (H2BodyReader, H2BodyWriter) {
+    let (mut send, mut recv) = stream.split();
+    let (input_tx, input_rx) = channel(H2_BODY_CHANNEL_CAPACITY);
+    let (output_tx, output_rx) = channel(H2_BODY_CHANNEL_CAPACITY);
+    tokio::spawn(async move {
+        let _ = read_h3_data(&mut recv, input_tx).await;
+    });
+    tokio::spawn(async move {
+        let _ = write_h3_data(&mut send, output_rx).await;
+    });
+    (H2BodyReader::new(input_rx), H2BodyWriter::new(output_tx))
+}
+
 async fn read_h2_data(mut stream: h2::RecvStream, tx: Sender<Bytes>) -> io::Result<()> {
     while let Some(chunk) = stream.data().await {
         let chunk = chunk.map_err(io_other)?;
@@ -649,6 +889,19 @@ async fn read_h2_data(mut stream: h2::RecvStream, tx: Sender<Bytes>) -> io::Resu
     Ok(())
 }
 
+async fn read_h3_data(stream: &mut H3ServerRecvStream, tx: Sender<Bytes>) -> io::Result<()> {
+    while let Some(mut chunk) = stream.recv_data().await.map_err(io_other)? {
+        let len = chunk.remaining();
+        if len > 0 {
+            let payload = chunk.copy_to_bytes(len);
+            if tx.send(payload).await.is_err() {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn write_h2_data(
     send: &mut h2::SendStream<Bytes>,
     mut rx: Receiver<Bytes>,
@@ -659,6 +912,15 @@ async fn write_h2_data(
         }
     }
     send.send_data(Bytes::new(), true).map_err(io_other)
+}
+
+async fn write_h3_data(stream: &mut H3ServerSendStream, mut rx: Receiver<Bytes>) -> io::Result<()> {
+    while let Some(payload) = rx.recv().await {
+        if !payload.is_empty() {
+            stream.send_data(payload).await.map_err(io_other)?;
+        }
+    }
+    stream.finish().await.map_err(io_other)
 }
 
 fn send_status(
@@ -677,6 +939,25 @@ fn send_status(
         .send_response(response.body(()).map_err(io_other)?, true)
         .map_err(io_other)?;
     Ok(())
+}
+
+async fn send_h3_status(
+    stream: &mut H3ServerStream,
+    status: StatusCode,
+    padding: bool,
+) -> io::Result<()> {
+    let mut response = Response::builder().status(status);
+    if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        response = response.header("proxy-authenticate", "Basic realm=\"naive\"");
+    }
+    if padding {
+        response = response.header("padding", generate_padding_header());
+    }
+    stream
+        .send_response(response.body(()).map_err(io_other)?)
+        .await
+        .map_err(io_other)?;
+    stream.finish().await.map_err(io_other)
 }
 
 fn parse_basic_auth(value: &str) -> Option<(String, String)> {
@@ -758,6 +1039,19 @@ fn parse_authority(value: &str, default_port: u16) -> io::Result<SocksTarget> {
     })
 }
 
+fn naive_quic_alpn(configured: &[String]) -> Vec<String> {
+    let mut alpn = configured.to_vec();
+    if alpn.is_empty() {
+        alpn.push("h3".to_string());
+    } else if !alpn
+        .iter()
+        .any(|value| value.trim().eq_ignore_ascii_case("h3"))
+    {
+        alpn.insert(0, "h3".to_string());
+    }
+    alpn
+}
+
 fn naive_tls_acceptor(config: &NaiveServerConfig) -> io::Result<TokioTlsAcceptor> {
     let mut alpn = config.alpn.clone();
     if alpn.is_empty() {
@@ -773,6 +1067,16 @@ fn naive_tls_acceptor(config: &NaiveServerConfig) -> io::Result<TokioTlsAcceptor
         config.reject_unknown_sni,
     )?;
     Ok(TokioTlsAcceptor::from(Arc::new(config)))
+}
+
+fn log_naive_quic_error(context: &str, error: &io::Error) {
+    match error.kind() {
+        io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::BrokenPipe => {}
+        _ => eprintln!("naive h3 {context} error: {error}"),
+    }
 }
 
 fn generate_padding_header() -> String {

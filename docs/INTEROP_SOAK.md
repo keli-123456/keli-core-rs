@@ -12,6 +12,7 @@ Run interop in this order:
 4. The same TCP protocol with WebSocket, HTTPUpgrade, and gRPC when those transports are used by live nodes.
 5. TUIC TCP and UDP.
 6. Naive HTTP/2 CONNECT over TLS, after the primary live protocols above are stable.
+7. Naive HTTP/3 CONNECT over QUIC, before enabling Naive on any high-latency or mobile-heavy site.
 
 ## Required Checks
 
@@ -81,10 +82,23 @@ cargo run --release -- bench tuic-udp --streams 16 --requests 5000 --payload 102
 cargo run --release -- bench vless-tcp-stream --streams 16 --requests 5000 --payload 1024
 ```
 
-Naive has a local H2/TLS CONNECT data-path test and `naive-tcp-stream` loopback benchmark. Use the
-official NaiveProxy client for interop and soak before enabling it for live traffic. Keep Naive
-marked `Partial` until H2/TLS client behavior, padding, delete-user behavior, traffic accounting,
-auth/backoff behavior, and long-running reconnect behavior are recorded.
+Naive has local H2/TLS and H3/QUIC CONNECT data-path tests plus the `naive-tcp-stream` loopback
+benchmark. Use the official NaiveProxy client for interop and soak before enabling it for live
+traffic. Keep Naive marked `Partial` until H2/TLS behavior, H3/QUIC behavior, padding,
+delete-user behavior, traffic accounting, auth/backoff behavior, and long-running reconnect
+behavior are recorded.
+
+Official NaiveProxy Linux soak helper:
+
+```bash
+bash scripts/naive_official_soak_linux.sh --case naive-h2-tls --rounds 1800 --interval-ms 1000
+bash scripts/naive_official_soak_linux.sh --case naive-h3-quic --rounds 1800 --interval-ms 1000
+bash scripts/naive_official_soak_linux.sh --case naive-h3-quic --rounds 600 --restart-every-rounds 50 --netem "delay 80ms 20ms loss 1%"
+```
+
+The helper installs a short-lived local CA certificate for the official client and removes it on
+exit. On Windows, the official client still requires the test certificate to be trusted by the OS;
+without that trust the `quic://` probe can close before returning HTTP response headers.
 
 Local Windows loopback baseline after the bounded `Bytes` H2 bridge change:
 

@@ -893,6 +893,7 @@ fn build_cases(
 
     cases.push(anytls_case(next_port()));
     cases.push(naive_case(next_port(), naive_server_name));
+    cases.push(naive_h3_case(next_port(), naive_server_name));
     cases.push(hysteria2_case(next_port(), "hy2-tls", None));
     cases.push(hysteria2_case(
         next_port(),
@@ -1192,6 +1193,33 @@ fn naive_case(port: u16, server_name: &str) -> InteropCase {
         mihomo_proxy: None,
         naive_proxy: Some(format!(
             "https://{USER_UUID}:{USER_PASSWORD}@{server_name}:{port}"
+        )),
+        naive_resolve_host: should_resolve_naive_host(server_name).then(|| server_name.to_string()),
+        probes: vec![Probe::Tcp],
+    }
+}
+
+fn naive_h3_case(port: u16, server_name: &str) -> InteropCase {
+    let mut tls = tls_config();
+    tls["server_name"] = json!(server_name);
+    tls["alpn"] = json!(["h3"]);
+    InteropCase {
+        name: "naive-h3-quic".to_string(),
+        core_port: port,
+        inbound: inbound(
+            "naive-h3-quic",
+            "naive",
+            port,
+            vec![user(USER_UUID, Some(USER_PASSWORD))],
+            "quic",
+            Some(tls),
+            None,
+            "",
+        ),
+        sing_outbound: Value::Null,
+        mihomo_proxy: None,
+        naive_proxy: Some(format!(
+            "quic://{USER_UUID}:{USER_PASSWORD}@{server_name}:{port}"
         )),
         naive_resolve_host: should_resolve_naive_host(server_name).then(|| server_name.to_string()),
         probes: vec![Probe::Tcp],
@@ -1655,7 +1683,7 @@ fn wait_for_tcp_case(cases: &[InteropCase]) -> Result<()> {
                 .get("transport")
                 .and_then(|transport| transport.get("network"))
                 .and_then(Value::as_str),
-            Some("hysteria" | "tuic")
+            Some("hysteria" | "tuic" | "quic")
         )
     }) else {
         thread::sleep(Duration::from_millis(600));
@@ -2241,6 +2269,24 @@ mod tests {
         assert_eq!(
             case.naive_proxy.as_deref(),
             Some("https://123e4567-e89b-12d3-a456-426614174000:interop-password@naive.example.test:24443")
+        );
+        assert_eq!(
+            case.naive_resolve_host.as_deref(),
+            Some("naive.example.test")
+        );
+    }
+
+    #[test]
+    fn naive_h3_case_uses_quic_proxy_and_transport() {
+        let case = naive_h3_case(24443, "naive.example.test");
+
+        assert_eq!(case.name, "naive-h3-quic");
+        assert_eq!(case.inbound["protocol"], "naive");
+        assert_eq!(case.inbound["transport"]["network"], "quic");
+        assert_eq!(case.inbound["tls"]["alpn"], json!(["h3"]));
+        assert_eq!(
+            case.naive_proxy.as_deref(),
+            Some("quic://123e4567-e89b-12d3-a456-426614174000:interop-password@naive.example.test:24443")
         );
         assert_eq!(
             case.naive_resolve_host.as_deref(),

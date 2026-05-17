@@ -964,9 +964,16 @@ impl InboundConfig {
         }
         if self.protocol == Protocol::Naive {
             let network = self.transport.network.trim();
-            if network != "tcp" {
+            let network_lc = network.to_ascii_lowercase();
+            let naive_h3 = network_lc == "quic"
+                || self.tls.as_ref().is_some_and(|tls| {
+                    tls.alpn
+                        .iter()
+                        .any(|value| value.trim().eq_ignore_ascii_case("h3"))
+                });
+            if !matches!(network_lc.as_str(), "tcp" | "quic") {
                 return Err(ValidationError::new(format!(
-                    "{} naive currently supports only tcp transport",
+                    "{} naive currently supports only tcp or quic transport",
                     self.tag
                 )));
             }
@@ -976,8 +983,11 @@ impl InboundConfig {
                     self.tag
                 )));
             }
-            validate_tls_config("naive", &self.tag, network, self.tls.as_ref())?;
-            validate_naive_tls_config(&self.tag, self.tls.as_ref())?;
+            if naive_h3 {
+                validate_quic_tls_config("naive", &self.tag, self.tls.as_ref())?;
+            } else {
+                validate_tls_config("naive", &self.tag, network, self.tls.as_ref())?;
+            }
             if self.users.is_empty() {
                 return Err(ValidationError::new(format!(
                     "{} naive requires at least one user",
@@ -1326,22 +1336,6 @@ fn validate_quic_tls_config(
     if tls.reject_unknown_sni && tls.server_name.trim().is_empty() {
         return Err(ValidationError::new(format!(
             "{tag} {protocol} reject_unknown_sni requires server_name"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_naive_tls_config(tag: &str, tls: Option<&TlsConfig>) -> Result<(), ValidationError> {
-    let Some(tls) = tls else {
-        return Ok(());
-    };
-    if tls
-        .alpn
-        .iter()
-        .any(|value| value.trim().eq_ignore_ascii_case("h3"))
-    {
-        return Err(ValidationError::new(format!(
-            "{tag} naive h3/quic transport is not implemented in keli-core-rs yet"
         )));
     }
     Ok(())
@@ -2351,7 +2345,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_naive_h3_alpn_until_quic_transport_exists() {
+    fn accepts_naive_h3_alpn_in_core_plan() {
         let inbound = InboundConfig {
             tag: "panel|naive|1".to_string(),
             protocol: Protocol::Naive,
@@ -2374,8 +2368,39 @@ mod tests {
             routes: Vec::new(),
         };
 
-        let error = inbound.validate().expect_err("naive h3 should be rejected");
-        assert!(error.to_string().contains("h3/quic"));
+        inbound.validate().expect("naive h3 alpn should validate");
+    }
+
+    #[test]
+    fn accepts_naive_quic_transport_in_core_plan() {
+        let inbound = InboundConfig {
+            tag: "panel|naive|1".to_string(),
+            protocol: Protocol::Naive,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![user()],
+            cipher: None,
+            flow: String::new(),
+            padding_scheme: Vec::new(),
+            transport: TransportConfig {
+                network: "quic".to_string(),
+                ..TransportConfig::default()
+            },
+            tls: Some(TlsConfig {
+                server_name: "naive.example.test".to_string(),
+                cert_file: Some("/tmp/cert.pem".to_string()),
+                key_file: Some("/tmp/key.pem".to_string()),
+                alpn: Vec::new(),
+                reject_unknown_sni: false,
+                reality: None,
+            }),
+            sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
+        };
+
+        inbound
+            .validate()
+            .expect("naive quic transport should validate");
     }
 
     #[test]

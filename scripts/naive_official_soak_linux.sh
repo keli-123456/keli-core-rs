@@ -6,6 +6,7 @@ ROUNDS="${KELI_NAIVE_SOAK_ROUNDS:-1800}"
 INTERVAL_MS="${KELI_NAIVE_SOAK_INTERVAL_MS:-1000}"
 RESTART_EVERY="${KELI_NAIVE_RESTART_EVERY_ROUNDS:-0}"
 SERVER_NAME="${KELI_NAIVE_SOAK_SERVER_NAME:-naive.local.test}"
+CASE="${KELI_NAIVE_SOAK_CASE:-naive-h2-tls}"
 NETEM_IFACE="${KELI_NAIVE_NETEM_IFACE:-lo}"
 NETEM_ARGS="${KELI_NAIVE_NETEM_ARGS:-}"
 CORE_BIN="${KELI_CORE_BIN:-}"
@@ -16,7 +17,7 @@ usage() {
   cat <<EOF
 Usage: $0 [options]
 
-Runs official NaiveProxy against native keli-core-rs naive-h2-tls on Linux.
+Runs official NaiveProxy against native keli-core-rs Naive cases on Linux.
 
 Options:
   --version VERSION              NaiveProxy release version (default: ${VERSION})
@@ -26,6 +27,7 @@ Options:
   --interval-ms N                delay between rounds (default: ${INTERVAL_MS})
   --restart-every-rounds N       restart official NaiveProxy every N rounds (default: disabled)
   --server-name NAME             certificate SAN / SNI name (default: ${SERVER_NAME})
+  --case NAME                    interop case substring (default: ${CASE}; use naive-h3-quic for QUIC)
   --netem "ARGS"                 optional tc netem args, for example: "delay 80ms 20ms loss 1%"
   --netem-iface IFACE            interface for netem (default: ${NETEM_IFACE})
   --skip-build                   do not run cargo build --release --locked
@@ -67,6 +69,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --server-name)
       SERVER_NAME="$2"
+      shift 2
+      ;;
+    --case)
+      CASE="$2"
       shift 2
       ;;
     --netem)
@@ -193,7 +199,7 @@ args=(
   --core "${CORE_BIN}"
   --client naive
   --naive "${NAIVE_BIN}"
-  --only naive-h2-tls
+  --only "${CASE}"
   --tls-cert "${CERT_PATH}"
   --tls-key "${KEY_PATH}"
   --naive-server-name "${SERVER_NAME}"
