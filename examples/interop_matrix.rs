@@ -87,13 +87,22 @@ struct Args {
 struct ProcessGuard {
     name: String,
     child: Child,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
 }
 
 impl ProcessGuard {
-    fn new(name: impl Into<String>, child: Child) -> Self {
+    fn new(
+        name: impl Into<String>,
+        child: Child,
+        stdout_path: PathBuf,
+        stderr_path: PathBuf,
+    ) -> Self {
         Self {
             name: name.into(),
             child,
+            stdout_path,
+            stderr_path,
         }
     }
 
@@ -103,9 +112,32 @@ impl ProcessGuard {
 
     fn fail_if_exited(&mut self) -> Result<()> {
         if let Some(status) = self.try_wait()? {
-            return Err(format!("{} exited early with {status}", self.name).into());
+            return Err(format!(
+                "{} exited early with {status}\n{}",
+                self.name,
+                self.log_diagnostics()
+            )
+            .into());
         }
         Ok(())
+    }
+
+    fn decorate_error(
+        &self,
+        context: &str,
+        error: impl std::fmt::Display,
+    ) -> Box<dyn std::error::Error> {
+        format!("{context}: {error}\n{}", self.log_diagnostics()).into()
+    }
+
+    fn log_diagnostics(&self) -> String {
+        format!(
+            "logs: stdout={} stderr={}\nstdout tail:\n{}\nstderr tail:\n{}",
+            self.stdout_path.display(),
+            self.stderr_path.display(),
+            redact_log_tail(&self.stdout_path),
+            redact_log_tail(&self.stderr_path),
+        )
     }
 }
 
@@ -1649,6 +1681,48 @@ fn io_other(error: impl std::fmt::Debug) -> io::Error {
     io::Error::new(io::ErrorKind::Other, format!("{error:?}"))
 }
 
+fn redact_log_tail(path: &Path) -> String {
+    const MAX_TAIL_BYTES: usize = 4096;
+    let Ok(mut body) = fs::read_to_string(path) else {
+        return "<unreadable>".to_string();
+    };
+    if body.len() > MAX_TAIL_BYTES {
+        let start = body.len().saturating_sub(MAX_TAIL_BYTES);
+        body = format!("...{}", &body[start..]);
+    }
+    redact_secrets(&body)
+}
+
+fn redact_secrets(input: &str) -> String {
+    let mut output = input
+        .replace(USER_UUID, "<redacted-user>")
+        .replace(USER_PASSWORD, "<redacted-password>")
+        .replace(SS_PASSWORD, "<redacted-ss-password>")
+        .replace(TUIC_PASSWORD, "<redacted-tuic-password>")
+        .replace(REALITY_PRIVATE_KEY, "<redacted-reality-key>");
+    let mut search_from = 0usize;
+    while let Some(scheme_rel) = output[search_from..].find("://") {
+        let scheme_pos = search_from + scheme_rel;
+        let credentials_start = scheme_pos + 3;
+        let Some(at_rel) = output[credentials_start..].find('@') else {
+            break;
+        };
+        let at_pos = credentials_start + at_rel;
+        let credentials = &output[credentials_start..at_pos];
+        if credentials.is_empty()
+            || credentials.contains('/')
+            || credentials.contains(' ')
+            || credentials.contains('\n')
+        {
+            search_from = credentials_start;
+            continue;
+        }
+        output.replace_range(credentials_start..at_pos, "<redacted-credentials>");
+        search_from = credentials_start + "<redacted-credentials>@".len();
+    }
+    output
+}
+
 fn write_core_config(path: &Path, cases: &[InteropCase]) -> Result<()> {
     let config = json!({
         "instance_id": "local-interop-matrix",
@@ -1670,15 +1744,17 @@ fn write_core_config(path: &Path, cases: &[InteropCase]) -> Result<()> {
 }
 
 fn start_process(name: &str, exe: &Path, args: &[String], work_dir: &Path) -> Result<ProcessGuard> {
-    let stdout = File::create(work_dir.join(format!("{name}.stdout.log")))?;
-    let stderr = File::create(work_dir.join(format!("{name}.stderr.log")))?;
+    let stdout_path = work_dir.join(format!("{name}.stdout.log"));
+    let stderr_path = work_dir.join(format!("{name}.stderr.log"));
+    let stdout = File::create(&stdout_path)?;
+    let stderr = File::create(&stderr_path)?;
     let child = Command::new(exe)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()?;
-    Ok(ProcessGuard::new(name, child))
+    Ok(ProcessGuard::new(name, child, stdout_path, stderr_path))
 }
 
 fn wait_for_tcp_case(cases: &[InteropCase]) -> Result<()> {
@@ -1906,7 +1982,8 @@ fn run_naive_proxy_case(
             naive = start_naive_proxy_process(naive_path, &config_path, case, args, socks_port)?;
         }
         naive.fail_if_exited()?;
-        let result = run_probes_with_retry(socks_port, &case.probes, tcp_echo, udp_echo)?;
+        let result = run_probes_with_retry(socks_port, &case.probes, tcp_echo, udp_echo)
+            .map_err(|error| naive.decorate_error("official NaiveProxy probe failed", error))?;
         summary.record_round(result, case.probes.len());
         if args.probe_rounds > 1 {
             println!(
@@ -2474,6 +2551,18 @@ mod tests {
         assert!(!body.contains("https://"));
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn redacts_credentials_from_log_tail() {
+        let input = format!(
+            "proxy=https://{USER_UUID}:{USER_PASSWORD}@naive.example.test:443 key={REALITY_PRIVATE_KEY}"
+        );
+        let redacted = redact_secrets(&input);
+        assert!(!redacted.contains(USER_UUID));
+        assert!(!redacted.contains(USER_PASSWORD));
+        assert!(!redacted.contains(REALITY_PRIVATE_KEY));
+        assert!(redacted.contains("https://<redacted-credentials>@naive.example.test:443"));
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
