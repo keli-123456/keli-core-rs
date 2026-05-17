@@ -1,8 +1,6 @@
 use std::fs;
 use std::io::{self, BufReader, Cursor, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
@@ -34,8 +32,6 @@ pub trait TlsSocket: Read + Write {
     fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()>;
     fn shutdown(&self, how: Shutdown) -> io::Result<()>;
-    #[cfg(unix)]
-    fn raw_fd(&self) -> RawFd;
 }
 
 impl TlsSocket for TcpStream {
@@ -59,10 +55,6 @@ impl TlsSocket for TcpStream {
         TcpStream::shutdown(self, how)
     }
 
-    #[cfg(unix)]
-    fn raw_fd(&self) -> RawFd {
-        self.as_raw_fd()
-    }
 }
 
 pub struct TlsConnection<S = TcpStream> {
@@ -194,11 +186,6 @@ where
 
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         self.socket.shutdown(how)
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn raw_fd(&self) -> RawFd {
-        self.socket.raw_fd()
     }
 
     fn flush_tls(&mut self) -> io::Result<()> {
