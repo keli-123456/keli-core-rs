@@ -3,7 +3,7 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
@@ -55,6 +55,7 @@ const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS: u64 = 3;
 const QUIC_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 static TCP_ACCEPT_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static CONNECTION_WORKER_POOL: OnceLock<ConnectionWorkerPool> = OnceLock::new();
+static QUIC_LISTENER_COUNT_HINT: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerStatus {
@@ -182,6 +183,7 @@ impl CoreService {
             .iter()
             .filter(|inbound| inbound_binds_quic(inbound))
             .count();
+        QUIC_LISTENER_COUNT_HINT.store(quic_listener_count.max(1), Ordering::Relaxed);
         let quic_connections = (quic_listener_count > 0)
             .then(|| SharedQuicConnectionLimiter::for_listener_count(quic_listener_count));
         if let Some(limiter) = &quic_connections {
@@ -2564,13 +2566,17 @@ fn quic_runtime_worker_threads() -> usize {
             return parsed.clamp(1, 64);
         }
     }
-    std::thread::available_parallelism()
-        .map(|parallelism| {
-            let threads = usize::from(parallelism);
-            (threads + 1) / 2
-        })
-        .unwrap_or(2)
-        .clamp(2, 8)
+    quic_runtime_worker_threads_from_resources(
+        available_parallelism_count(),
+        QUIC_LISTENER_COUNT_HINT.load(Ordering::Relaxed),
+    )
+}
+
+fn quic_runtime_worker_threads_from_resources(cpu_count: usize, listener_count: usize) -> usize {
+    let cpu_count = cpu_count.max(1);
+    let listener_count = listener_count.max(1);
+    let global_budget = cpu_count.div_ceil(2).clamp(1, 8);
+    global_budget.div_ceil(listener_count).clamp(1, 8)
 }
 
 fn tls_acceptor_for(inbound: &InboundConfig) -> Result<Option<TlsAcceptor>, CoreServiceError> {
@@ -2794,6 +2800,15 @@ mod tests {
             super::connection_worker_threads_from_resources(4, Some(4096), Some(600)),
             44
         );
+    }
+
+    #[test]
+    fn quic_worker_count_shares_cpu_budget_across_listeners() {
+        assert_eq!(super::quic_runtime_worker_threads_from_resources(4, 1), 2);
+        assert_eq!(super::quic_runtime_worker_threads_from_resources(4, 2), 1);
+        assert_eq!(super::quic_runtime_worker_threads_from_resources(4, 5), 1);
+        assert_eq!(super::quic_runtime_worker_threads_from_resources(16, 1), 8);
+        assert_eq!(super::quic_runtime_worker_threads_from_resources(16, 4), 2);
     }
 
     #[test]
