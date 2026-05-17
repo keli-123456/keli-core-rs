@@ -83,6 +83,8 @@ struct Args {
     naive_restart_every_rounds: Option<usize>,
     naive_net_log: bool,
     naive_ignore_spki_list: Option<String>,
+    max_retry_attempts: Option<usize>,
+    max_p99_ms: Option<u128>,
     keep: bool,
 }
 
@@ -552,6 +554,8 @@ fn write_matrix_summary(
         "naive_restart_every_rounds": args.naive_restart_every_rounds,
         "naive_net_log": args.naive_net_log,
         "naive_ignore_spki_list_configured": args.naive_ignore_spki_list.is_some(),
+        "max_retry_attempts": args.max_retry_attempts,
+        "max_p99_ms": args.max_p99_ms,
         "clients": args.clients.iter().map(|client| client.label()).collect::<Vec<_>>(),
         "only": args.only,
         "cases": reports,
@@ -598,6 +602,14 @@ fn parse_args() -> Result<Args> {
         "1" | "true" | "TRUE" | "yes" | "YES"
     );
     let mut naive_ignore_spki_list = env::var("KELI_INTEROP_NAIVE_IGNORE_SPKI_LIST").ok();
+    let mut max_retry_attempts = env::var("KELI_INTEROP_MAX_RETRY_ATTEMPTS")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?;
+    let mut max_p99_ms = env::var("KELI_INTEROP_MAX_P99_MS")
+        .ok()
+        .map(|value| value.parse::<u128>())
+        .transpose()?;
     let mut keep = false;
 
     let mut iter = env::args().skip(1);
@@ -691,6 +703,20 @@ fn parse_args() -> Result<Args> {
                         .ok_or("--naive-ignore-spki-list requires a value")?,
                 );
             }
+            "--max-retry-attempts" => {
+                max_retry_attempts = Some(
+                    iter.next()
+                        .ok_or("--max-retry-attempts requires a value")?
+                        .parse::<usize>()?,
+                );
+            }
+            "--max-p99-ms" => {
+                max_p99_ms = Some(
+                    iter.next()
+                        .ok_or("--max-p99-ms requires a value")?
+                        .parse::<u128>()?,
+                );
+            }
             "--keep" => keep = true,
             "--help" | "-h" => {
                 print_help();
@@ -734,13 +760,15 @@ fn parse_args() -> Result<Args> {
         naive_restart_every_rounds,
         naive_net_log,
         naive_ignore_spki_list,
+        max_retry_attempts,
+        max_p99_ms,
         keep,
     })
 }
 
 fn print_help() {
     println!(
-        "Usage: cargo run --example interop_matrix -- --core <keli-core-rs> --sing-box <sing-box> [--mihomo <mihomo>] [--naive <naive>] [--client sing-box|mihomo|naive|both|all] [--tls-cert <cert.pem> --tls-key <key.pem>] [--naive-server-name <name>] [--only hy2] [--probe-rounds 30] [--probe-interval-ms 1000] [--naive-restart-every-rounds N] [--naive-net-log] [--naive-ignore-spki-list BASE64_SHA256] [--keep]"
+        "Usage: cargo run --example interop_matrix -- --core <keli-core-rs> --sing-box <sing-box> [--mihomo <mihomo>] [--naive <naive>] [--client sing-box|mihomo|naive|both|all] [--tls-cert <cert.pem> --tls-key <key.pem>] [--naive-server-name <name>] [--only hy2] [--probe-rounds 30] [--probe-interval-ms 1000] [--naive-restart-every-rounds N] [--naive-net-log] [--naive-ignore-spki-list BASE64_SHA256] [--max-retry-attempts N] [--max-p99-ms N] [--keep]"
     );
     println!("Runs local real-client interop against temporary keli-core-rs listeners.");
 }
@@ -1866,6 +1894,12 @@ impl ProbeRunSummary {
             }
         })
     }
+
+    fn p99_latency_ms(&self) -> u128 {
+        let mut latencies = self.latencies_ms.clone();
+        latencies.sort_unstable();
+        percentile(&latencies, 99)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2061,6 +2095,7 @@ fn run_naive_proxy_case(
             thread::sleep(args.probe_interval);
         }
     }
+    validate_probe_thresholds(&summary, args)?;
     Ok(CaseOutcome::Passed(summary))
 }
 
@@ -2120,7 +2155,27 @@ fn run_probe_rounds(
             thread::sleep(args.probe_interval);
         }
     }
+    validate_probe_thresholds(&summary, args)?;
     Ok(summary)
+}
+
+fn validate_probe_thresholds(summary: &ProbeRunSummary, args: &Args) -> Result<()> {
+    if let Some(max) = args.max_retry_attempts {
+        if summary.retry_attempts > max {
+            return Err(format!(
+                "probe retry threshold exceeded: {} > {}",
+                summary.retry_attempts, max
+            )
+            .into());
+        }
+    }
+    if let Some(max) = args.max_p99_ms {
+        let p99 = summary.p99_latency_ms();
+        if p99 > max {
+            return Err(format!("probe p99 latency threshold exceeded: {p99}ms > {max}ms").into());
+        }
+    }
+    Ok(())
 }
 
 fn run_probes_with_retry(
@@ -2673,6 +2728,8 @@ mod tests {
             naive_restart_every_rounds: Some(2),
             naive_net_log: true,
             naive_ignore_spki_list: Some("abc123".to_string()),
+            max_retry_attempts: Some(2),
+            max_p99_ms: Some(10),
             keep: true,
         };
         let reports = vec![case_report(
@@ -2699,6 +2756,8 @@ mod tests {
         assert!(body.contains("\"naive_restart_every_rounds\": 2"));
         assert!(body.contains("\"naive_net_log\": true"));
         assert!(body.contains("\"naive_ignore_spki_list_configured\": true"));
+        assert!(body.contains("\"max_retry_attempts\": 2"));
+        assert!(body.contains("\"max_p99_ms\": 10"));
         assert!(!body.contains("abc123"));
         assert!(body.contains("\"retry_attempts\": 1"));
         assert!(body.contains("\"restarts\": 1"));
@@ -2707,6 +2766,52 @@ mod tests {
         assert!(!body.contains("https://"));
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn probe_thresholds_fail_on_retry_or_p99_excess() {
+        let mut args = Args {
+            core: PathBuf::from("keli-core-rs"),
+            sing_box: None,
+            mihomo: None,
+            naive: None,
+            tls_cert: None,
+            tls_key: None,
+            naive_server_name: "localhost".to_string(),
+            work_dir: PathBuf::from("runtime/interop-matrix"),
+            base_port: 23100,
+            only: Vec::new(),
+            clients: vec![ClientKind::SingBox],
+            probe_rounds: 1,
+            probe_interval: Duration::ZERO,
+            naive_restart_every_rounds: None,
+            naive_net_log: false,
+            naive_ignore_spki_list: None,
+            max_retry_attempts: Some(1),
+            max_p99_ms: Some(100),
+            keep: false,
+        };
+        let summary = ProbeRunSummary {
+            rounds: 3,
+            probes: 3,
+            retry_attempts: 2,
+            restarts: 0,
+            latencies_ms: vec![10, 20, 30],
+        };
+        let retry_error = validate_probe_thresholds(&summary, &args)
+            .expect_err("retry threshold should fail")
+            .to_string();
+        assert!(retry_error.contains("retry threshold"));
+
+        args.max_retry_attempts = Some(3);
+        args.max_p99_ms = Some(25);
+        let p99_error = validate_probe_thresholds(&summary, &args)
+            .expect_err("p99 threshold should fail")
+            .to_string();
+        assert!(p99_error.contains("p99 latency threshold"));
+
+        args.max_p99_ms = Some(30);
+        validate_probe_thresholds(&summary, &args).expect("thresholds satisfied");
     }
 
     #[test]

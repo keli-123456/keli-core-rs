@@ -13,6 +13,8 @@ CORE_BIN="${KELI_CORE_BIN:-}"
 NAIVE_BIN="${NAIVE_BIN:-}"
 NET_LOG="${KELI_NAIVE_NET_LOG:-0}"
 IGNORE_SPKI_LIST="${KELI_NAIVE_IGNORE_SPKI_LIST:-}"
+MAX_RETRY_ATTEMPTS="${KELI_NAIVE_MAX_RETRY_ATTEMPTS:-}"
+MAX_P99_MS="${KELI_NAIVE_MAX_P99_MS:-}"
 SKIP_BUILD=0
 
 usage() {
@@ -34,6 +36,8 @@ Options:
   --netem-iface IFACE            interface for netem (default: ${NETEM_IFACE})
   --net-log                      capture official NaiveProxy Chromium NetLog artifacts
   --ignore-spki-list VALUE       pass Chromium SPKI allowlist; auto-generated for the test cert when omitted
+  --max-retry-attempts N         fail the soak when total probe retries exceed N
+  --max-p99-ms N                 fail the soak when probe p99 latency exceeds N ms
   --skip-build                   do not run cargo build --release --locked
   -h, --help                     show this help
 
@@ -93,6 +97,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --ignore-spki-list)
       IGNORE_SPKI_LIST="$2"
+      shift 2
+      ;;
+    --max-retry-attempts)
+      MAX_RETRY_ATTEMPTS="$2"
+      shift 2
+      ;;
+    --max-p99-ms)
+      MAX_P99_MS="$2"
       shift 2
       ;;
     --skip-build)
@@ -274,6 +286,12 @@ if [[ "${NET_LOG}" == "1" || "${NET_LOG}" == "true" || "${NET_LOG}" == "TRUE" ]]
 fi
 if [[ -n "${IGNORE_SPKI_LIST}" ]]; then
   args+=(--naive-ignore-spki-list "${IGNORE_SPKI_LIST}")
+fi
+if [[ -n "${MAX_RETRY_ATTEMPTS}" ]]; then
+  args+=(--max-retry-attempts "${MAX_RETRY_ATTEMPTS}")
+fi
+if [[ -n "${MAX_P99_MS}" ]]; then
+  args+=(--max-p99-ms "${MAX_P99_MS}")
 fi
 
 cargo run --locked --release --example interop_matrix -- "${args[@]}"

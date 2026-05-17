@@ -98,6 +98,7 @@ bash scripts/naive_official_soak_linux.sh --rounds 1800 --interval-ms 1000
 bash scripts/naive_official_soak_linux.sh --case naive-h2-tls --rounds 1800 --interval-ms 1000
 bash scripts/naive_official_soak_linux.sh --case naive-h3-quic --rounds 1800 --interval-ms 1000
 bash scripts/naive_official_soak_linux.sh --case naive-h3-quic --rounds 600 --restart-every-rounds 50 --netem "delay 80ms 20ms loss 1%"
+bash scripts/naive_official_soak_linux.sh --case naive-h3-quic --rounds 1800 --interval-ms 1000 --max-retry-attempts 10 --max-p99-ms 250
 ```
 
 The helper generates a short-lived local CA plus leaf certificate, installs the CA root for the
@@ -114,6 +115,8 @@ NaiveProxy with `--log=` so its client-side TLS/QUIC/HTTP errors are captured in
 stdout/stderr logs and redacted before they are copied into failure summaries. Use
 `--naive-net-log` on the matrix or `--net-log` on the Linux helper for deeper Chromium NetLog
 artifacts when H3/QUIC still fails before normal client logs are emitted.
+Use `--max-retry-attempts` and `--max-p99-ms` to turn a soak into a gray-release gate instead of
+only a log-producing run. The same thresholds are written into `interop-summary.json`.
 
 Local Windows loopback baseline after the bounded `Bytes` H2 bridge change:
 
@@ -433,6 +436,8 @@ default. Set `case_filter` to one exact case name when you only want H2 or H3.
 Increase `probe_rounds` and set `probe_interval_ms` for a short CI soak before a gray release. For
 reconnect and weak-network Naive coverage, set `naive_restart_every_rounds` and optionally
 `naive_netem`, for example `delay 80ms 20ms loss 1%`.
+Set `naive_max_retry_attempts` and `naive_max_p99_ms` when the workflow should fail noisy H3
+soaks even if every round eventually succeeds after retry.
 The NaiveProxy job timeout is intentionally longer than the default so a 30 minute or 6 hour soak
 can run from the manual workflow. Mihomo coverage is currently a local matrix until the CI image has
 a pinned mihomo binary.

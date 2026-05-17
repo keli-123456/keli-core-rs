@@ -42,6 +42,14 @@ on:
         required: true
         type: boolean
         default: false
+      naive_max_retry_attempts:
+        description: Fail NaiveProxy soak when total probe retries exceed this value; empty disables
+        required: false
+        default: ""
+      naive_max_p99_ms:
+        description: Fail NaiveProxy soak when probe p99 latency exceeds this value in ms; empty disables
+        required: false
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.case_filter }}
@@ -238,6 +246,8 @@ jobs:
           NETEM_ARGS: ${{ inputs.naive_netem }}
           NETEM_IFACE: ${{ inputs.naive_netem_iface }}
           NAIVE_NET_LOG: ${{ inputs.naive_net_log }}
+          MAX_RETRY_ATTEMPTS: ${{ inputs.naive_max_retry_attempts }}
+          MAX_P99_MS: ${{ inputs.naive_max_p99_ms }}
         run: |
           set -euo pipefail
           cleanup() {
@@ -274,6 +284,12 @@ jobs:
           fi
           if [[ -n "${NAIVE_IGNORE_SPKI_LIST:-}" ]]; then
             args+=(--naive-ignore-spki-list "${NAIVE_IGNORE_SPKI_LIST}")
+          fi
+          if [[ -n "${MAX_RETRY_ATTEMPTS}" ]]; then
+            args+=(--max-retry-attempts "${MAX_RETRY_ATTEMPTS}")
+          fi
+          if [[ -n "${MAX_P99_MS}" ]]; then
+            args+=(--max-p99-ms "${MAX_P99_MS}")
           fi
           if [[ "${KEEP_ARTIFACTS}" == "true" ]]; then
             args+=(--keep)
