@@ -1,7 +1,7 @@
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
@@ -392,6 +392,7 @@ fn run() -> Result<()> {
         &args.work_dir,
         args.tls_cert.as_deref(),
         args.tls_key.as_deref(),
+        &args.naive_server_name,
     )?;
     let cases = filtered_cases(
         build_cases(
@@ -777,6 +778,7 @@ fn resolve_test_cert(
     work_dir: &Path,
     cert_path: Option<&Path>,
     key_path: Option<&Path>,
+    server_name: &str,
 ) -> Result<TestCert> {
     match (cert_path, key_path) {
         (Some(cert_path), Some(key_path)) => {
@@ -795,7 +797,11 @@ fn resolve_test_cert(
         _ => return Err("--tls-cert and --tls-key must be provided together".into()),
     }
 
-    let cert = generate_simple_self_signed(vec!["localhost".to_string()])?;
+    let mut names = vec![server_name.to_string()];
+    if server_name != "localhost" {
+        names.push("localhost".to_string());
+    }
+    let cert = generate_simple_self_signed(names)?;
     let cert_path = work_dir.join("interop.crt");
     let key_path = work_dir.join("interop.key");
     fs::write(&cert_path, cert.cert.pem())?;
@@ -1282,13 +1288,18 @@ fn naive_h3_case(port: u16, server_name: &str) -> InteropCase {
         naive_proxy: Some(format!(
             "quic://{USER_UUID}:{USER_PASSWORD}@{server_name}:{port}"
         )),
-        naive_resolve_host: should_resolve_naive_host(server_name).then(|| server_name.to_string()),
+        naive_resolve_host: should_resolve_naive_quic_host(server_name)
+            .then(|| server_name.to_string()),
         probes: vec![Probe::Tcp],
     }
 }
 
 fn should_resolve_naive_host(host: &str) -> bool {
     !matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn should_resolve_naive_quic_host(host: &str) -> bool {
+    host.parse::<IpAddr>().is_err()
 }
 
 fn hysteria2_case(port: u16, name: &str, obfs: Option<(&str, &str)>) -> InteropCase {
@@ -2515,6 +2526,16 @@ mod tests {
         assert!(naive_case(24443, "localhost").naive_resolve_host.is_none());
         assert!(naive_case(24443, "127.0.0.1").naive_resolve_host.is_none());
         assert!(naive_case(24443, "::1").naive_resolve_host.is_none());
+        assert_eq!(
+            naive_h3_case(24443, "localhost")
+                .naive_resolve_host
+                .as_deref(),
+            Some("localhost")
+        );
+        assert!(naive_h3_case(24443, "127.0.0.1")
+            .naive_resolve_host
+            .is_none());
+        assert!(naive_h3_case(24443, "::1").naive_resolve_host.is_none());
     }
 
     #[test]
@@ -2580,11 +2601,12 @@ mod tests {
         fs::write(&cert, "cert").expect("write cert");
         fs::write(&key, "key").expect("write key");
 
-        let resolved = resolve_test_cert(&dir, Some(&cert), Some(&key)).expect("resolve pair");
+        let resolved = resolve_test_cert(&dir, Some(&cert), Some(&key), "naive.example.test")
+            .expect("resolve pair");
         assert_eq!(resolved.cert_path, cert);
         assert_eq!(resolved.key_path, key);
 
-        let error = resolve_test_cert(&dir, Some(&resolved.cert_path), None)
+        let error = resolve_test_cert(&dir, Some(&resolved.cert_path), None, "naive.example.test")
             .expect_err("partial pair should fail")
             .to_string();
         assert!(error.contains("--tls-cert and --tls-key"));
