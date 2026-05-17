@@ -866,35 +866,22 @@ struct DirectionalLimiters {
 }
 
 impl DirectionalLimiters {
-    fn is_empty(&self) -> bool {
-        self.revoke.is_empty() && self.upload.is_empty() && self.download.is_empty()
-    }
-
     fn has_data_limits(&self) -> bool {
         !self.upload.is_empty() || !self.download.is_empty()
     }
 
     fn is_revoked(&self) -> bool {
-        self.revoke
-            .iter()
-            .chain(self.upload.iter())
-            .chain(self.download.iter())
-            .any(|limiter| limiter.is_revoked())
+        self.revoke.iter().any(|limiter| limiter.is_revoked())
     }
 
     async fn wait_revoked(&self) {
-        if self.is_empty() {
+        if self.revoke.is_empty() {
             std::future::pending::<()>().await;
         }
 
         let mut single = None;
         let mut count = 0usize;
-        for limiter in self
-            .revoke
-            .iter()
-            .chain(self.upload.iter())
-            .chain(self.download.iter())
-        {
+        for limiter in &self.revoke {
             count = count.saturating_add(1);
             single = Some(limiter);
             if count > 1 {
