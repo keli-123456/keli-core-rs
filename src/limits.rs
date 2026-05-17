@@ -667,6 +667,7 @@ impl std::error::Error for DeviceLimitExceeded {}
 impl UserConnectionHandle {
     fn close(&self) {
         for socket in &self.sockets {
+            let _ = SockRef::from(socket).set_linger(Some(Duration::ZERO));
             let _ = socket.shutdown(Shutdown::Both);
         }
     }
