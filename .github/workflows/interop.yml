@@ -37,6 +37,11 @@ on:
         description: Interface for NaiveProxy tc netem
         required: true
         default: "lo"
+      naive_net_log:
+        description: Capture official NaiveProxy Chromium NetLog artifacts
+        required: true
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.case_filter }}
@@ -194,6 +199,7 @@ jobs:
           RESTART_EVERY_ROUNDS: ${{ inputs.naive_restart_every_rounds }}
           NETEM_ARGS: ${{ inputs.naive_netem }}
           NETEM_IFACE: ${{ inputs.naive_netem_iface }}
+          NAIVE_NET_LOG: ${{ inputs.naive_net_log }}
         run: |
           set -euo pipefail
           cleanup() {
@@ -224,6 +230,9 @@ jobs:
           )
           if [[ "${RESTART_EVERY_ROUNDS}" != "0" ]]; then
             args+=(--naive-restart-every-rounds "${RESTART_EVERY_ROUNDS}")
+          fi
+          if [[ "${NAIVE_NET_LOG}" == "true" ]]; then
+            args+=(--naive-net-log)
           fi
           if [[ "${KEEP_ARTIFACTS}" == "true" ]]; then
             args+=(--keep)

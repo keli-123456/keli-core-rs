@@ -106,7 +106,11 @@ without that trust the `quic://` probe can close before returning HTTP response 
 The generated `runtime/interop-matrix/interop-summary.json` includes per-case probe telemetry:
 round count, probe count, retry attempts, planned client restarts, and p50/p95/p99/max probe
 latency. Treat a rising retry count or p99 over a long H3/weak-network run as a signal to inspect
-the kept core/client logs before enabling Naive on real users.
+the kept core/client logs before enabling Naive on real users. The matrix starts official
+NaiveProxy with `--log=` so its client-side TLS/QUIC/HTTP errors are captured in the process
+stdout/stderr logs and redacted before they are copied into failure summaries. Use
+`--naive-net-log` on the matrix or `--net-log` on the Linux helper for deeper Chromium NetLog
+artifacts when H3/QUIC still fails before normal client logs are emitted.
 
 Local Windows loopback baseline after the bounded `Bytes` H2 bridge change:
 

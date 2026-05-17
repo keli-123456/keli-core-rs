@@ -11,6 +11,7 @@ NETEM_IFACE="${KELI_NAIVE_NETEM_IFACE:-lo}"
 NETEM_ARGS="${KELI_NAIVE_NETEM_ARGS:-}"
 CORE_BIN="${KELI_CORE_BIN:-}"
 NAIVE_BIN="${NAIVE_BIN:-}"
+NET_LOG="${KELI_NAIVE_NET_LOG:-0}"
 SKIP_BUILD=0
 
 usage() {
@@ -30,6 +31,7 @@ Options:
   --case NAME                    interop case substring (default: ${CASE}; use naive-h3-quic for QUIC only)
   --netem "ARGS"                 optional tc netem args, for example: "delay 80ms 20ms loss 1%"
   --netem-iface IFACE            interface for netem (default: ${NETEM_IFACE})
+  --net-log                      capture official NaiveProxy Chromium NetLog artifacts
   --skip-build                   do not run cargo build --release --locked
   -h, --help                     show this help
 
@@ -82,6 +84,10 @@ while [[ $# -gt 0 ]]; do
     --netem-iface)
       NETEM_IFACE="$2"
       shift 2
+      ;;
+    --net-log)
+      NET_LOG=1
+      shift
       ;;
     --skip-build)
       SKIP_BUILD=1
@@ -209,6 +215,9 @@ args=(
 )
 if [[ -n "${RESTART_EVERY}" ]]; then
   args+=(--naive-restart-every-rounds "${RESTART_EVERY}")
+fi
+if [[ "${NET_LOG}" == "1" || "${NET_LOG}" == "true" || "${NET_LOG}" == "TRUE" ]]; then
+  args+=(--naive-net-log)
 fi
 
 cargo run --locked --release --example interop_matrix -- "${args[@]}"

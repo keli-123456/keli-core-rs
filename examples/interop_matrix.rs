@@ -81,6 +81,7 @@ struct Args {
     probe_rounds: usize,
     probe_interval: Duration,
     naive_restart_every_rounds: Option<usize>,
+    naive_net_log: bool,
     keep: bool,
 }
 
@@ -89,6 +90,7 @@ struct ProcessGuard {
     child: Child,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
+    extra_log_paths: Vec<PathBuf>,
 }
 
 impl ProcessGuard {
@@ -103,6 +105,7 @@ impl ProcessGuard {
             child,
             stdout_path,
             stderr_path,
+            extra_log_paths: Vec::new(),
         }
     }
 
@@ -130,14 +133,26 @@ impl ProcessGuard {
         format!("{context}: {error}\n{}", self.log_diagnostics()).into()
     }
 
+    fn add_log_path(&mut self, path: PathBuf) {
+        self.extra_log_paths.push(path);
+    }
+
     fn log_diagnostics(&self) -> String {
-        format!(
+        let mut diagnostics = format!(
             "logs: stdout={} stderr={}\nstdout tail:\n{}\nstderr tail:\n{}",
             self.stdout_path.display(),
             self.stderr_path.display(),
             redact_log_tail(&self.stdout_path),
             redact_log_tail(&self.stderr_path),
-        )
+        );
+        for path in &self.extra_log_paths {
+            diagnostics.push_str(&format!(
+                "\nextra log: {}\n{}",
+                path.display(),
+                redact_log_tail(path)
+            ));
+        }
+        diagnostics
     }
 }
 
@@ -533,6 +548,7 @@ fn write_matrix_summary(
         "probe_rounds": args.probe_rounds,
         "probe_interval_ms": args.probe_interval.as_millis(),
         "naive_restart_every_rounds": args.naive_restart_every_rounds,
+        "naive_net_log": args.naive_net_log,
         "clients": args.clients.iter().map(|client| client.label()).collect::<Vec<_>>(),
         "only": args.only,
         "cases": reports,
@@ -572,6 +588,12 @@ fn parse_args() -> Result<Args> {
         .ok()
         .map(|value| value.parse::<usize>())
         .transpose()?;
+    let mut naive_net_log = matches!(
+        env::var("KELI_INTEROP_NAIVE_NET_LOG")
+            .unwrap_or_default()
+            .as_str(),
+        "1" | "true" | "TRUE" | "yes" | "YES"
+    );
     let mut keep = false;
 
     let mut iter = env::args().skip(1);
@@ -658,6 +680,7 @@ fn parse_args() -> Result<Args> {
                         .parse::<usize>()?,
                 );
             }
+            "--naive-net-log" => naive_net_log = true,
             "--keep" => keep = true,
             "--help" | "-h" => {
                 print_help();
@@ -699,13 +722,14 @@ fn parse_args() -> Result<Args> {
         probe_rounds,
         probe_interval,
         naive_restart_every_rounds,
+        naive_net_log,
         keep,
     })
 }
 
 fn print_help() {
     println!(
-        "Usage: cargo run --example interop_matrix -- --core <keli-core-rs> --sing-box <sing-box> [--mihomo <mihomo>] [--naive <naive>] [--client sing-box|mihomo|naive|both|all] [--tls-cert <cert.pem> --tls-key <key.pem>] [--naive-server-name <name>] [--only hy2] [--probe-rounds 30] [--probe-interval-ms 1000] [--naive-restart-every-rounds N] [--keep]"
+        "Usage: cargo run --example interop_matrix -- --core <keli-core-rs> --sing-box <sing-box> [--mihomo <mihomo>] [--naive <naive>] [--client sing-box|mihomo|naive|both|all] [--tls-cert <cert.pem> --tls-key <key.pem>] [--naive-server-name <name>] [--only hy2] [--probe-rounds 30] [--probe-interval-ms 1000] [--naive-restart-every-rounds N] [--naive-net-log] [--keep]"
     );
     println!("Runs local real-client interop against temporary keli-core-rs listeners.");
 }
@@ -1963,8 +1987,26 @@ fn run_naive_proxy_case(
         .as_ref()
         .ok_or("naive client selected without a binary path")?;
     let config_path = args.work_dir.join(format!("{}.naive.json", case.name));
-    write_naive_proxy_config(&config_path, proxy, socks_port)?;
+    let client_log_path = args
+        .work_dir
+        .join(format!("naive-{}.client.log", case.name));
+    let net_log_path = args.naive_net_log.then(|| {
+        args.work_dir
+            .join(format!("naive-{}.netlog.json", case.name))
+    });
+    write_naive_proxy_config(
+        &config_path,
+        proxy,
+        socks_port,
+        case.naive_resolve_host.as_deref(),
+        Some(&client_log_path),
+        net_log_path.as_deref(),
+    )?;
     let mut naive = start_naive_proxy_process(naive_path, &config_path, case, args, socks_port)?;
+    naive.add_log_path(client_log_path);
+    if let Some(path) = net_log_path {
+        naive.add_log_path(path);
+    }
 
     let mut summary = ProbeRunSummary::default();
     for round in 0..args.probe_rounds {
@@ -2008,10 +2050,7 @@ fn start_naive_proxy_process(
     args: &Args,
     socks_port: u16,
 ) -> Result<ProcessGuard> {
-    let mut naive_args = vec![config_path.display().to_string()];
-    if let Some(host) = case.naive_resolve_host.as_ref() {
-        naive_args.push(format!("--host-resolver-rules=MAP {host} 127.0.0.1"));
-    }
+    let naive_args = vec![config_path.display().to_string()];
     let mut naive = start_process(
         &format!("naive-{}", case.name),
         naive_path,
@@ -2172,11 +2211,27 @@ fn write_mihomo_config(path: &Path, case: &InteropCase, socks_port: u16) -> Resu
     Ok(())
 }
 
-fn write_naive_proxy_config(path: &Path, proxy: &str, socks_port: u16) -> Result<()> {
-    let config = json!({
+fn write_naive_proxy_config(
+    path: &Path,
+    proxy: &str,
+    socks_port: u16,
+    resolve_host: Option<&str>,
+    log_path: Option<&Path>,
+    net_log_path: Option<&Path>,
+) -> Result<()> {
+    let mut config = json!({
         "listen": format!("socks://127.0.0.1:{socks_port}"),
         "proxy": proxy
     });
+    if let Some(host) = resolve_host {
+        config["host-resolver-rules"] = json!(format!("MAP {host} 127.0.0.1"));
+    }
+    if let Some(path) = log_path {
+        config["log"] = json!(path.display().to_string());
+    }
+    if let Some(path) = net_log_path {
+        config["log-net-log"] = json!(path.display().to_string());
+    }
     fs::write(path, serde_json::to_vec_pretty(&config)?)?;
     Ok(())
 }
@@ -2468,13 +2523,50 @@ mod tests {
         fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("config.json");
 
-        write_naive_proxy_config(&path, "https://user:pass@example.test:443", 12080)
-            .expect("write config");
+        write_naive_proxy_config(
+            &path,
+            "https://user:pass@example.test:443",
+            12080,
+            None,
+            None,
+            None,
+        )
+        .expect("write config");
 
         let config: Value =
             serde_json::from_slice(&fs::read(&path).expect("read config")).expect("json config");
         assert_eq!(config["listen"], "socks://127.0.0.1:12080");
         assert_eq!(config["proxy"], "https://user:pass@example.test:443");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn writes_naiveproxy_diagnostics_into_config_without_process_args() {
+        let dir = unique_temp_dir("naive-config-diagnostics");
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.json");
+        let client_log = dir.join("client.log");
+        let net_log = dir.join("netlog.json");
+
+        write_naive_proxy_config(
+            &path,
+            "quic://user:pass@naive.example.test:443",
+            12080,
+            Some("naive.example.test"),
+            Some(&client_log),
+            Some(&net_log),
+        )
+        .expect("write config");
+
+        let config: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read config")).expect("json config");
+        assert_eq!(
+            config["host-resolver-rules"],
+            "MAP naive.example.test 127.0.0.1"
+        );
+        assert_eq!(config["log"], client_log.display().to_string());
+        assert_eq!(config["log-net-log"], net_log.display().to_string());
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -2520,6 +2612,7 @@ mod tests {
             probe_rounds: 3,
             probe_interval: Duration::from_millis(250),
             naive_restart_every_rounds: Some(2),
+            naive_net_log: true,
             keep: true,
         };
         let reports = vec![case_report(
@@ -2544,6 +2637,7 @@ mod tests {
         assert!(body.contains("\"probe_rounds\": 3"));
         assert!(body.contains("\"probe_interval_ms\": 250"));
         assert!(body.contains("\"naive_restart_every_rounds\": 2"));
+        assert!(body.contains("\"naive_net_log\": true"));
         assert!(body.contains("\"retry_attempts\": 1"));
         assert!(body.contains("\"restarts\": 1"));
         assert!(body.contains("\"p95\": 8"));
