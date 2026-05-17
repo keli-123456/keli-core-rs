@@ -643,6 +643,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "http",
+ "libc",
  "md-5",
  "quinn",
  "rcgen",

@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Cursor as IoCursor, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, KeyInit};
@@ -539,6 +541,11 @@ impl TlsSocket for PrefixedTcpStream {
 
     fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         PrefixedTcpStream::shutdown(self, how)
+    }
+
+    #[cfg(unix)]
+    fn raw_fd(&self) -> RawFd {
+        self.socket.as_raw_fd()
     }
 }
 

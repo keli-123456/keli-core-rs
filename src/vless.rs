@@ -3,6 +3,8 @@ use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -2719,7 +2721,13 @@ where
         }
 
         if !progressed {
-            relay_idle_sleep(&mut idle_rounds);
+            relay_vision_wait_readable(
+                &client,
+                &remote,
+                !upload_done,
+                !download_done,
+                &mut idle_rounds,
+            );
         } else {
             idle_rounds = 0;
         }
@@ -2746,13 +2754,64 @@ fn trace_vless(message: impl FnOnce() -> String) {
     }
 }
 
+#[cfg(unix)]
+fn relay_vision_wait_readable<S>(
+    client: &TlsConnection<S>,
+    remote: &TcpStream,
+    wait_client: bool,
+    wait_remote: bool,
+    idle_rounds: &mut u8,
+) where
+    S: TlsSocket,
+{
+    let mut fds = Vec::with_capacity(2);
+    if wait_client {
+        fds.push(libc::pollfd {
+            fd: client.raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        });
+    }
+    if wait_remote {
+        fds.push(libc::pollfd {
+            fd: remote.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        });
+    }
+    if fds.is_empty() {
+        return;
+    }
+
+    let timeout_ms = relay_idle_timeout_ms(idle_rounds);
+    let _ = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+}
+
+#[cfg(not(unix))]
+fn relay_vision_wait_readable<S>(
+    _client: &TlsConnection<S>,
+    _remote: &TcpStream,
+    _wait_client: bool,
+    _wait_remote: bool,
+    idle_rounds: &mut u8,
+) where
+    S: TlsSocket,
+{
+    relay_idle_sleep(idle_rounds);
+}
+
 fn relay_idle_sleep(idle_rounds: &mut u8) {
-    const BACKOFF_MS: [u64; 5] = [1, 2, 4, 8, 16];
+    let timeout_ms = relay_idle_timeout_ms(idle_rounds);
+    thread::sleep(Duration::from_millis(timeout_ms as u64));
+}
+
+fn relay_idle_timeout_ms(idle_rounds: &mut u8) -> i32 {
+    const BACKOFF_MS: [i32; 7] = [1, 2, 4, 8, 16, 64, 250];
     let idx = usize::from((*idle_rounds).min((BACKOFF_MS.len() - 1) as u8));
-    thread::sleep(Duration::from_millis(BACKOFF_MS[idx]));
     *idle_rounds = idle_rounds
         .saturating_add(1)
         .min((BACKOFF_MS.len() - 1) as u8);
+    BACKOFF_MS[idx]
 }
 
 fn write_all_wait(writer: &mut TcpStream, mut input: &[u8]) -> io::Result<()> {
