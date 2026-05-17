@@ -35,6 +35,11 @@ pub trait TlsSocket: Read + Write {
     fn peer_closed(&self) -> io::Result<bool>;
 }
 
+pub trait RawTcpStreamAccess: TlsSocket {
+    fn raw_tcp_stream_ready(&self) -> bool;
+    fn into_raw_tcp_stream(self) -> TcpStream;
+}
+
 impl TlsSocket for TcpStream {
     fn peer_addr(&self) -> io::Result<SocketAddr> {
         TcpStream::peer_addr(self)
@@ -65,6 +70,16 @@ impl TlsSocket for TcpStream {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
             Err(error) => Err(error),
         }
+    }
+}
+
+impl RawTcpStreamAccess for TcpStream {
+    fn raw_tcp_stream_ready(&self) -> bool {
+        true
+    }
+
+    fn into_raw_tcp_stream(self) -> TcpStream {
+        self
     }
 }
 
@@ -357,6 +372,17 @@ where
     pub(crate) fn close_notify_wait(&mut self) -> io::Result<()> {
         self.connection.send_close_notify();
         self.flush_tls_wait()
+    }
+
+    pub(crate) fn into_socket(self) -> S {
+        self.socket
+    }
+
+    pub(crate) fn raw_tcp_stream_ready(&self) -> bool
+    where
+        S: RawTcpStreamAccess,
+    {
+        self.socket.raw_tcp_stream_ready()
     }
 }
 

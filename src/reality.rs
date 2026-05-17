@@ -13,7 +13,7 @@ use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
 use sha2::{Sha256, Sha512};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::tls::TlsSocket;
+use crate::tls::{RawTcpStreamAccess, TlsSocket};
 
 const TLS_RECORD_HANDSHAKE: u8 = 0x16;
 const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 0x14;
@@ -553,6 +553,16 @@ impl TlsSocket for PrefixedTcpStream {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
             Err(error) => Err(error),
         }
+    }
+}
+
+impl RawTcpStreamAccess for PrefixedTcpStream {
+    fn raw_tcp_stream_ready(&self) -> bool {
+        (self.prefix.position() as usize) >= self.prefix.get_ref().len()
+    }
+
+    fn into_raw_tcp_stream(self) -> TcpStream {
+        self.socket
     }
 }
 

@@ -32,7 +32,7 @@ use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
     relay_tcp_fast_unlimited_close_on_eof, relay_tcp_limited, spawn_native_blocking_relay,
 };
-use crate::tls::{relay_tls_stream, TlsConnection, TlsSocket};
+use crate::tls::{relay_tls_stream, RawTcpStreamAccess, TlsConnection, TlsSocket};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::vision::{VisionDecoder, VisionEncoder, VisionReader, VisionWriter};
@@ -396,7 +396,7 @@ impl VlessServer {
 
     pub fn handle_tls_client<S>(&self, mut client: TlsConnection<S>) -> io::Result<()>
     where
-        S: TlsSocket + Send + 'static,
+        S: TlsSocket + RawTcpStreamAccess + Send + 'static,
     {
         let _ = client.set_io_timeout(Some(self.config.connect_timeout));
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
@@ -796,7 +796,7 @@ impl VlessServer {
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()>
     where
-        S: TlsSocket + Send + 'static,
+        S: TlsSocket + RawTcpStreamAccess,
     {
         let (upload, download) = if request.flow == FLOW_XTLS_RPRX_VISION {
             relay_tls_vision_stream(client, remote, request.user_id, bandwidth)?
@@ -2513,7 +2513,7 @@ fn relay_tls_vision_stream<S>(
     limiter: Option<Arc<BandwidthLimiter>>,
 ) -> io::Result<(u64, u64)>
 where
-    S: TlsSocket,
+    S: TlsSocket + RawTcpStreamAccess,
 {
     let drain_after_client_eof = vless_vision_drain_after_client_eof();
     client.set_nonblocking(true)?;
@@ -2720,6 +2720,32 @@ where
             let _ = client.shutdown(Shutdown::Both);
             let _ = remote.shutdown(Shutdown::Both);
             break;
+        }
+
+        if uplink_direct
+            && downlink_direct
+            && vision_decoder.is_drained()
+            && client.raw_tcp_stream_ready()
+        {
+            if trace {
+                eprintln!("keli-core-rs vless trace: vision switched to raw tcp relay");
+            }
+            client.set_nonblocking(false)?;
+            remote.set_nonblocking(false)?;
+            let raw_client = client.into_socket().into_raw_tcp_stream();
+            let (raw_upload, raw_download) = match limiter.clone() {
+                Some(limiter) => relay_tcp_limited(raw_client, remote, limiter)?,
+                None => relay_tcp_fast_unlimited_close_on_eof(raw_client, remote)?,
+            };
+            upload = upload.saturating_add(raw_upload);
+            download = download.saturating_add(raw_download);
+            if trace {
+                eprintln!(
+                    "keli-core-rs vless trace: vision raw tcp relay finish upload={} download={}",
+                    upload, download
+                );
+            }
+            return Ok((upload, download));
         }
 
         if !progressed {

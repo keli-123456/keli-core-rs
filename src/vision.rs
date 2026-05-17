@@ -123,6 +123,10 @@ impl VisionDecoder {
     pub fn is_direct_copy(&self) -> bool {
         self.state.current_command == COMMAND_PADDING_DIRECT && self.state.plain
     }
+
+    pub fn is_drained(&self) -> bool {
+        self.input.is_empty() && self.output.is_empty()
+    }
 }
 
 impl VisionEncoder {
