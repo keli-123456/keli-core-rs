@@ -3956,7 +3956,7 @@ mod tests {
         let proxy_addr = listener.local_addr().expect("proxy addr");
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = stop.clone();
-        let handler_stop = stop.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
         let proxy_thread = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3978,7 +3978,7 @@ mod tests {
                 reader.read_exact(&mut payload).expect("payload");
                 assert_eq!(&payload, b"ping");
                 writer.write_all(b"pong").expect("response");
-                handler_stop.store(true, Ordering::SeqCst);
+                handled_tx.send(()).expect("handler notification");
             });
             runtime
                 .block_on(run_http2_listener(
@@ -4023,6 +4023,10 @@ mod tests {
         stream.read_exact(&mut response).expect("read response");
 
         assert_eq!(&response, b"pong");
+        handled_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handler completed");
+        stop.store(true, Ordering::SeqCst);
         proxy_thread.join().expect("proxy thread");
     }
 
@@ -4035,7 +4039,7 @@ mod tests {
         let proxy_addr = listener.local_addr().expect("proxy addr");
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = stop.clone();
-        let handler_stop = stop.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
         let proxy_thread = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -4057,7 +4061,7 @@ mod tests {
                 reader.read_exact(&mut payload).expect("payload");
                 assert_eq!(&payload, b"ping");
                 writer.write_all(b"pong").expect("response");
-                handler_stop.store(true, Ordering::SeqCst);
+                handled_tx.send(()).expect("handler notification");
             });
             runtime
                 .block_on(run_grpc_listener(
@@ -4101,6 +4105,10 @@ mod tests {
         stream.read_exact(&mut response).expect("read response");
 
         assert_eq!(&response, b"pong");
+        handled_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handler completed");
+        stop.store(true, Ordering::SeqCst);
         proxy_thread.join().expect("proxy thread");
     }
 
