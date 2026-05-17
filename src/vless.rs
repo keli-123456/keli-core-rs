@@ -4,6 +4,8 @@ use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -56,6 +58,9 @@ const MAX_UDP_PACKET_SIZE: usize = 65_535;
 const ASYNC_TRAFFIC_FLUSH_BYTES: u64 = 4 * 1024 * 1024;
 const VLESS_TRACE_ENV: &str = "KELI_CORE_VLESS_TRACE";
 const VLESS_VISION_DRAIN_SECS_ENV: &str = "KELI_CORE_VLESS_VISION_DRAIN_SECS";
+
+#[cfg(test)]
+static VLESS_VISION_RAW_RELAY_SWITCHES: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug)]
 pub struct VlessServerConfig {
@@ -2727,6 +2732,8 @@ where
             && vision_decoder.is_drained()
             && client.raw_tcp_stream_ready()
         {
+            #[cfg(test)]
+            VLESS_VISION_RAW_RELAY_SWITCHES.fetch_add(1, Ordering::Relaxed);
             if trace {
                 eprintln!("keli-core-rs vless trace: vision switched to raw tcp relay");
             }
@@ -3042,7 +3049,7 @@ mod tests {
     use crate::socks5::SocksTarget;
     use crate::tls::TlsAcceptor;
     use crate::user::{CoreUser, CoreUserDelta};
-    use crate::vision::{VisionReader, VisionWriter};
+    use crate::vision::{VisionEncoder, VisionReader, VisionWriter};
     use crate::vless::{compact_uuid, connect_vless_tcp_outbound, VlessServer, VlessServerConfig};
     use crate::websocket::{accept_websocket, accept_websocket_tls};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -3423,6 +3430,23 @@ mod tests {
         frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         frame.extend_from_slice(payload);
         frame
+    }
+
+    fn tls_client_hello_like_record() -> Vec<u8> {
+        vec![0x16, 0x03, 0x03, 0x00, 0x02, 0x01, 0x00]
+    }
+
+    fn tls_application_data_record(payload: &[u8]) -> Vec<u8> {
+        let mut record = Vec::with_capacity(5 + payload.len());
+        record.extend_from_slice(&[
+            0x17,
+            0x03,
+            0x03,
+            (payload.len() >> 8) as u8,
+            payload.len() as u8,
+        ]);
+        record.extend_from_slice(payload);
+        record
     }
 
     struct TestCert {
@@ -4658,6 +4682,82 @@ mod tests {
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn tls_vision_switches_to_raw_tcp_fast_path_after_direct_copy() {
+        super::VLESS_VISION_RAW_RELAY_SWITCHES.store(0, Ordering::SeqCst);
+        let cert = test_cert("vless-vision-raw-fast-path");
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let client_hello = tls_client_hello_like_record();
+        let app_data = tls_application_data_record(b"GET / HTTP/1.1\r\n\r\n");
+        let expected_len = client_hello.len() + app_data.len();
+        let client_hello_len = client_hello.len();
+        let app_data_len = app_data.len();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut first = vec![0u8; client_hello_len];
+            stream.read_exact(&mut first).expect("echo first read");
+            stream.write_all(&first).expect("echo first write");
+            let mut second = vec![0u8; app_data_len];
+            stream.read_exact(&mut second).expect("echo second read");
+            stream.write_all(&second).expect("echo second write");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("echo timeout");
+            let mut byte = [0u8; 1];
+            let _ = stream.read(&mut byte);
+        });
+
+        let server = server_with_flow("xtls-rprx-vision");
+        let listener = server.bind().expect("vless bind");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vless accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            server_clone.handle_tls_client(client)
+        });
+
+        let mut client = tls_client(vless_addr, cert.cert_der.clone());
+        client
+            .write_all(&vless_request_with_flow(echo_addr, "xtls-rprx-vision"))
+            .expect("client request");
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).expect("client response");
+        assert_eq!(response, [0x00, 0x00]);
+
+        let mut encoder = VisionEncoder::new([0x11; 16]);
+        let first_encoded = encoder.encode(&client_hello);
+        let second_encoded = encoder.encode(&app_data);
+        client
+            .write_all(&first_encoded)
+            .expect("client write client hello");
+        thread::sleep(Duration::from_millis(50));
+        client
+            .write_all(&second_encoded)
+            .expect("client write app data");
+
+        let mut vision_reader = VisionReader::new(&mut client, [0x11; 16]);
+        let mut echoed = vec![0u8; expected_len];
+        vision_reader
+            .read_exact(&mut echoed)
+            .expect("client read payload");
+        drop(vision_reader);
+        drop(client);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
+        assert!(
+            super::VLESS_VISION_RAW_RELAY_SWITCHES.load(Ordering::SeqCst) > 0,
+            "VLESS Vision relay should switch to the raw TCP fast path after direct copy"
+        );
     }
 
     #[test]
