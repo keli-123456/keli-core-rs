@@ -381,7 +381,7 @@ fn looks_like_bittorrent(payload: &[u8]) -> bool {
         && payload[8..12] == [0, 0, 0, 0]
 }
 
-fn is_private_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             ip.is_private()

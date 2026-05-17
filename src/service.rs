@@ -30,7 +30,10 @@ use crate::reality::{
 use crate::shadowsocks::{ShadowsocksServer, ShadowsocksServerConfig};
 use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::{Socks5Server, Socks5ServerConfig};
-use crate::tls::{relay_tls_stream, TlsAcceptor, TlsConnection};
+use crate::tls::{
+    classify_tls_handshake_error, relay_tls_stream, TlsAcceptor, TlsConnection,
+    TlsHandshakeErrorClass,
+};
 use crate::traffic::{SharedTrafficRegistry, TrafficDelta, TrafficRegistry};
 use crate::trojan::{TrojanServer, TrojanServerConfig};
 use crate::tuic::{TuicServer, TuicServerConfig};
@@ -570,6 +573,7 @@ fn start_vmess_listener(
     let websocket_path = inbound.transport.path.clone();
     let httpupgrade_host = inbound.transport.host.clone();
     let tls_acceptor = tls_acceptor_for(inbound)?;
+    let tag = inbound.tag.clone();
     let runtime_server = server.clone();
     let join = spawn_tcp_accept_loop(
         listener,
@@ -581,10 +585,10 @@ fn start_vmess_listener(
             let websocket_path = websocket_path.clone();
             let httpupgrade_host = httpupgrade_host.clone();
             let tls_acceptor = tls_acceptor.clone();
+            let tag = tag.clone();
             let result = if let Some(acceptor) = tls_acceptor {
-                acceptor
-                    .accept(stream)
-                    .and_then(|client| match network.as_str() {
+                accept_tls_connection(&acceptor, stream, Protocol::Vmess, &tag).and_then(|client| {
+                    match network.as_str() {
                         "ws" => {
                             server.handle_tls_websocket_client(client, websocket_path.as_deref())
                         }
@@ -595,7 +599,8 @@ fn start_vmess_listener(
                         )
                         .and_then(|client| server.handle_tls_client(client)),
                         _ => server.handle_tls_client(client),
-                    })
+                    }
+                })
             } else if network == "ws" {
                 server.handle_websocket_client(stream, websocket_path.as_deref())
             } else if network == "httpupgrade" {
@@ -853,6 +858,7 @@ fn start_anytls_listener(
     let workers = ConnectionWorkerGroup::new();
     let workers_for_thread = workers.clone();
     let tls_acceptor = tls_acceptor_for(inbound)?;
+    let tag = inbound.tag.clone();
     let runtime_server = server.clone();
     let join = spawn_tcp_accept_loop(
         listener,
@@ -861,9 +867,9 @@ fn start_anytls_listener(
         move |stream| {
             let server = server.clone();
             let tls_acceptor = tls_acceptor.clone();
+            let tag = tag.clone();
             let result = if let Some(acceptor) = tls_acceptor {
-                acceptor
-                    .accept(stream)
+                accept_tls_connection(&acceptor, stream, Protocol::AnyTls, &tag)
                     .and_then(local_bridge_for_tls)
                     .and_then(|stream| server.handle_tcp_client(stream))
             } else {
@@ -897,6 +903,26 @@ fn local_bridge_for_tls(tls: TlsConnection) -> io::Result<TcpStream> {
     })?;
 
     Ok(local_client)
+}
+
+fn accept_tls_connection(
+    acceptor: &TlsAcceptor,
+    stream: TcpStream,
+    protocol: Protocol,
+    tag: &str,
+) -> io::Result<TlsConnection> {
+    match acceptor.accept(stream) {
+        Ok(client) => Ok(client),
+        Err(error) => {
+            let class = classify_tls_handshake_error(&error);
+            if !matches!(class, TlsHandshakeErrorClass::ClientClosed) {
+                eprintln!(
+                    "WARN  tls    handshake failed protocol={protocol:?} tag={tag} class={class:?} error={error}"
+                );
+            }
+            Err(error)
+        }
+    }
 }
 
 fn start_shadowsocks_listener(
@@ -1074,6 +1100,7 @@ fn start_trojan_listener(
     let websocket_path = inbound.transport.path.clone();
     let httpupgrade_host = inbound.transport.host.clone();
     let tls_acceptor = tls_acceptor_for(inbound)?;
+    let tag = inbound.tag.clone();
     let runtime_server = server.clone();
     let join = spawn_tcp_accept_loop(
         listener,
@@ -1085,10 +1112,10 @@ fn start_trojan_listener(
             let websocket_path = websocket_path.clone();
             let httpupgrade_host = httpupgrade_host.clone();
             let tls_acceptor = tls_acceptor.clone();
+            let tag = tag.clone();
             let result = if let Some(acceptor) = tls_acceptor {
-                acceptor
-                    .accept(stream)
-                    .and_then(|client| match network.as_str() {
+                accept_tls_connection(&acceptor, stream, Protocol::Trojan, &tag).and_then(
+                    |client| match network.as_str() {
                         "ws" => {
                             server.handle_tls_websocket_client(client, websocket_path.as_deref())
                         }
@@ -1099,7 +1126,8 @@ fn start_trojan_listener(
                         )
                         .and_then(|client| server.handle_tls_client(client)),
                         _ => server.handle_tls_client(client),
-                    })
+                    },
+                )
             } else if network == "ws" {
                 server.handle_websocket_client(stream, websocket_path.as_deref())
             } else if network == "httpupgrade" {
@@ -1202,6 +1230,7 @@ fn start_vless_listener(
     let websocket_path = inbound.transport.path.clone();
     let httpupgrade_host = inbound.transport.host.clone();
     let tls_acceptor = tls_acceptor_for(inbound)?;
+    let tag = inbound.tag.clone();
     let runtime_server = server.clone();
     if tls_acceptor.is_none() && network == "tcp" {
         let join = spawn_async_tcp_accept_loop(
@@ -1239,10 +1268,10 @@ fn start_vless_listener(
             let websocket_path = websocket_path.clone();
             let httpupgrade_host = httpupgrade_host.clone();
             let tls_acceptor = tls_acceptor.clone();
+            let tag = tag.clone();
             let result = if let Some(acceptor) = tls_acceptor {
-                acceptor
-                    .accept(stream)
-                    .and_then(|client| match network.as_str() {
+                accept_tls_connection(&acceptor, stream, Protocol::Vless, &tag).and_then(|client| {
+                    match network.as_str() {
                         "ws" => {
                             server.handle_tls_websocket_client(client, websocket_path.as_deref())
                         }
@@ -1253,7 +1282,8 @@ fn start_vless_listener(
                         )
                         .and_then(|client| server.handle_tls_client(client)),
                         _ => server.handle_tls_client(client),
-                    })
+                    }
+                })
             } else if network == "ws" {
                 server.handle_websocket_client(stream, websocket_path.as_deref())
             } else if network == "httpupgrade" {

@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::{DnsConfig, DnsServerConfig};
-use crate::routing::route_targets_match;
+use crate::routing::{is_private_ip, route_targets_match};
 
 static DNS_CONFIG: OnceLock<RwLock<DnsConfig>> = OnceLock::new();
 static DNS_QUERY_ID: AtomicU16 = AtomicU16::new(1);
@@ -166,7 +166,8 @@ pub fn resolve_socket_addrs(
     timeout: Duration,
 ) -> io::Result<Vec<SocketAddr>> {
     if let Some(addr) = literal_socket_addr(host, port) {
-        return Ok(vec![addr]);
+        let config = current_config();
+        return filter_private_addrs(host, port, vec![addr], &config);
     }
 
     let host = host.trim().trim_matches(['[', ']']);
@@ -217,6 +218,7 @@ pub fn resolve_socket_addrs(
 
     match result {
         Ok(addrs) => {
+            let addrs = filter_private_addrs(host, port, addrs, &config)?;
             remove_negative_cache_entry(&cache_key);
             record_positive_cache(&cache_key, &addrs);
             Ok(addrs)
@@ -227,6 +229,33 @@ pub fn resolve_socket_addrs(
             Err(error)
         }
     }
+}
+
+fn filter_private_addrs(
+    host: &str,
+    port: u16,
+    addrs: Vec<SocketAddr>,
+    config: &DnsConfig,
+) -> io::Result<Vec<SocketAddr>> {
+    if !config.block_private_ips || private_ip_target_allowed(host, port, config) {
+        return Ok(addrs);
+    }
+    let public_addrs = addrs
+        .into_iter()
+        .filter(|addr| !is_private_ip(addr.ip()))
+        .collect::<Vec<_>>();
+    if public_addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("dns private ip blocked for {host}"),
+        ));
+    }
+    Ok(public_addrs)
+}
+
+fn private_ip_target_allowed(host: &str, port: u16, config: &DnsConfig) -> bool {
+    !config.private_ip_allowlist.is_empty()
+        && route_targets_match(&config.private_ip_allowlist, host, port, "")
 }
 
 fn clear_positive_cache() {
@@ -687,6 +716,7 @@ mod tests {
                 domains: vec!["domain:example.com".to_string()],
             }],
             query_strategy: "UseIPv4".to_string(),
+            ..DnsConfig::default()
         });
         let addrs =
             resolve_socket_addrs("api.example.com", 443, Duration::from_secs(2)).expect("resolve");
@@ -733,11 +763,69 @@ mod tests {
                 domains: vec!["domain:example.net".to_string()],
             }],
             query_strategy: "UseIPv4".to_string(),
+            ..DnsConfig::default()
         });
         let addrs =
             resolve_socket_addrs("api.example.net", 443, Duration::from_secs(2)).expect("resolve");
         assert_eq!(addrs, vec!["203.0.113.12:443".parse().unwrap()]);
         server.join().expect("server");
+        configure(DnsConfig::default());
+    }
+
+    #[test]
+    fn blocks_private_dns_answers_when_enabled() {
+        let (dns_addr, server) = spawn_udp_a_dns([127, 0, 0, 1]);
+        configure(DnsConfig {
+            servers: vec![DnsServerConfig {
+                address: dns_addr.to_string(),
+                domains: vec!["domain:rebind.example".to_string()],
+            }],
+            query_strategy: "UseIPv4".to_string(),
+            block_private_ips: true,
+            ..DnsConfig::default()
+        });
+
+        let error = resolve_socket_addrs("api.rebind.example", 443, Duration::from_secs(2))
+            .expect_err("private answer should be blocked");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("private ip blocked"));
+
+        server.join().expect("server");
+        configure(DnsConfig::default());
+    }
+
+    #[test]
+    fn private_dns_answer_allowlist_preserves_compatibility() {
+        let (dns_addr, server) = spawn_udp_a_dns([127, 0, 0, 1]);
+        configure(DnsConfig {
+            servers: vec![DnsServerConfig {
+                address: dns_addr.to_string(),
+                domains: vec!["domain:internal.example".to_string()],
+            }],
+            query_strategy: "UseIPv4".to_string(),
+            block_private_ips: true,
+            private_ip_allowlist: vec!["domain:internal.example".to_string()],
+        });
+
+        let addrs = resolve_socket_addrs("api.internal.example", 443, Duration::from_secs(2))
+            .expect("allowlisted private answer");
+        assert_eq!(addrs, vec!["127.0.0.1:443".parse().unwrap()]);
+
+        server.join().expect("server");
+        configure(DnsConfig::default());
+    }
+
+    #[test]
+    fn blocks_private_literal_targets_when_enabled() {
+        configure(DnsConfig {
+            block_private_ips: true,
+            ..DnsConfig::default()
+        });
+
+        let error = resolve_socket_addrs("127.0.0.1", 443, Duration::from_millis(1))
+            .expect_err("private literal should be blocked");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
         configure(DnsConfig::default());
     }
 
@@ -749,6 +837,7 @@ mod tests {
                 domains: Vec::new(),
             }],
             query_strategy: "UseIPv4".to_string(),
+            ..DnsConfig::default()
         });
 
         let ipv4 = resolve_socket_addrs_tokio("127.0.0.1", 443, Duration::from_millis(1))
@@ -762,6 +851,35 @@ mod tests {
         assert_eq!(ipv6, vec!["[::1]:443".parse().unwrap()]);
 
         configure(DnsConfig::default());
+    }
+
+    fn spawn_udp_a_dns(ip: [u8; 4]) -> (SocketAddr, thread::JoinHandle<()>) {
+        let dns = UdpSocket::bind("127.0.0.1:0").expect("dns bind");
+        dns.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("dns timeout");
+        let dns_addr = dns.local_addr().expect("dns addr");
+        let server = thread::spawn(move || {
+            let mut packet = [0u8; 512];
+            let (read, peer) = dns.recv_from(&mut packet).expect("dns recv");
+            assert!(read > 12);
+            let query_id = u16::from_be_bytes([packet[0], packet[1]]);
+            let mut response = Vec::new();
+            response.extend_from_slice(&query_id.to_be_bytes());
+            response.extend_from_slice(&0x8180u16.to_be_bytes());
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&0u16.to_be_bytes());
+            response.extend_from_slice(&0u16.to_be_bytes());
+            response.extend_from_slice(&packet[12..read]);
+            response.extend_from_slice(&[0xc0, 0x0c]);
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&30u32.to_be_bytes());
+            response.extend_from_slice(&4u16.to_be_bytes());
+            response.extend_from_slice(&ip);
+            dns.send_to(&response, peer).expect("dns response");
+        });
+        (dns_addr, server)
     }
 
     #[test]

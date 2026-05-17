@@ -30,6 +30,10 @@ pub struct DnsConfig {
     pub servers: Vec<DnsServerConfig>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub query_strategy: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub block_private_ips: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub private_ip_allowlist: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +246,11 @@ impl CoreConfig {
                 outbound: None,
             })?;
         }
+        validate_route_targets(&RouteRule {
+            targets: self.dns.private_ip_allowlist.clone(),
+            action: Direct,
+            outbound: None,
+        })?;
         Ok(())
     }
 

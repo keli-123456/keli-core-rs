@@ -13,6 +13,14 @@ use rustls::{ServerConfig, ServerConnection, SignatureAlgorithm, SignatureScheme
 
 use crate::limits::BandwidthLimiter;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TlsHandshakeErrorClass {
+    ClientClosed,
+    SniRejected,
+    InvalidHandshake,
+    Io,
+}
+
 #[derive(Clone)]
 pub struct TlsAcceptor {
     config: Arc<ServerConfig>,
@@ -78,6 +86,7 @@ impl TlsAcceptor {
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(tls_error)?;
+        apply_server_security_defaults(&mut config);
         config.alpn_protocols = alpn.iter().map(|value| value.as_bytes().to_vec()).collect();
         Ok(Self {
             config: Arc::new(config),
@@ -93,6 +102,7 @@ impl TlsAcceptor {
         let certified_key = reality_ed25519_certified_key(certs, key, builder.crypto_provider())?;
         let mut config =
             builder.with_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key)));
+        apply_server_security_defaults(&mut config);
         config.alpn_protocols = alpn.iter().map(|value| value.as_bytes().to_vec()).collect();
         Ok(Self {
             config: Arc::new(config),
@@ -535,8 +545,14 @@ pub(crate) fn server_config_from_files(
     } else {
         builder.with_single_cert(certs, key).map_err(tls_error)?
     };
+    apply_server_security_defaults(&mut config);
     config.alpn_protocols = alpn.iter().map(|value| value.as_bytes().to_vec()).collect();
     Ok(config)
+}
+
+fn apply_server_security_defaults(config: &mut ServerConfig) {
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
 }
 
 #[derive(Debug)]
@@ -569,6 +585,27 @@ fn tls_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
+pub(crate) fn classify_tls_handshake_error(error: &io::Error) -> TlsHandshakeErrorClass {
+    match error.kind() {
+        io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::BrokenPipe => TlsHandshakeErrorClass::ClientClosed,
+        io::ErrorKind::InvalidData | io::ErrorKind::PermissionDenied => {
+            let message = error.to_string().to_ascii_lowercase();
+            if message.contains("no certificates available")
+                || message.contains("certificate resolver")
+                || message.contains("sni")
+            {
+                TlsHandshakeErrorClass::SniRejected
+            } else {
+                TlsHandshakeErrorClass::InvalidHandshake
+            }
+        }
+        _ => TlsHandshakeErrorClass::Io,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -576,7 +613,10 @@ mod tests {
 
     use crate::reality::generate_reality_temporary_certificate;
 
-    use super::{reality_ed25519_certified_key, sni_matches};
+    use super::{
+        classify_tls_handshake_error, reality_ed25519_certified_key, server_config_from_files,
+        sni_matches, TlsHandshakeErrorClass,
+    };
 
     #[test]
     fn matches_exact_and_wildcard_sni() {
@@ -604,5 +644,63 @@ mod tests {
             .expect("fallback signer");
 
         assert_eq!(signer.scheme(), SignatureScheme::ED25519);
+    }
+
+    #[test]
+    fn tls_server_config_disables_session_tickets_by_default() {
+        let cert = generate_reality_temporary_certificate(&[0x24; 32], "tls.example.test")
+            .expect("temporary certificate");
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join(format!("keli-core-tls-ticket-{suffix}.crt"));
+        let key_path = dir.join(format!("keli-core-tls-ticket-{suffix}.key"));
+        std::fs::write(&cert_path, pem("CERTIFICATE", &cert.certificate_der)).expect("write cert");
+        std::fs::write(&key_path, pem("PRIVATE KEY", &cert.private_key_der)).expect("write key");
+
+        let config =
+            server_config_from_files(&cert_path, &key_path, &[], "", false).expect("server config");
+        assert!(!config.session_storage.can_cache());
+        assert!(!config.ticketer.enabled());
+        assert_eq!(config.send_tls13_tickets, 0);
+
+        let _ = std::fs::remove_file(cert_path);
+        let _ = std::fs::remove_file(key_path);
+    }
+
+    #[test]
+    fn classifies_tls_handshake_errors() {
+        let closed = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "client closed");
+        assert_eq!(
+            classify_tls_handshake_error(&closed),
+            TlsHandshakeErrorClass::ClientClosed
+        );
+
+        let sni = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "no certificates available for SNI",
+        );
+        assert_eq!(
+            classify_tls_handshake_error(&sni),
+            TlsHandshakeErrorClass::SniRejected
+        );
+
+        let invalid = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad record");
+        assert_eq!(
+            classify_tls_handshake_error(&invalid),
+            TlsHandshakeErrorClass::InvalidHandshake
+        );
+    }
+
+    fn pem(label: &str, der: &[u8]) -> String {
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, der);
+        let mut body = String::new();
+        for chunk in encoded.as_bytes().chunks(64) {
+            body.push_str(std::str::from_utf8(chunk).expect("base64 utf8"));
+            body.push('\n');
+        }
+        format!("-----BEGIN {label}-----\n{body}-----END {label}-----\n")
     }
 }
