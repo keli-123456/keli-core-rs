@@ -58,6 +58,8 @@ const MAX_UDP_PACKET_SIZE: usize = 65_535;
 const ASYNC_TRAFFIC_FLUSH_BYTES: u64 = 4 * 1024 * 1024;
 const VLESS_TRACE_ENV: &str = "KELI_CORE_VLESS_TRACE";
 const VLESS_VISION_DRAIN_SECS_ENV: &str = "KELI_CORE_VLESS_VISION_DRAIN_SECS";
+const VLESS_ASYNC_RELAY_IO_TIMEOUT_SECS_ENV: &str = "KELI_CORE_VLESS_RELAY_IO_TIMEOUT_SECS";
+const DEFAULT_VLESS_ASYNC_RELAY_IO_TIMEOUT_SECS: u64 = 15;
 
 #[cfg(test)]
 static VLESS_VISION_RAW_RELAY_SWITCHES: AtomicUsize = AtomicUsize::new(0);
@@ -2381,7 +2383,9 @@ async fn relay_tcp_streams_async(
                     return Ok::<u64, io::Error>(total);
                 }
             }
-            if let Err(error) = remote_write.write_all(&buffer[..read]).await {
+            if let Err(error) =
+                async_write_all_with_timeout(&mut remote_write, &buffer[..read]).await
+            {
                 on_upload(0);
                 let _ = remote_write.shutdown().await;
                 close_tcp_pair(&upload_client_shutdown, &upload_remote_shutdown);
@@ -2431,7 +2435,9 @@ async fn relay_tcp_streams_async(
                     return Ok::<u64, io::Error>(total);
                 }
             }
-            if let Err(error) = client_write.write_all(&buffer[..read]).await {
+            if let Err(error) =
+                async_write_all_with_timeout(&mut client_write, &buffer[..read]).await
+            {
                 on_download(0);
                 let _ = client_write.shutdown().await;
                 close_tcp_pair(&download_client_shutdown, &download_remote_shutdown);
@@ -2454,6 +2460,28 @@ fn clone_tokio_tcp_stream_for_shutdown(socket: &tokio::net::TcpStream) -> io::Re
 fn close_tcp_pair(left: &TcpStream, right: &TcpStream) {
     let _ = left.shutdown(Shutdown::Both);
     let _ = right.shutdown(Shutdown::Both);
+}
+
+async fn async_write_all_with_timeout<W>(writer: &mut W, buffer: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(vless_async_relay_io_timeout(), writer.write_all(buffer)).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "vless relay write timed out",
+        )),
+    }
+}
+
+fn vless_async_relay_io_timeout() -> Duration {
+    let seconds = env::var(VLESS_ASYNC_RELAY_IO_TIMEOUT_SECS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT_VLESS_ASYNC_RELAY_IO_TIMEOUT_SECS);
+    Duration::from_secs(seconds)
 }
 
 async fn wait_limiter_revoke(limiter: &BandwidthLimiter) {
