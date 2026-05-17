@@ -2719,6 +2719,17 @@ where
         }
 
         if !progressed {
+            if !upload_done && vless_vision_client_peer_closed(&client) {
+                upload_done = true;
+                client_eof_at = Some(Instant::now());
+                let _ = remote.shutdown(Shutdown::Write);
+                if drain_after_client_eof.is_zero() {
+                    let _ = client.shutdown(Shutdown::Both);
+                    let _ = remote.shutdown(Shutdown::Both);
+                    break;
+                }
+                continue;
+            }
             relay_vision_wait_readable(
                 &client,
                 &remote,
@@ -2740,6 +2751,17 @@ where
         );
     }
     Ok((upload, download))
+}
+
+fn vless_vision_client_peer_closed<S>(client: &TlsConnection<S>) -> bool
+where
+    S: TlsSocket,
+{
+    match client.peer_closed() {
+        Ok(closed) => closed,
+        Err(error) if is_stream_closed(&error) => true,
+        Err(_) => false,
+    }
 }
 
 fn vless_trace_enabled() -> bool {
@@ -2958,7 +2980,7 @@ fn hex_digit(value: u8) -> char {
 mod tests {
     use std::fs;
     use std::io::{self, Cursor, Read, Write};
-    use std::net::{TcpListener, TcpStream, UdpSocket};
+    use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::sync::{
@@ -4629,6 +4651,57 @@ mod tests {
         assert!(
             remote_thread.join().expect("remote thread"),
             "remote side should be closed when VLESS Vision client disconnects"
+        );
+        relay_thread.join().expect("relay thread");
+    }
+
+    #[test]
+    fn tls_vision_relay_exits_when_client_half_closes_while_remote_is_idle() {
+        let cert = test_cert("vless-vision-client-half-close");
+        let inbound = TcpListener::bind("127.0.0.1:0").expect("inbound bind");
+        let inbound_addr = inbound.local_addr().expect("inbound addr");
+        let remote = TcpListener::bind("127.0.0.1:0").expect("remote bind");
+        let remote_addr = remote.local_addr().expect("remote addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+
+        let (relay_tx, relay_rx) = mpsc::channel();
+        let relay_thread = thread::spawn(move || {
+            let (stream, _) = inbound.accept().expect("accept inbound");
+            let client = acceptor.accept(stream).expect("tls accept");
+            let remote_stream = TcpStream::connect(remote_addr).expect("connect remote");
+            let result = super::relay_tls_vision_stream(client, remote_stream, [0x11; 16], None);
+            relay_tx.send(result).expect("send relay result");
+        });
+
+        let remote_thread = thread::spawn(move || {
+            let (mut stream, _) = remote.accept().expect("accept remote");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("remote timeout");
+            let mut byte = [0u8; 1];
+            matches!(stream.read(&mut byte), Ok(0) | Err(_))
+        });
+
+        let mut client = tls_client(inbound_addr, cert.cert_der.clone());
+        while client.conn.is_handshaking() {
+            client
+                .conn
+                .complete_io(&mut client.sock)
+                .expect("client tls handshake");
+        }
+        client
+            .sock
+            .shutdown(Shutdown::Write)
+            .expect("client half close");
+
+        relay_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("relay must exit after client half close")
+            .expect("relay result");
+        assert!(
+            remote_thread.join().expect("remote thread"),
+            "remote side should be closed when VLESS Vision client half-closes"
         );
         relay_thread.join().expect("relay thread");
     }

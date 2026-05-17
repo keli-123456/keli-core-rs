@@ -32,6 +32,7 @@ pub trait TlsSocket: Read + Write {
     fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()>;
     fn shutdown(&self, how: Shutdown) -> io::Result<()>;
+    fn peer_closed(&self) -> io::Result<bool>;
 }
 
 impl TlsSocket for TcpStream {
@@ -55,6 +56,16 @@ impl TlsSocket for TcpStream {
         TcpStream::shutdown(self, how)
     }
 
+    fn peer_closed(&self) -> io::Result<bool> {
+        let mut byte = [0u8; 1];
+        match self.peek(&mut byte) {
+            Ok(0) => Ok(true),
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 pub struct TlsConnection<S = TcpStream> {
@@ -186,6 +197,10 @@ where
 
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         self.socket.shutdown(how)
+    }
+
+    pub(crate) fn peer_closed(&self) -> io::Result<bool> {
+        self.socket.peer_closed()
     }
 
     fn flush_tls(&mut self) -> io::Result<()> {

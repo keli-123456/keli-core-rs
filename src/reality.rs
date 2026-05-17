@@ -541,6 +541,19 @@ impl TlsSocket for PrefixedTcpStream {
         PrefixedTcpStream::shutdown(self, how)
     }
 
+    fn peer_closed(&self) -> io::Result<bool> {
+        if (self.prefix.position() as usize) < self.prefix.get_ref().len() {
+            return Ok(false);
+        }
+        let mut byte = [0u8; 1];
+        match self.socket.peek(&mut byte) {
+            Ok(0) => Ok(true),
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 impl RealityAuthenticatedStream {
