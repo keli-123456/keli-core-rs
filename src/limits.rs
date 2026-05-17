@@ -28,7 +28,12 @@ pub struct UserSessionTracker {
 #[derive(Clone, Debug)]
 pub struct UserBandwidthLimiters {
     limiters: BandwidthLimiterShards,
-    connections: UserConnectionShards,
+    connections: ActiveConnectionRegistry,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActiveConnectionRegistry {
+    active: UserConnectionShards,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,7 +99,15 @@ impl Default for UserBandwidthLimiters {
     fn default() -> Self {
         Self {
             limiters: sharded_hash_maps(),
-            connections: sharded_hash_maps(),
+            connections: ActiveConnectionRegistry::default(),
+        }
+    }
+}
+
+impl Default for ActiveConnectionRegistry {
+    fn default() -> Self {
+        Self {
+            active: sharded_hash_maps(),
         }
     }
 }
@@ -217,18 +230,7 @@ impl UserBandwidthLimiters {
         user_uuid: Option<&str>,
         sockets: &[&TcpStream],
     ) -> io::Result<Option<UserConnectionGuard>> {
-        let Some(user_uuid) = user_uuid.map(str::trim).filter(|uuid| !uuid.is_empty()) else {
-            return Ok(None);
-        };
-        if sockets.is_empty() {
-            return Ok(None);
-        }
-
-        let sockets = sockets
-            .iter()
-            .map(|socket| socket.try_clone())
-            .collect::<io::Result<Vec<_>>>()?;
-        self.register_owned_tcp_connections(Some(user_uuid), sockets)
+        self.connections.register_tcp_connection(user_uuid, sockets)
     }
 
     pub fn register_tokio_tcp_connection(
@@ -236,48 +238,8 @@ impl UserBandwidthLimiters {
         user_uuid: Option<&str>,
         sockets: &[&tokio::net::TcpStream],
     ) -> io::Result<Option<UserConnectionGuard>> {
-        let Some(user_uuid) = user_uuid.map(str::trim).filter(|uuid| !uuid.is_empty()) else {
-            return Ok(None);
-        };
-        if sockets.is_empty() {
-            return Ok(None);
-        }
-
-        let sockets = sockets
-            .iter()
-            .map(|socket| {
-                let cloned = SockRef::from(*socket).try_clone()?;
-                Ok(TcpStream::from(cloned))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        self.register_owned_tcp_connections(Some(user_uuid), sockets)
-    }
-
-    fn register_owned_tcp_connections(
-        &self,
-        user_uuid: Option<&str>,
-        sockets: Vec<TcpStream>,
-    ) -> io::Result<Option<UserConnectionGuard>> {
-        let Some(user_uuid) = user_uuid.map(str::trim).filter(|uuid| !uuid.is_empty()) else {
-            return Ok(None);
-        };
-        if sockets.is_empty() {
-            return Ok(None);
-        }
-
-        let handle = Arc::new(UserConnectionHandle { sockets });
-        let mut active = user_connection_shard(&self.connections, user_uuid)
-            .lock()
-            .expect("user connection lock poisoned");
-        let handles = active.entry(user_uuid.to_string()).or_default();
-        handles.retain(|handle| handle.upgrade().is_some());
-        handles.push(Arc::downgrade(&handle));
-
-        Ok(Some(UserConnectionGuard {
-            user_uuid: user_uuid.to_string(),
-            handle,
-            active: Arc::clone(&self.connections),
-        }))
+        self.connections
+            .register_tokio_tcp_connection(user_uuid, sockets)
     }
 
     pub fn limiter_for(&self, user: Option<&CoreUser>) -> Option<Arc<BandwidthLimiter>> {
@@ -375,8 +337,101 @@ impl UserBandwidthLimiters {
     }
 
     pub fn close_all_connections(&self) {
+        self.connections.close_all();
+    }
+
+    pub fn active_connection_count(&self, user_uuid: &str) -> usize {
+        self.connections.active_count(user_uuid)
+    }
+
+    pub fn has_limiter_for(&self, user_uuid: &str) -> bool {
+        bandwidth_limiter_shard(&self.limiters, user_uuid)
+            .lock()
+            .expect("user bandwidth limiter lock poisoned")
+            .contains_key(user_uuid)
+    }
+
+    fn close_user_connections(&self, user_uuids: &[String]) {
+        self.connections.close_users(user_uuids);
+    }
+
+    fn close_connections_except(&self, active_uuids: &HashSet<&str>) {
+        self.connections.close_except(active_uuids);
+    }
+}
+
+impl ActiveConnectionRegistry {
+    pub fn register_tcp_connection(
+        &self,
+        user_uuid: Option<&str>,
+        sockets: &[&TcpStream],
+    ) -> io::Result<Option<UserConnectionGuard>> {
+        let Some(user_uuid) = user_uuid.map(str::trim).filter(|uuid| !uuid.is_empty()) else {
+            return Ok(None);
+        };
+        if sockets.is_empty() {
+            return Ok(None);
+        }
+
+        let sockets = sockets
+            .iter()
+            .map(|socket| socket.try_clone())
+            .collect::<io::Result<Vec<_>>>()?;
+        self.register_owned_tcp_connections(Some(user_uuid), sockets)
+    }
+
+    pub fn register_tokio_tcp_connection(
+        &self,
+        user_uuid: Option<&str>,
+        sockets: &[&tokio::net::TcpStream],
+    ) -> io::Result<Option<UserConnectionGuard>> {
+        let Some(user_uuid) = user_uuid.map(str::trim).filter(|uuid| !uuid.is_empty()) else {
+            return Ok(None);
+        };
+        if sockets.is_empty() {
+            return Ok(None);
+        }
+
+        let sockets = sockets
+            .iter()
+            .map(|socket| {
+                let cloned = SockRef::from(*socket).try_clone()?;
+                Ok(TcpStream::from(cloned))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        self.register_owned_tcp_connections(Some(user_uuid), sockets)
+    }
+
+    fn register_owned_tcp_connections(
+        &self,
+        user_uuid: Option<&str>,
+        sockets: Vec<TcpStream>,
+    ) -> io::Result<Option<UserConnectionGuard>> {
+        let Some(user_uuid) = user_uuid.map(str::trim).filter(|uuid| !uuid.is_empty()) else {
+            return Ok(None);
+        };
+        if sockets.is_empty() {
+            return Ok(None);
+        }
+
+        let handle = Arc::new(UserConnectionHandle { sockets });
+        let mut active = user_connection_shard(&self.active, user_uuid)
+            .lock()
+            .expect("user connection lock poisoned");
+        let handles = active.entry(user_uuid.to_string()).or_default();
+        handles.retain(|handle| handle.upgrade().is_some());
+        handles.push(Arc::downgrade(&handle));
+
+        Ok(Some(UserConnectionGuard {
+            user_uuid: user_uuid.to_string(),
+            handle,
+            active: Arc::clone(&self.active),
+        }))
+    }
+
+    pub fn close_all(&self) {
         let mut handles = Vec::new();
-        for shard in self.connections.iter() {
+        for shard in self.active.iter() {
             let active = shard.lock().expect("user connection lock poisoned");
             handles.extend(
                 active
@@ -389,8 +444,8 @@ impl UserBandwidthLimiters {
         }
     }
 
-    pub fn active_connection_count(&self, user_uuid: &str) -> usize {
-        let mut active = user_connection_shard(&self.connections, user_uuid)
+    pub fn active_count(&self, user_uuid: &str) -> usize {
+        let mut active = user_connection_shard(&self.active, user_uuid)
             .lock()
             .expect("user connection lock poisoned");
         let Some(handles) = active.get_mut(user_uuid) else {
@@ -404,14 +459,7 @@ impl UserBandwidthLimiters {
         count
     }
 
-    pub fn has_limiter_for(&self, user_uuid: &str) -> bool {
-        bandwidth_limiter_shard(&self.limiters, user_uuid)
-            .lock()
-            .expect("user bandwidth limiter lock poisoned")
-            .contains_key(user_uuid)
-    }
-
-    fn close_user_connections(&self, user_uuids: &[String]) {
+    pub fn close_users(&self, user_uuids: &[String]) {
         for user_uuid in user_uuids {
             let handles = self.connection_handles(user_uuid);
             for handle in handles {
@@ -420,9 +468,9 @@ impl UserBandwidthLimiters {
         }
     }
 
-    fn close_connections_except(&self, active_uuids: &HashSet<&str>) {
+    pub fn close_except(&self, active_uuids: &HashSet<&str>) {
         let removed = self
-            .connections
+            .active
             .iter()
             .flat_map(|shard| {
                 let active = shard.lock().expect("user connection lock poisoned");
@@ -433,11 +481,11 @@ impl UserBandwidthLimiters {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        self.close_user_connections(&removed);
+        self.close_users(&removed);
     }
 
     fn connection_handles(&self, user_uuid: &str) -> Vec<Arc<UserConnectionHandle>> {
-        let mut active = user_connection_shard(&self.connections, user_uuid)
+        let mut active = user_connection_shard(&self.active, user_uuid)
             .lock()
             .expect("user connection lock poisoned");
         let Some(handles) = active.get_mut(user_uuid) else {
@@ -707,7 +755,8 @@ mod tests {
     use std::time::Duration;
 
     use crate::limits::{
-        speed_limit_mbps_to_bytes_per_second, UserBandwidthLimiters, UserSessionTracker,
+        speed_limit_mbps_to_bytes_per_second, ActiveConnectionRegistry, UserBandwidthLimiters,
+        UserSessionTracker,
     };
     use crate::user::CoreUser;
 
@@ -953,6 +1002,47 @@ mod tests {
         drop(guard_b);
         assert_eq!(limiters.active_connection_count(&user_a.uuid), 0);
         assert_eq!(limiters.active_connection_count(&user_b.uuid), 0);
+    }
+
+    #[test]
+    fn active_connection_registry_closes_only_deleted_user() {
+        let registry = ActiveConnectionRegistry::default();
+        let user_a = user(0);
+        let mut user_b = user(0);
+        user_b.uuid = "user-b".to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let client_a = TcpStream::connect(listener.local_addr().expect("addr")).expect("client a");
+        let (server_a, _) = listener.accept().expect("server a");
+        let client_b = TcpStream::connect(listener.local_addr().expect("addr")).expect("client b");
+        let (server_b, _) = listener.accept().expect("server b");
+        client_a
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("client a timeout");
+        client_b
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("client b timeout");
+
+        let guard_a = registry
+            .register_tcp_connection(Some(&user_a.uuid), &[&client_a, &server_a])
+            .expect("register a")
+            .expect("guard a");
+        let guard_b = registry
+            .register_tcp_connection(Some(&user_b.uuid), &[&client_b, &server_b])
+            .expect("register b")
+            .expect("guard b");
+        registry.close_users(std::slice::from_ref(&user_a.uuid));
+
+        let mut buffer = [0u8; 1];
+        let a_closed = matches!(client_a.peek(&mut buffer), Ok(0) | Err(_))
+            || matches!(
+                client_a.try_clone().unwrap().read(&mut buffer),
+                Ok(0) | Err(_)
+            );
+        assert!(a_closed, "deleted user's connection should close");
+        assert_eq!(registry.active_count(&user_b.uuid), 1);
+
+        drop(guard_a);
+        drop(guard_b);
     }
 
     #[test]

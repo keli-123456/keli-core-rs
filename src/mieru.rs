@@ -5,9 +5,10 @@ use std::net::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arc_swap::ArcSwap;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
@@ -70,7 +71,8 @@ pub struct MieruServerConfig {
 #[derive(Clone, Debug)]
 pub struct MieruServer {
     config: MieruServerConfig,
-    users: Arc<RwLock<Vec<CoreUser>>>,
+    users: Arc<ArcSwap<Vec<CoreUser>>>,
+    user_updates: Arc<Mutex<()>>,
     router: RouteMatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
@@ -210,7 +212,8 @@ impl MieruServer {
         Self {
             router,
             config,
-            users: Arc::new(RwLock::new(users)),
+            users: Arc::new(ArcSwap::from_pointee(users)),
+            user_updates: Arc::new(Mutex::new(())),
             traffic,
             sessions,
             bandwidth,
@@ -223,7 +226,8 @@ impl MieruServer {
 
     pub fn handle_tcp_client(&self, client: TcpStream) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
-        let mut reader = MieruReader::accept(client.try_clone()?, &self.active_users())?;
+        let users = self.users_snapshot();
+        let mut reader = MieruReader::accept(client.try_clone()?, users.as_ref())?;
         let user = reader.user().clone();
         let _connection = self
             .bandwidth
@@ -327,21 +331,32 @@ impl MieruServer {
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
         self.bandwidth.sync_users(&users);
-        let mut current = self.users.write().expect("mieru users lock poisoned");
-        *current = active_user_list(&users);
+        let _guard = self
+            .user_updates
+            .lock()
+            .expect("mieru users write lock poisoned");
+        self.users.store(Arc::new(active_user_list(&users)));
     }
 
     pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
         sync_delta_bandwidth(&self.bandwidth, &self.sessions, delta);
-        let mut current = self.users.write().expect("mieru users lock poisoned");
-        apply_user_delta_to_vec(&mut current, delta)
+        let _guard = self
+            .user_updates
+            .lock()
+            .expect("mieru users write lock poisoned");
+        let mut current = self.users.load_full().as_ref().clone();
+        let result = apply_user_delta_to_vec(&mut current, delta);
+        self.users.store(Arc::new(current));
+        result
     }
 
+    fn users_snapshot(&self) -> Arc<Vec<CoreUser>> {
+        self.users.load_full()
+    }
+
+    #[cfg(test)]
     fn active_users(&self) -> Vec<CoreUser> {
-        self.users
-            .read()
-            .expect("mieru users lock poisoned")
-            .clone()
+        self.users.load_full().as_ref().clone()
     }
 }
 
@@ -1743,6 +1758,43 @@ mod tests {
         assert_ne!(key, derive_mieru_key("user-b", "pass-a", rounded));
         assert_ne!(key, derive_mieru_key("user-a", "pass-b", rounded));
         assert_ne!(key, derive_mieru_key("user-a", "pass-a", rounded + 120));
+    }
+
+    #[test]
+    fn apply_user_delta_updates_mieru_users_from_snapshot() {
+        let server = MieruServer::new(MieruServerConfig {
+            node_tag: "panel|mieru|1".to_string(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            users: vec![user()],
+            routes: Vec::new(),
+            connect_timeout: Duration::from_secs(5),
+        });
+        let mut updated = user();
+        updated.password = Some("rotated".to_string());
+        updated.speed_limit = 64;
+        updated.device_limit = 3;
+        let mut added = user();
+        added.id = 2;
+        added.uuid = "user-b".to_string();
+
+        let result = server.apply_user_delta(&CoreUserDelta {
+            updated: vec![updated.clone()],
+            added: vec![added.clone()],
+            ..CoreUserDelta::default()
+        });
+
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.added, 1);
+        let users = server.active_users();
+        assert_eq!(users.len(), 2);
+        assert!(users.iter().any(|user| user.uuid == added.uuid));
+        let current = users
+            .iter()
+            .find(|user| user.uuid == updated.uuid)
+            .expect("updated user");
+        assert_eq!(current.password, updated.password);
+        assert_eq!(current.speed_limit, updated.speed_limit);
+        assert_eq!(current.device_limit, updated.device_limit);
     }
 
     #[test]
