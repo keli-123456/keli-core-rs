@@ -2213,6 +2213,7 @@ fn open_file_soft_limit() -> Option<usize> {
     None
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_meminfo_total_mib(content: &str) -> Option<usize> {
     for line in content.lines() {
         let Some(rest) = line.strip_prefix("MemTotal:") else {
@@ -2224,6 +2225,7 @@ fn parse_proc_meminfo_total_mib(content: &str) -> Option<usize> {
     None
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_cgroup_memory_limit_mib(content: &str) -> Option<usize> {
     let value = content.trim();
     if value.is_empty() || value == "max" {
@@ -2233,6 +2235,7 @@ fn parse_cgroup_memory_limit_mib(content: &str) -> Option<usize> {
     Some(bytes / 1024 / 1024)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_limits_open_files(content: &str) -> Option<usize> {
     for line in content.lines() {
         let Some(rest) = line.strip_prefix("Max open files") else {

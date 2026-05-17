@@ -171,6 +171,7 @@ pub(crate) fn open_file_soft_limit() -> Option<usize> {
     None
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_meminfo_total_mib(content: &str) -> Option<usize> {
     content.lines().find_map(|line| {
         let rest = line.strip_prefix("MemTotal:")?;
@@ -179,6 +180,7 @@ fn parse_proc_meminfo_total_mib(content: &str) -> Option<usize> {
     })
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_cgroup_memory_limit_mib(value: &str) -> Option<usize> {
     let trimmed = value.trim();
     if trimmed.eq_ignore_ascii_case("max") {
@@ -188,6 +190,7 @@ fn parse_cgroup_memory_limit_mib(value: &str) -> Option<usize> {
     Some(bytes / 1024 / 1024)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_limits_open_files(content: &str) -> Option<usize> {
     content.lines().find_map(|line| {
         if !line.starts_with("Max open files") {
