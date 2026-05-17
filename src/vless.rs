@@ -2485,9 +2485,7 @@ fn vless_async_relay_io_timeout() -> Duration {
 }
 
 async fn wait_limiter_revoke(limiter: &BandwidthLimiter) {
-    while !limiter.is_revoked() {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    limiter.wait_revoked().await;
 }
 
 fn relay_vision_tcp_streams(
