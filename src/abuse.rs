@@ -7,6 +7,10 @@ const TLS_FAILURE_THRESHOLD: u32 = 6;
 const TLS_FAILURE_WINDOW: Duration = Duration::from_secs(30);
 const TLS_FAILURE_BLOCK_DURATION: Duration = Duration::from_secs(10);
 const TLS_FAILURE_MAX_ENTRIES: usize = 4096;
+const TCP_AUTH_FAILURE_THRESHOLD: u32 = 12;
+const TCP_AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(30);
+const TCP_AUTH_FAILURE_BLOCK_DURATION: Duration = Duration::from_secs(10);
+const TCP_AUTH_FAILURE_MAX_ENTRIES: usize = 8192;
 
 #[derive(Clone, Debug)]
 pub struct ClientFailureBackoff {
@@ -39,6 +43,10 @@ impl ClientFailureBackoff {
 
     pub fn tls_handshake() -> Self {
         Self::new(ClientFailureBackoffPolicy::tls_handshake())
+    }
+
+    pub fn tcp_auth() -> Self {
+        Self::new(ClientFailureBackoffPolicy::tcp_auth())
     }
 
     pub fn is_blocked(&self, ip: IpAddr) -> bool {
@@ -120,6 +128,15 @@ impl ClientFailureBackoffPolicy {
             window: TLS_FAILURE_WINDOW,
             block_duration: TLS_FAILURE_BLOCK_DURATION,
             max_entries: TLS_FAILURE_MAX_ENTRIES,
+        }
+    }
+
+    pub fn tcp_auth() -> Self {
+        Self {
+            threshold: TCP_AUTH_FAILURE_THRESHOLD,
+            window: TCP_AUTH_FAILURE_WINDOW,
+            block_duration: TCP_AUTH_FAILURE_BLOCK_DURATION,
+            max_entries: TCP_AUTH_FAILURE_MAX_ENTRIES,
         }
     }
 }

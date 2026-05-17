@@ -594,33 +594,33 @@ fn start_vmess_listener(
             let tls_acceptor = tls_acceptor.clone();
             let tls_failures = tls_failures.clone();
             let tag = tag.clone();
-            let result = if let Some(acceptor) = tls_acceptor {
-                accept_tls_connection(&acceptor, stream, Protocol::Vmess, &tag, &tls_failures)
-                    .and_then(|client| match network.as_str() {
-                        "ws" => {
-                            server.handle_tls_websocket_client(client, websocket_path.as_deref())
-                        }
-                        "httpupgrade" => accept_httpupgrade_tls(
-                            client,
-                            websocket_path.as_deref(),
-                            httpupgrade_host.as_deref(),
-                        )
-                        .and_then(|client| server.handle_tls_client(client)),
-                        _ => server.handle_tls_client(client),
-                    })
-            } else if network == "ws" {
-                server.handle_websocket_client(stream, websocket_path.as_deref())
-            } else if network == "httpupgrade" {
-                accept_httpupgrade(
-                    stream,
-                    websocket_path.as_deref(),
-                    httpupgrade_host.as_deref(),
-                )
-                .and_then(|stream| server.handle_tcp_client(stream))
-            } else {
-                server.handle_tcp_client(stream)
-            };
-            let _ = result;
+            let _ = handle_tcp_connection_with_failure_backoff(stream, move |stream| {
+                if let Some(acceptor) = tls_acceptor {
+                    accept_tls_connection(&acceptor, stream, Protocol::Vmess, &tag, &tls_failures)
+                        .and_then(|client| match network.as_str() {
+                            "ws" => server
+                                .handle_tls_websocket_client(client, websocket_path.as_deref()),
+                            "httpupgrade" => accept_httpupgrade_tls(
+                                client,
+                                websocket_path.as_deref(),
+                                httpupgrade_host.as_deref(),
+                            )
+                            .and_then(|client| server.handle_tls_client(client)),
+                            _ => server.handle_tls_client(client),
+                        })
+                } else if network == "ws" {
+                    server.handle_websocket_client(stream, websocket_path.as_deref())
+                } else if network == "httpupgrade" {
+                    accept_httpupgrade(
+                        stream,
+                        websocket_path.as_deref(),
+                        httpupgrade_host.as_deref(),
+                    )
+                    .and_then(|stream| server.handle_tcp_client(stream))
+                } else {
+                    server.handle_tcp_client(stream)
+                }
+            });
         },
     );
 
@@ -877,14 +877,15 @@ fn start_anytls_listener(
             let tls_acceptor = tls_acceptor.clone();
             let tls_failures = tls_failures.clone();
             let tag = tag.clone();
-            let result = if let Some(acceptor) = tls_acceptor {
-                accept_tls_connection(&acceptor, stream, Protocol::AnyTls, &tag, &tls_failures)
-                    .and_then(local_bridge_for_tls)
-                    .and_then(|stream| server.handle_tcp_client(stream))
-            } else {
-                server.handle_tcp_client(stream)
-            };
-            let _ = result;
+            let _ = handle_tcp_connection_with_failure_backoff(stream, move |stream| {
+                if let Some(acceptor) = tls_acceptor {
+                    accept_tls_connection(&acceptor, stream, Protocol::AnyTls, &tag, &tls_failures)
+                        .and_then(local_bridge_for_tls)
+                        .and_then(|stream| server.handle_tcp_client(stream))
+                } else {
+                    server.handle_tcp_client(stream)
+                }
+            });
         },
     );
 
@@ -951,6 +952,67 @@ fn accept_tls_connection(
             Err(error)
         }
     }
+}
+
+fn handle_tcp_connection_with_failure_backoff<F>(stream: TcpStream, handler: F) -> io::Result<()>
+where
+    F: FnOnce(TcpStream) -> io::Result<()>,
+{
+    let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
+    let failures = tcp_auth_failure_backoff();
+    if let Some(ip) = peer_ip {
+        if failures.is_blocked(ip) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tcp auth backoff active",
+            ));
+        }
+    }
+    let result = handler(stream);
+    match result {
+        Ok(()) => {
+            if let Some(ip) = peer_ip {
+                failures.record_success(ip);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(ip) = peer_ip {
+                if should_record_tcp_auth_failure(&error) {
+                    failures.record_failure(ip);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+fn tcp_auth_failure_backoff() -> &'static ClientFailureBackoff {
+    static BACKOFF: OnceLock<ClientFailureBackoff> = OnceLock::new();
+    BACKOFF.get_or_init(ClientFailureBackoff::tcp_auth)
+}
+
+fn should_record_tcp_auth_failure(error: &io::Error) -> bool {
+    if error.kind() != io::ErrorKind::PermissionDenied {
+        return false;
+    }
+    let text = error.to_string().to_ascii_lowercase();
+    if text.contains("target blocked")
+        || text.contains("blocked by route")
+        || text.contains("route")
+        || text.contains("device limit")
+    {
+        return false;
+    }
+    text.contains("auth")
+        || text.contains("unknown")
+        || text.contains("password")
+        || text.contains("credential")
+        || text.contains("token")
+        || text.contains("username")
+        || text.contains("replayed")
+        || text.contains("user")
 }
 
 fn start_shadowsocks_listener(
@@ -1039,7 +1101,9 @@ fn start_shadowsocks_listener(
         workers_for_thread,
         move |stream| {
             let server = server.clone();
-            let _ = server.handle_tcp_client(stream);
+            let _ = handle_tcp_connection_with_failure_backoff(stream, move |stream| {
+                server.handle_tcp_client(stream)
+            });
         },
     );
 
@@ -1143,33 +1207,33 @@ fn start_trojan_listener(
             let tls_acceptor = tls_acceptor.clone();
             let tls_failures = tls_failures.clone();
             let tag = tag.clone();
-            let result = if let Some(acceptor) = tls_acceptor {
-                accept_tls_connection(&acceptor, stream, Protocol::Trojan, &tag, &tls_failures)
-                    .and_then(|client| match network.as_str() {
-                        "ws" => {
-                            server.handle_tls_websocket_client(client, websocket_path.as_deref())
-                        }
-                        "httpupgrade" => accept_httpupgrade_tls(
-                            client,
-                            websocket_path.as_deref(),
-                            httpupgrade_host.as_deref(),
-                        )
-                        .and_then(|client| server.handle_tls_client(client)),
-                        _ => server.handle_tls_client(client),
-                    })
-            } else if network == "ws" {
-                server.handle_websocket_client(stream, websocket_path.as_deref())
-            } else if network == "httpupgrade" {
-                accept_httpupgrade(
-                    stream,
-                    websocket_path.as_deref(),
-                    httpupgrade_host.as_deref(),
-                )
-                .and_then(|stream| server.handle_tcp_client(stream))
-            } else {
-                server.handle_tcp_client(stream)
-            };
-            let _ = result;
+            let _ = handle_tcp_connection_with_failure_backoff(stream, move |stream| {
+                if let Some(acceptor) = tls_acceptor {
+                    accept_tls_connection(&acceptor, stream, Protocol::Trojan, &tag, &tls_failures)
+                        .and_then(|client| match network.as_str() {
+                            "ws" => server
+                                .handle_tls_websocket_client(client, websocket_path.as_deref()),
+                            "httpupgrade" => accept_httpupgrade_tls(
+                                client,
+                                websocket_path.as_deref(),
+                                httpupgrade_host.as_deref(),
+                            )
+                            .and_then(|client| server.handle_tls_client(client)),
+                            _ => server.handle_tls_client(client),
+                        })
+                } else if network == "ws" {
+                    server.handle_websocket_client(stream, websocket_path.as_deref())
+                } else if network == "httpupgrade" {
+                    accept_httpupgrade(
+                        stream,
+                        websocket_path.as_deref(),
+                        httpupgrade_host.as_deref(),
+                    )
+                    .and_then(|stream| server.handle_tcp_client(stream))
+                } else {
+                    server.handle_tcp_client(stream)
+                }
+            });
         },
     );
 
@@ -1300,33 +1364,33 @@ fn start_vless_listener(
             let tls_acceptor = tls_acceptor.clone();
             let tls_failures = tls_failures.clone();
             let tag = tag.clone();
-            let result = if let Some(acceptor) = tls_acceptor {
-                accept_tls_connection(&acceptor, stream, Protocol::Vless, &tag, &tls_failures)
-                    .and_then(|client| match network.as_str() {
-                        "ws" => {
-                            server.handle_tls_websocket_client(client, websocket_path.as_deref())
-                        }
-                        "httpupgrade" => accept_httpupgrade_tls(
-                            client,
-                            websocket_path.as_deref(),
-                            httpupgrade_host.as_deref(),
-                        )
-                        .and_then(|client| server.handle_tls_client(client)),
-                        _ => server.handle_tls_client(client),
-                    })
-            } else if network == "ws" {
-                server.handle_websocket_client(stream, websocket_path.as_deref())
-            } else if network == "httpupgrade" {
-                accept_httpupgrade(
-                    stream,
-                    websocket_path.as_deref(),
-                    httpupgrade_host.as_deref(),
-                )
-                .and_then(|stream| server.handle_tcp_client(stream))
-            } else {
-                server.handle_tcp_client(stream)
-            };
-            let _ = result;
+            let _ = handle_tcp_connection_with_failure_backoff(stream, move |stream| {
+                if let Some(acceptor) = tls_acceptor {
+                    accept_tls_connection(&acceptor, stream, Protocol::Vless, &tag, &tls_failures)
+                        .and_then(|client| match network.as_str() {
+                            "ws" => server
+                                .handle_tls_websocket_client(client, websocket_path.as_deref()),
+                            "httpupgrade" => accept_httpupgrade_tls(
+                                client,
+                                websocket_path.as_deref(),
+                                httpupgrade_host.as_deref(),
+                            )
+                            .and_then(|client| server.handle_tls_client(client)),
+                            _ => server.handle_tls_client(client),
+                        })
+                } else if network == "ws" {
+                    server.handle_websocket_client(stream, websocket_path.as_deref())
+                } else if network == "httpupgrade" {
+                    accept_httpupgrade(
+                        stream,
+                        websocket_path.as_deref(),
+                        httpupgrade_host.as_deref(),
+                    )
+                    .and_then(|stream| server.handle_tcp_client(stream))
+                } else {
+                    server.handle_tcp_client(stream)
+                }
+            });
         },
     );
 
@@ -1397,7 +1461,9 @@ fn start_socks_listener(
         workers_for_thread,
         move |stream| {
             let server = server.clone();
-            let _ = server.handle_tcp_client(stream);
+            let _ = handle_tcp_connection_with_failure_backoff(stream, move |stream| {
+                server.handle_tcp_client(stream)
+            });
         },
     );
 
@@ -1468,7 +1534,9 @@ fn start_mieru_listener(
         workers_for_thread,
         move |stream| {
             let server = server.clone();
-            let _ = server.handle_tcp_client(stream);
+            let _ = handle_tcp_connection_with_failure_backoff(stream, move |stream| {
+                server.handle_tcp_client(stream)
+            });
         },
     );
 
@@ -1539,7 +1607,9 @@ fn start_http_listener(
         workers_for_thread,
         move |stream| {
             let server = server.clone();
-            let _ = server.handle_tcp_client(stream);
+            let _ = handle_tcp_connection_with_failure_backoff(stream, move |stream| {
+                server.handle_tcp_client(stream)
+            });
         },
     );
 
@@ -3446,6 +3516,34 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("backoff"));
+    }
+
+    #[test]
+    fn tcp_auth_backoff_only_records_auth_like_permission_failures() {
+        assert!(super::should_record_tcp_auth_failure(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unknown vless user",
+        )));
+        assert!(super::should_record_tcp_auth_failure(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid vmess auth id",
+        )));
+        assert!(super::should_record_tcp_auth_failure(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "proxy authentication required",
+        )));
+        assert!(!super::should_record_tcp_auth_failure(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "target blocked by route",
+        )));
+        assert!(!super::should_record_tcp_auth_failure(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "device limit reached for user",
+        )));
+        assert!(!super::should_record_tcp_auth_failure(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid request",
+        )));
     }
 
     #[test]
