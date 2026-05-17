@@ -122,10 +122,13 @@ struct BenchReport {
     requests_per_second: f64,
     roundtrip_mbps: f64,
     latency: LatencyReport,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    phases: Vec<BenchPhaseReport>,
 }
 
 impl BenchReport {
-    fn completed(
+    #[allow(clippy::too_many_arguments)]
+    fn completed_with_phases(
         protocol: &'static str,
         mode: &'static str,
         options: &BenchOptions,
@@ -135,6 +138,7 @@ impl BenchReport {
         retries: usize,
         elapsed: Duration,
         latencies: &[u128],
+        phases: &[BenchPhaseSample],
     ) -> Self {
         let total_requests = options.streams.saturating_mul(options.requests);
         let completed_requests = latencies.len();
@@ -162,6 +166,7 @@ impl BenchReport {
             requests_per_second: completed_requests as f64 / seconds,
             roundtrip_mbps: ((upload_bytes + download_bytes) as f64 * 8.0) / seconds / 1_000_000.0,
             latency: latency_report(latencies),
+            phases: phase_reports(phases),
         }
     }
 }
@@ -175,10 +180,46 @@ struct LatencyReport {
     max_us: u128,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BenchPhaseReport {
+    name: String,
+    count: usize,
+    total_us: u128,
+    avg_us: f64,
+    p50_us: u128,
+    p95_us: u128,
+    p99_us: u128,
+    max_us: u128,
+}
+
+#[derive(Clone, Debug)]
+struct BenchPhaseSample {
+    name: &'static str,
+    duration_us: u128,
+}
+
 #[derive(Debug)]
 struct ClientStats {
     latencies: Vec<u128>,
     retries: usize,
+    phases: Vec<BenchPhaseSample>,
+}
+
+impl ClientStats {
+    fn new(latencies: Vec<u128>, retries: usize) -> Self {
+        Self {
+            latencies,
+            retries,
+            phases: Vec::new(),
+        }
+    }
+
+    fn push_phase(&mut self, name: &'static str, elapsed: Duration) {
+        self.phases.push(BenchPhaseSample {
+            name,
+            duration_us: elapsed.as_micros(),
+        });
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -983,15 +1024,7 @@ fn run_external_stream_bench(
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_client_workers(workers, protocol)?;
     let elapsed = started.elapsed();
 
     echo_stop.store(true, Ordering::SeqCst);
@@ -1002,7 +1035,7 @@ fn run_external_stream_bench(
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         protocol,
         mode,
         options,
@@ -1012,6 +1045,7 @@ fn run_external_stream_bench(
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -1155,15 +1189,7 @@ fn run_direct_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_client_workers(workers, "direct tcp")?;
     let elapsed = started.elapsed();
 
     echo_stop.store(true, Ordering::SeqCst);
@@ -1174,7 +1200,7 @@ fn run_direct_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "direct-tcp",
         "direct-echo-stream",
         options,
@@ -1184,6 +1210,7 @@ fn run_direct_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -1203,15 +1230,7 @@ fn run_direct_tcp_proxy_stream_bench(options: &BenchOptions) -> io::Result<Bench
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_client_workers(workers, "direct tcp proxy")?;
     let elapsed = started.elapsed();
 
     proxy_stop.store(true, Ordering::SeqCst);
@@ -1225,7 +1244,7 @@ fn run_direct_tcp_proxy_stream_bench(options: &BenchOptions) -> io::Result<Bench
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "direct-tcp-proxy",
         "raw-proxy-stream",
         options,
@@ -1235,6 +1254,7 @@ fn run_direct_tcp_proxy_stream_bench(options: &BenchOptions) -> io::Result<Bench
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -1253,15 +1273,7 @@ fn run_http_connect_stream_bench(options: &BenchOptions) -> io::Result<BenchRepo
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_client_workers(workers, "http connect")?;
     let elapsed = started.elapsed();
 
     core_stop.store(true, Ordering::SeqCst);
@@ -1275,7 +1287,7 @@ fn run_http_connect_stream_bench(options: &BenchOptions) -> io::Result<BenchRepo
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "http-connect",
         "connection-per-stream",
         options,
@@ -1285,6 +1297,7 @@ fn run_http_connect_stream_bench(options: &BenchOptions) -> io::Result<BenchRepo
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -1303,15 +1316,7 @@ fn run_shadowsocks_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchR
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_client_workers(workers, "shadowsocks")?;
     let elapsed = started.elapsed();
 
     core_stop.store(true, Ordering::SeqCst);
@@ -1325,7 +1330,7 @@ fn run_shadowsocks_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchR
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "shadowsocks-tcp",
         "connection-per-stream",
         options,
@@ -1335,6 +1340,7 @@ fn run_shadowsocks_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchR
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -1353,15 +1359,7 @@ fn run_socks_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport>
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_client_workers(workers, "socks")?;
     let elapsed = started.elapsed();
 
     core_stop.store(true, Ordering::SeqCst);
@@ -1375,7 +1373,7 @@ fn run_socks_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport>
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "socks-tcp",
         "connection-per-stream",
         options,
@@ -1385,6 +1383,7 @@ fn run_socks_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport>
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -1403,15 +1402,7 @@ fn run_trojan_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_client_workers(workers, "trojan")?;
     let elapsed = started.elapsed();
 
     core_stop.store(true, Ordering::SeqCst);
@@ -1425,7 +1416,7 @@ fn run_trojan_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "trojan-tcp",
         "connection-per-stream",
         options,
@@ -1435,6 +1426,7 @@ fn run_trojan_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -1453,15 +1445,7 @@ fn run_anytls_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_client_workers(workers, "anytls")?;
     let elapsed = started.elapsed();
 
     core_stop.store(true, Ordering::SeqCst);
@@ -1475,7 +1459,7 @@ fn run_anytls_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "anytls-tcp",
         "connection-per-stream",
         options,
@@ -1485,6 +1469,7 @@ fn run_anytls_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -1635,15 +1620,7 @@ fn run_vless_tcp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_client_workers(workers, "vless tcp")?;
     let elapsed = started.elapsed();
 
     core_stop.store(true, Ordering::SeqCst);
@@ -1657,7 +1634,7 @@ fn run_vless_tcp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "vless-tcp",
         "connection-per-request",
         options,
@@ -1667,6 +1644,7 @@ fn run_vless_tcp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -1686,15 +1664,7 @@ fn run_external_vless_tcp_bench(
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_client_workers(workers, "external vless tcp")?;
     let elapsed = started.elapsed();
 
     echo_stop.store(true, Ordering::SeqCst);
@@ -1705,7 +1675,7 @@ fn run_external_vless_tcp_bench(
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "vless-tcp",
         "connection-per-request",
         options,
@@ -1715,6 +1685,7 @@ fn run_external_vless_tcp_bench(
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -1733,15 +1704,7 @@ fn run_vmess_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport>
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_client_workers(workers, "vmess")?;
     let elapsed = started.elapsed();
 
     core_stop.store(true, Ordering::SeqCst);
@@ -1755,7 +1718,7 @@ fn run_vmess_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport>
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "vmess-tcp",
         "connection-per-stream",
         options,
@@ -1765,6 +1728,7 @@ fn run_vmess_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport>
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -1819,8 +1783,9 @@ fn run_tuic_udp_bench(options: &BenchOptions) -> io::Result<BenchReport> {
 async fn collect_quic_workers(
     workers: Vec<tokio::task::JoinHandle<io::Result<ClientStats>>>,
     label: &str,
-) -> io::Result<(Vec<u128>, usize)> {
+) -> io::Result<(Vec<u128>, usize, Vec<BenchPhaseSample>)> {
     let mut latencies = Vec::new();
+    let mut phases = Vec::new();
     let mut retries = 0usize;
     for worker in workers {
         let mut stats = worker.await.map_err(|_| {
@@ -1828,8 +1793,27 @@ async fn collect_quic_workers(
         })??;
         retries = retries.saturating_add(stats.retries);
         latencies.append(&mut stats.latencies);
+        phases.append(&mut stats.phases);
     }
-    Ok((latencies, retries))
+    Ok((latencies, retries, phases))
+}
+
+fn collect_client_workers(
+    workers: Vec<thread::JoinHandle<io::Result<ClientStats>>>,
+    label: &str,
+) -> io::Result<(Vec<u128>, usize, Vec<BenchPhaseSample>)> {
+    let mut latencies = Vec::new();
+    let mut phases = Vec::new();
+    let mut retries = 0usize;
+    for worker in workers {
+        let mut stats = worker.join().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, format!("{label} worker panicked"))
+        })??;
+        retries = retries.saturating_add(stats.retries);
+        latencies.append(&mut stats.latencies);
+        phases.append(&mut stats.phases);
+    }
+    Ok((latencies, retries, phases))
 }
 
 fn start_udp_echo_task(
@@ -1888,7 +1872,8 @@ async fn run_external_hy2_tcp_bench_async(
         }));
     }
 
-    let (mut latencies, retries) = collect_quic_workers(workers, "external hy2 tcp").await?;
+    let (mut latencies, retries, phases) =
+        collect_quic_workers(workers, "external hy2 tcp").await?;
     let elapsed = started.elapsed();
 
     connection.close(0u32.into(), b"bench done");
@@ -1901,7 +1886,7 @@ async fn run_external_hy2_tcp_bench_async(
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "hy2-tcp",
         "external-single-quic-connection",
         options,
@@ -1911,6 +1896,7 @@ async fn run_external_hy2_tcp_bench_async(
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -1941,14 +1927,15 @@ async fn run_external_hy2_auth_bench_async(
                     }
                 }
             }
-            Ok::<ClientStats, io::Error>(ClientStats { latencies, retries })
+            Ok::<ClientStats, io::Error>(ClientStats::new(latencies, retries))
         }));
     }
 
-    let (mut latencies, retries) = collect_quic_workers(workers, "external hy2 auth").await?;
+    let (mut latencies, retries, phases) =
+        collect_quic_workers(workers, "external hy2 auth").await?;
     let elapsed = started.elapsed();
     latencies.sort_unstable();
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "hy2-auth",
         "external-auth-connection-per-request",
         options,
@@ -1958,6 +1945,7 @@ async fn run_external_hy2_auth_bench_async(
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -2007,7 +1995,8 @@ async fn run_external_hy2_tcp_stream_bench_async(
         }));
     }
 
-    let (mut latencies, retries) = collect_quic_workers(workers, "external hy2 stream").await?;
+    let (mut latencies, retries, phases) =
+        collect_quic_workers(workers, "external hy2 stream").await?;
     let elapsed = started.elapsed();
 
     connection.close(0u32.into(), b"bench done");
@@ -2020,7 +2009,7 @@ async fn run_external_hy2_tcp_stream_bench_async(
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "hy2-tcp",
         "external-hy2-tcp-stream-per-worker",
         options,
@@ -2030,6 +2019,7 @@ async fn run_external_hy2_tcp_stream_bench_async(
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -2062,7 +2052,8 @@ async fn run_external_hy2_udp_bench_async(
         }));
     }
 
-    let (mut latencies, retries) = collect_quic_workers(workers, "external hy2 udp").await?;
+    let (mut latencies, retries, phases) =
+        collect_quic_workers(workers, "external hy2 udp").await?;
     let elapsed = started.elapsed();
 
     echo_stop.store(true, Ordering::SeqCst);
@@ -2075,7 +2066,7 @@ async fn run_external_hy2_udp_bench_async(
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "hy2-udp",
         "external-hy2-udp-datagram-connection-per-worker",
         options,
@@ -2085,6 +2076,7 @@ async fn run_external_hy2_udp_bench_async(
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -2114,7 +2106,8 @@ async fn run_external_tuic_tcp_bench_async(
         }));
     }
 
-    let (mut latencies, retries) = collect_quic_workers(workers, "external tuic tcp").await?;
+    let (mut latencies, retries, phases) =
+        collect_quic_workers(workers, "external tuic tcp").await?;
     let elapsed = started.elapsed();
 
     connection.close(0u32.into(), b"bench done");
@@ -2127,7 +2120,7 @@ async fn run_external_tuic_tcp_bench_async(
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "tuic-tcp",
         "external-single-quic-connection",
         options,
@@ -2137,6 +2130,7 @@ async fn run_external_tuic_tcp_bench_async(
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -2166,7 +2160,8 @@ async fn run_external_tuic_tcp_stream_bench_async(
         }));
     }
 
-    let (mut latencies, retries) = collect_quic_workers(workers, "external tuic stream").await?;
+    let (mut latencies, retries, phases) =
+        collect_quic_workers(workers, "external tuic stream").await?;
     let elapsed = started.elapsed();
 
     connection.close(0u32.into(), b"bench done");
@@ -2179,7 +2174,7 @@ async fn run_external_tuic_tcp_stream_bench_async(
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "tuic-tcp",
         "external-tuic-tcp-stream-per-worker",
         options,
@@ -2189,6 +2184,7 @@ async fn run_external_tuic_tcp_stream_bench_async(
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -2221,7 +2217,8 @@ async fn run_external_tuic_udp_bench_async(
         }));
     }
 
-    let (mut latencies, retries) = collect_quic_workers(workers, "external tuic udp").await?;
+    let (mut latencies, retries, phases) =
+        collect_quic_workers(workers, "external tuic udp").await?;
     let elapsed = started.elapsed();
 
     echo_stop.store(true, Ordering::SeqCst);
@@ -2234,7 +2231,7 @@ async fn run_external_tuic_udp_bench_async(
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "tuic-udp",
         "external-tuic-udp-datagram-connection-per-worker",
         options,
@@ -2244,6 +2241,7 @@ async fn run_external_tuic_udp_bench_async(
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -2290,15 +2288,7 @@ async fn run_hy2_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "hy2 bench worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_quic_workers(workers, "hy2 tcp").await?;
     let elapsed = started.elapsed();
 
     connection.close(0u32.into(), b"bench done");
@@ -2315,7 +2305,7 @@ async fn run_hy2_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "hy2-tcp",
         "single-quic-connection",
         options,
@@ -2325,6 +2315,7 @@ async fn run_hy2_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -2371,15 +2362,7 @@ async fn run_hy2_tcp_stream_bench_async(options: &BenchOptions) -> io::Result<Be
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker.await.map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "hy2 stream bench worker panicked")
-        })??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_quic_workers(workers, "hy2 stream").await?;
     let elapsed = started.elapsed();
 
     connection.close(0u32.into(), b"bench done");
@@ -2396,7 +2379,7 @@ async fn run_hy2_tcp_stream_bench_async(options: &BenchOptions) -> io::Result<Be
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "hy2-tcp",
         "hy2-tcp-stream-per-worker",
         options,
@@ -2406,6 +2389,7 @@ async fn run_hy2_tcp_stream_bench_async(options: &BenchOptions) -> io::Result<Be
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -2476,15 +2460,7 @@ async fn run_hy2_udp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "hy2 udp worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_quic_workers(workers, "hy2 udp").await?;
     let elapsed = started.elapsed();
 
     stop.store(true, Ordering::SeqCst);
@@ -2500,7 +2476,7 @@ async fn run_hy2_udp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "hy2-udp",
         "hy2-udp-datagram-connection-per-worker",
         options,
@@ -2510,6 +2486,7 @@ async fn run_hy2_udp_bench_async(options: &BenchOptions) -> io::Result<BenchRepo
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -2552,15 +2529,7 @@ async fn run_tuic_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchRep
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "tuic tcp worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_quic_workers(workers, "tuic tcp").await?;
     let elapsed = started.elapsed();
 
     connection.close(0u32.into(), b"bench done");
@@ -2577,7 +2546,7 @@ async fn run_tuic_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchRep
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "tuic-tcp",
         "single-quic-connection",
         options,
@@ -2587,6 +2556,7 @@ async fn run_tuic_tcp_bench_async(options: &BenchOptions) -> io::Result<BenchRep
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -2629,15 +2599,7 @@ async fn run_tuic_tcp_stream_bench_async(options: &BenchOptions) -> io::Result<B
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker.await.map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "tuic stream bench worker panicked")
-        })??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_quic_workers(workers, "tuic stream").await?;
     let elapsed = started.elapsed();
 
     connection.close(0u32.into(), b"bench done");
@@ -2654,7 +2616,7 @@ async fn run_tuic_tcp_stream_bench_async(options: &BenchOptions) -> io::Result<B
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "tuic-tcp",
         "tuic-tcp-stream-per-worker",
         options,
@@ -2664,6 +2626,7 @@ async fn run_tuic_tcp_stream_bench_async(options: &BenchOptions) -> io::Result<B
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -2730,15 +2693,7 @@ async fn run_tuic_udp_bench_async(options: &BenchOptions) -> io::Result<BenchRep
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "tuic udp worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_quic_workers(workers, "tuic udp").await?;
     let elapsed = started.elapsed();
 
     stop.store(true, Ordering::SeqCst);
@@ -2754,7 +2709,7 @@ async fn run_tuic_udp_bench_async(options: &BenchOptions) -> io::Result<BenchRep
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "tuic-udp",
         "tuic-udp-datagram-connection-per-worker",
         options,
@@ -2764,6 +2719,7 @@ async fn run_tuic_udp_bench_async(options: &BenchOptions) -> io::Result<BenchRep
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -2782,15 +2738,7 @@ fn run_vless_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport>
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) = collect_client_workers(workers, "vless stream")?;
     let elapsed = started.elapsed();
 
     core_stop.store(true, Ordering::SeqCst);
@@ -2804,7 +2752,7 @@ fn run_vless_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport>
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "vless-tcp",
         "connection-per-stream",
         options,
@@ -2814,6 +2762,7 @@ fn run_vless_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport>
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -2833,15 +2782,8 @@ fn run_external_vless_tcp_stream_bench(
         }));
     }
 
-    let mut latencies = Vec::with_capacity(options.streams.saturating_mul(options.requests));
-    let mut retries = 0usize;
-    for worker in workers {
-        let mut stats = worker
-            .join()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "bench worker panicked"))??;
-        retries = retries.saturating_add(stats.retries);
-        latencies.append(&mut stats.latencies);
-    }
+    let (mut latencies, retries, phases) =
+        collect_client_workers(workers, "external vless stream")?;
     let elapsed = started.elapsed();
 
     echo_stop.store(true, Ordering::SeqCst);
@@ -2852,7 +2794,7 @@ fn run_external_vless_tcp_stream_bench(
     let total_requests = options.streams.saturating_mul(options.requests);
     let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
     let download_bytes = upload_bytes;
-    Ok(BenchReport::completed(
+    Ok(BenchReport::completed_with_phases(
         "vless-tcp",
         "connection-per-stream",
         options,
@@ -2862,6 +2804,7 @@ fn run_external_vless_tcp_stream_bench(
         retries,
         elapsed,
         &latencies,
+        &phases,
     ))
 }
 
@@ -3244,12 +3187,16 @@ fn run_http_connect_stream_client(
 ) -> io::Result<ClientStats> {
     let payload = bench_payload(stream_id, options.payload_size);
     let mut response = vec![0u8; payload.len()];
-    let mut latencies = Vec::with_capacity(options.requests);
+    let mut stats = ClientStats::new(Vec::with_capacity(options.requests), 0);
+    let started = Instant::now();
     let mut stream = TcpStream::connect(core_addr)?;
+    stats.push_phase("tcp_connect", started.elapsed());
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let started = Instant::now();
     write_http_connect(&mut stream, echo_addr)?;
+    stats.push_phase("protocol_setup", started.elapsed());
 
     for request_index in 0..options.requests {
         let started = Instant::now();
@@ -3277,13 +3224,12 @@ fn run_http_connect_stream_client(
                 "http connect bench echo payload mismatch",
             ));
         }
-        latencies.push(started.elapsed().as_micros());
+        let elapsed = started.elapsed();
+        stats.latencies.push(elapsed.as_micros());
+        stats.push_phase("relay_roundtrip", elapsed);
     }
 
-    Ok(ClientStats {
-        latencies,
-        retries: 0,
-    })
+    Ok(stats)
 }
 
 fn run_shadowsocks_tcp_stream_client(
@@ -3293,12 +3239,15 @@ fn run_shadowsocks_tcp_stream_client(
     options: &BenchOptions,
 ) -> io::Result<ClientStats> {
     let target = socket_addr_target(echo_addr);
+    let started = Instant::now();
     let mut stream = connect_shadowsocks_tcp_outbound(
         &shadowsocks_outbound(core_addr),
         &target,
         Duration::from_secs(10),
     )?;
-    run_plain_stream_echo_client(&mut stream, "shadowsocks", stream_id, options)
+    let mut stats = run_plain_stream_echo_client(&mut stream, "shadowsocks", stream_id, options)?;
+    stats.push_phase("protocol_connect", started.elapsed());
+    Ok(stats)
 }
 
 fn run_socks_tcp_stream_client(
@@ -3309,12 +3258,16 @@ fn run_socks_tcp_stream_client(
 ) -> io::Result<ClientStats> {
     let payload = bench_payload(stream_id, options.payload_size);
     let mut response = vec![0u8; payload.len()];
-    let mut latencies = Vec::with_capacity(options.requests);
+    let mut stats = ClientStats::new(Vec::with_capacity(options.requests), 0);
+    let started = Instant::now();
     let mut stream = TcpStream::connect(core_addr)?;
+    stats.push_phase("tcp_connect", started.elapsed());
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let started = Instant::now();
     write_socks5_connect(&mut stream, echo_addr)?;
+    stats.push_phase("protocol_setup", started.elapsed());
 
     for request_index in 0..options.requests {
         let started = Instant::now();
@@ -3342,13 +3295,12 @@ fn run_socks_tcp_stream_client(
                 "socks bench echo payload mismatch",
             ));
         }
-        latencies.push(started.elapsed().as_micros());
+        let elapsed = started.elapsed();
+        stats.latencies.push(elapsed.as_micros());
+        stats.push_phase("relay_roundtrip", elapsed);
     }
 
-    Ok(ClientStats {
-        latencies,
-        retries: 0,
-    })
+    Ok(stats)
 }
 
 fn run_vmess_tcp_stream_client(
@@ -3358,9 +3310,12 @@ fn run_vmess_tcp_stream_client(
     options: &BenchOptions,
 ) -> io::Result<ClientStats> {
     let target = socket_addr_target(echo_addr);
+    let started = Instant::now();
     let mut stream =
         connect_vmess_tcp_outbound(&vmess_outbound(core_addr), &target, Duration::from_secs(10))?;
-    run_plain_stream_echo_client(&mut stream, "vmess", stream_id, options)
+    let mut stats = run_plain_stream_echo_client(&mut stream, "vmess", stream_id, options)?;
+    stats.push_phase("protocol_connect", started.elapsed());
+    Ok(stats)
 }
 
 fn run_trojan_tcp_stream_client(
@@ -3371,12 +3326,16 @@ fn run_trojan_tcp_stream_client(
 ) -> io::Result<ClientStats> {
     let payload = bench_payload(stream_id, options.payload_size);
     let mut response = vec![0u8; payload.len()];
-    let mut latencies = Vec::with_capacity(options.requests);
+    let mut stats = ClientStats::new(Vec::with_capacity(options.requests), 0);
+    let started = Instant::now();
     let mut stream = TcpStream::connect(core_addr)?;
+    stats.push_phase("tcp_connect", started.elapsed());
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let started = Instant::now();
     stream.write_all(&trojan_tcp_request(echo_addr))?;
+    stats.push_phase("protocol_setup", started.elapsed());
 
     for request_index in 0..options.requests {
         let started = Instant::now();
@@ -3404,13 +3363,12 @@ fn run_trojan_tcp_stream_client(
                 "trojan bench echo payload mismatch",
             ));
         }
-        latencies.push(started.elapsed().as_micros());
+        let elapsed = started.elapsed();
+        stats.latencies.push(elapsed.as_micros());
+        stats.push_phase("relay_roundtrip", elapsed);
     }
 
-    Ok(ClientStats {
-        latencies,
-        retries: 0,
-    })
+    Ok(stats)
 }
 
 fn run_anytls_tcp_stream_client(
@@ -3421,12 +3379,17 @@ fn run_anytls_tcp_stream_client(
 ) -> io::Result<ClientStats> {
     let payload = bench_payload(stream_id, options.payload_size);
     let mut response = vec![0u8; payload.len()];
-    let mut latencies = Vec::with_capacity(options.requests);
+    let mut stats = ClientStats::new(Vec::with_capacity(options.requests), 0);
+    let started = Instant::now();
     let mut stream = TcpStream::connect(core_addr)?;
+    stats.push_phase("tcp_connect", started.elapsed());
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let started = Instant::now();
     write_anytls_auth(&mut stream)?;
+    stats.push_phase("auth_write", started.elapsed());
+    let started = Instant::now();
     write_anytls_frame(
         &mut stream,
         ANYTLS_CMD_PSH,
@@ -3434,6 +3397,7 @@ fn run_anytls_tcp_stream_client(
         &socks_target_bytes(echo_addr),
     )?;
     read_anytls_synack(&mut stream)?;
+    stats.push_phase("protocol_setup", started.elapsed());
 
     for request_index in 0..options.requests {
         let started = Instant::now();
@@ -3463,14 +3427,13 @@ fn run_anytls_tcp_stream_client(
                 "anytls bench echo payload mismatch",
             ));
         }
-        latencies.push(started.elapsed().as_micros());
+        let elapsed = started.elapsed();
+        stats.latencies.push(elapsed.as_micros());
+        stats.push_phase("relay_roundtrip", elapsed);
     }
     let _ = write_anytls_frame(&mut stream, ANYTLS_CMD_FIN, ANYTLS_STREAM_ID, &[]);
 
-    Ok(ClientStats {
-        latencies,
-        retries: 0,
-    })
+    Ok(stats)
 }
 
 fn run_plain_stream_echo_client(
@@ -3484,7 +3447,7 @@ fn run_plain_stream_echo_client(
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let payload = bench_payload(stream_id, options.payload_size);
     let mut response = vec![0u8; payload.len()];
-    let mut latencies = Vec::with_capacity(options.requests);
+    let mut stats = ClientStats::new(Vec::with_capacity(options.requests), 0);
 
     for request_index in 0..options.requests {
         let started = Instant::now();
@@ -3512,13 +3475,12 @@ fn run_plain_stream_echo_client(
                 format!("{label} bench echo payload mismatch"),
             ));
         }
-        latencies.push(started.elapsed().as_micros());
+        let elapsed = started.elapsed();
+        stats.latencies.push(elapsed.as_micros());
+        stats.push_phase("relay_roundtrip", elapsed);
     }
 
-    Ok(ClientStats {
-        latencies,
-        retries: 0,
-    })
+    Ok(stats)
 }
 
 fn run_vless_tcp_client(
@@ -3557,7 +3519,7 @@ fn run_vless_tcp_client(
             }
         }
     }
-    Ok(ClientStats { latencies, retries })
+    Ok(ClientStats::new(latencies, retries))
 }
 
 fn run_one_vless_tcp_request(
@@ -3592,12 +3554,16 @@ fn run_vless_tcp_stream_client(
 ) -> io::Result<ClientStats> {
     let payload = bench_payload(stream_id, options.payload_size);
     let mut response = vec![0u8; payload.len()];
-    let mut latencies = Vec::with_capacity(options.requests);
+    let mut stats = ClientStats::new(Vec::with_capacity(options.requests), 0);
+    let started = Instant::now();
     let mut stream = TcpStream::connect(core_addr)?;
+    stats.push_phase("tcp_connect", started.elapsed());
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let started = Instant::now();
     stream.write_all(&vless_tcp_request(echo_addr))?;
+    stats.push_phase("auth_request_write", started.elapsed());
     let mut response_header_read = false;
 
     for request_index in 0..options.requests {
@@ -3630,13 +3596,12 @@ fn run_vless_tcp_stream_client(
                 "bench echo payload mismatch",
             ));
         }
-        latencies.push(started.elapsed().as_micros());
+        let elapsed = started.elapsed();
+        stats.latencies.push(elapsed.as_micros());
+        stats.push_phase("relay_roundtrip", elapsed);
     }
 
-    Ok(ClientStats {
-        latencies,
-        retries: 0,
-    })
+    Ok(stats)
 }
 
 fn is_retryable_bench_error(error: &io::Error) -> bool {
@@ -4090,7 +4055,7 @@ async fn run_hy2_tcp_client(
         }
     }
 
-    Ok(ClientStats { latencies, retries })
+    Ok(ClientStats::new(latencies, retries))
 }
 
 async fn run_one_hy2_tcp_request(
@@ -4130,12 +4095,14 @@ async fn run_hy2_tcp_stream_client(
 ) -> io::Result<ClientStats> {
     let payload = bench_payload(stream_id, options.payload_size);
     let mut response = vec![0u8; payload.len()];
-    let mut latencies = Vec::with_capacity(options.requests);
+    let mut stats = ClientStats::new(Vec::with_capacity(options.requests), 0);
+    let started = Instant::now();
     let (mut send, mut recv) = connection.open_bi().await.map_err(io_other)?;
     send.write_all(&hy2_tcp_request(echo_addr))
         .await
         .map_err(io_other)?;
     read_hy2_tcp_response_header(&mut recv).await?;
+    stats.push_phase("quic_stream_setup", started.elapsed());
 
     for request_index in 0..options.requests {
         let started = Instant::now();
@@ -4163,14 +4130,13 @@ async fn run_hy2_tcp_stream_client(
                 "hy2 stream bench echo payload mismatch",
             ));
         }
-        latencies.push(started.elapsed().as_micros());
+        let elapsed = started.elapsed();
+        stats.latencies.push(elapsed.as_micros());
+        stats.push_phase("relay_roundtrip", elapsed);
     }
 
     send.finish().map_err(io_other)?;
-    Ok(ClientStats {
-        latencies,
-        retries: 0,
-    })
+    Ok(stats)
 }
 
 async fn run_hy2_udp_client(
@@ -4181,16 +4147,20 @@ async fn run_hy2_udp_client(
     stream_id: usize,
     options: &BenchOptions,
 ) -> io::Result<ClientStats> {
+    let mut stats = ClientStats::new(Vec::with_capacity(options.requests), 0);
     let client_endpoint = hy2_client_endpoint(cert_der)?;
+    let started = Instant::now();
     let connection = client_endpoint
         .connect(server_addr, &server_name)
         .map_err(io_other)?
         .await
         .map_err(io_other)?;
+    stats.push_phase("quic_connect", started.elapsed());
+    let started = Instant::now();
     authenticate_hy2(&connection).await?;
+    stats.push_phase("auth", started.elapsed());
     let payload = bench_payload(stream_id, options.payload_size);
     let session_id = stream_id.saturating_add(1) as u32;
-    let mut latencies = Vec::with_capacity(options.requests);
     let mut retries = 0usize;
 
     for request_index in 0..options.requests {
@@ -4229,14 +4199,17 @@ async fn run_hy2_udp_client(
                     "hy2 udp bench echo payload mismatch",
                 ));
             }
-            latencies.push(started.elapsed().as_micros());
+            let elapsed = started.elapsed();
+            stats.latencies.push(elapsed.as_micros());
+            stats.push_phase("udp_roundtrip", elapsed);
             break;
         }
     }
 
     connection.close(0u32.into(), b"bench done");
     client_endpoint.wait_idle().await;
-    Ok(ClientStats { latencies, retries })
+    stats.retries = retries;
+    Ok(stats)
 }
 
 async fn run_tuic_tcp_client(
@@ -4276,7 +4249,7 @@ async fn run_tuic_tcp_client(
         }
     }
 
-    Ok(ClientStats { latencies, retries })
+    Ok(ClientStats::new(latencies, retries))
 }
 
 async fn run_one_tuic_tcp_request(
@@ -4315,11 +4288,13 @@ async fn run_tuic_tcp_stream_client(
 ) -> io::Result<ClientStats> {
     let payload = bench_payload(stream_id, options.payload_size);
     let mut response = vec![0u8; payload.len()];
-    let mut latencies = Vec::with_capacity(options.requests);
+    let mut stats = ClientStats::new(Vec::with_capacity(options.requests), 0);
+    let started = Instant::now();
     let (mut send, mut recv) = connection.open_bi().await.map_err(io_other)?;
     send.write_all(&tuic_connect_command(echo_addr))
         .await
         .map_err(io_other)?;
+    stats.push_phase("quic_stream_setup", started.elapsed());
 
     for request_index in 0..options.requests {
         let started = Instant::now();
@@ -4347,14 +4322,13 @@ async fn run_tuic_tcp_stream_client(
                 "tuic stream bench echo payload mismatch",
             ));
         }
-        latencies.push(started.elapsed().as_micros());
+        let elapsed = started.elapsed();
+        stats.latencies.push(elapsed.as_micros());
+        stats.push_phase("relay_roundtrip", elapsed);
     }
 
     send.finish().map_err(io_other)?;
-    Ok(ClientStats {
-        latencies,
-        retries: 0,
-    })
+    Ok(stats)
 }
 
 async fn run_tuic_udp_client(
@@ -4365,16 +4339,20 @@ async fn run_tuic_udp_client(
     stream_id: usize,
     options: &BenchOptions,
 ) -> io::Result<ClientStats> {
+    let mut stats = ClientStats::new(Vec::with_capacity(options.requests), 0);
     let client_endpoint = hy2_client_endpoint(cert_der)?;
+    let started = Instant::now();
     let connection = client_endpoint
         .connect(server_addr, &server_name)
         .map_err(io_other)?
         .await
         .map_err(io_other)?;
+    stats.push_phase("quic_connect", started.elapsed());
+    let started = Instant::now();
     authenticate_tuic(&connection).await?;
+    stats.push_phase("auth", started.elapsed());
     let payload = bench_payload(stream_id, options.payload_size);
     let assoc_id = stream_id.saturating_add(1) as u16;
-    let mut latencies = Vec::with_capacity(options.requests);
     let mut retries = 0usize;
 
     for request_index in 0..options.requests {
@@ -4414,14 +4392,17 @@ async fn run_tuic_udp_client(
                     "tuic udp bench echo payload mismatch",
                 ));
             }
-            latencies.push(started.elapsed().as_micros());
+            let elapsed = started.elapsed();
+            stats.latencies.push(elapsed.as_micros());
+            stats.push_phase("udp_roundtrip", elapsed);
             break;
         }
     }
 
     connection.close(0u32.into(), b"bench done");
     client_endpoint.wait_idle().await;
-    Ok(ClientStats { latencies, retries })
+    stats.retries = retries;
+    Ok(stats)
 }
 
 async fn authenticate_tuic(connection: &quinn::Connection) -> io::Result<()> {
@@ -5072,6 +5053,42 @@ fn latency_report(values: &[u128]) -> LatencyReport {
     }
 }
 
+fn phase_reports(samples: &[BenchPhaseSample]) -> Vec<BenchPhaseReport> {
+    let mut by_name = HashMap::<&'static str, Vec<u128>>::new();
+    for sample in samples {
+        by_name
+            .entry(sample.name)
+            .or_default()
+            .push(sample.duration_us);
+    }
+    let mut names = by_name.keys().copied().collect::<Vec<_>>();
+    names.sort_unstable();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let values = by_name.get_mut(name)?;
+            values.sort_unstable();
+            let total_us = values.iter().copied().sum::<u128>();
+            let count = values.len();
+            let latency = latency_report(values);
+            Some(BenchPhaseReport {
+                name: name.to_string(),
+                count,
+                total_us,
+                avg_us: if count == 0 {
+                    0.0
+                } else {
+                    total_us as f64 / count as f64
+                },
+                p50_us: latency.p50_us,
+                p95_us: latency.p95_us,
+                p99_us: latency.p99_us,
+                max_us: latency.max_us,
+            })
+        })
+        .collect()
+}
+
 fn percentile(values: &[u128], percentile: usize) -> u128 {
     if values.is_empty() {
         return 0;
@@ -5397,6 +5414,38 @@ mod tests {
     }
 
     #[test]
+    fn bench_report_deserializes_legacy_json_without_phases() {
+        let report: BenchReport = serde_json::from_value(serde_json::json!({
+            "protocol": "vless-tcp",
+            "mode": "connection-per-stream",
+            "streams": 1,
+            "runtime_workers": null,
+            "requests_per_stream": 1,
+            "payload_bytes": 16,
+            "total_requests": 1,
+            "completed_requests": 1,
+            "upload_bytes": 16,
+            "download_bytes": 16,
+            "retries": 0,
+            "errors": 0,
+            "error_rate": 0.0,
+            "elapsed_ms": 1,
+            "requests_per_second": 1000.0,
+            "roundtrip_mbps": 0.256,
+            "latency": {
+                "min_us": 1,
+                "p50_us": 1,
+                "p95_us": 1,
+                "p99_us": 1,
+                "max_us": 1
+            }
+        }))
+        .expect("legacy report");
+
+        assert!(report.phases.is_empty());
+    }
+
+    #[test]
     fn runs_direct_tcp_stream_bench_smoke() {
         let report = run_direct_tcp_stream_bench(&BenchOptions {
             streams: 1,
@@ -5413,6 +5462,7 @@ mod tests {
         assert_eq!(report.error_rate, 0.0);
         assert_eq!(report.runtime_workers, None);
         assert!(report.download_bytes > 0);
+        assert_phase(&report, "relay_roundtrip");
     }
 
     #[test]
@@ -5432,6 +5482,7 @@ mod tests {
         assert_eq!(report.error_rate, 0.0);
         assert_eq!(report.runtime_workers, None);
         assert!(report.download_bytes > 0);
+        assert_phase(&report, "relay_roundtrip");
     }
 
     #[test]
@@ -5470,6 +5521,9 @@ mod tests {
         assert_eq!(report.error_rate, 0.0);
         assert_eq!(report.runtime_workers, None);
         assert!(report.download_bytes > 0);
+        assert_phase(&report, "tcp_connect");
+        assert_phase(&report, "protocol_setup");
+        assert_phase(&report, "relay_roundtrip");
     }
 
     #[test]
@@ -5489,6 +5543,9 @@ mod tests {
         assert_eq!(report.error_rate, 0.0);
         assert_eq!(report.runtime_workers, None);
         assert!(report.download_bytes > 0);
+        assert_phase(&report, "tcp_connect");
+        assert_phase(&report, "protocol_setup");
+        assert_phase(&report, "relay_roundtrip");
     }
 
     #[test]
@@ -5508,6 +5565,8 @@ mod tests {
         assert_eq!(report.error_rate, 0.0);
         assert_eq!(report.runtime_workers, None);
         assert!(report.download_bytes > 0);
+        assert_phase(&report, "protocol_connect");
+        assert_phase(&report, "relay_roundtrip");
     }
 
     #[test]
@@ -5527,6 +5586,9 @@ mod tests {
         assert_eq!(report.error_rate, 0.0);
         assert_eq!(report.runtime_workers, None);
         assert!(report.download_bytes > 0);
+        assert_phase(&report, "tcp_connect");
+        assert_phase(&report, "protocol_setup");
+        assert_phase(&report, "relay_roundtrip");
     }
 
     #[test]
@@ -5546,6 +5608,10 @@ mod tests {
         assert_eq!(report.error_rate, 0.0);
         assert_eq!(report.runtime_workers, None);
         assert!(report.download_bytes > 0);
+        assert_phase(&report, "tcp_connect");
+        assert_phase(&report, "auth_write");
+        assert_phase(&report, "protocol_setup");
+        assert_phase(&report, "relay_roundtrip");
     }
 
     #[test]
@@ -5565,6 +5631,9 @@ mod tests {
         assert_eq!(report.error_rate, 0.0);
         assert_eq!(report.runtime_workers, None);
         assert!(report.download_bytes > 0);
+        assert_phase(&report, "tcp_connect");
+        assert_phase(&report, "auth_request_write");
+        assert_phase(&report, "relay_roundtrip");
     }
 
     #[test]
@@ -5584,6 +5653,8 @@ mod tests {
         assert_eq!(report.error_rate, 0.0);
         assert_eq!(report.runtime_workers, None);
         assert!(report.download_bytes > 0);
+        assert_phase(&report, "protocol_connect");
+        assert_phase(&report, "relay_roundtrip");
     }
 
     #[test]
@@ -5768,6 +5839,16 @@ mod tests {
                 p99_us,
                 max_us: p99_us,
             },
+            phases: Vec::new(),
         }
+    }
+
+    fn assert_phase(report: &BenchReport, name: &str) {
+        let phase = report
+            .phases
+            .iter()
+            .find(|phase| phase.name == name)
+            .unwrap_or_else(|| panic!("missing bench phase {name}"));
+        assert!(phase.count > 0);
     }
 }
