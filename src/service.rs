@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 
+use crate::abuse::ClientFailureBackoff;
 use crate::anytls::{AnyTlsServer, AnyTlsServerConfig};
 use crate::config::{CoreConfig, InboundConfig, TransportConfig, ValidationError};
 use crate::grpc::{
@@ -170,6 +171,7 @@ impl CoreService {
         let traffic = TrafficRegistry::shared();
         let sessions = UserSessionTracker::default();
         let bandwidth = UserBandwidthLimiters::default();
+        let tls_failures = ClientFailureBackoff::tls_handshake();
         let quic_listener_count = config
             .inbounds
             .iter()
@@ -219,6 +221,7 @@ impl CoreService {
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
+                    tls_failures.clone(),
                 )?,
                 Protocol::Vmess => start_vmess_listener(
                     &inbound,
@@ -226,6 +229,7 @@ impl CoreService {
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
+                    tls_failures.clone(),
                 )?,
                 Protocol::Trojan => start_trojan_listener(
                     &inbound,
@@ -233,6 +237,7 @@ impl CoreService {
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
+                    tls_failures.clone(),
                 )?,
                 Protocol::Shadowsocks => start_shadowsocks_listener(
                     &inbound,
@@ -247,6 +252,7 @@ impl CoreService {
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
+                    tls_failures.clone(),
                 )?,
                 Protocol::Tuic => start_tuic_listener(
                     &inbound,
@@ -516,6 +522,7 @@ fn start_vmess_listener(
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
+    tls_failures: ClientFailureBackoff,
 ) -> Result<ListenerHandle, CoreServiceError> {
     let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
         CoreServiceError::Bind {
@@ -585,10 +592,11 @@ fn start_vmess_listener(
             let websocket_path = websocket_path.clone();
             let httpupgrade_host = httpupgrade_host.clone();
             let tls_acceptor = tls_acceptor.clone();
+            let tls_failures = tls_failures.clone();
             let tag = tag.clone();
             let result = if let Some(acceptor) = tls_acceptor {
-                accept_tls_connection(&acceptor, stream, Protocol::Vmess, &tag).and_then(|client| {
-                    match network.as_str() {
+                accept_tls_connection(&acceptor, stream, Protocol::Vmess, &tag, &tls_failures)
+                    .and_then(|client| match network.as_str() {
                         "ws" => {
                             server.handle_tls_websocket_client(client, websocket_path.as_deref())
                         }
@@ -599,8 +607,7 @@ fn start_vmess_listener(
                         )
                         .and_then(|client| server.handle_tls_client(client)),
                         _ => server.handle_tls_client(client),
-                    }
-                })
+                    })
             } else if network == "ws" {
                 server.handle_websocket_client(stream, websocket_path.as_deref())
             } else if network == "httpupgrade" {
@@ -816,6 +823,7 @@ fn start_anytls_listener(
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
+    tls_failures: ClientFailureBackoff,
 ) -> Result<ListenerHandle, CoreServiceError> {
     let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
         CoreServiceError::Bind {
@@ -867,9 +875,10 @@ fn start_anytls_listener(
         move |stream| {
             let server = server.clone();
             let tls_acceptor = tls_acceptor.clone();
+            let tls_failures = tls_failures.clone();
             let tag = tag.clone();
             let result = if let Some(acceptor) = tls_acceptor {
-                accept_tls_connection(&acceptor, stream, Protocol::AnyTls, &tag)
+                accept_tls_connection(&acceptor, stream, Protocol::AnyTls, &tag, &tls_failures)
                     .and_then(local_bridge_for_tls)
                     .and_then(|stream| server.handle_tcp_client(stream))
             } else {
@@ -910,12 +919,31 @@ fn accept_tls_connection(
     stream: TcpStream,
     protocol: Protocol,
     tag: &str,
+    failures: &ClientFailureBackoff,
 ) -> io::Result<TlsConnection> {
+    let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
+    if let Some(ip) = peer_ip {
+        if failures.is_blocked(ip) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tls handshake backoff active",
+            ));
+        }
+    }
     match acceptor.accept(stream) {
-        Ok(client) => Ok(client),
+        Ok(client) => {
+            if let Some(ip) = peer_ip {
+                failures.record_success(ip);
+            }
+            Ok(client)
+        }
         Err(error) => {
             let class = classify_tls_handshake_error(&error);
             if !matches!(class, TlsHandshakeErrorClass::ClientClosed) {
+                if let Some(ip) = peer_ip {
+                    failures.record_failure(ip);
+                }
                 eprintln!(
                     "WARN  tls    handshake failed protocol={protocol:?} tag={tag} class={class:?} error={error}"
                 );
@@ -1042,6 +1070,7 @@ fn start_trojan_listener(
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
+    tls_failures: ClientFailureBackoff,
 ) -> Result<ListenerHandle, CoreServiceError> {
     let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
         CoreServiceError::Bind {
@@ -1112,10 +1141,11 @@ fn start_trojan_listener(
             let websocket_path = websocket_path.clone();
             let httpupgrade_host = httpupgrade_host.clone();
             let tls_acceptor = tls_acceptor.clone();
+            let tls_failures = tls_failures.clone();
             let tag = tag.clone();
             let result = if let Some(acceptor) = tls_acceptor {
-                accept_tls_connection(&acceptor, stream, Protocol::Trojan, &tag).and_then(
-                    |client| match network.as_str() {
+                accept_tls_connection(&acceptor, stream, Protocol::Trojan, &tag, &tls_failures)
+                    .and_then(|client| match network.as_str() {
                         "ws" => {
                             server.handle_tls_websocket_client(client, websocket_path.as_deref())
                         }
@@ -1126,8 +1156,7 @@ fn start_trojan_listener(
                         )
                         .and_then(|client| server.handle_tls_client(client)),
                         _ => server.handle_tls_client(client),
-                    },
-                )
+                    })
             } else if network == "ws" {
                 server.handle_websocket_client(stream, websocket_path.as_deref())
             } else if network == "httpupgrade" {
@@ -1163,6 +1192,7 @@ fn start_vless_listener(
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
+    tls_failures: ClientFailureBackoff,
 ) -> Result<ListenerHandle, CoreServiceError> {
     let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
         CoreServiceError::Bind {
@@ -1268,10 +1298,11 @@ fn start_vless_listener(
             let websocket_path = websocket_path.clone();
             let httpupgrade_host = httpupgrade_host.clone();
             let tls_acceptor = tls_acceptor.clone();
+            let tls_failures = tls_failures.clone();
             let tag = tag.clone();
             let result = if let Some(acceptor) = tls_acceptor {
-                accept_tls_connection(&acceptor, stream, Protocol::Vless, &tag).and_then(|client| {
-                    match network.as_str() {
+                accept_tls_connection(&acceptor, stream, Protocol::Vless, &tag, &tls_failures)
+                    .and_then(|client| match network.as_str() {
                         "ws" => {
                             server.handle_tls_websocket_client(client, websocket_path.as_deref())
                         }
@@ -1282,8 +1313,7 @@ fn start_vless_listener(
                         )
                         .and_then(|client| server.handle_tls_client(client)),
                         _ => server.handle_tls_client(client),
-                    }
-                })
+                    })
             } else if network == "ws" {
                 server.handle_websocket_client(stream, websocket_path.as_deref())
             } else if network == "httpupgrade" {
@@ -2421,6 +2451,7 @@ mod tests {
     use crate::grpc::{decode_hunk_message, encode_grpc_hunk, take_grpc_message};
     use crate::protocol::Protocol;
     use crate::service::CoreService;
+    use crate::tls::TlsAcceptor;
     use crate::user::{CoreUser, CoreUserDelta};
 
     use super::reality_tls_acceptor;
@@ -3382,6 +3413,39 @@ mod tests {
             key_path,
             cert_der: cert.cert.der().clone(),
         }
+    }
+
+    #[test]
+    fn tls_handshake_backoff_rejects_blocked_peer_before_handshake() {
+        let cert = test_cert("tls-backoff");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind tls listener");
+        let addr = listener.local_addr().expect("local addr");
+        let _client = TcpStream::connect(addr).expect("connect tls listener");
+        let (server, peer) = listener.accept().expect("accept tls peer");
+        let failures =
+            crate::abuse::ClientFailureBackoff::new(crate::abuse::ClientFailureBackoffPolicy {
+                threshold: 1,
+                window: Duration::from_secs(30),
+                block_duration: Duration::from_secs(30),
+                max_entries: 16,
+            });
+        failures.record_failure(peer.ip());
+
+        let error = match super::accept_tls_connection(
+            &acceptor,
+            server,
+            Protocol::Vless,
+            "tls-backoff-test",
+            &failures,
+        ) {
+            Ok(_) => panic!("blocked peer should fail before TLS handshake"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("backoff"));
     }
 
     #[test]

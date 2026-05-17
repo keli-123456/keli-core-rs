@@ -1,3 +1,4 @@
+pub mod abuse;
 pub mod anytls;
 pub mod bench;
 pub mod config;
@@ -53,6 +54,7 @@ pub(crate) mod test_support {
     }
 }
 
+pub use abuse::{ClientFailureBackoff, ClientFailureBackoffPolicy};
 pub use anytls::{AnyTlsServer, AnyTlsServerConfig};
 pub use config::{
     CoreConfig, InboundConfig, OutboundConfig, RealityConfig, RouteAction, RouteRule,
