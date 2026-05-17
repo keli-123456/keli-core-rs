@@ -62,6 +62,9 @@ const HY2_AUTH_TIMEOUT_SECS_ENV: &str = "KELI_CORE_HY2_AUTH_TIMEOUT_SECS";
 const DEFAULT_HY2_AUTH_TIMEOUT_SECS: u64 = 5;
 const HY2_RELAY_IO_TIMEOUT_SECS_ENV: &str = "KELI_CORE_HY2_RELAY_IO_TIMEOUT_SECS";
 const DEFAULT_HY2_RELAY_IO_TIMEOUT_SECS: u64 = 15;
+const HY2_SOFTWARE_BANDWIDTH_LIMIT_MAX_MBPS_ENV: &str =
+    "KELI_CORE_HY2_SOFTWARE_BANDWIDTH_LIMIT_MAX_MBPS";
+const DEFAULT_HY2_SOFTWARE_BANDWIDTH_LIMIT_MAX_MBPS: u32 = 200;
 const QUIC_ENDPOINT_STOP_WAIT: Duration = Duration::from_secs(3);
 static HY2_ACTIVE_UDP_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 static HY2_UDP_SESSION_LIMIT: OnceLock<usize> = OnceLock::new();
@@ -818,12 +821,14 @@ impl Hysteria2Server {
             download.push(limiter);
         }
         if !self.config.ignore_client_bandwidth {
-            if let Some(server_down_bps) = mbps_to_bytes_per_second(self.config.down_mbps) {
+            if let Some(server_down_bps) = enforced_hy2_bandwidth_bps(self.config.down_mbps) {
                 upload.push(Arc::new(BandwidthLimiter::new(server_down_bps)));
             }
-            let server_up_bps = mbps_to_bytes_per_second(self.config.up_mbps);
-            if let Some(download_bps) = min_nonzero(server_up_bps, client_rx_bps) {
-                download.push(Arc::new(BandwidthLimiter::new(download_bps)));
+            let server_up_bps = enforced_hy2_bandwidth_bps(self.config.up_mbps);
+            if server_up_bps.is_some() {
+                if let Some(download_bps) = min_nonzero(server_up_bps, client_rx_bps) {
+                    download.push(Arc::new(BandwidthLimiter::new(download_bps)));
+                }
             }
         }
         DirectionalLimiters {
@@ -1494,6 +1499,21 @@ fn mbps_to_bytes_per_second(mbps: u32) -> Option<u64> {
             .saturating_div(8)
             .max(1),
     )
+}
+
+fn enforced_hy2_bandwidth_bps(mbps: u32) -> Option<u64> {
+    if mbps == 0 || mbps > hy2_software_bandwidth_limit_max_mbps() {
+        return None;
+    }
+    mbps_to_bytes_per_second(mbps)
+}
+
+fn hy2_software_bandwidth_limit_max_mbps() -> u32 {
+    env::var(HY2_SOFTWARE_BANDWIDTH_LIMIT_MAX_MBPS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .map(|value| value.min(10_000))
+        .unwrap_or(DEFAULT_HY2_SOFTWARE_BANDWIDTH_LIMIT_MAX_MBPS)
 }
 
 fn min_nonzero(left: Option<u64>, right: Option<u64>) -> Option<u64> {
@@ -2367,6 +2387,77 @@ mod tests {
         assert_eq!(limits.revoke.len(), 1);
         assert!(limits.upload.is_empty());
         assert!(limits.download.is_empty());
+    }
+
+    #[test]
+    fn high_hysteria2_bandwidth_hint_does_not_force_software_limiters() {
+        let cert = test_cert("hy2-high-bandwidth-fast-path");
+        let server = server_with_bandwidth(
+            &cert,
+            "127.0.0.1:0".parse().expect("addr"),
+            1000,
+            1000,
+            false,
+        );
+        let user = user();
+
+        let limits = server.connection_limiters(
+            server.bandwidth.limiter_for(Some(&user)),
+            server.bandwidth.limiter_for_limited(Some(&user)),
+            Some(mbps_to_bytes_per_second(1000).expect("client rx")),
+        );
+
+        assert_eq!(limits.revoke.len(), 1);
+        assert!(
+            limits.upload.is_empty(),
+            "1000 Mbps HY2 bandwidth should stay a congestion hint, not force per-packet limiter"
+        );
+        assert!(
+            limits.download.is_empty(),
+            "1000 Mbps HY2 bandwidth should stay a congestion hint, not force per-packet limiter"
+        );
+    }
+
+    #[test]
+    fn low_hysteria2_bandwidth_still_uses_software_limiters() {
+        let cert = test_cert("hy2-low-bandwidth-limiter");
+        let server =
+            server_with_bandwidth(&cert, "127.0.0.1:0".parse().expect("addr"), 100, 80, false);
+        let user = user();
+
+        let limits = server.connection_limiters(
+            server.bandwidth.limiter_for(Some(&user)),
+            server.bandwidth.limiter_for_limited(Some(&user)),
+            Some(mbps_to_bytes_per_second(60).expect("client rx")),
+        );
+
+        assert_eq!(limits.revoke.len(), 1);
+        assert_eq!(limits.upload.len(), 1);
+        assert_eq!(limits.download.len(), 1);
+    }
+
+    #[test]
+    fn user_speed_limit_still_applies_when_hysteria2_bandwidth_hint_is_high() {
+        let cert = test_cert("hy2-user-speed-limit");
+        let server = server_with_bandwidth(
+            &cert,
+            "127.0.0.1:0".parse().expect("addr"),
+            1000,
+            1000,
+            false,
+        );
+        let mut user = user();
+        user.speed_limit = 1024;
+
+        let limits = server.connection_limiters(
+            server.bandwidth.limiter_for(Some(&user)),
+            server.bandwidth.limiter_for_limited(Some(&user)),
+            None,
+        );
+
+        assert_eq!(limits.revoke.len(), 1);
+        assert_eq!(limits.upload.len(), 1);
+        assert_eq!(limits.download.len(), 1);
     }
 
     #[test]
