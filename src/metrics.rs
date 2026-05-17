@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +27,8 @@ pub struct CoreMetricsSnapshot {
     pub keli_core_tcp_auth_backoff_reject_total: u64,
     pub keli_core_tcp_auth_backoff_active_ips: usize,
     pub keli_core_tcp_auth_backoff_blocked_ips: usize,
+    #[serde(default)]
+    pub keli_core_connection_error_total: BTreeMap<String, u64>,
     pub keli_core_dns: DnsMetricsSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keli_core_quic_resource: Option<QuicResourceSnapshot>,
@@ -79,6 +82,7 @@ impl CoreMetrics {
             snapshot.keli_core_tcp_auth_backoff_active_ips = tcp_auth.active_ips;
             snapshot.keli_core_tcp_auth_backoff_blocked_ips = tcp_auth.blocked_ips;
         }
+        snapshot.keli_core_connection_error_total = connection_error_metrics_snapshot();
         snapshot
     }
 
@@ -167,10 +171,51 @@ fn is_current_revision_missing(message: &str) -> bool {
     message.contains("current <missing>") || message.contains("full snapshot required")
 }
 
+pub fn record_connection_error(protocol: &'static str, scope: &'static str, reason: &'static str) {
+    let key = connection_error_key(protocol, scope, reason);
+    let mut metrics = connection_error_metrics()
+        .lock()
+        .expect("connection error metrics poisoned");
+    let counter = metrics.entry(key).or_default();
+    *counter = counter.saturating_add(1);
+}
+
+fn connection_error_metrics_snapshot() -> BTreeMap<String, u64> {
+    connection_error_metrics()
+        .lock()
+        .expect("connection error metrics poisoned")
+        .clone()
+}
+
+fn connection_error_metrics() -> &'static Mutex<BTreeMap<String, u64>> {
+    static METRICS: OnceLock<Mutex<BTreeMap<String, u64>>> = OnceLock::new();
+    METRICS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn connection_error_key(protocol: &str, scope: &str, reason: &str) -> String {
+    format!(
+        "{}.{}.{}",
+        sanitize_connection_error_part(protocol),
+        sanitize_connection_error_part(scope),
+        sanitize_connection_error_part(reason)
+    )
+}
+
+fn sanitize_connection_error_part(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | '0'..='9' | '_' | '-' => ch,
+            'A'..='Z' => ch.to_ascii_lowercase(),
+            _ => '_',
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::abuse::ClientFailureBackoffSnapshot;
-    use crate::metrics::CoreMetrics;
+    use crate::metrics::{record_connection_error, CoreMetrics};
     use crate::quic_resources::QuicResourceSnapshot;
 
     #[test]
@@ -278,5 +323,21 @@ mod tests {
         let snapshot = metrics.snapshot_with_runtime_metrics(None, None, None);
 
         assert_eq!(snapshot.keli_core_dns, dns);
+    }
+
+    #[test]
+    fn snapshots_include_connection_error_metrics_without_dynamic_labels() {
+        let metrics = CoreMetrics::default();
+
+        record_connection_error("VLESS", "tcp relay", "upstream timeout");
+
+        let snapshot = metrics.snapshot_with_runtime_metrics(None, None, None);
+        assert_eq!(
+            snapshot.keli_core_connection_error_total["vless.tcp_relay.upstream_timeout"],
+            1
+        );
+        assert!(!snapshot
+            .keli_core_connection_error_total
+            .contains_key("user-a"));
     }
 }

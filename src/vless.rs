@@ -148,7 +148,15 @@ impl VlessServer {
         bind_dual_stack_tcp_listener(self.config.listen)
     }
 
-    pub fn handle_tcp_client(&self, mut client: TcpStream) -> io::Result<()> {
+    pub fn handle_tcp_client(&self, client: TcpStream) -> io::Result<()> {
+        let result = self.handle_tcp_client_inner(client);
+        if let Err(error) = &result {
+            record_vless_connection_error("tcp", error);
+        }
+        result
+    }
+
+    fn handle_tcp_client_inner(&self, mut client: TcpStream) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let mut request = match self.read_request(&mut client) {
             Ok(request) => request,
@@ -215,7 +223,15 @@ impl VlessServer {
         self.relay(client, remote, request, bandwidth)
     }
 
-    pub async fn handle_tcp_client_async(
+    pub async fn handle_tcp_client_async(&self, client: tokio::net::TcpStream) -> io::Result<()> {
+        let result = self.handle_tcp_client_async_inner(client).await;
+        if let Err(error) = &result {
+            record_vless_connection_error("tcp", error);
+        }
+        result
+    }
+
+    async fn handle_tcp_client_async_inner(
         &self,
         mut client: tokio::net::TcpStream,
     ) -> io::Result<()> {
@@ -1140,6 +1156,56 @@ fn sync_delta_bandwidth(
     delta: &CoreUserDelta,
 ) {
     sync_user_limit_delta(bandwidth, sessions, delta);
+}
+
+fn record_vless_connection_error(scope: &'static str, error: &io::Error) {
+    crate::metrics::record_connection_error("vless", scope, classify_vless_connection_error(error));
+}
+
+fn classify_vless_connection_error(error: &io::Error) -> &'static str {
+    let text = error.to_string();
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        if text.contains("target blocked by route") {
+            return "route_blocked";
+        }
+        if text.contains("private ip blocked") {
+            return "dns_private_blocked";
+        }
+        if text.contains("unknown vless user")
+            || text.contains("not allowed")
+            || text.contains("requires xtls-rprx-vision")
+            || text.contains("device limit")
+            || text.contains("session limit")
+        {
+            return "auth_failed";
+        }
+        return "permission_denied";
+    }
+    if error.kind() == io::ErrorKind::TimedOut || text.contains("timed out") {
+        return "upstream_timeout";
+    }
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::AddrNotAvailable
+    ) {
+        return "upstream_connect_failed";
+    }
+    if matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::UnexpectedEof
+    ) {
+        return "client_closed";
+    }
+    if error.kind() == io::ErrorKind::Unsupported {
+        return "unsupported";
+    }
+    if error.kind() == io::ErrorKind::InvalidData {
+        return "invalid_request";
+    }
+    "error"
 }
 
 impl VlessUdpRelayState {
@@ -2849,7 +2915,7 @@ fn hex_digit(value: u8) -> char {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::{Cursor, Read, Write};
+    use std::io::{self, Cursor, Read, Write};
     use std::net::{TcpListener, TcpStream, UdpSocket};
     use std::path::PathBuf;
     use std::sync::mpsc;
@@ -2915,6 +2981,38 @@ mod tests {
             speed_limit: 0,
             device_limit: 0,
         }
+    }
+
+    #[test]
+    fn classifies_vless_connection_errors_with_low_cardinality_reasons() {
+        assert_eq!(
+            super::classify_vless_connection_error(&io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unknown vless user",
+            )),
+            "auth_failed"
+        );
+        assert_eq!(
+            super::classify_vless_connection_error(&io::Error::new(
+                io::ErrorKind::TimedOut,
+                "tcp connect timed out",
+            )),
+            "upstream_timeout"
+        );
+        assert_eq!(
+            super::classify_vless_connection_error(&io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private ip blocked by dns guard",
+            )),
+            "dns_private_blocked"
+        );
+        assert_eq!(
+            super::classify_vless_connection_error(&io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "Connection reset by peer",
+            )),
+            "client_closed"
+        );
     }
 
     fn server() -> VlessServer {

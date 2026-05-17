@@ -1895,6 +1895,7 @@ impl Hysteria2AuthBackoffEntry {
 fn log_hysteria2_error(scope: &'static str, error: &io::Error) {
     let text = error.to_string();
     let class = classify_hysteria2_error_text(error, &text);
+    crate::metrics::record_connection_error("hysteria2", scope, class.label());
     if class == Hysteria2ErrorClass::ExpectedClose {
         return;
     }
