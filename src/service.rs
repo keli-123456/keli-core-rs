@@ -4629,6 +4629,59 @@ mod tests {
     }
 
     #[test]
+    fn naive_h3_listener_handles_repeated_client_reconnects() {
+        let cert = test_cert("naive-h3-reconnect");
+        let greeting = GreetingServer::start(b"r");
+        let mut config = config(free_port());
+        config.inbounds[0].tag = "panel|naive-h3|1".to_string();
+        config.inbounds[0].protocol = Protocol::Naive;
+        config.inbounds[0].transport = TransportConfig {
+            network: "quic".to_string(),
+            ..TransportConfig::default()
+        };
+        config.inbounds[0].tls = Some(TlsConfig {
+            server_name: "localhost".to_string(),
+            cert_file: Some(cert.cert_path.to_string_lossy().to_string()),
+            key_file: Some(cert.key_path.to_string_lossy().to_string()),
+            alpn: vec!["h3".to_string()],
+            reject_unknown_sni: false,
+            reality: None,
+        });
+        let mut service = CoreService::start(config).expect("service start");
+        let server_addr = service.listeners()[0].local_addr;
+        thread::sleep(Duration::from_millis(50));
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        for _ in 0..5 {
+            let output = runtime
+                .block_on(naive_h3_connect_round_trip(
+                    server_addr,
+                    cert.cert_der.clone(),
+                    greeting.addr,
+                    "user-a",
+                    "user-a",
+                ))
+                .expect("naive h3 reconnect");
+            assert_eq!(output, b"r");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut traffic = Vec::new();
+        for _ in 0..50 {
+            traffic = service.drain_traffic(1);
+            if !traffic.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(traffic.len(), 1);
+        assert_eq!(traffic[0].user_id, Some(1));
+        assert_eq!(traffic[0].upload, 0);
+        assert_eq!(traffic[0].download, 5);
+        service.stop();
+    }
+
+    #[test]
     fn starts_http_listener_from_core_config() {
         let mut config = config(free_port());
         config.inbounds[0].tag = "panel|http|1".to_string();
