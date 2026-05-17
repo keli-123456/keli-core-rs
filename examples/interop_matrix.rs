@@ -445,8 +445,8 @@ fn run() -> Result<()> {
                     ));
                 }
                 Err(error) => {
+                    let error = format!("{error}\ncore diagnostics:\n{}", core.log_diagnostics());
                     println!("FAIL {} {}: {error}", client.label(), case.name);
-                    let error = error.to_string();
                     reports.push(case_report(
                         client.label(),
                         &case.name,
