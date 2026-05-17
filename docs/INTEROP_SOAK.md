@@ -313,6 +313,7 @@ Short soak / repeated probe runs:
 
 ```bash
 cargo run --example interop_matrix -- --client naive --naive /path/to/naive --only naive-h2-tls --probe-rounds 120 --probe-interval-ms 1000 --keep
+cargo run --example interop_matrix -- --client naive --naive /path/to/naive --only naive-h2-tls --probe-rounds 120 --probe-interval-ms 1000 --naive-restart-every-rounds 30 --keep
 cargo run --example interop_matrix -- --sing-box /path/to/sing-box --only hy2 --probe-rounds 120 --probe-interval-ms 1000 --keep
 ```
 
@@ -344,6 +345,17 @@ result: 120 / 120 probe rounds passed, 1 passed, 0 skipped, 0 failed
 duration: 62347 ms
 certificate handling: localhost test certificate was temporarily trusted in the CurrentUser Root store and removed after the run
 artifact summary: runtime/interop-matrix/interop-summary.json
+```
+
+Latest official NaiveProxy reconnect sample:
+
+```text
+client: naiveproxy-v148.0.7778.96-5-win-x64
+case: naive-h2-tls
+command: cargo run --release --example interop_matrix -- --core target\release\keli-core-rs.exe --client naive --naive tools\naiveproxy\naiveproxy-v148.0.7778.96-5-win-x64\naive.exe --only naive --tls-cert runtime\interop-certs\naive-local.crt --tls-key runtime\interop-certs\naive-local.key --probe-rounds 30 --probe-interval-ms 200 --naive-restart-every-rounds 10 --keep
+result: 30 / 30 probe rounds passed, with official NaiveProxy restarted before rounds 11 and 21
+summary: 1 passed, 0 skipped, 0 failed
+certificate handling: localhost test certificate was temporarily trusted in the CurrentUser Root store and removed after the run
 ```
 
 Both clients use a deterministic local TLS destination fixture for REALITY.

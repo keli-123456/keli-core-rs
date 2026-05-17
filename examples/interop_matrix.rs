@@ -80,6 +80,7 @@ struct Args {
     clients: Vec<ClientKind>,
     probe_rounds: usize,
     probe_interval: Duration,
+    naive_restart_every_rounds: Option<usize>,
     keep: bool,
 }
 
@@ -494,6 +495,7 @@ fn write_matrix_summary(
         "failed": failed,
         "probe_rounds": args.probe_rounds,
         "probe_interval_ms": args.probe_interval.as_millis(),
+        "naive_restart_every_rounds": args.naive_restart_every_rounds,
         "clients": args.clients.iter().map(|client| client.label()).collect::<Vec<_>>(),
         "only": args.only,
         "cases": reports,
@@ -529,6 +531,10 @@ fn parse_args() -> Result<Args> {
             .transpose()?
             .unwrap_or(0),
     );
+    let mut naive_restart_every_rounds = env::var("KELI_INTEROP_NAIVE_RESTART_EVERY_ROUNDS")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?;
     let mut keep = false;
 
     let mut iter = env::args().skip(1);
@@ -608,6 +614,13 @@ fn parse_args() -> Result<Args> {
                         .parse::<u64>()?,
                 );
             }
+            "--naive-restart-every-rounds" => {
+                naive_restart_every_rounds = Some(
+                    iter.next()
+                        .ok_or("--naive-restart-every-rounds requires a value")?
+                        .parse::<usize>()?,
+                );
+            }
             "--keep" => keep = true,
             "--help" | "-h" => {
                 print_help();
@@ -630,6 +643,9 @@ fn parse_args() -> Result<Args> {
     if probe_rounds == 0 {
         return Err("--probe-rounds must be greater than 0".into());
     }
+    if naive_restart_every_rounds == Some(0) {
+        return Err("--naive-restart-every-rounds must be greater than 0".into());
+    }
 
     Ok(Args {
         core,
@@ -645,13 +661,14 @@ fn parse_args() -> Result<Args> {
         clients,
         probe_rounds,
         probe_interval,
+        naive_restart_every_rounds,
         keep,
     })
 }
 
 fn print_help() {
     println!(
-        "Usage: cargo run --example interop_matrix -- --core <keli-core-rs> --sing-box <sing-box> [--mihomo <mihomo>] [--naive <naive>] [--client sing-box|mihomo|naive|both|all] [--tls-cert <cert.pem> --tls-key <key.pem>] [--naive-server-name <name>] [--only hy2] [--probe-rounds 30] [--probe-interval-ms 1000] [--keep]"
+        "Usage: cargo run --example interop_matrix -- --core <keli-core-rs> --sing-box <sing-box> [--mihomo <mihomo>] [--naive <naive>] [--client sing-box|mihomo|naive|both|all] [--tls-cert <cert.pem> --tls-key <key.pem>] [--naive-server-name <name>] [--only hy2] [--probe-rounds 30] [--probe-interval-ms 1000] [--naive-restart-every-rounds N] [--keep]"
     );
     println!("Runs local real-client interop against temporary keli-core-rs listeners.");
 }
@@ -1784,6 +1801,40 @@ fn run_naive_proxy_case(
         .ok_or("naive client selected without a binary path")?;
     let config_path = args.work_dir.join(format!("{}.naive.json", case.name));
     write_naive_proxy_config(&config_path, proxy, socks_port)?;
+    let mut naive = start_naive_proxy_process(naive_path, &config_path, case, args, socks_port)?;
+
+    for round in 0..args.probe_rounds {
+        if round > 0
+            && args
+                .naive_restart_every_rounds
+                .is_some_and(|every| round % every == 0)
+        {
+            drop(naive);
+            println!(
+                "restarting official NaiveProxy before probe round {}",
+                round + 1
+            );
+            naive = start_naive_proxy_process(naive_path, &config_path, case, args, socks_port)?;
+        }
+        naive.fail_if_exited()?;
+        run_probes_with_retry(socks_port, &case.probes, tcp_echo, udp_echo)?;
+        if args.probe_rounds > 1 {
+            println!("probe round {}/{} passed", round + 1, args.probe_rounds);
+        }
+        if round + 1 < args.probe_rounds && !args.probe_interval.is_zero() {
+            thread::sleep(args.probe_interval);
+        }
+    }
+    Ok(CaseOutcome::Passed)
+}
+
+fn start_naive_proxy_process(
+    naive_path: &Path,
+    config_path: &Path,
+    case: &InteropCase,
+    args: &Args,
+    socks_port: u16,
+) -> Result<ProcessGuard> {
     let mut naive_args = vec![config_path.display().to_string()];
     if let Some(host) = case.naive_resolve_host.as_ref() {
         naive_args.push(format!("--host-resolver-rules=MAP {host} 127.0.0.1"));
@@ -1796,9 +1847,7 @@ fn run_naive_proxy_case(
     )?;
     wait_for_tcp(("127.0.0.1", socks_port), Duration::from_secs(8))?;
     naive.fail_if_exited()?;
-
-    run_probe_rounds(socks_port, &case.probes, tcp_echo, udp_echo, args)?;
-    Ok(CaseOutcome::Passed)
+    Ok(naive)
 }
 
 fn run_probe_rounds(
@@ -2263,6 +2312,7 @@ mod tests {
             clients: vec![ClientKind::NaiveProxy],
             probe_rounds: 3,
             probe_interval: Duration::from_millis(250),
+            naive_restart_every_rounds: Some(2),
             keep: true,
         };
         let reports = vec![case_report(
@@ -2279,6 +2329,7 @@ mod tests {
         let body = fs::read_to_string(&path).expect("read summary");
         assert!(body.contains("\"probe_rounds\": 3"));
         assert!(body.contains("\"probe_interval_ms\": 250"));
+        assert!(body.contains("\"naive_restart_every_rounds\": 2"));
         assert!(!body.contains("interop-password"));
         assert!(!body.contains("https://"));
 
