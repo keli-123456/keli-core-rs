@@ -317,6 +317,25 @@ cargo run --example interop_matrix -- --client naive --naive /path/to/naive --on
 cargo run --example interop_matrix -- --sing-box /path/to/sing-box --only hy2 --probe-rounds 120 --probe-interval-ms 1000 --keep
 ```
 
+Linux official NaiveProxy soak helper:
+
+```bash
+# 30 minute smoke, one probe per second.
+bash scripts/naive_official_soak_linux.sh --rounds 1800 --interval-ms 1000
+
+# Reconnect soak: restart the official NaiveProxy client every 5 minutes.
+bash scripts/naive_official_soak_linux.sh --rounds 1800 --interval-ms 1000 --restart-every-rounds 300
+
+# Weak-network loopback soak. This applies tc netem to lo and removes it on exit.
+bash scripts/naive_official_soak_linux.sh --rounds 1800 --interval-ms 1000 --restart-every-rounds 300 --netem "delay 80ms 20ms loss 1%"
+```
+
+The Linux helper downloads the pinned official NaiveProxy release when `--naive` is omitted,
+generates a one-day local test certificate, installs it into the system trust store, runs the
+interop matrix, and removes the certificate on exit. When `--netem` is set, it also installs and
+removes the selected `tc netem` qdisc. Use it only on a disposable test host because `tc` on `lo`
+affects other loopback traffic while the soak is running.
+
 The sing-box client verifies TCP forwarding for SOCKS, HTTP proxy, Shadowsocks, VLESS, VLESS
 REALITY Vision, VMess, Trojan, AnyTLS, Hysteria2, and TUIC combinations, plus UDP relay through
 Shadowsocks, Hysteria2, and TUIC.
