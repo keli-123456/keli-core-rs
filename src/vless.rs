@@ -57,6 +57,8 @@ const FLOW_XTLS_RPRX_VISION: &str = "xtls-rprx-vision";
 const MAX_UDP_PACKET_SIZE: usize = 65_535;
 const ASYNC_TRAFFIC_FLUSH_BYTES: u64 = 4 * 1024 * 1024;
 const VLESS_TRACE_ENV: &str = "KELI_CORE_VLESS_TRACE";
+#[cfg(unix)]
+const VLESS_VISION_POLL_IDLE_ENV: &str = "KELI_CORE_VLESS_VISION_POLL_IDLE";
 
 #[derive(Clone, Debug)]
 pub struct VlessServerConfig {
@@ -2764,6 +2766,11 @@ fn relay_vision_wait_readable<S>(
 ) where
     S: TlsSocket,
 {
+    if env::var_os(VLESS_VISION_POLL_IDLE_ENV).is_none() {
+        relay_idle_sleep(idle_rounds);
+        return;
+    }
+
     let mut fds = Vec::with_capacity(2);
     if wait_client {
         fds.push(libc::pollfd {
