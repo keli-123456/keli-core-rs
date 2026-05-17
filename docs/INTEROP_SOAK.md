@@ -91,6 +91,10 @@ behavior are recorded.
 Official NaiveProxy Linux soak helper:
 
 ```bash
+# Default runs both native Naive cases: naive-h2-tls and naive-h3-quic.
+bash scripts/naive_official_soak_linux.sh --rounds 1800 --interval-ms 1000
+
+# Focused runs when narrowing a failure.
 bash scripts/naive_official_soak_linux.sh --case naive-h2-tls --rounds 1800 --interval-ms 1000
 bash scripts/naive_official_soak_linux.sh --case naive-h3-quic --rounds 1800 --interval-ms 1000
 bash scripts/naive_official_soak_linux.sh --case naive-h3-quic --rounds 600 --restart-every-rounds 50 --netem "delay 80ms 20ms loss 1%"

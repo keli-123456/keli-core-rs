@@ -6,7 +6,7 @@ ROUNDS="${KELI_NAIVE_SOAK_ROUNDS:-1800}"
 INTERVAL_MS="${KELI_NAIVE_SOAK_INTERVAL_MS:-1000}"
 RESTART_EVERY="${KELI_NAIVE_RESTART_EVERY_ROUNDS:-0}"
 SERVER_NAME="${KELI_NAIVE_SOAK_SERVER_NAME:-naive.local.test}"
-CASE="${KELI_NAIVE_SOAK_CASE:-naive-h2-tls}"
+CASE="${KELI_NAIVE_SOAK_CASE:-naive}"
 NETEM_IFACE="${KELI_NAIVE_NETEM_IFACE:-lo}"
 NETEM_ARGS="${KELI_NAIVE_NETEM_ARGS:-}"
 CORE_BIN="${KELI_CORE_BIN:-}"
@@ -27,7 +27,7 @@ Options:
   --interval-ms N                delay between rounds (default: ${INTERVAL_MS})
   --restart-every-rounds N       restart official NaiveProxy every N rounds (default: disabled)
   --server-name NAME             certificate SAN / SNI name (default: ${SERVER_NAME})
-  --case NAME                    interop case substring (default: ${CASE}; use naive-h3-quic for QUIC)
+  --case NAME                    interop case substring (default: ${CASE}; use naive-h3-quic for QUIC only)
   --netem "ARGS"                 optional tc netem args, for example: "delay 80ms 20ms loss 1%"
   --netem-iface IFACE            interface for netem (default: ${NETEM_IFACE})
   --skip-build                   do not run cargo build --release --locked
