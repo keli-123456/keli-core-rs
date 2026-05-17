@@ -525,6 +525,14 @@ impl TlsSocket for PrefixedTcpStream {
         PrefixedTcpStream::peer_addr(self)
     }
 
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.socket.set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.socket.set_write_timeout(timeout)
+    }
+
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         PrefixedTcpStream::set_nonblocking(self, nonblocking)
     }

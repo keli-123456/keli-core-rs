@@ -958,7 +958,7 @@ fn accept_tls_connection(
             ));
         }
     }
-    match acceptor.accept(stream) {
+    match acceptor.accept_with_timeout(stream, outbound_connect_timeout()) {
         Ok(client) => {
             if let Some(ip) = peer_ip {
                 failures.record_success(ip);
@@ -1840,6 +1840,9 @@ fn start_vless_reality_listener(
             if trace {
                 eprintln!("keli-core-rs reality trace: accepted peer={peer}");
             }
+            let handshake_timeout = outbound_connect_timeout();
+            let _ = stream.set_read_timeout(Some(handshake_timeout));
+            let _ = stream.set_write_timeout(Some(handshake_timeout));
             let result = handle_reality_preface(stream, &gateway);
             match result {
                 Ok(RealityGatewayResult::Authenticated(authenticated)) => {
@@ -1863,7 +1866,9 @@ fn start_vless_reality_listener(
                             return;
                         }
                     };
-                    let client = match acceptor.accept_stream(authenticated.stream) {
+                    let client = match acceptor
+                        .accept_stream_with_timeout(authenticated.stream, handshake_timeout)
+                    {
                         Ok(client) => {
                             if trace {
                                 eprintln!("keli-core-rs reality trace: tls accepted peer={peer}");

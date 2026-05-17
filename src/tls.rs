@@ -28,6 +28,8 @@ pub struct TlsAcceptor {
 
 pub trait TlsSocket: Read + Write {
     fn peer_addr(&self) -> io::Result<SocketAddr>;
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()>;
     fn shutdown(&self, how: Shutdown) -> io::Result<()>;
 }
@@ -35,6 +37,14 @@ pub trait TlsSocket: Read + Write {
 impl TlsSocket for TcpStream {
     fn peer_addr(&self) -> io::Result<SocketAddr> {
         TcpStream::peer_addr(self)
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
     }
 
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
@@ -113,6 +123,29 @@ impl TlsAcceptor {
         self.accept_stream(socket)
     }
 
+    pub fn accept_with_timeout(
+        &self,
+        socket: TcpStream,
+        timeout: Duration,
+    ) -> io::Result<TlsConnection> {
+        self.accept_stream_with_timeout(socket, timeout)
+    }
+
+    pub fn accept_stream_with_timeout<S>(
+        &self,
+        socket: S,
+        timeout: Duration,
+    ) -> io::Result<TlsConnection<S>>
+    where
+        S: TlsSocket,
+    {
+        let _ = socket.set_read_timeout(Some(timeout));
+        let _ = socket.set_write_timeout(Some(timeout));
+        let connection = self.accept_stream(socket)?;
+        let _ = connection.set_io_timeout(None);
+        Ok(connection)
+    }
+
     pub fn accept_stream<S>(&self, socket: S) -> io::Result<TlsConnection<S>>
     where
         S: TlsSocket,
@@ -143,6 +176,11 @@ where
 
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         self.socket.set_nonblocking(nonblocking)
+    }
+
+    pub fn set_io_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.socket.set_read_timeout(timeout)?;
+        self.socket.set_write_timeout(timeout)
     }
 
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {

@@ -157,6 +157,8 @@ impl VlessServer {
     }
 
     fn handle_tcp_client_inner(&self, mut client: TcpStream) -> io::Result<()> {
+        let _ = client.set_read_timeout(Some(self.config.connect_timeout));
+        let _ = client.set_write_timeout(Some(self.config.connect_timeout));
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let mut request = match self.read_request(&mut client) {
             Ok(request) => request,
@@ -165,6 +167,8 @@ impl VlessServer {
                 return Err(error);
             }
         };
+        let _ = client.set_read_timeout(None);
+        let _ = client.set_write_timeout(None);
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
@@ -393,8 +397,10 @@ impl VlessServer {
     where
         S: TlsSocket + Send + 'static,
     {
+        let _ = client.set_io_timeout(Some(self.config.connect_timeout));
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let mut request = self.read_request(&mut client)?;
+        let _ = client.set_io_timeout(None);
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
