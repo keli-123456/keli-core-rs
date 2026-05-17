@@ -99,6 +99,10 @@ bash scripts/naive_official_soak_linux.sh --case naive-h3-quic --rounds 600 --re
 The helper installs a short-lived local CA certificate for the official client and removes it on
 exit. On Windows, the official client still requires the test certificate to be trusted by the OS;
 without that trust the `quic://` probe can close before returning HTTP response headers.
+The generated `runtime/interop-matrix/interop-summary.json` includes per-case probe telemetry:
+round count, probe count, retry attempts, planned client restarts, and p50/p95/p99/max probe
+latency. Treat a rising retry count or p99 over a long H3/weak-network run as a signal to inspect
+the kept core/client logs before enabling Naive on real users.
 
 Local Windows loopback baseline after the bounded `Bytes` H2 bridge change:
 

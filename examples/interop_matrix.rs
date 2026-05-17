@@ -386,7 +386,7 @@ fn run() -> Result<()> {
         for (index, case) in cases.iter().enumerate() {
             let started = Instant::now();
             match run_case(*client, index, case, &args, tcp_echo.addr, udp_echo.addr) {
-                Ok(CaseOutcome::Passed) => {
+                Ok(CaseOutcome::Passed(summary)) => {
                     passed += 1;
                     println!("PASS {} {}", client.label(), case.name);
                     reports.push(case_report(
@@ -395,6 +395,7 @@ fn run() -> Result<()> {
                         "passed",
                         started.elapsed(),
                         args.probe_rounds,
+                        Some(&summary),
                         None,
                     ));
                 }
@@ -407,6 +408,7 @@ fn run() -> Result<()> {
                         "skipped",
                         started.elapsed(),
                         0,
+                        None,
                         Some(&reason),
                     ));
                 }
@@ -419,6 +421,7 @@ fn run() -> Result<()> {
                         "failed",
                         started.elapsed(),
                         args.probe_rounds,
+                        None,
                         Some(&error),
                     ));
                     failed.push((format!("{} {}", client.label(), case.name), error));
@@ -469,6 +472,7 @@ fn case_report(
     status: &str,
     duration: Duration,
     probe_rounds: usize,
+    probe_summary: Option<&ProbeRunSummary>,
     error: Option<&str>,
 ) -> Value {
     json!({
@@ -477,6 +481,7 @@ fn case_report(
         "status": status,
         "duration_ms": duration.as_millis(),
         "probe_rounds": probe_rounds,
+        "probe_summary": probe_summary.map(ProbeRunSummary::to_json),
         "error": error,
     })
 }
@@ -1703,9 +1708,63 @@ fn wait_for_tcp(addr: (&str, u16), timeout: Duration) -> Result<()> {
     Err(format!("timed out waiting for {}:{}", addr.0, addr.1).into())
 }
 
+#[derive(Clone, Debug, Default)]
+struct ProbeRunSummary {
+    rounds: usize,
+    probes: usize,
+    retry_attempts: usize,
+    restarts: usize,
+    latencies_ms: Vec<u128>,
+}
+
+impl ProbeRunSummary {
+    fn record_round(&mut self, result: ProbeRoundResult, probes: usize) {
+        self.rounds += 1;
+        self.probes += probes;
+        self.retry_attempts += result.retry_attempts;
+        self.latencies_ms.push(result.elapsed.as_millis());
+    }
+
+    fn record_restart(&mut self) {
+        self.restarts += 1;
+    }
+
+    fn to_json(&self) -> Value {
+        let mut latencies = self.latencies_ms.clone();
+        latencies.sort_unstable();
+        json!({
+            "rounds": self.rounds,
+            "probes": self.probes,
+            "retry_attempts": self.retry_attempts,
+            "restarts": self.restarts,
+            "latency_ms": {
+                "p50": percentile(&latencies, 50),
+                "p95": percentile(&latencies, 95),
+                "p99": percentile(&latencies, 99),
+                "max": latencies.last().copied().unwrap_or(0),
+            }
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProbeRoundResult {
+    retry_attempts: usize,
+    elapsed: Duration,
+}
+
 enum CaseOutcome {
-    Passed,
+    Passed(ProbeRunSummary),
     Skipped(String),
+}
+
+fn percentile(sorted: &[u128], pct: usize) -> u128 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let pct = pct.min(100);
+    let rank = ((sorted.len() - 1) * pct + 99) / 100;
+    sorted[rank]
 }
 
 fn run_case(
@@ -1759,8 +1818,8 @@ fn run_sing_box_case(
     wait_for_tcp(("127.0.0.1", socks_port), Duration::from_secs(8))?;
     sing_box.fail_if_exited()?;
 
-    run_probe_rounds(socks_port, &case.probes, tcp_echo, udp_echo, args)?;
-    Ok(CaseOutcome::Passed)
+    let summary = run_probe_rounds(socks_port, &case.probes, tcp_echo, udp_echo, args)?;
+    Ok(CaseOutcome::Passed(summary))
 }
 
 fn run_mihomo_case(
@@ -1802,8 +1861,8 @@ fn run_mihomo_case(
     wait_for_tcp(("127.0.0.1", socks_port), Duration::from_secs(8))?;
     mihomo.fail_if_exited()?;
 
-    run_probe_rounds(socks_port, &case.probes, tcp_echo, udp_echo, args)?;
-    Ok(CaseOutcome::Passed)
+    let summary = run_probe_rounds(socks_port, &case.probes, tcp_echo, udp_echo, args)?;
+    Ok(CaseOutcome::Passed(summary))
 }
 
 fn run_naive_proxy_case(
@@ -1831,6 +1890,7 @@ fn run_naive_proxy_case(
     write_naive_proxy_config(&config_path, proxy, socks_port)?;
     let mut naive = start_naive_proxy_process(naive_path, &config_path, case, args, socks_port)?;
 
+    let mut summary = ProbeRunSummary::default();
     for round in 0..args.probe_rounds {
         if round > 0
             && args
@@ -1838,6 +1898,7 @@ fn run_naive_proxy_case(
                 .is_some_and(|every| round % every == 0)
         {
             drop(naive);
+            summary.record_restart();
             println!(
                 "restarting official NaiveProxy before probe round {}",
                 round + 1
@@ -1845,15 +1906,22 @@ fn run_naive_proxy_case(
             naive = start_naive_proxy_process(naive_path, &config_path, case, args, socks_port)?;
         }
         naive.fail_if_exited()?;
-        run_probes_with_retry(socks_port, &case.probes, tcp_echo, udp_echo)?;
+        let result = run_probes_with_retry(socks_port, &case.probes, tcp_echo, udp_echo)?;
+        summary.record_round(result, case.probes.len());
         if args.probe_rounds > 1 {
-            println!("probe round {}/{} passed", round + 1, args.probe_rounds);
+            println!(
+                "probe round {}/{} passed latency_ms={} retries={}",
+                round + 1,
+                args.probe_rounds,
+                result.elapsed.as_millis(),
+                result.retry_attempts
+            );
         }
         if round + 1 < args.probe_rounds && !args.probe_interval.is_zero() {
             thread::sleep(args.probe_interval);
         }
     }
-    Ok(CaseOutcome::Passed)
+    Ok(CaseOutcome::Passed(summary))
 }
 
 fn start_naive_proxy_process(
@@ -1884,17 +1952,25 @@ fn run_probe_rounds(
     tcp_echo: SocketAddr,
     udp_echo: SocketAddr,
     args: &Args,
-) -> Result<()> {
+) -> Result<ProbeRunSummary> {
+    let mut summary = ProbeRunSummary::default();
     for round in 0..args.probe_rounds {
-        run_probes_with_retry(socks_port, probes, tcp_echo, udp_echo)?;
+        let result = run_probes_with_retry(socks_port, probes, tcp_echo, udp_echo)?;
+        summary.record_round(result, probes.len());
         if args.probe_rounds > 1 {
-            println!("probe round {}/{} passed", round + 1, args.probe_rounds);
+            println!(
+                "probe round {}/{} passed latency_ms={} retries={}",
+                round + 1,
+                args.probe_rounds,
+                result.elapsed.as_millis(),
+                result.retry_attempts
+            );
         }
         if round + 1 < args.probe_rounds && !args.probe_interval.is_zero() {
             thread::sleep(args.probe_interval);
         }
     }
-    Ok(())
+    Ok(summary)
 }
 
 fn run_probes_with_retry(
@@ -1902,13 +1978,21 @@ fn run_probes_with_retry(
     probes: &[Probe],
     tcp_echo: SocketAddr,
     udp_echo: SocketAddr,
-) -> Result<()> {
+) -> Result<ProbeRoundResult> {
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut last_error = None;
+    let started = Instant::now();
+    let mut retry_attempts = 0usize;
     while Instant::now() < deadline {
         match run_probes(socks_port, probes, tcp_echo, udp_echo) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                return Ok(ProbeRoundResult {
+                    retry_attempts,
+                    elapsed: started.elapsed(),
+                });
+            }
             Err(error) => {
+                retry_attempts += 1;
                 last_error = Some(error.to_string());
                 thread::sleep(Duration::from_millis(250));
             }
@@ -2367,6 +2451,13 @@ mod tests {
             "passed",
             Duration::from_millis(12),
             3,
+            Some(&ProbeRunSummary {
+                rounds: 3,
+                probes: 3,
+                retry_attempts: 1,
+                restarts: 1,
+                latencies_ms: vec![2, 4, 8],
+            }),
             None,
         )];
 
@@ -2376,6 +2467,9 @@ mod tests {
         assert!(body.contains("\"probe_rounds\": 3"));
         assert!(body.contains("\"probe_interval_ms\": 250"));
         assert!(body.contains("\"naive_restart_every_rounds\": 2"));
+        assert!(body.contains("\"retry_attempts\": 1"));
+        assert!(body.contains("\"restarts\": 1"));
+        assert!(body.contains("\"p95\": 8"));
         assert!(!body.contains("interop-password"));
         assert!(!body.contains("https://"));
 
