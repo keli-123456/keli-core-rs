@@ -39,6 +39,7 @@ use crate::vmess::{connect_vmess_tcp_outbound, VmessServer, VmessServerConfig};
 const BENCH_USER_UUID: &str = "11111111-1111-1111-1111-111111111111";
 const BENCH_USER_BYTES: [u8; 16] = [0x11; 16];
 const HY2_PASSWORD: &str = "hy2-password";
+const HY2_TCP_REQUEST_ID: u64 = 0x401;
 const TUIC_PASSWORD: &str = "tuic-password";
 const BENCH_HY2_PASSWORD_ENV: &str = "KELI_CORE_BENCH_HY2_PASSWORD";
 const TUIC_VERSION: u8 = 0x05;
@@ -5086,7 +5087,7 @@ fn bench_hy2_password() -> String {
 
 fn hy2_tcp_request(target: SocketAddr) -> Vec<u8> {
     let address = format_socket_addr(&target);
-    let mut request = Vec::new();
+    let mut request = encode_hy2_varint(HY2_TCP_REQUEST_ID).expect("request id");
     request.extend_from_slice(&encode_hy2_varint(address.len() as u64).expect("address length"));
     request.extend_from_slice(address.as_bytes());
     request.extend_from_slice(&encode_hy2_varint(0).expect("padding length"));

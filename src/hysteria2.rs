@@ -32,6 +32,7 @@ use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::{connect_tcp_outbound_tokio, send_udp_outbound_tokio};
 
+const TCP_REQUEST_ID: u64 = 0x401;
 const RESPONSE_OK: u8 = 0x00;
 const RESPONSE_ERROR: u8 = 0x01;
 const UDP_DATAGRAM_BUFFER_SIZE: usize = 1024 * 1024;
@@ -1309,7 +1310,15 @@ where
 }
 
 async fn read_tcp_target(stream: &mut quinn::RecvStream) -> io::Result<SocksTarget> {
-    let address_len = read_varint(stream).await?;
+    let first = read_varint(stream).await?;
+    // Xray-style Hysteria wraps TCP streams with a 0x401 frame marker before
+    // the protocol-level request. Official/native clients may send the
+    // request body directly, so accept both forms.
+    let address_len = if first == TCP_REQUEST_ID {
+        read_varint(stream).await?
+    } else {
+        first
+    };
     if address_len == 0 || address_len > 4096 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2582,6 +2591,12 @@ mod tests {
         request
     }
 
+    fn tcp_request_with_frame(addr: SocketAddr) -> Vec<u8> {
+        let mut request = encode_varint(TCP_REQUEST_ID).expect("request id");
+        request.extend_from_slice(&tcp_request(addr));
+        request
+    }
+
     fn udp_request(session_id: u32, packet_id: u16, addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
         encode_udp_datagram(
             session_id,
@@ -2802,7 +2817,7 @@ mod tests {
             authenticate(&connection).await;
 
             let (mut send, mut recv) = connection.open_bi().await.expect("connect stream");
-            send.write_all(&tcp_request(echo_addr))
+            send.write_all(&tcp_request_with_frame(echo_addr))
                 .await
                 .expect("tcp request");
             let mut status = [0u8; 1];
