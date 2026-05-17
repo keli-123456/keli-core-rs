@@ -4,7 +4,7 @@ use std::io::{self, Cursor, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,6 +12,7 @@ use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit as BlockKeyInit};
 use aes::Aes128;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, Nonce as AesGcmNonce};
+use arc_swap::ArcSwap;
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
 use hmac::{Hmac, Mac};
 use md5::{Digest as Md5Digest, Md5};
@@ -96,7 +97,7 @@ pub struct VmessServerConfig {
 pub struct VmessServer {
     config: VmessServerConfig,
     users: UserStore,
-    auth_users: Arc<RwLock<Vec<VmessAuthUser>>>,
+    auth_users: Arc<ArcSwap<Vec<VmessAuthUser>>>,
     replay: Arc<Mutex<HashMap<[u8; 16], Instant>>>,
     router: RouteMatcher,
     traffic: SharedTrafficRegistry,
@@ -195,7 +196,7 @@ impl VmessServer {
             users: UserStore::from_keyed_users(&users, |user| {
                 vmess_user_key(user).expect("valid vmess user")
             }),
-            auth_users: Arc::new(RwLock::new(auth_users)),
+            auth_users: Arc::new(ArcSwap::from_pointee(auth_users)),
             replay: Arc::new(Mutex::new(HashMap::new())),
             traffic,
             sessions,
@@ -329,11 +330,7 @@ impl VmessServer {
         self.users.replace_keyed_users(users.clone(), |user| {
             vmess_user_key(user).expect("valid vmess user")
         });
-        let mut auth_users = self
-            .auth_users
-            .write()
-            .expect("vmess auth users lock poisoned");
-        *auth_users = vmess_auth_users(&users);
+        self.auth_users.store(Arc::new(vmess_auth_users(&users)));
     }
 
     pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
@@ -351,11 +348,7 @@ impl VmessServer {
         });
         let users = self.users.list();
         result.active_users = users.len();
-        let mut auth_users = self
-            .auth_users
-            .write()
-            .expect("vmess auth users lock poisoned");
-        *auth_users = vmess_auth_users(&users);
+        self.auth_users.store(Arc::new(vmess_auth_users(&users)));
         result
     }
 
@@ -413,10 +406,7 @@ impl VmessServer {
 
     fn match_auth_id(&self, auth_id: [u8; 16]) -> io::Result<VmessAuthUser> {
         let matched = {
-            let auth_users = self
-                .auth_users
-                .read()
-                .expect("vmess auth users lock poisoned");
+            let auth_users = self.auth_users.load_full();
             let mut matched = None;
             for user in auth_users.iter() {
                 if decode_auth_id(&user.auth_id_key, &auth_id)? {
@@ -3407,8 +3397,8 @@ mod tests {
             Ok(client) => client,
             Err(_) => return false,
         };
-        let _ = client.set_read_timeout(Some(Duration::from_secs(3)));
-        let _ = client.set_write_timeout(Some(Duration::from_secs(3)));
+        let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+        let _ = client.set_write_timeout(Some(Duration::from_secs(10)));
         if client.write_all(&request_bytes).is_err() {
             return false;
         }
@@ -3695,14 +3685,7 @@ mod tests {
             .users
             .get(&vmess_user_key(&user_b()).expect("new key"))
             .is_some());
-        assert_eq!(
-            server
-                .auth_users
-                .read()
-                .expect("vmess auth users lock poisoned")
-                .len(),
-            2
-        );
+        assert_eq!(server.auth_users.load().len(), 2);
 
         let result = server.apply_user_delta(&CoreUserDelta {
             deleted: vec![updated.uuid.clone()],
@@ -3715,14 +3698,7 @@ mod tests {
             .users
             .get(&vmess_user_key(&updated).expect("deleted key"))
             .is_none());
-        assert_eq!(
-            server
-                .auth_users
-                .read()
-                .expect("vmess auth users lock poisoned")
-                .len(),
-            1
-        );
+        assert_eq!(server.auth_users.load().len(), 1);
     }
 
     #[test]

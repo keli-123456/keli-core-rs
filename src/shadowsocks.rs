@@ -4,11 +4,12 @@ use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce as AesNonce};
+use arc_swap::ArcSwap;
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
 use hkdf::Hkdf;
 use md5::{Digest as Md5Digest, Md5};
@@ -54,7 +55,8 @@ pub struct ShadowsocksServerConfig {
 #[derive(Clone, Debug)]
 pub struct ShadowsocksServer {
     config: ShadowsocksServerConfig,
-    users: Arc<RwLock<Vec<CoreUser>>>,
+    users: Arc<ArcSwap<Vec<CoreUser>>>,
+    user_updates: Arc<Mutex<()>>,
     router: RouteMatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
@@ -144,7 +146,8 @@ impl ShadowsocksServer {
         Self {
             router,
             config,
-            users: Arc::new(RwLock::new(users)),
+            users: Arc::new(ArcSwap::from_pointee(users)),
+            user_updates: Arc::new(Mutex::new(())),
             traffic,
             sessions,
             bandwidth,
@@ -198,21 +201,27 @@ impl ShadowsocksServer {
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
         self.bandwidth.sync_users(&users);
-        let mut current = self.users.write().expect("shadowsocks users lock poisoned");
-        *current = active_user_list(&users);
+        let _guard = self
+            .user_updates
+            .lock()
+            .expect("shadowsocks users write lock poisoned");
+        self.users.store(Arc::new(active_user_list(&users)));
     }
 
     pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
         sync_delta_bandwidth(&self.bandwidth, &self.sessions, delta);
-        let mut current = self.users.write().expect("shadowsocks users lock poisoned");
-        apply_user_delta_to_vec(&mut current, delta)
+        let _guard = self
+            .user_updates
+            .lock()
+            .expect("shadowsocks users write lock poisoned");
+        let mut current = self.users.load_full().as_ref().clone();
+        let result = apply_user_delta_to_vec(&mut current, delta);
+        self.users.store(Arc::new(current));
+        result
     }
 
     fn active_users(&self) -> Vec<CoreUser> {
-        self.users
-            .read()
-            .expect("shadowsocks users lock poisoned")
-            .clone()
+        self.users.load_full().as_ref().clone()
     }
 
     pub fn serve_udp(&self, udp: UdpSocket, stop: Arc<AtomicBool>) -> io::Result<()> {

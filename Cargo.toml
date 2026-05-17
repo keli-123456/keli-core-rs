@@ -1,6 +1,6 @@
 [package]
 name = "keli-core-rs"
-version = "0.1.42"
+version = "0.1.43"
 edition = "2021"
 rust-version = "1.74"
 license = "MPL-2.0"
@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 aes = "0.8"
 aes-gcm = "0.10"
+arc-swap = "1"
 base64 = "0.22"
 blake2 = "0.10"
 bytes = "1"

@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use quinn::crypto::rustls::QuicServerConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -58,7 +59,8 @@ pub struct TuicServerConfig {
 #[derive(Clone, Debug)]
 pub struct TuicServer {
     config: TuicServerConfig,
-    users: Arc<RwLock<HashMap<[u8; 16], CoreUser>>>,
+    users: Arc<ArcSwap<HashMap<[u8; 16], CoreUser>>>,
+    user_updates: Arc<Mutex<()>>,
     router: RouteMatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
@@ -105,7 +107,8 @@ impl TuicServer {
         Self {
             router,
             config,
-            users: Arc::new(RwLock::new(users)),
+            users: Arc::new(ArcSwap::from_pointee(users)),
+            user_updates: Arc::new(Mutex::new(())),
             traffic,
             sessions,
             bandwidth,
@@ -183,24 +186,29 @@ impl TuicServer {
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
         self.bandwidth.sync_users(&users);
-        let mut current = self.users.write().expect("tuic users lock poisoned");
-        *current = tuic_user_map(&users);
+        let _guard = self
+            .user_updates
+            .lock()
+            .expect("tuic users write lock poisoned");
+        self.users.store(Arc::new(tuic_user_map(&users)));
     }
 
     pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
         sync_delta_bandwidth(&self.bandwidth, &self.sessions, delta);
-        let mut current = self.users.write().expect("tuic users lock poisoned");
-        apply_user_delta_to_keyed_map(&mut current, delta, |user| {
+        let _guard = self
+            .user_updates
+            .lock()
+            .expect("tuic users write lock poisoned");
+        let mut current = self.users.load_full().as_ref().clone();
+        let result = apply_user_delta_to_keyed_map(&mut current, delta, |user| {
             parse_uuid_bytes(&user.uuid).ok()
-        })
+        });
+        self.users.store(Arc::new(current));
+        result
     }
 
     fn user_for_uuid(&self, uuid: &[u8; 16]) -> Option<CoreUser> {
-        self.users
-            .read()
-            .expect("tuic users lock poisoned")
-            .get(uuid)
-            .cloned()
+        self.users.load().get(uuid).cloned()
     }
 
     async fn handle_incoming(&self, incoming: quinn::Incoming) -> io::Result<()> {

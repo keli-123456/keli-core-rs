@@ -522,7 +522,7 @@ mod tests {
     use crate::config::{OutboundConfig, RouteAction, RouteRule};
     use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 
-    use super::{matches_geosite_domain, matches_geosite_rule};
+    use super::{matches_geoip_rule, matches_geosite_domain, matches_geosite_rule};
 
     #[test]
     fn matches_exact_and_suffix_block_rules() {
@@ -646,6 +646,19 @@ mod tests {
             matcher.decide_target("example.com", 443, "tcp,http"),
             RouteDecision::Direct
         );
+    }
+
+    #[test]
+    fn geoip_private_covers_local_ipv4_and_ipv6_ranges() {
+        assert!(matches_geoip_rule("10.1.2.3".parse().unwrap(), "private"));
+        assert!(matches_geoip_rule(
+            "192.168.1.10".parse().unwrap(),
+            "private"
+        ));
+        assert!(matches_geoip_rule("127.0.0.1".parse().unwrap(), "private"));
+        assert!(matches_geoip_rule("fc00::1".parse().unwrap(), "private"));
+        assert!(matches_geoip_rule("fe80::1".parse().unwrap(), "private"));
+        assert!(!matches_geoip_rule("8.8.8.8".parse().unwrap(), "private"));
     }
 
     #[test]

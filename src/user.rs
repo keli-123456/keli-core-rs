@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,9 +56,10 @@ impl CoreUser {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
 pub struct UserStore {
-    users: Arc<RwLock<UserStoreState>>,
+    users: Arc<ArcSwap<UserStoreState>>,
+    writes: Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -67,6 +69,10 @@ struct UserStoreState {
 }
 
 impl UserStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn from_uuid_users(users: &[CoreUser]) -> Self {
         Self::from_keyed_users(users, |user| user.uuid.clone())
     }
@@ -76,7 +82,8 @@ impl UserStore {
         F: Fn(&CoreUser) -> String,
     {
         Self {
-            users: Arc::new(RwLock::new(keyed_user_state(users, key))),
+            users: Arc::new(ArcSwap::from_pointee(keyed_user_state(users, key))),
+            writes: Arc::new(Mutex::new(())),
         }
     }
 
@@ -89,31 +96,21 @@ impl UserStore {
         F: Fn(&CoreUser) -> String,
     {
         let next = keyed_user_state(&users, key);
-        let mut current = self.users.write().expect("user store lock poisoned");
-        *current = next;
+        let _guard = self.writes.lock().expect("user store write lock poisoned");
+        self.users.store(Arc::new(next));
     }
 
     pub fn is_empty(&self) -> bool {
-        self.users
-            .read()
-            .expect("user store lock poisoned")
-            .users
-            .is_empty()
+        self.users.load().users.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.users
-            .read()
-            .expect("user store lock poisoned")
-            .users
-            .len()
+        self.users.load().users.len()
     }
 
     pub fn list(&self) -> Vec<CoreUser> {
-        let mut users = self
-            .users
-            .read()
-            .expect("user store lock poisoned")
+        let snapshot = self.users.load_full();
+        let mut users = snapshot
             .users
             .values()
             .map(|user| user.as_ref().clone())
@@ -127,12 +124,7 @@ impl UserStore {
     }
 
     pub fn get_arc(&self, uuid: &str) -> Option<Arc<CoreUser>> {
-        self.users
-            .read()
-            .expect("user store lock poisoned")
-            .users
-            .get(uuid)
-            .cloned()
+        self.users.load().users.get(uuid).cloned()
     }
 
     pub fn apply_uuid_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
@@ -144,17 +136,20 @@ impl UserStore {
         F: Fn(&CoreUser) -> String,
     {
         if let Some(full) = delta.full.as_ref() {
-            let mut current = self.users.write().expect("user store lock poisoned");
-            *current = keyed_user_state(full, key);
+            let _guard = self.writes.lock().expect("user store write lock poisoned");
+            let next = keyed_user_state(full, key);
+            let active_users = next.users.len();
+            self.users.store(Arc::new(next));
             return CoreUserDeltaResult {
-                active_users: current.users.len(),
+                active_users,
                 full_applied: true,
                 ..CoreUserDeltaResult::default()
             };
         }
 
         let mut result = CoreUserDeltaResult::default();
-        let mut current = self.users.write().expect("user store lock poisoned");
+        let _guard = self.writes.lock().expect("user store write lock poisoned");
+        let mut current = self.users.load_full().as_ref().clone();
         for user in &delta.added {
             if user.is_empty() {
                 continue;
@@ -194,7 +189,26 @@ impl UserStore {
             }
         }
         result.active_users = current.users.len();
+        self.users.store(Arc::new(current));
         result
+    }
+}
+
+impl Default for UserStore {
+    fn default() -> Self {
+        Self {
+            users: Arc::new(ArcSwap::from_pointee(UserStoreState::default())),
+            writes: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
+impl std::fmt::Debug for UserStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UserStore")
+            .field("len", &self.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -421,6 +435,7 @@ mod tests {
     #[test]
     fn user_store_applies_uuid_delta() {
         let store = UserStore::from_uuid_users(&[user("user-a"), user("user-b")]);
+        let old_user_b = store.get_arc("user-b").expect("old user b snapshot");
         let result = store.apply_uuid_delta(&CoreUserDelta {
             added: vec![user("user-c")],
             updated: vec![limited_user("user-b", 1024)],
@@ -435,6 +450,10 @@ mod tests {
         assert!(store.get("user-a").is_none());
         assert_eq!(store.get("user-b").expect("user b").speed_limit, 1024);
         assert!(store.get("user-c").is_some());
+        assert_eq!(
+            old_user_b.speed_limit, 0,
+            "existing readers keep a stable pre-delta snapshot"
+        );
     }
 
     #[test]

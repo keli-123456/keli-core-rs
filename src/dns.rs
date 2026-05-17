@@ -10,15 +10,25 @@ use crate::routing::route_targets_match;
 
 static DNS_CONFIG: OnceLock<RwLock<DnsConfig>> = OnceLock::new();
 static DNS_QUERY_ID: AtomicU16 = AtomicU16::new(1);
+static DNS_POSITIVE_CACHE: OnceLock<Mutex<HashMap<DnsCacheKey, DnsPositiveCacheEntry>>> =
+    OnceLock::new();
 static DNS_NEGATIVE_CACHE: OnceLock<Mutex<HashMap<DnsCacheKey, DnsNegativeCacheEntry>>> =
     OnceLock::new();
+const DNS_POSITIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const DNS_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(15);
+const DNS_POSITIVE_CACHE_MAX_ENTRIES: usize = 8192;
 const DNS_NEGATIVE_CACHE_MAX_ENTRIES: usize = 4096;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct DnsCacheKey {
     host: String,
     port: u16,
+}
+
+#[derive(Clone, Debug)]
+struct DnsPositiveCacheEntry {
+    expires_at: Instant,
+    addrs: Vec<SocketAddr>,
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +41,7 @@ struct DnsNegativeCacheEntry {
 pub fn configure(config: DnsConfig) {
     let lock = DNS_CONFIG.get_or_init(|| RwLock::new(DnsConfig::default()));
     *lock.write().expect("dns config lock poisoned") = config;
+    clear_positive_cache();
     clear_negative_cache();
 }
 
@@ -163,6 +174,9 @@ pub fn resolve_socket_addrs(
         host: host.to_ascii_lowercase(),
         port,
     };
+    if let Some(addrs) = cached_positive_addrs(&cache_key) {
+        return Ok(addrs);
+    }
     if let Some(error) = cached_negative_error(&cache_key) {
         return Err(error);
     }
@@ -204,12 +218,20 @@ pub fn resolve_socket_addrs(
     match result {
         Ok(addrs) => {
             remove_negative_cache_entry(&cache_key);
+            record_positive_cache(&cache_key, &addrs);
             Ok(addrs)
         }
         Err(error) => {
+            remove_positive_cache_entry(&cache_key);
             record_negative_cache(&cache_key, &error);
             Err(error)
         }
+    }
+}
+
+fn clear_positive_cache() {
+    if let Some(cache) = DNS_POSITIVE_CACHE.get() {
+        cache.lock().expect("dns positive cache poisoned").clear();
     }
 }
 
@@ -219,8 +241,27 @@ fn clear_negative_cache() {
     }
 }
 
+fn positive_cache() -> &'static Mutex<HashMap<DnsCacheKey, DnsPositiveCacheEntry>> {
+    DNS_POSITIVE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn negative_cache() -> &'static Mutex<HashMap<DnsCacheKey, DnsNegativeCacheEntry>> {
     DNS_NEGATIVE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_positive_addrs(key: &DnsCacheKey) -> Option<Vec<SocketAddr>> {
+    let now = Instant::now();
+    let mut cache = positive_cache()
+        .lock()
+        .expect("dns positive cache poisoned");
+    let Some(entry) = cache.get(key) else {
+        return None;
+    };
+    if now >= entry.expires_at {
+        cache.remove(key);
+        return None;
+    }
+    Some(entry.addrs.clone())
 }
 
 fn cached_negative_error(key: &DnsCacheKey) -> Option<io::Error> {
@@ -236,6 +277,31 @@ fn cached_negative_error(key: &DnsCacheKey) -> Option<io::Error> {
         return None;
     }
     Some(io::Error::new(entry.kind, entry.message.clone()))
+}
+
+fn record_positive_cache(key: &DnsCacheKey, addrs: &[SocketAddr]) {
+    if addrs.is_empty() {
+        return;
+    }
+    let mut cache = positive_cache()
+        .lock()
+        .expect("dns positive cache poisoned");
+    if cache.len() >= DNS_POSITIVE_CACHE_MAX_ENTRIES {
+        let now = Instant::now();
+        cache.retain(|_, entry| entry.expires_at > now);
+        if cache.len() >= DNS_POSITIVE_CACHE_MAX_ENTRIES {
+            if let Some(first) = cache.keys().next().cloned() {
+                cache.remove(&first);
+            }
+        }
+    }
+    cache.insert(
+        key.clone(),
+        DnsPositiveCacheEntry {
+            expires_at: Instant::now() + DNS_POSITIVE_CACHE_TTL,
+            addrs: addrs.to_vec(),
+        },
+    );
 }
 
 fn record_negative_cache(key: &DnsCacheKey, error: &io::Error) {
@@ -259,6 +325,15 @@ fn record_negative_cache(key: &DnsCacheKey, error: &io::Error) {
             message: error.to_string(),
         },
     );
+}
+
+fn remove_positive_cache_entry(key: &DnsCacheKey) {
+    if let Some(cache) = DNS_POSITIVE_CACHE.get() {
+        cache
+            .lock()
+            .expect("dns positive cache poisoned")
+            .remove(key);
+    }
 }
 
 fn remove_negative_cache_entry(key: &DnsCacheKey) {
@@ -706,5 +781,23 @@ mod tests {
 
         configure(DnsConfig::default());
         assert!(cached_negative_error(&key).is_none());
+    }
+
+    #[test]
+    fn positive_dns_cache_reuses_recent_answers_and_clears_on_configure() {
+        let key = DnsCacheKey {
+            host: "cached.example.test".to_string(),
+            port: 443,
+        };
+        let addrs = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 443),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 443),
+        ];
+        record_positive_cache(&key, &addrs);
+
+        assert_eq!(cached_positive_addrs(&key), Some(addrs));
+
+        configure(DnsConfig::default());
+        assert!(cached_positive_addrs(&key).is_none());
     }
 }

@@ -4,9 +4,10 @@ use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use md5::Md5;
 use sha2::{Digest, Sha256};
 
@@ -58,7 +59,8 @@ pub struct AnyTlsServerConfig {
 #[derive(Clone, Debug)]
 pub struct AnyTlsServer {
     config: AnyTlsServerConfig,
-    users: Arc<RwLock<HashMap<[u8; 32], CoreUser>>>,
+    users: Arc<ArcSwap<HashMap<[u8; 32], CoreUser>>>,
+    user_updates: Arc<Mutex<()>>,
     router: RouteMatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
@@ -164,7 +166,8 @@ impl AnyTlsServer {
         Self {
             router,
             config,
-            users: Arc::new(RwLock::new(users)),
+            users: Arc::new(ArcSwap::from_pointee(users)),
+            user_updates: Arc::new(Mutex::new(())),
             traffic,
             sessions,
             bandwidth,
@@ -223,22 +226,29 @@ impl AnyTlsServer {
 
     pub fn replace_users(&self, users: Vec<CoreUser>) {
         self.bandwidth.sync_users(&users);
-        let mut current = self.users.write().expect("anytls users lock poisoned");
-        *current = anytls_user_map(&users);
+        let _guard = self
+            .user_updates
+            .lock()
+            .expect("anytls users write lock poisoned");
+        self.users.store(Arc::new(anytls_user_map(&users)));
     }
 
     pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
         sync_delta_bandwidth(&self.bandwidth, &self.sessions, delta);
-        let mut current = self.users.write().expect("anytls users lock poisoned");
-        apply_user_delta_to_keyed_map(&mut current, delta, |user| Some(sha256(user.credential())))
+        let _guard = self
+            .user_updates
+            .lock()
+            .expect("anytls users write lock poisoned");
+        let mut current = self.users.load_full().as_ref().clone();
+        let result = apply_user_delta_to_keyed_map(&mut current, delta, |user| {
+            Some(sha256(user.credential()))
+        });
+        self.users.store(Arc::new(current));
+        result
     }
 
     fn user_for_password_hash(&self, password_hash: &[u8; 32]) -> Option<CoreUser> {
-        self.users
-            .read()
-            .expect("anytls users lock poisoned")
-            .get(password_hash)
-            .cloned()
+        self.users.load().get(password_hash).cloned()
     }
 
     fn read_auth(&self, client: &mut TcpStream) -> io::Result<CoreUser> {
