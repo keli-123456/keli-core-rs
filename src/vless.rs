@@ -2790,7 +2790,7 @@ fn relay_vision_wait_readable<S>(
         return;
     }
 
-    let timeout_ms = relay_idle_timeout_ms(idle_rounds);
+    let timeout_ms = relay_poll_idle_timeout_ms(idle_rounds);
     let _ = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
 }
 
@@ -2808,11 +2808,21 @@ fn relay_vision_wait_readable<S>(
 }
 
 fn relay_idle_sleep(idle_rounds: &mut u8) {
-    let timeout_ms = relay_idle_timeout_ms(idle_rounds);
+    let timeout_ms = relay_sleep_idle_timeout_ms(idle_rounds);
     thread::sleep(Duration::from_millis(timeout_ms as u64));
 }
 
-fn relay_idle_timeout_ms(idle_rounds: &mut u8) -> i32 {
+fn relay_sleep_idle_timeout_ms(idle_rounds: &mut u8) -> i32 {
+    const BACKOFF_MS: [i32; 5] = [1, 2, 4, 8, 16];
+    let idx = usize::from((*idle_rounds).min((BACKOFF_MS.len() - 1) as u8));
+    *idle_rounds = idle_rounds
+        .saturating_add(1)
+        .min((BACKOFF_MS.len() - 1) as u8);
+    BACKOFF_MS[idx]
+}
+
+#[cfg(unix)]
+fn relay_poll_idle_timeout_ms(idle_rounds: &mut u8) -> i32 {
     const BACKOFF_MS: [i32; 7] = [1, 2, 4, 8, 16, 64, 250];
     let idx = usize::from((*idle_rounds).min((BACKOFF_MS.len() - 1) as u8));
     *idle_rounds = idle_rounds
