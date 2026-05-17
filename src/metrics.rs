@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::abuse::ClientFailureBackoffSnapshot;
 use crate::quic_resources::QuicResourceSnapshot;
 
 const USER_DELTA_DURATION_BUCKETS_MS: [u64; 10] = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000];
@@ -16,6 +17,14 @@ pub struct CoreMetricsSnapshot {
     pub keli_core_user_delta_current_revision_missing_total: u64,
     pub keli_core_user_delta_apply_duration_ms: CoreDurationMetrics,
     pub keli_core_user_delta_active_users: BTreeMap<String, usize>,
+    pub keli_core_tls_handshake_failure_total: u64,
+    pub keli_core_tls_handshake_backoff_reject_total: u64,
+    pub keli_core_tls_handshake_backoff_active_ips: usize,
+    pub keli_core_tls_handshake_backoff_blocked_ips: usize,
+    pub keli_core_tcp_auth_failure_total: u64,
+    pub keli_core_tcp_auth_backoff_reject_total: u64,
+    pub keli_core_tcp_auth_backoff_active_ips: usize,
+    pub keli_core_tcp_auth_backoff_blocked_ips: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keli_core_quic_resource: Option<QuicResourceSnapshot>,
 }
@@ -43,8 +52,30 @@ impl CoreMetrics {
         &self,
         quic_resource: Option<QuicResourceSnapshot>,
     ) -> CoreMetricsSnapshot {
+        self.snapshot_with_runtime_metrics(quic_resource, None, None)
+    }
+
+    pub fn snapshot_with_runtime_metrics(
+        &self,
+        quic_resource: Option<QuicResourceSnapshot>,
+        tls_handshake: Option<ClientFailureBackoffSnapshot>,
+        tcp_auth: Option<ClientFailureBackoffSnapshot>,
+    ) -> CoreMetricsSnapshot {
         let mut snapshot = self.snapshot();
         snapshot.keli_core_quic_resource = quic_resource;
+        if let Some(tls_handshake) = tls_handshake {
+            snapshot.keli_core_tls_handshake_failure_total = tls_handshake.failure_total;
+            snapshot.keli_core_tls_handshake_backoff_reject_total =
+                tls_handshake.backoff_reject_total;
+            snapshot.keli_core_tls_handshake_backoff_active_ips = tls_handshake.active_ips;
+            snapshot.keli_core_tls_handshake_backoff_blocked_ips = tls_handshake.blocked_ips;
+        }
+        if let Some(tcp_auth) = tcp_auth {
+            snapshot.keli_core_tcp_auth_failure_total = tcp_auth.failure_total;
+            snapshot.keli_core_tcp_auth_backoff_reject_total = tcp_auth.backoff_reject_total;
+            snapshot.keli_core_tcp_auth_backoff_active_ips = tcp_auth.active_ips;
+            snapshot.keli_core_tcp_auth_backoff_blocked_ips = tcp_auth.blocked_ips;
+        }
         snapshot
     }
 
@@ -135,6 +166,7 @@ fn is_current_revision_missing(message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::abuse::ClientFailureBackoffSnapshot;
     use crate::metrics::CoreMetrics;
     use crate::quic_resources::QuicResourceSnapshot;
 
@@ -203,5 +235,35 @@ mod tests {
         assert_eq!(quic.total_limit, 4096);
         assert_eq!(quic.active_connections, 12);
         assert_eq!(quic.listener_count, 2);
+    }
+
+    #[test]
+    fn snapshots_include_abuse_backoff_metrics_without_ip_labels() {
+        let metrics = CoreMetrics::default();
+
+        let snapshot = metrics.snapshot_with_runtime_metrics(
+            None,
+            Some(ClientFailureBackoffSnapshot {
+                failure_total: 7,
+                backoff_reject_total: 2,
+                active_ips: 3,
+                blocked_ips: 1,
+            }),
+            Some(ClientFailureBackoffSnapshot {
+                failure_total: 11,
+                backoff_reject_total: 4,
+                active_ips: 5,
+                blocked_ips: 2,
+            }),
+        );
+
+        assert_eq!(snapshot.keli_core_tls_handshake_failure_total, 7);
+        assert_eq!(snapshot.keli_core_tls_handshake_backoff_reject_total, 2);
+        assert_eq!(snapshot.keli_core_tls_handshake_backoff_active_ips, 3);
+        assert_eq!(snapshot.keli_core_tls_handshake_backoff_blocked_ips, 1);
+        assert_eq!(snapshot.keli_core_tcp_auth_failure_total, 11);
+        assert_eq!(snapshot.keli_core_tcp_auth_backoff_reject_total, 4);
+        assert_eq!(snapshot.keli_core_tcp_auth_backoff_active_ips, 5);
+        assert_eq!(snapshot.keli_core_tcp_auth_backoff_blocked_ips, 2);
     }
 }

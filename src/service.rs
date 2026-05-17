@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 
-use crate::abuse::ClientFailureBackoff;
+use crate::abuse::{ClientFailureBackoff, ClientFailureBackoffSnapshot};
 use crate::anytls::{AnyTlsServer, AnyTlsServerConfig};
 use crate::config::{CoreConfig, InboundConfig, TransportConfig, ValidationError};
 use crate::grpc::{
@@ -101,6 +101,7 @@ pub struct CoreService {
     traffic: SharedTrafficRegistry,
     bandwidth: UserBandwidthLimiters,
     quic_connections: Option<SharedQuicConnectionLimiter>,
+    tls_failures: ClientFailureBackoff,
     user_revisions: HashMap<String, String>,
     stopped: bool,
 }
@@ -299,6 +300,7 @@ impl CoreService {
             traffic,
             bandwidth,
             quic_connections,
+            tls_failures,
             user_revisions: HashMap::new(),
             stopped: false,
         })
@@ -315,6 +317,14 @@ impl CoreService {
         self.quic_connections
             .as_ref()
             .map(SharedQuicConnectionLimiter::snapshot)
+    }
+
+    pub fn tls_failure_snapshot(&self) -> ClientFailureBackoffSnapshot {
+        self.tls_failures.snapshot()
+    }
+
+    pub fn tcp_auth_failure_snapshot(&self) -> ClientFailureBackoffSnapshot {
+        tcp_auth_failure_backoff().snapshot()
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<TrafficDelta> {

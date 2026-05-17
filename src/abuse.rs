@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 const TLS_FAILURE_THRESHOLD: u32 = 6;
 const TLS_FAILURE_WINDOW: Duration = Duration::from_secs(30);
@@ -15,7 +18,16 @@ const TCP_AUTH_FAILURE_MAX_ENTRIES: usize = 8192;
 #[derive(Clone, Debug)]
 pub struct ClientFailureBackoff {
     entries: Arc<Mutex<HashMap<IpAddr, ClientFailureEntry>>>,
+    metrics: Arc<ClientFailureBackoffMetrics>,
     policy: ClientFailureBackoffPolicy,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientFailureBackoffSnapshot {
+    pub failure_total: u64,
+    pub backoff_reject_total: u64,
+    pub active_ips: usize,
+    pub blocked_ips: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,10 +45,17 @@ struct ClientFailureEntry {
     blocked_until: Option<Instant>,
 }
 
+#[derive(Debug, Default)]
+struct ClientFailureBackoffMetrics {
+    failure_total: AtomicU64,
+    backoff_reject_total: AtomicU64,
+}
+
 impl ClientFailureBackoff {
     pub fn new(policy: ClientFailureBackoffPolicy) -> Self {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Arc::new(ClientFailureBackoffMetrics::default()),
             policy,
         }
     }
@@ -50,10 +69,17 @@ impl ClientFailureBackoff {
     }
 
     pub fn is_blocked(&self, ip: IpAddr) -> bool {
-        self.is_blocked_at(ip, Instant::now())
+        let blocked = self.is_blocked_at(ip, Instant::now());
+        if blocked {
+            self.metrics
+                .backoff_reject_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        blocked
     }
 
     pub fn record_failure(&self, ip: IpAddr) {
+        self.metrics.failure_total.fetch_add(1, Ordering::Relaxed);
         self.record_failure_at(ip, Instant::now());
     }
 
@@ -70,6 +96,31 @@ impl ClientFailureBackoff {
             .lock()
             .expect("client failure backoff state poisoned")
             .len()
+    }
+
+    pub fn snapshot(&self) -> ClientFailureBackoffSnapshot {
+        let now = Instant::now();
+        let entries = self
+            .entries
+            .lock()
+            .expect("client failure backoff state poisoned");
+        let mut active_ips = 0usize;
+        let mut blocked_ips = 0usize;
+        for entry in entries.values() {
+            if entry.is_expired(now, self.policy.window) {
+                continue;
+            }
+            active_ips += 1;
+            if entry.blocked_until.is_some_and(|until| now < until) {
+                blocked_ips += 1;
+            }
+        }
+        ClientFailureBackoffSnapshot {
+            failure_total: self.metrics.failure_total.load(Ordering::Relaxed),
+            backoff_reject_total: self.metrics.backoff_reject_total.load(Ordering::Relaxed),
+            active_ips,
+            blocked_ips,
+        }
     }
 
     pub(crate) fn is_blocked_at(&self, ip: IpAddr, now: Instant) -> bool {
@@ -229,5 +280,22 @@ mod tests {
         assert!(backoff.len() <= 2);
         assert!(!backoff.is_blocked_at(active, now + Duration::from_secs(27)));
         assert!(!backoff.is_blocked_at(next, now + Duration::from_secs(27)));
+    }
+
+    #[test]
+    fn snapshot_counts_public_failures_and_backoff_rejections_without_ip_labels() {
+        let backoff = ClientFailureBackoff::new(policy());
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 16));
+
+        backoff.record_failure(ip);
+        backoff.record_failure(ip);
+        backoff.record_failure(ip);
+        assert!(backoff.is_blocked(ip));
+
+        let snapshot = backoff.snapshot();
+        assert_eq!(snapshot.failure_total, 3);
+        assert_eq!(snapshot.backoff_reject_total, 1);
+        assert_eq!(snapshot.active_ips, 1);
+        assert_eq!(snapshot.blocked_ips, 1);
     }
 }
