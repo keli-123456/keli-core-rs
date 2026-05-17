@@ -180,7 +180,7 @@ impl CoreService {
         let quic_listener_count = config
             .inbounds
             .iter()
-            .filter(|inbound| is_quic_protocol(&inbound.protocol))
+            .filter(|inbound| inbound_binds_quic(inbound))
             .count();
         let quic_connections = (quic_listener_count > 0)
             .then(|| SharedQuicConnectionLimiter::for_listener_count(quic_listener_count));
@@ -2209,8 +2209,22 @@ fn connection_worker_pool() -> &'static ConnectionWorkerPool {
     CONNECTION_WORKER_POOL.get_or_init(ConnectionWorkerPool::new)
 }
 
-fn is_quic_protocol(protocol: &Protocol) -> bool {
-    matches!(protocol, Protocol::Hysteria2 | Protocol::Tuic)
+fn inbound_binds_quic(inbound: &InboundConfig) -> bool {
+    matches!(inbound.protocol, Protocol::Hysteria2 | Protocol::Tuic) || naive_uses_quic(inbound)
+}
+
+fn naive_uses_quic(inbound: &InboundConfig) -> bool {
+    inbound.protocol == Protocol::Naive
+        && (inbound
+            .transport
+            .network
+            .trim()
+            .eq_ignore_ascii_case("quic")
+            || inbound.tls.as_ref().is_some_and(|tls| {
+                tls.alpn
+                    .iter()
+                    .any(|value| value.trim().eq_ignore_ascii_case("h3"))
+            }))
 }
 
 fn connection_worker_threads() -> usize {
@@ -2577,11 +2591,11 @@ fn protocol_binds_tcp(inbound: &InboundConfig) -> bool {
             | Protocol::Shadowsocks
             | Protocol::AnyTls
             | Protocol::Mieru
-    )
+    ) || (inbound.protocol == Protocol::Naive && !naive_uses_quic(inbound))
 }
 
 fn protocol_binds_udp(inbound: &InboundConfig) -> bool {
-    matches!(inbound.protocol, Protocol::Hysteria2 | Protocol::Tuic)
+    inbound_binds_quic(inbound)
         || (inbound.protocol == Protocol::Shadowsocks
             && shadowsocks_udp_enabled(&inbound.transport))
 }
@@ -2748,6 +2762,23 @@ mod tests {
     }
 
     #[test]
+    fn listener_bind_validation_rejects_duplicate_naive_tcp_port() {
+        let inbounds = vec![
+            bind_validation_inbound("node-a|vless", Protocol::Vless, "127.0.0.1", 25005, "tcp"),
+            bind_validation_inbound("node-b|naive", Protocol::Naive, "127.0.0.1", 25005, "tcp"),
+        ];
+
+        let error = super::validate_unique_listener_binds(&inbounds)
+            .expect_err("naive h2 tcp bind should conflict with another tcp listener")
+            .to_string();
+
+        assert!(error.contains("duplicate tcp listen"));
+        assert!(error.contains("25005"));
+        assert!(error.contains("node-a|vless"));
+        assert!(error.contains("node-b|naive"));
+    }
+
+    #[test]
     fn listener_bind_validation_treats_wildcard_as_conflicting_with_explicit_ip() {
         let inbounds = vec![
             bind_validation_inbound("node-a|vless", Protocol::Vless, "0.0.0.0", 25002, "tcp"),
@@ -2804,6 +2835,47 @@ mod tests {
 
         assert!(error.contains("duplicate udp listen"));
         assert!(error.contains("25004"));
+    }
+
+    #[test]
+    fn listener_bind_validation_treats_naive_h3_as_udp() {
+        let mut naive_h3 = bind_validation_inbound(
+            "node-a|naive-h3",
+            Protocol::Naive,
+            "127.0.0.1",
+            25006,
+            "tcp",
+        );
+        naive_h3.tls = Some(TlsConfig {
+            server_name: "localhost".to_string(),
+            cert_file: Some("cert.pem".to_string()),
+            key_file: Some("key.pem".to_string()),
+            alpn: vec!["h3".to_string()],
+            reject_unknown_sni: false,
+            reality: None,
+        });
+
+        super::validate_unique_listener_binds(&[
+            bind_validation_inbound("node-b|vless", Protocol::Vless, "127.0.0.1", 25006, "tcp"),
+            naive_h3.clone(),
+        ])
+        .expect("naive h3 udp and vless tcp may share a numeric port");
+
+        let error = super::validate_unique_listener_binds(&[
+            bind_validation_inbound(
+                "node-b|hysteria2",
+                Protocol::Hysteria2,
+                "127.0.0.1",
+                25006,
+                "udp",
+            ),
+            naive_h3,
+        ])
+        .expect_err("naive h3 should conflict with another udp listener")
+        .to_string();
+
+        assert!(error.contains("duplicate udp listen"));
+        assert!(error.contains("25006"));
     }
 
     #[test]
