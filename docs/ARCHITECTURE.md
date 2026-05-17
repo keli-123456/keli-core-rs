@@ -31,7 +31,7 @@ The control boundary accepts transport-neutral commands:
 
 The control boundary also exposes `metrics`, a JSON snapshot intended for the agent or a future exporter. The current low-cardinality counters cover native user delta attempts, successes/errors, incremental versus full snapshot applies, revision mismatch/current-missing fallback signals, duration histogram buckets, and per-inbound active user counts. It deliberately does not use `user_uuid` as a metric dimension.
 
-Production control sockets must either listen on a loopback address or set `KELI_CORE_CONTROL_TOKEN`. The TCP JSON-line transport remains useful for development and agent sidecars, but the core rejects non-loopback listeners without a token so `stop`, `apply_config`, `apply_user_delta`, `drain_traffic`, and `requeue_traffic` are not accidentally exposed.
+Production control sockets must either listen on a loopback address or set `KELI_CORE_CONTROL_TOKEN`. The TCP JSON-line transport remains useful for development and local agents, but the core rejects non-loopback listeners without a token so `stop`, `apply_config`, `apply_user_delta`, `drain_traffic`, and `requeue_traffic` are not accidentally exposed.
 
 The binary also exposes a minimal process boundary:
 
@@ -44,11 +44,12 @@ The binary also exposes a minimal process boundary:
 Protocols are split by responsibility:
 
 ```text
-Core-planned:      VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC, AnyTLS, Mieru TCP, SOCKS, HTTP
-External sidecar:  Naive
+Core-planned: VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC, AnyTLS, Mieru TCP, Naive H2/TLS, SOCKS, HTTP
 ```
 
-External sidecar protocols must be handled by `keli-edge`. The Rust core should not silently accept them and produce a fake running state.
+Unsupported protocol shapes must be rejected until they have native listeners, traffic accounting,
+user delta behavior, and real-client interop coverage. The Rust core should not silently accept
+them and produce a fake running state.
 
 ## First Production Gate
 
@@ -96,6 +97,6 @@ Native DNS config is process-wide for the active core instance. It supports UDP 
 
 VLESS REALITY is still treated as a gray-stage path. The core validates REALITY config, authenticates the client ClientHello, falls back invalid clients to the configured target, mirrors the first ClientHello to the target, validates/captures the target ServerHello, generates a temporary Ed25519 certificate, embeds the REALITY certificate signature, completes the rustls server handshake over the prefixed ClientHello stream, and hands the decrypted stream to VLESS/Vision. It has deterministic local sing-box interop coverage, but it is not production-ready until the broader client matrix and soak runs cover the clients Keli expects to support.
 
-The code-level parity gate is maintained in `docs/PARITY.md`. Anything not marked as a real code path there must remain rejected or sidecar-only.
+The code-level parity gate is maintained in `docs/PARITY.md`. Anything not marked as a real code path there must remain rejected.
 
 Once that path is real, the same runtime/control boundary can be expanded protocol by protocol.

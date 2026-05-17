@@ -2,7 +2,7 @@
 
 `keli-core-rs` is the experimental Rust data-plane core track for Keli.
 
-Production should keep using the current Go node stack:
+The legacy production baseline is the Go node stack:
 
 ```text
 keliboard -> kelinode -> keli-core
@@ -14,14 +14,14 @@ This repository is for the long-term Rust core path:
 keliboard -> kelinode-rs -> keli-core-rs
 ```
 
-The first goal is not to replace Xray immediately. The first goal is to define a small, testable core boundary that `kelinode-rs` can eventually drive without guessing behavior.
+The current goal is to make `kelinode-rs -> keli-core-rs` the native Keli data-plane path while keeping old Go behavior as the comparison and rollback baseline.
 
 ## Current Scope
 
 Implemented in this first skeleton:
 
 - Core config model for inbound, outbound, routing, TLS, sniffing, users, and stats.
-- Protocol placement rules so external sidecar protocols such as Naive are not faked inside the core.
+- Protocol validation rules so unsupported protocol shapes are rejected instead of reported as fake running listeners.
 - Go-compatible user traffic keys using `<node-tag>|<user-uuid>`.
 - Traffic registry with minimum-threshold draining.
 - Runtime planning with deterministic config fingerprints.
@@ -51,11 +51,13 @@ Implemented in this first skeleton:
 - TUIC QUIC TCP and UDP data paths, including cubic/bbr/new_reno congestion selection.
 - VLESS REALITY config validation, client ClientHello authentication, fallback routing, dest ServerHello validation, dest handshake capture, temporary certificate generation, REALITY certificate signature embedding, rustls TLS accept, and VLESS/Vision handoff.
 - Mieru stream-underlay session demux so multiple TCP sessions can share one encrypted underlay connection.
-- Local sing-box and mihomo real-client interop matrix coverage for VLESS REALITY Vision and other primary protocol paths.
+- Naive HTTP/2 CONNECT over TLS with Basic authentication, optional Naive padding frames, TCP forwarding, per-user traffic accounting, speed/device limits, and ApplyUserDelta user-table updates.
+- Local sing-box and mihomo real-client interop matrix coverage for VLESS REALITY Vision and other primary protocol paths, plus a NaiveProxy official-client entry for the native Naive H2/TLS path.
 
 Not implemented yet:
 
 - REALITY ML-DSA-65 certificate signing.
+- Naive H3/QUIC transport and long production NaiveProxy soak coverage.
 - DoH/DoT DNS execution, cache policy, and custom outbounds beyond freedom/SOCKS/HTTP/Shadowsocks/Trojan TCP+TLS+WS+HTTPUpgrade+H2+gRPC/VLESS TCP+TLS+WS+HTTPUpgrade+H2+gRPC+Vision TCP TLS/VMess TCP+TLS+WS+HTTPUpgrade+H2+gRPC+UDP-over-stream+legacy alterId auth/XHTTP stream-one rendered as H2.
 - Realtime integration.
 - Broader release platform matrix and performance profiles.
@@ -78,17 +80,13 @@ The code-level protocol and runtime parity gate is tracked in `docs/PARITY.md`.
 
 `kelinode-rs`
 
-- Experimental Rust rewrite of the node agent.
-- Should eventually choose between `keli-core`, `keli-core-rs`, and sidecars per protocol.
+- Rust rewrite of the node agent.
+- Drives `keli-core-rs` as the native data-plane core for server-side node execution.
 
 `keli-core-rs`
 
-- Experimental Rust rewrite path for the protocol core.
-- Should only claim a protocol after it has real data-path tests.
-
-`keli-edge`
-
-- Sidecar supervisor/runtime for protocols that should not be forced into Xray-style core plans, such as Naive.
+- Rust native protocol core.
+- Should only claim a protocol after it has real data-path tests and clear validation for unsupported shapes.
 
 ## Protocol Strategy
 
@@ -104,12 +102,11 @@ Early core-planned protocols:
 - TUIC
 - AnyTLS
 - Mieru TCP
+- Naive H2/TLS
 
-External sidecar protocols:
-
-- Naive
-
-Sidecar protocols are rejected by `keli-core-rs` config validation. They should be handled by `kelinode-rs` through `keli-edge`.
+Protocols that are not listed as core-planned above must stay rejected until they have strict
+validation, native listeners, traffic accounting, user delta behavior, and real-client interop
+coverage.
 
 ## Build
 
@@ -124,6 +121,7 @@ cargo run -- run-config ./core.json
 cargo run -- run-config ./core.json --control 127.0.0.1:18080
 cargo run -- bench direct-tcp-stream --streams 8 --requests 1000 --payload 1024
 cargo run -- bench direct-tcp-proxy-stream --streams 8 --requests 1000 --payload 1024
+cargo run -- bench naive-tcp-stream --streams 8 --requests 1000 --payload 1024
 cargo run -- bench vless-tcp --streams 8 --requests 1000 --payload 1024
 cargo run -- bench vless-tcp-stream --streams 8 --requests 1000 --payload 1024
 cargo run -- bench hy2-tcp --streams 8 --requests 1000 --payload 1024
@@ -148,6 +146,10 @@ without protocol parsing, which is the baseline for TCP stream fixed overhead. T
 connection-per-request so it measures VLESS TCP setup plus one echo payload per request.
 The `vless-tcp-stream` benchmark opens one VLESS TCP connection per stream and sends
 all request payloads through that connection, so it isolates the steady-state relay path.
+The `naive-tcp-stream` benchmark opens one Naive H2 CONNECT tunnel over TLS per worker and
+sends all request payloads through that tunnel, isolating native Naive H2/TLS relay overhead.
+The Naive H2 body bridge uses bounded `Bytes` channels so slow clients apply backpressure instead
+of growing unbounded relay memory.
 The `hy2-tcp` benchmark authenticates once and opens TCP request streams over a single
 QUIC connection, so the stream count represents HY2 multiplexed concurrency.
 The `hy2-tcp-stream` benchmark opens one HY2 TCP stream per worker and sends all request
@@ -159,6 +161,7 @@ TUIC relay without exhausting local ephemeral ports on Windows.
 ```bash
 cargo run --release -- bench direct-tcp-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench direct-tcp-proxy-stream --streams 16 --requests 5000 --payload 1024
+cargo run --release -- bench naive-tcp-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench vless-tcp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench vless-tcp-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-tcp --streams 16 --requests 5000 --payload 1024

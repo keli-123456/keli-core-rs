@@ -12,6 +12,19 @@ on:
         required: true
         type: boolean
         default: false
+      include_naive:
+        description: Run the official NaiveProxy H2/TLS client case
+        required: true
+        type: boolean
+        default: false
+      probe_rounds:
+        description: Number of probe rounds per selected case
+        required: true
+        default: "1"
+      probe_interval_ms:
+        description: Delay between probe rounds in milliseconds
+        required: true
+        default: "0"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.case_filter }}
@@ -65,6 +78,8 @@ jobs:
         env:
           CASE_FILTER: ${{ inputs.case_filter }}
           KEEP_ARTIFACTS: ${{ inputs.keep_artifacts }}
+          PROBE_ROUNDS: ${{ inputs.probe_rounds }}
+          PROBE_INTERVAL_MS: ${{ inputs.probe_interval_ms }}
         run: |
           set -euo pipefail
           args=(--core target/release/keli-core-rs --sing-box tools/sing-box/sing-box)
@@ -74,6 +89,7 @@ jobs:
           if [[ "${KEEP_ARTIFACTS}" == "true" ]]; then
             args+=(--keep)
           fi
+          args+=(--probe-rounds "${PROBE_ROUNDS}" --probe-interval-ms "${PROBE_INTERVAL_MS}")
           cargo run --locked --example interop_matrix -- "${args[@]}"
 
       - name: Upload interop artifacts
@@ -81,5 +97,114 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: keli-core-rs-interop-${{ github.run_id }}
+          path: runtime/interop-matrix
+          if-no-files-found: ignore
+
+  naiveproxy:
+    name: NaiveProxy official-client loopback
+    if: ${{ inputs.include_naive || contains(inputs.case_filter, 'naive') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-naive-interop-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-naive-interop-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Download NaiveProxy
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="v148.0.7778.96-5"
+          archive="naiveproxy-${version}-linux-x64.tar.xz"
+          mkdir -p tools/naiveproxy
+          curl -fsSL \
+            "https://github.com/klzgrad/naiveproxy/releases/download/${version}/${archive}" \
+            -o /tmp/naiveproxy.tar.xz
+          tar -xJf /tmp/naiveproxy.tar.xz -C tools/naiveproxy --strip-components=1
+          chmod +x tools/naiveproxy/naive
+          tools/naiveproxy/naive --version
+
+      - name: Generate trusted local certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runtime/interop-certs
+          cat > runtime/interop-certs/openssl.cnf <<'EOF'
+          [req]
+          distinguished_name = dn
+          x509_extensions = v3_req
+          prompt = no
+
+          [dn]
+          CN = naive.local.test
+
+          [v3_req]
+          subjectAltName = @alt_names
+
+          [alt_names]
+          DNS.1 = naive.local.test
+          EOF
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout runtime/interop-certs/naive.key \
+            -out runtime/interop-certs/naive.crt \
+            -days 1 \
+            -config runtime/interop-certs/openssl.cnf
+          sudo cp runtime/interop-certs/naive.crt /usr/local/share/ca-certificates/keli-naive-interop.crt
+          sudo update-ca-certificates
+
+      - name: Build release core
+        run: cargo build --release --locked
+
+      - name: Run NaiveProxy interop case
+        shell: bash
+        env:
+          CASE_FILTER: ${{ inputs.case_filter }}
+          KEEP_ARTIFACTS: ${{ inputs.keep_artifacts }}
+          PROBE_ROUNDS: ${{ inputs.probe_rounds }}
+          PROBE_INTERVAL_MS: ${{ inputs.probe_interval_ms }}
+        run: |
+          set -euo pipefail
+          filter="${CASE_FILTER}"
+          if [[ -z "${filter}" || "${filter}" != *naive* ]]; then
+            filter="naive"
+          fi
+          args=(
+            --core target/release/keli-core-rs
+            --client naive
+            --naive tools/naiveproxy/naive
+            --only "${filter}"
+            --tls-cert runtime/interop-certs/naive.crt
+            --tls-key runtime/interop-certs/naive.key
+            --naive-server-name naive.local.test
+            --probe-rounds "${PROBE_ROUNDS}"
+            --probe-interval-ms "${PROBE_INTERVAL_MS}"
+          )
+          if [[ "${KEEP_ARTIFACTS}" == "true" ]]; then
+            args+=(--keep)
+          fi
+          cargo run --locked --example interop_matrix -- "${args[@]}"
+
+      - name: Upload NaiveProxy interop artifacts
+        if: ${{ always() && inputs.keep_artifacts }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: keli-core-rs-naive-interop-${{ github.run_id }}
           path: runtime/interop-matrix
           if-no-files-found: ignore

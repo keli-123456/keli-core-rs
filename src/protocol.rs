@@ -19,46 +19,23 @@ pub enum Protocol {
     Mieru,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProtocolPlacement {
-    CorePlanned,
-    ExternalSidecar,
-}
-
-impl Protocol {
-    pub fn placement(&self) -> ProtocolPlacement {
-        match self {
-            Protocol::Naive => ProtocolPlacement::ExternalSidecar,
-            Protocol::Shadowsocks
-            | Protocol::Vmess
-            | Protocol::Vless
-            | Protocol::Trojan
-            | Protocol::Hysteria2
-            | Protocol::Tuic
-            | Protocol::AnyTls
-            | Protocol::Mieru
-            | Protocol::Socks
-            | Protocol::Http => ProtocolPlacement::CorePlanned,
-        }
-    }
-
-    pub fn can_enter_core_plan(&self) -> bool {
-        self.placement() == ProtocolPlacement::CorePlanned
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Protocol, ProtocolPlacement};
+    use super::Protocol;
 
     #[test]
-    fn separates_external_sidecar_protocols() {
-        assert_eq!(
-            Protocol::Naive.placement(),
-            ProtocolPlacement::ExternalSidecar
-        );
-        assert_eq!(Protocol::Mieru.placement(), ProtocolPlacement::CorePlanned);
-        assert!(Protocol::Vless.can_enter_core_plan());
-        assert!(Protocol::Mieru.can_enter_core_plan());
+    fn deserializes_native_protocols() {
+        assert!(matches!(
+            serde_json::from_str::<Protocol>("\"naive\"").expect("naive"),
+            Protocol::Naive
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Protocol>("\"mieru\"").expect("mieru"),
+            Protocol::Mieru
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Protocol>("\"vless\"").expect("vless"),
+            Protocol::Vless
+        ));
     }
 }

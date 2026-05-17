@@ -43,6 +43,8 @@ struct InteropCase {
     inbound: Value,
     sing_outbound: Value,
     mihomo_proxy: Option<Value>,
+    naive_proxy: Option<String>,
+    naive_resolve_host: Option<String>,
     probes: Vec<Probe>,
 }
 
@@ -50,6 +52,7 @@ struct InteropCase {
 enum ClientKind {
     SingBox,
     Mihomo,
+    NaiveProxy,
 }
 
 impl ClientKind {
@@ -57,6 +60,7 @@ impl ClientKind {
         match self {
             Self::SingBox => "sing-box",
             Self::Mihomo => "mihomo",
+            Self::NaiveProxy => "naive",
         }
     }
 }
@@ -66,10 +70,16 @@ struct Args {
     core: PathBuf,
     sing_box: Option<PathBuf>,
     mihomo: Option<PathBuf>,
+    naive: Option<PathBuf>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    naive_server_name: String,
     work_dir: PathBuf,
     base_port: u16,
     only: Vec<String>,
     clients: Vec<ClientKind>,
+    probe_rounds: usize,
+    probe_interval: Duration,
     keep: bool,
 }
 
@@ -313,17 +323,34 @@ fn run() -> Result<()> {
             .into());
         }
     }
+    if args.clients.contains(&ClientKind::NaiveProxy) {
+        let Some(naive) = args.naive.as_ref() else {
+            return Err("naive client selected; pass --naive <naive binary>".into());
+        };
+        if !naive.exists() {
+            return Err(format!(
+                "naive binary not found at {}; pass --naive",
+                naive.display()
+            )
+            .into());
+        }
+    }
 
     prepare_work_dir(&args.work_dir)?;
     let tcp_echo = TcpEcho::start()?;
     let udp_echo = UdpEcho::start()?;
     let reality_dest = TlsDest::start()?;
-    let cert = write_test_cert(&args.work_dir)?;
+    let cert = resolve_test_cert(
+        &args.work_dir,
+        args.tls_cert.as_deref(),
+        args.tls_key.as_deref(),
+    )?;
     let cases = filtered_cases(
         build_cases(
             args.base_port,
             &cert.cert_path,
             &cert.key_path,
+            &args.naive_server_name,
             reality_dest.addr,
         ),
         &args.only,
@@ -353,23 +380,47 @@ fn run() -> Result<()> {
     let mut passed = 0usize;
     let mut skipped = 0usize;
     let mut failed = Vec::new();
+    let mut reports = Vec::new();
     for client in &args.clients {
         for (index, case) in cases.iter().enumerate() {
+            let started = Instant::now();
             match run_case(*client, index, case, &args, tcp_echo.addr, udp_echo.addr) {
                 Ok(CaseOutcome::Passed) => {
                     passed += 1;
                     println!("PASS {} {}", client.label(), case.name);
+                    reports.push(case_report(
+                        client.label(),
+                        &case.name,
+                        "passed",
+                        started.elapsed(),
+                        args.probe_rounds,
+                        None,
+                    ));
                 }
                 Ok(CaseOutcome::Skipped(reason)) => {
                     skipped += 1;
                     println!("SKIP {} {}: {reason}", client.label(), case.name);
+                    reports.push(case_report(
+                        client.label(),
+                        &case.name,
+                        "skipped",
+                        started.elapsed(),
+                        0,
+                        Some(&reason),
+                    ));
                 }
                 Err(error) => {
                     println!("FAIL {} {}: {error}", client.label(), case.name);
-                    failed.push((
-                        format!("{} {}", client.label(), case.name),
-                        error.to_string(),
+                    let error = error.to_string();
+                    reports.push(case_report(
+                        client.label(),
+                        &case.name,
+                        "failed",
+                        started.elapsed(),
+                        args.probe_rounds,
+                        Some(&error),
                     ));
+                    failed.push((format!("{} {}", client.label(), case.name), error));
                 }
             }
             core.fail_if_exited()?;
@@ -377,7 +428,18 @@ fn run() -> Result<()> {
     }
 
     println!("SKIP mieru: no official mieru client is bundled with this matrix");
-    println!("SKIP naive: native core intentionally treats Naive as a sidecar");
+    if !args.clients.contains(&ClientKind::NaiveProxy) {
+        println!("SKIP naive official-client: pass --client naive --naive <naive> --only naive");
+    }
+
+    write_matrix_summary(
+        &args.work_dir.join("interop-summary.json"),
+        &args,
+        &reports,
+        passed,
+        skipped,
+        failed.len(),
+    )?;
 
     if !failed.is_empty() {
         println!(
@@ -400,16 +462,73 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+fn case_report(
+    client: &str,
+    case: &str,
+    status: &str,
+    duration: Duration,
+    probe_rounds: usize,
+    error: Option<&str>,
+) -> Value {
+    json!({
+        "client": client,
+        "case": case,
+        "status": status,
+        "duration_ms": duration.as_millis(),
+        "probe_rounds": probe_rounds,
+        "error": error,
+    })
+}
+
+fn write_matrix_summary(
+    path: &Path,
+    args: &Args,
+    reports: &[Value],
+    passed: usize,
+    skipped: usize,
+    failed: usize,
+) -> Result<()> {
+    let summary = json!({
+        "passed": passed,
+        "skipped": skipped,
+        "failed": failed,
+        "probe_rounds": args.probe_rounds,
+        "probe_interval_ms": args.probe_interval.as_millis(),
+        "clients": args.clients.iter().map(|client| client.label()).collect::<Vec<_>>(),
+        "only": args.only,
+        "cases": reports,
+    });
+    fs::write(path, serde_json::to_vec_pretty(&summary)?)?;
+    Ok(())
+}
+
 fn parse_args() -> Result<Args> {
     let mut core = default_core_path();
     let mut sing_box = env::var_os("SING_BOX")
         .map(PathBuf::from)
         .or_else(|| Some(default_sing_box_path()));
     let mut mihomo = env::var_os("MIHOMO").map(PathBuf::from);
+    let mut naive = env::var_os("NAIVE").map(PathBuf::from);
+    let mut tls_cert = env::var_os("KELI_INTEROP_TLS_CERT").map(PathBuf::from);
+    let mut tls_key = env::var_os("KELI_INTEROP_TLS_KEY").map(PathBuf::from);
+    let mut naive_server_name =
+        env::var("KELI_INTEROP_NAIVE_SERVER_NAME").unwrap_or_else(|_| "localhost".to_string());
     let mut work_dir = env::current_dir()?.join("runtime").join("interop-matrix");
     let mut base_port = 23100u16;
     let mut only = Vec::new();
     let mut clients = Vec::new();
+    let mut probe_rounds = env::var("KELI_INTEROP_PROBE_ROUNDS")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(1);
+    let mut probe_interval = Duration::from_millis(
+        env::var("KELI_INTEROP_PROBE_INTERVAL_MS")
+            .ok()
+            .map(|value| value.parse::<u64>())
+            .transpose()?
+            .unwrap_or(0),
+    );
     let mut keep = false;
 
     let mut iter = env::args().skip(1);
@@ -428,16 +547,38 @@ fn parse_args() -> Result<Args> {
                     iter.next().ok_or("--mihomo requires a path")?,
                 ));
             }
+            "--naive" => {
+                naive = Some(PathBuf::from(iter.next().ok_or("--naive requires a path")?));
+            }
+            "--tls-cert" => {
+                tls_cert = Some(PathBuf::from(
+                    iter.next().ok_or("--tls-cert requires a path")?,
+                ));
+            }
+            "--tls-key" => {
+                tls_key = Some(PathBuf::from(
+                    iter.next().ok_or("--tls-key requires a path")?,
+                ));
+            }
+            "--naive-server-name" => {
+                naive_server_name = iter.next().ok_or("--naive-server-name requires a value")?;
+            }
             "--client" => {
                 let value = iter
                     .next()
-                    .ok_or("--client requires sing-box, mihomo or both")?;
+                    .ok_or("--client requires sing-box, mihomo, naive, both, or all")?;
                 match value.as_str() {
                     "sing-box" | "sing_box" => clients.push(ClientKind::SingBox),
                     "mihomo" | "clash" => clients.push(ClientKind::Mihomo),
+                    "naive" | "naiveproxy" | "naive-proxy" => clients.push(ClientKind::NaiveProxy),
                     "both" => {
                         clients.push(ClientKind::SingBox);
                         clients.push(ClientKind::Mihomo);
+                    }
+                    "all" => {
+                        clients.push(ClientKind::SingBox);
+                        clients.push(ClientKind::Mihomo);
+                        clients.push(ClientKind::NaiveProxy);
                     }
                     other => return Err(format!("unknown client {other}").into()),
                 }
@@ -454,6 +595,19 @@ fn parse_args() -> Result<Args> {
             "--only" => {
                 only.push(iter.next().ok_or("--only requires a case substring")?);
             }
+            "--probe-rounds" => {
+                probe_rounds = iter
+                    .next()
+                    .ok_or("--probe-rounds requires a value")?
+                    .parse::<usize>()?;
+            }
+            "--probe-interval-ms" => {
+                probe_interval = Duration::from_millis(
+                    iter.next()
+                        .ok_or("--probe-interval-ms requires a value")?
+                        .parse::<u64>()?,
+                );
+            }
             "--keep" => keep = true,
             "--help" | "-h" => {
                 print_help();
@@ -468,24 +622,36 @@ fn parse_args() -> Result<Args> {
         if mihomo.is_some() {
             clients.push(ClientKind::Mihomo);
         }
+        if naive.is_some() {
+            clients.push(ClientKind::NaiveProxy);
+        }
     }
     clients.dedup();
+    if probe_rounds == 0 {
+        return Err("--probe-rounds must be greater than 0".into());
+    }
 
     Ok(Args {
         core,
         sing_box,
         mihomo,
+        naive,
+        tls_cert,
+        tls_key,
+        naive_server_name,
         work_dir,
         base_port,
         only,
         clients,
+        probe_rounds,
+        probe_interval,
         keep,
     })
 }
 
 fn print_help() {
     println!(
-        "Usage: cargo run --example interop_matrix -- --core <keli-core-rs> --sing-box <sing-box> [--mihomo <mihomo>] [--client sing-box|mihomo|both] [--only hy2] [--keep]"
+        "Usage: cargo run --example interop_matrix -- --core <keli-core-rs> --sing-box <sing-box> [--mihomo <mihomo>] [--naive <naive>] [--client sing-box|mihomo|naive|both|all] [--tls-cert <cert.pem> --tls-key <key.pem>] [--naive-server-name <name>] [--only hy2] [--probe-rounds 30] [--probe-interval-ms 1000] [--keep]"
     );
     println!("Runs local real-client interop against temporary keli-core-rs listeners.");
 }
@@ -523,12 +689,34 @@ fn prepare_work_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)
 }
 
+#[derive(Debug)]
 struct TestCert {
     cert_path: PathBuf,
     key_path: PathBuf,
 }
 
-fn write_test_cert(work_dir: &Path) -> Result<TestCert> {
+fn resolve_test_cert(
+    work_dir: &Path,
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+) -> Result<TestCert> {
+    match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            if !cert_path.exists() {
+                return Err(format!("tls cert not found at {}", cert_path.display()).into());
+            }
+            if !key_path.exists() {
+                return Err(format!("tls key not found at {}", key_path.display()).into());
+            }
+            return Ok(TestCert {
+                cert_path: cert_path.to_path_buf(),
+                key_path: key_path.to_path_buf(),
+            });
+        }
+        (None, None) => {}
+        _ => return Err("--tls-cert and --tls-key must be provided together".into()),
+    }
+
     let cert = generate_simple_self_signed(vec!["localhost".to_string()])?;
     let cert_path = work_dir.join("interop.crt");
     let key_path = work_dir.join("interop.key");
@@ -560,6 +748,7 @@ fn build_cases(
     base_port: u16,
     cert: &Path,
     key: &Path,
+    naive_server_name: &str,
     reality_dest: SocketAddr,
 ) -> Vec<InteropCase> {
     let mut port = base_port;
@@ -686,6 +875,7 @@ fn build_cases(
     cases.push(trojan_case(next_port(), "trojan-grpc-tls", "grpc", true));
 
     cases.push(anytls_case(next_port()));
+    cases.push(naive_case(next_port(), naive_server_name));
     cases.push(hysteria2_case(next_port(), "hy2-tls", None));
     cases.push(hysteria2_case(
         next_port(),
@@ -730,6 +920,8 @@ fn proxy_case(name: &str, port: u16, protocol: &str) -> InteropCase {
         inbound: inbound(name, protocol, port, vec![user], "tcp", None, None, ""),
         sing_outbound: outbound,
         mihomo_proxy: Some(mihomo_proxy_case(protocol, port)),
+        naive_proxy: None,
+        naive_resolve_host: None,
         probes: vec![Probe::Tcp],
     }
 }
@@ -765,6 +957,8 @@ fn shadowsocks_case(port: u16, probes: Vec<Probe>) -> InteropCase {
             "password": SS_PASSWORD,
             "udp": true
         })),
+        naive_proxy: None,
+        naive_resolve_host: None,
         probes,
     }
 }
@@ -818,6 +1012,8 @@ fn vless_case(
         sing_outbound: outbound,
         mihomo_proxy: (network != "httpupgrade")
             .then(|| mihomo_vless_proxy(port, network, tls, flow, None)),
+        naive_proxy: None,
+        naive_resolve_host: None,
         probes: vec![Probe::Tcp],
     }
 }
@@ -856,6 +1052,8 @@ fn vless_reality_case(port: u16, reality_dest: SocketAddr) -> InteropCase {
             "xtls-rprx-vision",
             Some(mihomo_reality_opts()),
         )),
+        naive_proxy: None,
+        naive_resolve_host: None,
         probes: vec![Probe::Tcp],
     }
 }
@@ -889,6 +1087,8 @@ fn vmess_case(port: u16, name: &str, network: &str, tls: bool) -> InteropCase {
             network,
         ),
         mihomo_proxy: (network != "httpupgrade").then(|| mihomo_vmess_proxy(port, network, tls)),
+        naive_proxy: None,
+        naive_resolve_host: None,
         probes: vec![Probe::Tcp],
     }
 }
@@ -920,6 +1120,8 @@ fn trojan_case(port: u16, name: &str, network: &str, tls: bool) -> InteropCase {
             network,
         ),
         mihomo_proxy: (tls && network != "httpupgrade").then(|| mihomo_trojan_proxy(port, network)),
+        naive_proxy: None,
+        naive_resolve_host: None,
         probes: vec![Probe::Tcp],
     }
 }
@@ -947,8 +1149,40 @@ fn anytls_case(port: u16) -> InteropCase {
             "tls": sing_tls("tcp")
         }),
         mihomo_proxy: None,
+        naive_proxy: None,
+        naive_resolve_host: None,
         probes: vec![Probe::Tcp],
     }
+}
+
+fn naive_case(port: u16, server_name: &str) -> InteropCase {
+    let mut tls = tls_config();
+    tls["server_name"] = json!(server_name);
+    InteropCase {
+        name: "naive-h2-tls".to_string(),
+        core_port: port,
+        inbound: inbound(
+            "naive-h2-tls",
+            "naive",
+            port,
+            vec![user(USER_UUID, Some(USER_PASSWORD))],
+            "tcp",
+            Some(tls),
+            None,
+            "",
+        ),
+        sing_outbound: Value::Null,
+        mihomo_proxy: None,
+        naive_proxy: Some(format!(
+            "https://{USER_UUID}:{USER_PASSWORD}@{server_name}:{port}"
+        )),
+        naive_resolve_host: should_resolve_naive_host(server_name).then(|| server_name.to_string()),
+        probes: vec![Probe::Tcp],
+    }
+}
+
+fn should_resolve_naive_host(host: &str) -> bool {
+    !matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 fn hysteria2_case(port: u16, name: &str, obfs: Option<(&str, &str)>) -> InteropCase {
@@ -989,6 +1223,8 @@ fn hysteria2_case(port: u16, name: &str, obfs: Option<(&str, &str)>) -> InteropC
         ),
         sing_outbound: outbound,
         mihomo_proxy: Some(mihomo_hysteria2_proxy(port, obfs)),
+        naive_proxy: None,
+        naive_resolve_host: None,
         probes: vec![Probe::Tcp, Probe::Udp],
     }
 }
@@ -1025,6 +1261,8 @@ fn tuic_case(port: u16) -> InteropCase {
             }
         }),
         mihomo_proxy: Some(mihomo_tuic_proxy(port)),
+        naive_proxy: None,
+        naive_resolve_host: None,
         probes: vec![Probe::Tcp, Probe::Udp],
     }
 }
@@ -1436,6 +1674,7 @@ fn run_case(
     match client {
         ClientKind::SingBox => run_sing_box_case(index, case, args, tcp_echo, udp_echo),
         ClientKind::Mihomo => run_mihomo_case(index, case, args, tcp_echo, udp_echo),
+        ClientKind::NaiveProxy => run_naive_proxy_case(index, case, args, tcp_echo, udp_echo),
     }
 }
 
@@ -1446,6 +1685,11 @@ fn run_sing_box_case(
     tcp_echo: SocketAddr,
     udp_echo: SocketAddr,
 ) -> Result<CaseOutcome> {
+    if case.sing_outbound.is_null() {
+        return Ok(CaseOutcome::Skipped(
+            "no sing-box-compatible outbound for this case yet".to_string(),
+        ));
+    }
     let socks_port = args
         .base_port
         .checked_add(1000)
@@ -1470,7 +1714,7 @@ fn run_sing_box_case(
     wait_for_tcp(("127.0.0.1", socks_port), Duration::from_secs(8))?;
     sing_box.fail_if_exited()?;
 
-    run_probes_with_retry(socks_port, &case.probes, tcp_echo, udp_echo)?;
+    run_probe_rounds(socks_port, &case.probes, tcp_echo, udp_echo, args)?;
     Ok(CaseOutcome::Passed)
 }
 
@@ -1513,8 +1757,67 @@ fn run_mihomo_case(
     wait_for_tcp(("127.0.0.1", socks_port), Duration::from_secs(8))?;
     mihomo.fail_if_exited()?;
 
-    run_probes_with_retry(socks_port, &case.probes, tcp_echo, udp_echo)?;
+    run_probe_rounds(socks_port, &case.probes, tcp_echo, udp_echo, args)?;
     Ok(CaseOutcome::Passed)
+}
+
+fn run_naive_proxy_case(
+    index: usize,
+    case: &InteropCase,
+    args: &Args,
+    tcp_echo: SocketAddr,
+    udp_echo: SocketAddr,
+) -> Result<CaseOutcome> {
+    let Some(proxy) = case.naive_proxy.as_ref() else {
+        return Ok(CaseOutcome::Skipped(
+            "no NaiveProxy-compatible config for this case".to_string(),
+        ));
+    };
+    let socks_port = args
+        .base_port
+        .checked_add(3000)
+        .and_then(|port| port.checked_add(index as u16))
+        .ok_or("local naive socks port overflow")?;
+    let naive_path = args
+        .naive
+        .as_ref()
+        .ok_or("naive client selected without a binary path")?;
+    let config_path = args.work_dir.join(format!("{}.naive.json", case.name));
+    write_naive_proxy_config(&config_path, proxy, socks_port)?;
+    let mut naive_args = vec![config_path.display().to_string()];
+    if let Some(host) = case.naive_resolve_host.as_ref() {
+        naive_args.push(format!("--host-resolver-rules=MAP {host} 127.0.0.1"));
+    }
+    let mut naive = start_process(
+        &format!("naive-{}", case.name),
+        naive_path,
+        &naive_args,
+        &args.work_dir,
+    )?;
+    wait_for_tcp(("127.0.0.1", socks_port), Duration::from_secs(8))?;
+    naive.fail_if_exited()?;
+
+    run_probe_rounds(socks_port, &case.probes, tcp_echo, udp_echo, args)?;
+    Ok(CaseOutcome::Passed)
+}
+
+fn run_probe_rounds(
+    socks_port: u16,
+    probes: &[Probe],
+    tcp_echo: SocketAddr,
+    udp_echo: SocketAddr,
+    args: &Args,
+) -> Result<()> {
+    for round in 0..args.probe_rounds {
+        run_probes_with_retry(socks_port, probes, tcp_echo, udp_echo)?;
+        if args.probe_rounds > 1 {
+            println!("probe round {}/{} passed", round + 1, args.probe_rounds);
+        }
+        if round + 1 < args.probe_rounds && !args.probe_interval.is_zero() {
+            thread::sleep(args.probe_interval);
+        }
+    }
+    Ok(())
 }
 
 fn run_probes_with_retry(
@@ -1628,6 +1931,15 @@ fn write_mihomo_config(path: &Path, case: &InteropCase, socks_port: u16) -> Resu
     output.push_str("  - MATCH,Proxy\n");
 
     fs::write(path, output)?;
+    Ok(())
+}
+
+fn write_naive_proxy_config(path: &Path, proxy: &str, socks_port: u16) -> Result<()> {
+    let config = json!({
+        "listen": format!("socks://127.0.0.1:{socks_port}"),
+        "proxy": proxy
+    });
+    fs::write(path, serde_json::to_vec_pretty(&config)?)?;
     Ok(())
 }
 
@@ -1864,4 +2176,123 @@ fn parse_socks_udp_payload(packet: &[u8]) -> Result<Vec<u8>> {
         return Err("truncated socks udp payload".into());
     }
     Ok(packet[offset..].to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn naive_case_uses_server_name_and_loopback_host_resolver() {
+        let case = naive_case(24443, "naive.example.test");
+
+        assert_eq!(case.name, "naive-h2-tls");
+        assert_eq!(case.inbound["protocol"], "naive");
+        assert_eq!(case.inbound["tls"]["server_name"], "naive.example.test");
+        assert_eq!(
+            case.naive_proxy.as_deref(),
+            Some("https://123e4567-e89b-12d3-a456-426614174000:interop-password@naive.example.test:24443")
+        );
+        assert_eq!(
+            case.naive_resolve_host.as_deref(),
+            Some("naive.example.test")
+        );
+    }
+
+    #[test]
+    fn naive_case_does_not_resolve_loopback_server_names() {
+        assert!(naive_case(24443, "localhost").naive_resolve_host.is_none());
+        assert!(naive_case(24443, "127.0.0.1").naive_resolve_host.is_none());
+        assert!(naive_case(24443, "::1").naive_resolve_host.is_none());
+    }
+
+    #[test]
+    fn writes_naiveproxy_config_in_official_shape() {
+        let dir = unique_temp_dir("naive-config");
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.json");
+
+        write_naive_proxy_config(&path, "https://user:pass@example.test:443", 12080)
+            .expect("write config");
+
+        let config: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read config")).expect("json config");
+        assert_eq!(config["listen"], "socks://127.0.0.1:12080");
+        assert_eq!(config["proxy"], "https://user:pass@example.test:443");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_test_cert_accepts_existing_pair_and_rejects_partial_pair() {
+        let dir = unique_temp_dir("naive-cert");
+        fs::create_dir_all(&dir).expect("temp dir");
+        let cert = dir.join("test.crt");
+        let key = dir.join("test.key");
+        fs::write(&cert, "cert").expect("write cert");
+        fs::write(&key, "key").expect("write key");
+
+        let resolved = resolve_test_cert(&dir, Some(&cert), Some(&key)).expect("resolve pair");
+        assert_eq!(resolved.cert_path, cert);
+        assert_eq!(resolved.key_path, key);
+
+        let error = resolve_test_cert(&dir, Some(&resolved.cert_path), None)
+            .expect_err("partial pair should fail")
+            .to_string();
+        assert!(error.contains("--tls-cert and --tls-key"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn writes_interop_summary_without_client_secrets() {
+        let dir = unique_temp_dir("summary");
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("summary.json");
+        let args = Args {
+            core: PathBuf::from("keli-core-rs"),
+            sing_box: None,
+            mihomo: None,
+            naive: Some(PathBuf::from("naive")),
+            tls_cert: None,
+            tls_key: None,
+            naive_server_name: "naive.example.test".to_string(),
+            work_dir: dir.clone(),
+            base_port: 23100,
+            only: vec!["naive".to_string()],
+            clients: vec![ClientKind::NaiveProxy],
+            probe_rounds: 3,
+            probe_interval: Duration::from_millis(250),
+            keep: true,
+        };
+        let reports = vec![case_report(
+            "naive",
+            "naive-h2-tls",
+            "passed",
+            Duration::from_millis(12),
+            3,
+            None,
+        )];
+
+        write_matrix_summary(&path, &args, &reports, 1, 0, 0).expect("write summary");
+
+        let body = fs::read_to_string(&path).expect("read summary");
+        assert!(body.contains("\"probe_rounds\": 3"));
+        assert!(body.contains("\"probe_interval_ms\": 250"));
+        assert!(!body.contains("interop-password"));
+        assert!(!body.contains("https://"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "keli-core-rs-interop-matrix-{label}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
 }

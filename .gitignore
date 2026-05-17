@@ -1,5 +1,6 @@
 /target/
 /runtime/
+/tools/
 *.log
 *.tmp
 .env

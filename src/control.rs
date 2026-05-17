@@ -754,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_config_reports_sidecar_protocol_errors() {
+    fn apply_config_reports_naive_tls_errors() {
         let mut controller = CoreController::new();
 
         let response = controller.handle(CoreCommand::ApplyConfig {
@@ -762,7 +762,7 @@ mod tests {
         });
 
         match response {
-            CoreResponse::Error { message } => assert!(message.contains("external sidecar")),
+            CoreResponse::Error { message } => assert!(message.contains("tls")),
             response => panic!("unexpected response: {response:?}"),
         }
     }

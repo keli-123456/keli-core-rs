@@ -11,6 +11,7 @@ Run interop in this order:
 3. VLESS TCP TLS Vision, or Trojan TCP TLS if that is the larger live protocol for the target site.
 4. The same TCP protocol with WebSocket, HTTPUpgrade, and gRPC when those transports are used by live nodes.
 5. TUIC TCP and UDP.
+6. Naive HTTP/2 CONNECT over TLS, after the primary live protocols above are stable.
 
 ## Required Checks
 
@@ -70,6 +71,7 @@ Loopback benchmarks are useful for regression detection, not production certific
 ```bash
 cargo run --release -- bench direct-tcp-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench direct-tcp-proxy-stream --streams 16 --requests 5000 --payload 1024
+cargo run --release -- bench naive-tcp-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-tcp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-tcp-stream --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench hy2-udp --streams 16 --requests 5000 --payload 1024
@@ -78,6 +80,19 @@ cargo run --release -- bench tuic-tcp-stream --streams 16 --requests 5000 --payl
 cargo run --release -- bench tuic-udp --streams 16 --requests 5000 --payload 1024
 cargo run --release -- bench vless-tcp-stream --streams 16 --requests 5000 --payload 1024
 ```
+
+Naive has a local H2/TLS CONNECT data-path test and `naive-tcp-stream` loopback benchmark. Use the
+official NaiveProxy client for interop and soak before enabling it for live traffic. Keep Naive
+marked `Partial` until H2/TLS client behavior, padding, delete-user behavior, traffic accounting,
+auth/backoff behavior, and long-running reconnect behavior are recorded.
+
+Local Windows loopback baseline after the bounded `Bytes` H2 bridge change:
+
+| Command | Throughput | Requests | Errors | Retries | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `naive-tcp-stream --streams 16 --requests 1000 --payload 1024` | 649 Mbps | 16000 | 0 | 0 | 271 us | 570 us | 980 us |
+| `naive-tcp-stream --streams 16 --requests 1000 --payload 4096` | 1.89 Gbps | 16000 | 0 | 0 | 328 us | 903 us | 1.68 ms |
+| `naive-tcp-stream --streams 16 --requests 1000 --payload 65536` | 7.08 Gbps | 16000 | 0 | 0 | 1.87 ms | 4.08 ms | 5.86 ms |
 
 For repeatable Rust-vs-baseline comparisons, collect a suite report instead of copying
 one-off command output:
@@ -272,6 +287,7 @@ server, and one client config per case:
 cargo build --release
 cargo run --example interop_matrix -- --sing-box /path/to/sing-box
 cargo run --example interop_matrix -- --client mihomo --mihomo /path/to/mihomo
+cargo run --example interop_matrix -- --client naive --naive /path/to/naive --only naive
 cargo run --example interop_matrix -- --client both --sing-box /path/to/sing-box --mihomo /path/to/mihomo
 ```
 
@@ -280,6 +296,7 @@ On the Windows development workspace used for Keli, the bundled client paths are
 ```powershell
 cargo run --example interop_matrix -- --sing-box ..\tools\sing-box\sing-box-1.12.22-windows-amd64\sing-box.exe
 cargo run --example interop_matrix -- --client mihomo --mihomo ..\tools\mihomo\mihomo-windows-amd64-v1.19.24\mihomo-windows-amd64.exe
+cargo run --example interop_matrix -- --client naive --naive C:\path\to\naive.exe --only naive
 ```
 
 Useful filters:
@@ -287,7 +304,16 @@ Useful filters:
 ```bash
 cargo run --example interop_matrix -- --sing-box /path/to/sing-box --only vless
 cargo run --example interop_matrix -- --client mihomo --mihomo /path/to/mihomo --only vless-reality
+cargo run --example interop_matrix -- --client naive --naive /path/to/naive --only naive-h2-tls --keep
+cargo run --example interop_matrix -- --client naive --naive /path/to/naive --only naive-h2-tls --tls-cert /path/to/trusted.crt --tls-key /path/to/trusted.key --naive-server-name naive.example.test --keep
 cargo run --example interop_matrix -- --client both --sing-box /path/to/sing-box --mihomo /path/to/mihomo --only hy2 --keep
+```
+
+Short soak / repeated probe runs:
+
+```bash
+cargo run --example interop_matrix -- --client naive --naive /path/to/naive --only naive-h2-tls --probe-rounds 120 --probe-interval-ms 1000 --keep
+cargo run --example interop_matrix -- --sing-box /path/to/sing-box --only hy2 --probe-rounds 120 --probe-interval-ms 1000 --keep
 ```
 
 The sing-box client verifies TCP forwarding for SOCKS, HTTP proxy, Shadowsocks, VLESS, VLESS
@@ -299,6 +325,27 @@ VLESS REALITY Vision, VLESS WS/gRPC, VMess TCP/TLS/WS/gRPC, Trojan TLS/WS/gRPC, 
 Hysteria2 Salamander, and TUIC TCP/UDP. It skips cases without a reliable mihomo proxy equivalent
 in this matrix, such as HTTPUpgrade, Trojan plain TCP, AnyTLS, Mieru, and Naive.
 
+The NaiveProxy client verifies the native `naive-h2-tls` case with a generated
+`listen=socks://127.0.0.1:<port>` and `proxy=https://user:pass@localhost:<port>`
+configuration. Because the matrix uses a temporary self-signed localhost certificate by default,
+official NaiveProxy runs may require the generated certificate to be trusted by the host OS or a
+trusted local test certificate to be wired in before recording the result as production interop.
+Use `--tls-cert`, `--tls-key`, and `--naive-server-name` for that path. When the Naive server name
+is not localhost, the matrix passes a NaiveProxy host-resolver rule so the official client still
+connects to the loopback core listener.
+
+Latest official NaiveProxy Windows x64 interop/short-soak sample:
+
+```text
+client: naiveproxy-v148.0.7778.96-5-win-x64
+case: naive-h2-tls
+command: cargo run --release --example interop_matrix -- --core target\release\keli-core-rs.exe --client naive --naive tools\naiveproxy\naiveproxy-v148.0.7778.96-5-win-x64\naive.exe --only naive --tls-cert runtime\interop-certs\naive-local.crt --tls-key runtime\interop-certs\naive-local.key --probe-rounds 120 --probe-interval-ms 500 --keep
+result: 120 / 120 probe rounds passed, 1 passed, 0 skipped, 0 failed
+duration: 62347 ms
+certificate handling: localhost test certificate was temporarily trusted in the CurrentUser Root store and removed after the run
+artifact summary: runtime/interop-matrix/interop-summary.json
+```
+
 Both clients use a deterministic local TLS destination fixture for REALITY.
 
 Latest local Windows loopback sample:
@@ -306,7 +353,7 @@ Latest local Windows loopback sample:
 ```text
 interop matrix summary: 34 passed, 0 skipped, 0 failed
 SKIP mieru: no official mieru client is bundled with this matrix
-SKIP naive: native core intentionally treats Naive as a sidecar
+SKIP naive official-client: pass --client naive --naive <naive> --only naive
 ```
 
 Latest local Windows loopback sample for mihomo v1.19.24:
@@ -314,10 +361,13 @@ Latest local Windows loopback sample for mihomo v1.19.24:
 ```text
 interop matrix summary: 24 passed, 10 skipped, 0 failed
 SKIP mieru: no official mieru client is bundled with this matrix
-SKIP naive: native core intentionally treats Naive as a sidecar
+SKIP naive official-client: pass --client naive --naive <naive> --only naive
 ```
 
 The same matrix is available from GitHub Actions as the manual `Native Interop Matrix`
 workflow. Use the optional `case_filter` input to run one protocol family before a focused
-gray release, or leave it empty to run all supported sing-box cases. Mihomo coverage is currently
-a local matrix until the CI image has a pinned mihomo binary.
+gray release, or leave it empty to run all supported sing-box cases. Enable `include_naive` to
+download the pinned official NaiveProxy Linux client, install a temporary trusted local certificate,
+and run the `naive-h2-tls` case. Increase `probe_rounds` and set `probe_interval_ms` for a short
+CI soak before a gray release. Mihomo coverage is currently a local matrix until the CI image has a
+pinned mihomo binary.

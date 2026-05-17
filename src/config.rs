@@ -842,12 +842,6 @@ impl InboundConfig {
                 self.tag
             )));
         }
-        if !self.protocol.can_enter_core_plan() {
-            return Err(ValidationError::new(format!(
-                "{} is an external sidecar protocol and must not be faked inside keli-core-rs",
-                self.tag
-            )));
-        }
         if self.users.iter().any(CoreUser::is_empty) {
             return Err(ValidationError::new(format!(
                 "{} contains an empty user uuid",
@@ -964,6 +958,29 @@ impl InboundConfig {
             if self.users.is_empty() {
                 return Err(ValidationError::new(format!(
                     "{} mieru requires at least one user",
+                    self.tag
+                )));
+            }
+        }
+        if self.protocol == Protocol::Naive {
+            let network = self.transport.network.trim();
+            if network != "tcp" {
+                return Err(ValidationError::new(format!(
+                    "{} naive currently supports only tcp transport",
+                    self.tag
+                )));
+            }
+            if self.tls.is_none() {
+                return Err(ValidationError::new(format!(
+                    "{} naive requires tls config",
+                    self.tag
+                )));
+            }
+            validate_tls_config("naive", &self.tag, network, self.tls.as_ref())?;
+            validate_naive_tls_config(&self.tag, self.tls.as_ref())?;
+            if self.users.is_empty() {
+                return Err(ValidationError::new(format!(
+                    "{} naive requires at least one user",
                     self.tag
                 )));
             }
@@ -1309,6 +1326,22 @@ fn validate_quic_tls_config(
     if tls.reject_unknown_sni && tls.server_name.trim().is_empty() {
         return Err(ValidationError::new(format!(
             "{tag} {protocol} reject_unknown_sni requires server_name"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_naive_tls_config(tag: &str, tls: Option<&TlsConfig>) -> Result<(), ValidationError> {
+    let Some(tls) = tls else {
+        return Ok(());
+    };
+    if tls
+        .alpn
+        .iter()
+        .any(|value| value.trim().eq_ignore_ascii_case("h3"))
+    {
+        return Err(ValidationError::new(format!(
+            "{tag} naive h3/quic transport is not implemented in keli-core-rs yet"
         )));
     }
     Ok(())
@@ -2295,7 +2328,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_sidecar_protocols_in_core_plan() {
+    fn rejects_naive_without_tls_in_core_plan() {
         let inbound = InboundConfig {
             tag: "panel|naive|1".to_string(),
             protocol: Protocol::Naive,
@@ -2311,7 +2344,38 @@ mod tests {
             routes: Vec::new(),
         };
 
-        assert!(inbound.validate().is_err());
+        let error = inbound
+            .validate()
+            .expect_err("naive without tls should be rejected");
+        assert!(error.to_string().contains("tls"));
+    }
+
+    #[test]
+    fn rejects_naive_h3_alpn_until_quic_transport_exists() {
+        let inbound = InboundConfig {
+            tag: "panel|naive|1".to_string(),
+            protocol: Protocol::Naive,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: vec![user()],
+            cipher: None,
+            flow: String::new(),
+            padding_scheme: Vec::new(),
+            transport: TransportConfig::default(),
+            tls: Some(TlsConfig {
+                server_name: "naive.example.test".to_string(),
+                cert_file: Some("/tmp/cert.pem".to_string()),
+                key_file: Some("/tmp/key.pem".to_string()),
+                alpn: vec!["h3".to_string()],
+                reject_unknown_sni: false,
+                reality: None,
+            }),
+            sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
+        };
+
+        let error = inbound.validate().expect_err("naive h3 should be rejected");
+        assert!(error.to_string().contains("h3/quic"));
     }
 
     #[test]

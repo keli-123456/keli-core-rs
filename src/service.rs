@@ -22,6 +22,7 @@ use crate::httpupgrade::{accept_httpupgrade, accept_httpupgrade_tls};
 use crate::hysteria2::{Hysteria2ObfsConfig, Hysteria2Server, Hysteria2ServerConfig};
 use crate::limits::{UserBandwidthLimiters, UserSessionTracker};
 use crate::mieru::{MieruServer, MieruServerConfig};
+use crate::naive::{NaiveServer, NaiveServerConfig};
 use crate::protocol::Protocol;
 use crate::quic_resources::{QuicResourceSnapshot, SharedQuicConnectionLimiter};
 use crate::reality::{
@@ -127,6 +128,7 @@ enum ListenerRuntime {
     Tuic(TuicServer),
     Hysteria2(Hysteria2Server),
     Mieru(MieruServer),
+    Naive(NaiveServer),
 }
 
 impl ListenerRuntime {
@@ -142,6 +144,7 @@ impl ListenerRuntime {
             ListenerRuntime::Tuic(server) => server.replace_users(users),
             ListenerRuntime::Hysteria2(server) => server.replace_users(users),
             ListenerRuntime::Mieru(server) => server.replace_users(users),
+            ListenerRuntime::Naive(server) => server.replace_users(users),
         }
     }
 
@@ -157,6 +160,7 @@ impl ListenerRuntime {
             ListenerRuntime::Tuic(server) => server.apply_user_delta(delta),
             ListenerRuntime::Hysteria2(server) => server.apply_user_delta(delta),
             ListenerRuntime::Mieru(server) => server.apply_user_delta(delta),
+            ListenerRuntime::Naive(server) => server.apply_user_delta(delta),
         }
     }
 }
@@ -284,12 +288,14 @@ impl CoreService {
                     sessions.clone(),
                     bandwidth.clone(),
                 )?,
-                _ => {
-                    return Err(CoreServiceError::UnsupportedProtocol {
-                        tag: inbound.tag,
-                        protocol: inbound.protocol,
-                    });
-                }
+                Protocol::Naive => start_naive_listener(
+                    &inbound,
+                    routes.clone(),
+                    traffic.clone(),
+                    sessions.clone(),
+                    bandwidth.clone(),
+                    tls_failures.clone(),
+                )?,
             };
             listeners.push(handle);
         }
@@ -1557,6 +1563,94 @@ fn start_mieru_listener(
             local_addr,
         },
         runtime: ListenerRuntime::Mieru(runtime_server),
+        stop,
+        workers,
+        join: Some(join),
+    })
+}
+
+fn start_naive_listener(
+    inbound: &InboundConfig,
+    routes: Vec<crate::RouteRule>,
+    traffic: SharedTrafficRegistry,
+    sessions: UserSessionTracker,
+    bandwidth: UserBandwidthLimiters,
+    tls_failures: ClientFailureBackoff,
+) -> Result<ListenerHandle, CoreServiceError> {
+    let listen = resolve_listen_addr(&inbound.listen, inbound.port).map_err(|source| {
+        CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        }
+    })?;
+    let tls = inbound.tls.as_ref().ok_or_else(|| CoreServiceError::Bind {
+        tag: inbound.tag.clone(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, "naive requires tls config"),
+    })?;
+    let server = NaiveServer::with_shared_limits_and_backoff(
+        NaiveServerConfig {
+            node_tag: inbound.tag.clone(),
+            listen,
+            users: inbound.users.clone(),
+            routes,
+            cert_file: tls.cert_file.clone().unwrap_or_default(),
+            key_file: tls.key_file.clone().unwrap_or_default(),
+            server_name: tls.server_name.clone(),
+            alpn: tls.alpn.clone(),
+            reject_unknown_sni: tls.reject_unknown_sni,
+            connect_timeout: outbound_connect_timeout(),
+        },
+        traffic,
+        sessions,
+        bandwidth,
+        tls_failures,
+        tcp_auth_failure_backoff().clone(),
+    )
+    .map_err(|source| CoreServiceError::Bind {
+        tag: inbound.tag.clone(),
+        source,
+    })?;
+    let listener = server.bind().map_err(|source| CoreServiceError::Bind {
+        tag: inbound.tag.clone(),
+        source,
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|source| CoreServiceError::Bind {
+            tag: inbound.tag.clone(),
+            source,
+        })?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = stop.clone();
+    let workers = ConnectionWorkerGroup::new();
+    let workers_for_thread = workers.clone();
+    let runtime_server = server.clone();
+    let join = spawn_async_tcp_accept_loop(
+        listener,
+        stop_for_thread,
+        workers_for_thread,
+        move |stream| {
+            let server = server.clone();
+            async move {
+                let _ = server.handle_tcp_client(stream).await;
+            }
+        },
+    );
+
+    Ok(ListenerHandle {
+        status: ListenerStatus {
+            tag: inbound.tag.clone(),
+            protocol: Protocol::Naive,
+            local_addr,
+        },
+        runtime: ListenerRuntime::Naive(runtime_server),
         stop,
         workers,
         join: Some(join),
@@ -3633,13 +3727,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_external_sidecar_protocols() {
+    fn naive_requires_tls_config() {
         let mut config = config(free_port());
         config.inbounds[0].protocol = Protocol::Naive;
 
-        let error = CoreService::start(config).expect_err("naive should not start in core");
+        let error = CoreService::start(config).expect_err("naive without tls should fail");
 
-        assert!(error.to_string().contains("external sidecar"));
+        assert!(error.to_string().contains("tls"));
     }
 
     #[test]
@@ -4197,6 +4291,29 @@ mod tests {
 
         assert_eq!(listeners.len(), 1);
         assert_eq!(listeners[0].protocol, Protocol::AnyTls);
+        service.stop();
+    }
+
+    #[test]
+    fn starts_naive_listener_from_core_config() {
+        let cert = test_cert("naive");
+        let mut config = config(free_port());
+        config.inbounds[0].tag = "panel|naive|1".to_string();
+        config.inbounds[0].protocol = Protocol::Naive;
+        config.inbounds[0].tls = Some(TlsConfig {
+            server_name: "localhost".to_string(),
+            cert_file: Some(cert.cert_path.to_string_lossy().to_string()),
+            key_file: Some(cert.key_path.to_string_lossy().to_string()),
+            alpn: Vec::new(),
+            reject_unknown_sni: false,
+            reality: None,
+        });
+
+        let mut service = CoreService::start(config).expect("service start");
+        let listeners = service.listeners();
+
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].protocol, Protocol::Naive);
         service.stop();
     }
 

@@ -13,16 +13,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bytes::Bytes;
 use quinn::crypto::rustls::QuicClientConfig;
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{CertificateDer, ServerName};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::AsyncReadExt;
+use tokio_rustls::TlsConnector;
 
 use crate::anytls::{AnyTlsServer, AnyTlsServerConfig};
 use crate::config::OutboundConfig;
 use crate::http_proxy::{HttpProxyServer, HttpProxyServerConfig};
 use crate::hysteria2::{Hysteria2Server, Hysteria2ServerConfig};
+use crate::naive::{NaiveServer, NaiveServerConfig};
 use crate::shadowsocks::{
     connect_shadowsocks_tcp_outbound, ShadowsocksServer, ShadowsocksServerConfig,
 };
@@ -75,6 +77,7 @@ const DEFAULT_SUITE_COMMANDS: &[&str] = &[
     "socks-tcp-stream",
     "trojan-tcp-stream",
     "anytls-tcp-stream",
+    "naive-tcp-stream",
     "vless-tcp-stream",
     "vmess-tcp-stream",
     "hy2-auth",
@@ -764,7 +767,7 @@ fn bench_quic_runtime_workers() -> usize {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench direct-tcp-proxy-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench anytls-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-auth [--streams N] [--requests N]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --core command=HOST:PORT [--core other=HOST:PORT] [--cert CERT.pem] [--cert command=CERT.pem] [--server-name NAME] [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
+        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench direct-tcp-proxy-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench anytls-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench naive-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-auth [--streams N] [--requests N]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --core command=HOST:PORT [--core other=HOST:PORT] [--cert CERT.pem] [--cert command=CERT.pem] [--server-name NAME] [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
     );
 }
 
@@ -779,6 +782,7 @@ fn canonical_bench_command(command: &str) -> Option<&'static str> {
         "socks-tcp-stream" | "socks5-tcp-stream" | "socks-stream" => Some("socks-tcp-stream"),
         "trojan-tcp-stream" | "trojan-stream" => Some("trojan-tcp-stream"),
         "anytls-tcp-stream" | "anytls-stream" => Some("anytls-tcp-stream"),
+        "naive-tcp-stream" | "naive-stream" => Some("naive-tcp-stream"),
         "vless-tcp" => Some("vless-tcp"),
         "vless-tcp-stream" | "vless-stream" => Some("vless-tcp-stream"),
         "vmess-tcp-stream" | "vmess-stream" => Some("vmess-tcp-stream"),
@@ -802,6 +806,7 @@ fn run_named_bench(command: &str, options: &BenchOptions) -> io::Result<BenchRep
         Some("socks-tcp-stream") => run_socks_tcp_stream_bench(options),
         Some("trojan-tcp-stream") => run_trojan_tcp_stream_bench(options),
         Some("anytls-tcp-stream") => run_anytls_tcp_stream_bench(options),
+        Some("naive-tcp-stream") => run_naive_tcp_stream_bench(options),
         Some("vless-tcp") => run_vless_tcp_bench(options),
         Some("vless-tcp-stream") => run_vless_tcp_stream_bench(options),
         Some("vmess-tcp-stream") => run_vmess_tcp_stream_bench(options),
@@ -1486,6 +1491,50 @@ fn run_anytls_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport
     Ok(BenchReport::completed_with_phases(
         "anytls-tcp",
         "connection-per-stream",
+        options,
+        None,
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+        &phases,
+    ))
+}
+
+fn run_naive_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let core_stop = Arc::new(AtomicBool::new(false));
+    let (core_addr, cert_der, core_thread) = start_naive_server(core_stop.clone())?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        let cert_der = cert_der.clone();
+        workers.push(thread::spawn(move || {
+            run_naive_tcp_stream_client(core_addr, echo_addr, cert_der, stream_id, &options)
+        }));
+    }
+
+    let (mut latencies, retries, phases) = collect_client_workers(workers, "naive")?;
+    let elapsed = started.elapsed();
+
+    core_stop.store(true, Ordering::SeqCst);
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(core_addr);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(core_thread)?;
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let upload_bytes = (total_requests as u64).saturating_mul(options.payload_size as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed_with_phases(
+        "naive-tcp",
+        "h2-connect-connection-per-stream",
         options,
         None,
         upload_bytes,
@@ -3175,6 +3224,64 @@ fn start_anytls_server(
     Ok((addr, handle))
 }
 
+fn start_naive_server(
+    stop: Arc<AtomicBool>,
+) -> io::Result<(
+    SocketAddr,
+    CertificateDer<'static>,
+    thread::JoinHandle<io::Result<()>>,
+)> {
+    let cert = BenchCert::new("naive-bench")?;
+    let cert_der = cert.cert_der.clone();
+    let server = NaiveServer::new(NaiveServerConfig {
+        node_tag: "bench|naive|tcp".to_string(),
+        listen: "127.0.0.1:0".parse().expect("valid listen addr"),
+        users: vec![bench_user()],
+        routes: Vec::new(),
+        cert_file: cert.cert_path.to_string_lossy().to_string(),
+        key_file: cert.key_path.to_string_lossy().to_string(),
+        server_name: "localhost".to_string(),
+        alpn: vec!["h2".to_string()],
+        reject_unknown_sni: false,
+        connect_timeout: Duration::from_secs(3),
+    })?;
+    let listener = server.bind()?;
+    listener.set_nonblocking(true)?;
+    let addr = listener.local_addr()?;
+    let handle = thread::spawn(move || {
+        let _cert = cert;
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener)?;
+                while !stop.load(Ordering::SeqCst) {
+                    match tokio::time::timeout(Duration::from_millis(20), listener.accept()).await {
+                        Ok(Ok((stream, _))) => {
+                            let _ = stream.set_nodelay(true);
+                            let server = server.clone();
+                            let stop_for_connection = stop.clone();
+                            tokio::spawn(async move {
+                                if let Err(error) = server.handle_tcp_client(stream).await {
+                                    if !stop_for_connection.load(Ordering::SeqCst)
+                                        && !is_expected_bench_disconnect(&error)
+                                        && !is_expected_naive_bench_disconnect(&error)
+                                    {
+                                        eprintln!("bench naive server connection error: {error}");
+                                    }
+                                }
+                            });
+                        }
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => {}
+                    }
+                }
+                Ok(())
+            })
+    });
+    Ok((addr, cert_der, handle))
+}
+
 fn start_vmess_server(
     stop: Arc<AtomicBool>,
 ) -> io::Result<(SocketAddr, thread::JoinHandle<io::Result<()>>)> {
@@ -3267,6 +3374,10 @@ fn is_expected_bench_disconnect(error: &io::Error) -> bool {
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::BrokenPipe
     )
+}
+
+fn is_expected_naive_bench_disconnect(error: &io::Error) -> bool {
+    error.to_string().contains("tls handshake eof")
 }
 
 fn run_http_connect_stream_client(
@@ -3524,6 +3635,145 @@ fn run_anytls_tcp_stream_client(
     let _ = write_anytls_frame(&mut stream, ANYTLS_CMD_FIN, ANYTLS_STREAM_ID, &[]);
 
     Ok(stats)
+}
+
+fn run_naive_tcp_stream_client(
+    core_addr: SocketAddr,
+    echo_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    stream_id: usize,
+    options: &BenchOptions,
+) -> io::Result<ClientStats> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_naive_tcp_stream_client_async(
+            core_addr, echo_addr, cert_der, stream_id, options,
+        ))
+}
+
+async fn run_naive_tcp_stream_client_async(
+    core_addr: SocketAddr,
+    echo_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    stream_id: usize,
+    options: &BenchOptions,
+) -> io::Result<ClientStats> {
+    let payload = bench_payload(stream_id, options.payload_size);
+    let mut stats = ClientStats::new(Vec::with_capacity(options.requests), 0);
+
+    let started = Instant::now();
+    let stream = tokio::net::TcpStream::connect(core_addr).await?;
+    stream.set_nodelay(true)?;
+    stats.push_phase("tcp_connect", started.elapsed());
+
+    let started = Instant::now();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert_der).map_err(io_other)?;
+    let mut tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+    let tls = TlsConnector::from(Arc::new(tls_config))
+        .connect(
+            ServerName::try_from("localhost")
+                .map_err(io_other)?
+                .to_owned(),
+            stream,
+        )
+        .await
+        .map_err(io_other)?;
+    stats.push_phase("tls_connect", started.elapsed());
+
+    let started = Instant::now();
+    let (mut client, connection) = h2::client::handshake(tls).await.map_err(io_other)?;
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let auth = BASE64_STANDARD.encode(format!("{BENCH_USER_UUID}:{BENCH_USER_UUID}"));
+    let request = http::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri(format!("https://{echo_addr}"))
+        .header("proxy-authorization", format!("Basic {auth}"))
+        .body(())
+        .map_err(io_other)?;
+    let (response, mut send) = client.send_request(request, false).map_err(io_other)?;
+    let response = response.await.map_err(io_other)?;
+    if response.status() != http::StatusCode::OK {
+        connection_task.abort();
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("naive CONNECT failed with status {}", response.status()),
+        ));
+    }
+    let mut body = response.into_body();
+    stats.push_phase("protocol_setup", started.elapsed());
+
+    for request_index in 0..options.requests {
+        let started = Instant::now();
+        send.send_data(Bytes::copy_from_slice(&payload), false)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!(
+                        "naive stream {stream_id} request {} write failed: {error}",
+                        request_index + 1
+                    ),
+                )
+            })?;
+        let response = read_h2_payload_exact(&mut body, payload.len())
+            .await
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "naive stream {stream_id} request {} read failed: {error}",
+                        request_index + 1
+                    ),
+                )
+            })?;
+        if response != payload {
+            connection_task.abort();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "naive bench echo payload mismatch",
+            ));
+        }
+        let elapsed = started.elapsed();
+        stats.latencies.push(elapsed.as_micros());
+        stats.push_phase("relay_roundtrip", elapsed);
+    }
+
+    let _ = send.send_data(Bytes::new(), true);
+    connection_task.abort();
+    Ok(stats)
+}
+
+async fn read_h2_payload_exact(
+    body: &mut h2::RecvStream,
+    expected_len: usize,
+) -> io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(expected_len);
+    while output.len() < expected_len {
+        let Some(chunk) = body.data().await else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "naive bench response ended before expected payload",
+            ));
+        };
+        let chunk = chunk.map_err(io_other)?;
+        let chunk_len = chunk.len();
+        let _ = body.flow_control().release_capacity(chunk_len);
+        let remaining = expected_len.saturating_sub(output.len());
+        if chunk_len > remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "naive bench response exceeded expected payload size",
+            ));
+        }
+        output.extend_from_slice(&chunk);
+    }
+    Ok(output)
 }
 
 fn run_plain_stream_echo_client(
@@ -5200,9 +5450,9 @@ mod tests {
         parse_bench_suite_options, parse_external_bench_suite_options, percent_change,
         run_anytls_tcp_stream_bench, run_direct_tcp_proxy_stream_bench,
         run_direct_tcp_stream_bench, run_external_vless_tcp_stream_bench,
-        run_http_connect_stream_bench, run_hy2_udp_bench, run_shadowsocks_tcp_stream_bench,
-        run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench, run_tuic_tcp_bench,
-        run_tuic_tcp_stream_bench, run_tuic_udp_bench, run_vless_tcp_bench,
+        run_http_connect_stream_bench, run_hy2_udp_bench, run_naive_tcp_stream_bench,
+        run_shadowsocks_tcp_stream_bench, run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench,
+        run_tuic_tcp_bench, run_tuic_tcp_stream_bench, run_tuic_udp_bench, run_vless_tcp_bench,
         run_vless_tcp_stream_bench, run_vmess_tcp_stream_bench, summarize_bench_runs,
         validate_udp_bench_payload, BenchCert, BenchOptions, BenchPhaseReport, BenchPhaseSummary,
         BenchReport, BenchSuiteRun, LatencyReport,
@@ -5431,6 +5681,10 @@ mod tests {
         assert_eq!(
             canonical_bench_command("anytls-stream"),
             Some("anytls-tcp-stream")
+        );
+        assert_eq!(
+            canonical_bench_command("naive-stream"),
+            Some("naive-tcp-stream")
         );
         assert_eq!(
             canonical_bench_command("http-stream"),
@@ -5733,6 +5987,29 @@ mod tests {
         assert!(report.download_bytes > 0);
         assert_phase(&report, "tcp_connect");
         assert_phase(&report, "auth_write");
+        assert_phase(&report, "protocol_setup");
+        assert_phase(&report, "relay_roundtrip");
+    }
+
+    #[test]
+    fn runs_naive_tcp_stream_bench_smoke() {
+        let report = run_naive_tcp_stream_bench(&BenchOptions {
+            streams: 1,
+            requests: 3,
+            payload_size: 16,
+        })
+        .expect("bench");
+
+        assert_eq!(report.protocol, "naive-tcp");
+        assert_eq!(report.mode, "h2-connect-connection-per-stream");
+        assert_eq!(report.total_requests, 3);
+        assert_eq!(report.completed_requests, 3);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert_eq!(report.runtime_workers, None);
+        assert!(report.download_bytes > 0);
+        assert_phase(&report, "tcp_connect");
+        assert_phase(&report, "tls_connect");
         assert_phase(&report, "protocol_setup");
         assert_phase(&report, "relay_roundtrip");
     }

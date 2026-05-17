@@ -27,7 +27,7 @@ keliboard -> kelinode-rs -> keli-core-rs
 | Code path | Validation, listener startup, auth, forwarding, and traffic accounting exist in Rust. |
 | Partial | Some real code exists, but common panel options or real-client coverage are still missing. |
 | Rejected | The Rust core intentionally rejects this so it cannot look supported by accident. |
-| Sidecar | The feature belongs to an external runtime rather than `keli-core-rs`. |
+| Rejected | The shape is intentionally refused until a real native data path exists. |
 
 ## Protocol Matrix
 
@@ -43,8 +43,8 @@ keliboard -> kelinode-rs -> keli-core-rs
 | AnyTLS | Rendered by `kelinode-rs` | Partial | TCP frame inbound, password authentication, TCP stream forwarding, UDP-over-TCP, padding-scheme update negotiation, per-user traffic, speed/device limits, ApplyUserDelta TCP relay revocation/tail-traffic coverage | Real-client matrix |
 | Hysteria2 | Rendered by `kelinode-rs` | Partial | QUIC listener, password auth, TCP relay, UDP relay, salamander obfs, bandwidth options, per-user traffic, speed/device limits, ApplyUserDelta auth plus TCP relay data-path and delete-user connection-close coverage | Real-client matrix and production soak |
 | TUIC | Rendered by `kelinode-rs` when 0-RTT is absent | Partial | QUIC listener, UUID/token auth, TCP relay, UDP relay, cubic/bbr/new_reno congestion selection, per-user traffic, speed/device limits, delete-user connection close and tail-traffic coverage | zero-RTT, real-client matrix |
-| Naive | Sidecar plan only | Sidecar | Explicitly rejected by native core validation | Concrete Caddy forward_proxy deployment integration |
-| Mieru | Rendered by `kelinode-rs` for `keli-core-rs`; sidecar for Xray | Partial | TCP listener, stream underlay session demux, documented key derivation, XChaCha20-Poly1305 segments, SOCKS CONNECT relay, UDP ASSOCIATE over TCP underlay, per-user traffic, speed/device limits, ApplyUserDelta TCP underlay revocation/tail-traffic coverage | UDP underlay transport, traffic-pattern tuning, broader real-client matrix |
+| Naive | Rendered by `kelinode-rs` for `keli-core-rs` | Partial | HTTP/2 CONNECT over TLS, Basic authentication, TLS/auth failure backoff, optional Naive padding frames, TCP forwarding, bounded H2 body bridge with backpressure, per-user traffic, speed/device limits, ApplyUserDelta auth updates, delete-user H2 tunnel close with tail traffic, listener startup, data-path tests, `naive-tcp-stream` benchmark, and official NaiveProxy Windows x64 `naive-h2-tls` interop/120-round short-soak coverage | H3/QUIC transport, longer real-client soak under weak-network/reconnect conditions, production soak |
+| Mieru | Rendered by `kelinode-rs` for `keli-core-rs` | Partial | TCP listener, stream underlay session demux, documented key derivation, XChaCha20-Poly1305 segments, SOCKS CONNECT relay, UDP ASSOCIATE over TCP underlay, per-user traffic, speed/device limits, ApplyUserDelta TCP underlay revocation/tail-traffic coverage | UDP underlay transport, traffic-pattern tuning, broader real-client matrix |
 
 ## Transport Matrix
 
@@ -54,6 +54,7 @@ keliboard -> kelinode-rs -> keli-core-rs
 | TLS over TCP | VLESS, VMess, Trojan | Code path/partial by protocol | Certificate file based TLS exists. |
 | WS | VLESS, VMess, Trojan | Code path | Path and Host settings are accepted. |
 | TLS WS | VLESS, VMess, Trojan | Code path | Real-client matrix still required. |
+| H2 CONNECT over TLS | Naive | Partial | Native Naive listener accepts HTTP/2 CONNECT over TLS with Basic authentication and optional Naive padding. H3/QUIC is not implemented. |
 | HTTPUpgrade | VLESS, VMess, Trojan | Code path | Path and Host settings are accepted. |
 | gRPC | VLESS, VMess, Trojan | Code path | `TunMulti` is rejected. |
 | REALITY | VLESS only | Partial | TCP only, with deterministic local sing-box and mihomo interop coverage for Vision. ML-DSA-65 is rejected. |
@@ -61,7 +62,7 @@ keliboard -> kelinode-rs -> keli-core-rs
 | QUIC/TUIC | TUIC | Partial | TCP and UDP relay paths exist. |
 | H2 custom outbound transport | Native route outbounds | Partial | VLESS, VMess, and Trojan route outbounds can carry TCP streams over HTTP/2 `httpSettings`; TLS, h2c, custom method, and request headers are supported. `kelinode-rs` may map XHTTP/splithttp `stream-one` route outbounds onto this H2 path with the required XHTTP-compatible headers. |
 | Old QUIC custom outbound transport | Native route outbounds | Partial | VLESS, VMess, and Trojan route outbounds can carry TCP streams over V2Ray-style QUIC when `header.type` is `none`; `quicSettings.security` supports `none`, `aes-128-gcm`, and `chacha20-poly1305`. VMess UDP over the QUIC stream path is also wired. QUIC packet header obfuscation is still rejected. |
-| KCP/XHTTP packet-up/stream-up/H3 | Xray production path only | Rejected | Do not render into `keli-core-rs` until native data paths exist. |
+| KCP/XHTTP packet-up/stream-up/H3 | Not yet native | Rejected | Do not render into `keli-core-rs` until native data paths exist. |
 
 ## Runtime Capability Matrix
 
@@ -99,3 +100,4 @@ The first interop batch should be:
 4. Trojan TCP TLS and WS TLS.
 5. Hysteria2 TCP/UDP.
 6. TUIC TCP/UDP.
+7. Naive HTTP/2 CONNECT over TLS with the official NaiveProxy client.

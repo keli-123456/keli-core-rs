@@ -15,6 +15,7 @@ pub mod limits;
 pub mod metrics;
 pub mod mieru;
 pub mod mkcp;
+pub mod naive;
 pub mod outbound;
 pub mod protocol;
 pub mod quic;
@@ -74,11 +75,12 @@ pub use limits::{
 };
 pub use metrics::{CoreDurationMetrics, CoreMetricsSnapshot};
 pub use mieru::{MieruServer, MieruServerConfig};
+pub use naive::{NaiveServer, NaiveServerConfig};
 pub use outbound::{
     connect_tcp_outbound, connect_tcp_outbound_tokio, outbound_udp_target, send_udp_outbound,
     send_udp_outbound_tokio,
 };
-pub use protocol::{Protocol, ProtocolPlacement};
+pub use protocol::Protocol;
 pub use quic_resources::{QuicResourceSnapshot, SharedQuicConnectionLimiter};
 pub use routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 pub use runtime::{CorePlan, CoreStatus, ReloadDecision, RuntimeState};
