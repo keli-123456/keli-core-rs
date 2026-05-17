@@ -32,7 +32,6 @@ use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::{connect_tcp_outbound_tokio, send_udp_outbound_tokio};
 
-const TCP_REQUEST_ID: u64 = 0x401;
 const RESPONSE_OK: u8 = 0x00;
 const RESPONSE_ERROR: u8 = 0x01;
 const UDP_DATAGRAM_BUFFER_SIZE: usize = 1024 * 1024;
@@ -418,16 +417,6 @@ impl Hysteria2Server {
         bandwidth: DirectionalLimiters,
         client_ip: IpAddr,
     ) -> io::Result<()> {
-        let request_id = read_varint(&mut recv).await?;
-        if request_id != TCP_REQUEST_ID {
-            write_tcp_response(&mut send, RESPONSE_ERROR, "unsupported request").await?;
-            let _ = send.finish();
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid hysteria2 tcp request id",
-            ));
-        }
-
         let target = read_tcp_target(&mut recv).await?;
         let decision = self.router.decide_target(&target.host, target.port, "tcp");
         let remote = match &decision {
@@ -2586,7 +2575,7 @@ mod tests {
 
     fn tcp_request(addr: SocketAddr) -> Vec<u8> {
         let address = format_socket_addr(&addr);
-        let mut request = encode_varint(TCP_REQUEST_ID).expect("request id");
+        let mut request = Vec::new();
         request.extend_from_slice(&encode_varint(address.len() as u64).expect("addr len"));
         request.extend_from_slice(address.as_bytes());
         request.extend_from_slice(&encode_varint(0).expect("padding len"));

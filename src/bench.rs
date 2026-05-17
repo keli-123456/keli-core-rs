@@ -41,7 +41,6 @@ const BENCH_USER_BYTES: [u8; 16] = [0x11; 16];
 const HY2_PASSWORD: &str = "hy2-password";
 const TUIC_PASSWORD: &str = "tuic-password";
 const BENCH_HY2_PASSWORD_ENV: &str = "KELI_CORE_BENCH_HY2_PASSWORD";
-const HY2_TCP_REQUEST_ID: u64 = 0x401;
 const TUIC_VERSION: u8 = 0x05;
 const TUIC_COMMAND_AUTHENTICATE: u8 = 0x00;
 const TUIC_COMMAND_CONNECT: u8 = 0x01;
@@ -5087,7 +5086,7 @@ fn bench_hy2_password() -> String {
 
 fn hy2_tcp_request(target: SocketAddr) -> Vec<u8> {
     let address = format_socket_addr(&target);
-    let mut request = encode_hy2_varint(HY2_TCP_REQUEST_ID).expect("request id");
+    let mut request = Vec::new();
     request.extend_from_slice(&encode_hy2_varint(address.len() as u64).expect("address length"));
     request.extend_from_slice(address.as_bytes());
     request.extend_from_slice(&encode_hy2_varint(0).expect("padding length"));
