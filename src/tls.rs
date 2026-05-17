@@ -224,6 +224,12 @@ where
             match self.flush_tls() {
                 Ok(()) => return Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if self.peer_closed_for_write_wait() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "tls peer closed while waiting for tls flush",
+                        ));
+                    }
                     thread::sleep(Duration::from_millis(1));
                 }
                 Err(error) => return Err(error),
@@ -261,12 +267,31 @@ where
                 }
                 Ok(written) => input = &input[written..],
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if self.peer_closed_for_write_wait() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "tls peer closed while waiting for raw write",
+                        ));
+                    }
                     thread::sleep(Duration::from_millis(1));
                 }
                 Err(error) => return Err(error),
             }
         }
         Ok(())
+    }
+
+    fn peer_closed_for_write_wait(&self) -> bool {
+        match self.peer_closed() {
+            Ok(closed) => closed,
+            Err(error) => matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+            ),
+        }
     }
 
     fn read_tls_record_limited(&mut self) -> io::Result<usize> {

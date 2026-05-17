@@ -2575,7 +2575,9 @@ where
                                 continue;
                             }
                         }
-                        write_all_wait(&mut remote, &client_buffer[..read])?;
+                        write_all_wait_or_cancel(&mut remote, &client_buffer[..read], || {
+                            vless_vision_client_peer_closed(&client)
+                        })?;
                         upload = upload.saturating_add(read as u64);
                         progressed = true;
                     }
@@ -2606,7 +2608,9 @@ where
                             continue;
                         }
                     }
-                    write_all_wait(&mut remote, &client_buffer[..decoded])?;
+                    write_all_wait_or_cancel(&mut remote, &client_buffer[..decoded], || {
+                        vless_vision_client_peer_closed(&client)
+                    })?;
                     upload = upload.saturating_add(decoded as u64);
                     progressed = true;
                     if vision_decoder.is_direct_copy() {
@@ -2813,7 +2817,11 @@ fn vless_vision_drain_after_client_eof() -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn write_all_wait(writer: &mut TcpStream, mut input: &[u8]) -> io::Result<()> {
+fn write_all_wait_or_cancel(
+    writer: &mut TcpStream,
+    mut input: &[u8],
+    mut should_cancel: impl FnMut() -> bool,
+) -> io::Result<()> {
     while !input.is_empty() {
         match writer.write(input) {
             Ok(0) => {
@@ -2824,6 +2832,12 @@ fn write_all_wait(writer: &mut TcpStream, mut input: &[u8]) -> io::Result<()> {
             }
             Ok(written) => input = &input[written..],
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if should_cancel() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "peer closed while waiting for socket write",
+                    ));
+                }
                 thread::sleep(Duration::from_millis(1));
             }
             Err(error) => return Err(error),
