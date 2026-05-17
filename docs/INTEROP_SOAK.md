@@ -417,8 +417,9 @@ The same matrix is available from GitHub Actions as the manual `Native Interop M
 workflow. Use the optional `case_filter` input to run one protocol family before a focused
 gray release, or leave it empty to run all supported sing-box cases. Enable `include_naive` to
 download the pinned official NaiveProxy Linux client, install a temporary trusted local certificate,
-and run the `naive-h2-tls` case. Increase `probe_rounds` and set `probe_interval_ms` for a short
-CI soak before a gray release. For reconnect and weak-network Naive coverage, set
+and run both `naive-h2-tls` and `naive-h3-quic` by default. Set `case_filter` to one exact case name
+when you only want H2 or H3. Increase `probe_rounds` and set `probe_interval_ms` for a short CI soak
+before a gray release. For reconnect and weak-network Naive coverage, set
 `naive_restart_every_rounds` and optionally `naive_netem`, for example `delay 80ms 20ms loss 1%`.
 The NaiveProxy job timeout is intentionally longer than the default so a 30 minute or 6 hour soak
 can run from the manual workflow. Mihomo coverage is currently a local matrix until the CI image has

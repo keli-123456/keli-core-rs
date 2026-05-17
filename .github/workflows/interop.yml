@@ -13,7 +13,7 @@ on:
         type: boolean
         default: false
       include_naive:
-        description: Run the official NaiveProxy H2/TLS client case
+        description: Run official NaiveProxy H2/TLS and H3/QUIC client cases
         required: true
         type: boolean
         default: false
@@ -105,7 +105,7 @@ jobs:
           cargo run --locked --example interop_matrix -- "${args[@]}"
 
       - name: Upload interop artifacts
-        if: ${{ always() && inputs.keep_artifacts }}
+        if: ${{ always() && (inputs.keep_artifacts || failure()) }}
         uses: actions/upload-artifact@v4
         with:
           name: keli-core-rs-interop-${{ github.run_id }}
@@ -113,7 +113,7 @@ jobs:
           if-no-files-found: ignore
 
   naiveproxy:
-    name: NaiveProxy official-client loopback
+    name: NaiveProxy official-client H2/H3 loopback
     if: ${{ inputs.include_naive || contains(inputs.case_filter, 'naive') }}
     runs-on: ubuntu-latest
     timeout-minutes: 420
@@ -184,7 +184,7 @@ jobs:
       - name: Build release core
         run: cargo build --release --locked
 
-      - name: Run NaiveProxy interop case
+      - name: Run NaiveProxy interop cases
         shell: bash
         env:
           CASE_FILTER: ${{ inputs.case_filter }}
@@ -231,7 +231,7 @@ jobs:
           cargo run --locked --example interop_matrix -- "${args[@]}"
 
       - name: Upload NaiveProxy interop artifacts
-        if: ${{ always() && inputs.keep_artifacts }}
+        if: ${{ always() && (inputs.keep_artifacts || failure()) }}
         uses: actions/upload-artifact@v4
         with:
           name: keli-core-rs-naive-interop-${{ github.run_id }}
