@@ -82,6 +82,7 @@ struct Args {
     probe_interval: Duration,
     naive_restart_every_rounds: Option<usize>,
     naive_net_log: bool,
+    naive_ignore_spki_list: Option<String>,
     keep: bool,
 }
 
@@ -550,6 +551,7 @@ fn write_matrix_summary(
         "probe_interval_ms": args.probe_interval.as_millis(),
         "naive_restart_every_rounds": args.naive_restart_every_rounds,
         "naive_net_log": args.naive_net_log,
+        "naive_ignore_spki_list_configured": args.naive_ignore_spki_list.is_some(),
         "clients": args.clients.iter().map(|client| client.label()).collect::<Vec<_>>(),
         "only": args.only,
         "cases": reports,
@@ -595,6 +597,7 @@ fn parse_args() -> Result<Args> {
             .as_str(),
         "1" | "true" | "TRUE" | "yes" | "YES"
     );
+    let mut naive_ignore_spki_list = env::var("KELI_INTEROP_NAIVE_IGNORE_SPKI_LIST").ok();
     let mut keep = false;
 
     let mut iter = env::args().skip(1);
@@ -682,6 +685,12 @@ fn parse_args() -> Result<Args> {
                 );
             }
             "--naive-net-log" => naive_net_log = true,
+            "--naive-ignore-spki-list" => {
+                naive_ignore_spki_list = Some(
+                    iter.next()
+                        .ok_or("--naive-ignore-spki-list requires a value")?,
+                );
+            }
             "--keep" => keep = true,
             "--help" | "-h" => {
                 print_help();
@@ -724,13 +733,14 @@ fn parse_args() -> Result<Args> {
         probe_interval,
         naive_restart_every_rounds,
         naive_net_log,
+        naive_ignore_spki_list,
         keep,
     })
 }
 
 fn print_help() {
     println!(
-        "Usage: cargo run --example interop_matrix -- --core <keli-core-rs> --sing-box <sing-box> [--mihomo <mihomo>] [--naive <naive>] [--client sing-box|mihomo|naive|both|all] [--tls-cert <cert.pem> --tls-key <key.pem>] [--naive-server-name <name>] [--only hy2] [--probe-rounds 30] [--probe-interval-ms 1000] [--naive-restart-every-rounds N] [--naive-net-log] [--keep]"
+        "Usage: cargo run --example interop_matrix -- --core <keli-core-rs> --sing-box <sing-box> [--mihomo <mihomo>] [--naive <naive>] [--client sing-box|mihomo|naive|both|all] [--tls-cert <cert.pem> --tls-key <key.pem>] [--naive-server-name <name>] [--only hy2] [--probe-rounds 30] [--probe-interval-ms 1000] [--naive-restart-every-rounds N] [--naive-net-log] [--naive-ignore-spki-list BASE64_SHA256] [--keep]"
     );
     println!("Runs local real-client interop against temporary keli-core-rs listeners.");
 }
@@ -2061,7 +2071,7 @@ fn start_naive_proxy_process(
     args: &Args,
     socks_port: u16,
 ) -> Result<ProcessGuard> {
-    let naive_args = vec![config_path.display().to_string()];
+    let naive_args = naive_proxy_process_args(config_path, args.naive_ignore_spki_list.as_deref());
     let mut naive = start_process(
         &format!("naive-{}", case.name),
         naive_path,
@@ -2071,6 +2081,19 @@ fn start_naive_proxy_process(
     wait_for_tcp(("127.0.0.1", socks_port), Duration::from_secs(8))?;
     naive.fail_if_exited()?;
     Ok(naive)
+}
+
+fn naive_proxy_process_args(config_path: &Path, ignore_spki_list: Option<&str>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(spki_list) = ignore_spki_list.filter(|value| !value.is_empty()) {
+        args.push(format!(
+            "--user-data-dir={}",
+            config_path.with_extension("profile").display()
+        ));
+        args.push(format!("--ignore-certificate-errors-spki-list={spki_list}"));
+    }
+    args.push(config_path.display().to_string());
+    args
 }
 
 fn run_probe_rounds(
@@ -2563,7 +2586,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_naiveproxy_diagnostics_into_config_without_process_args() {
+    fn writes_naiveproxy_diagnostics_into_config() {
         let dir = unique_temp_dir("naive-config-diagnostics");
         fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("config.json");
@@ -2590,6 +2613,20 @@ mod tests {
         assert_eq!(config["log-net-log"], net_log.display().to_string());
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn passes_naiveproxy_spki_allowlist_as_process_switch() {
+        let args = naive_proxy_process_args(Path::new("config.json"), Some("abc123"));
+
+        assert_eq!(
+            args,
+            vec![
+                "--user-data-dir=config.profile".to_string(),
+                "--ignore-certificate-errors-spki-list=abc123".to_string(),
+                "config.json".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -2635,6 +2672,7 @@ mod tests {
             probe_interval: Duration::from_millis(250),
             naive_restart_every_rounds: Some(2),
             naive_net_log: true,
+            naive_ignore_spki_list: Some("abc123".to_string()),
             keep: true,
         };
         let reports = vec![case_report(
@@ -2660,6 +2698,8 @@ mod tests {
         assert!(body.contains("\"probe_interval_ms\": 250"));
         assert!(body.contains("\"naive_restart_every_rounds\": 2"));
         assert!(body.contains("\"naive_net_log\": true"));
+        assert!(body.contains("\"naive_ignore_spki_list_configured\": true"));
+        assert!(!body.contains("abc123"));
         assert!(body.contains("\"retry_attempts\": 1"));
         assert!(body.contains("\"restarts\": 1"));
         assert!(body.contains("\"p95\": 8"));

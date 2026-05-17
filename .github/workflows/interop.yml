@@ -163,28 +163,66 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p runtime/interop-certs
+          cat > runtime/interop-certs/ca.openssl.cnf <<'EOF'
+          [req]
+          distinguished_name = dn
+          x509_extensions = v3_ca
+          prompt = no
+
+          [dn]
+          CN = Keli Naive Interop Local CA
+
+          [v3_ca]
+          basicConstraints = critical,CA:true,pathlen:0
+          keyUsage = critical,keyCertSign,cRLSign
+          subjectKeyIdentifier = hash
+          authorityKeyIdentifier = keyid:always,issuer
+          EOF
           cat > runtime/interop-certs/openssl.cnf <<'EOF'
           [req]
           distinguished_name = dn
-          x509_extensions = v3_req
           prompt = no
 
           [dn]
           CN = naive.local.test
 
           [v3_req]
+          basicConstraints = critical,CA:false
+          keyUsage = critical,digitalSignature,keyEncipherment
+          extendedKeyUsage = serverAuth
           subjectAltName = @alt_names
 
           [alt_names]
           DNS.1 = naive.local.test
           EOF
           openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout runtime/interop-certs/naive-ca.key \
+            -out runtime/interop-certs/naive-ca.crt \
+            -days 1 \
+            -config runtime/interop-certs/ca.openssl.cnf
+          openssl req -newkey rsa:2048 -nodes \
             -keyout runtime/interop-certs/naive.key \
-            -out runtime/interop-certs/naive.crt \
+            -out runtime/interop-certs/naive.csr \
             -days 1 \
             -config runtime/interop-certs/openssl.cnf
-          sudo cp runtime/interop-certs/naive.crt /usr/local/share/ca-certificates/keli-naive-interop.crt
+          openssl x509 -req \
+            -in runtime/interop-certs/naive.csr \
+            -CA runtime/interop-certs/naive-ca.crt \
+            -CAkey runtime/interop-certs/naive-ca.key \
+            -CAcreateserial \
+            -out runtime/interop-certs/naive.crt \
+            -days 1 \
+            -extensions v3_req \
+            -extfile runtime/interop-certs/openssl.cnf
+          sudo cp runtime/interop-certs/naive-ca.crt /usr/local/share/ca-certificates/keli-naive-interop.crt
           sudo update-ca-certificates
+          spki="$(
+            openssl x509 -in runtime/interop-certs/naive.crt -pubkey -noout \
+              | openssl pkey -pubin -outform DER \
+              | openssl dgst -sha256 -binary \
+              | openssl base64 -A
+          )"
+          echo "NAIVE_IGNORE_SPKI_LIST=${spki}" >> "${GITHUB_ENV}"
 
       - name: Build release core
         run: cargo build --release --locked
@@ -233,6 +271,9 @@ jobs:
           fi
           if [[ "${NAIVE_NET_LOG}" == "true" ]]; then
             args+=(--naive-net-log)
+          fi
+          if [[ -n "${NAIVE_IGNORE_SPKI_LIST:-}" ]]; then
+            args+=(--naive-ignore-spki-list "${NAIVE_IGNORE_SPKI_LIST}")
           fi
           if [[ "${KEEP_ARTIFACTS}" == "true" ]]; then
             args+=(--keep)

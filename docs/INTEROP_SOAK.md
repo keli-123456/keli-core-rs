@@ -100,9 +100,12 @@ bash scripts/naive_official_soak_linux.sh --case naive-h3-quic --rounds 1800 --i
 bash scripts/naive_official_soak_linux.sh --case naive-h3-quic --rounds 600 --restart-every-rounds 50 --netem "delay 80ms 20ms loss 1%"
 ```
 
-The helper installs a short-lived local CA certificate for the official client and removes it on
-exit. On Windows, the official client still requires the test certificate to be trusted by the OS;
-without that trust the `quic://` probe can close before returning HTTP response headers.
+The helper generates a short-lived local CA plus leaf certificate, installs the CA root for the
+official Linux client, computes the leaf SPKI allowlist used by Chromium's QUIC verifier, and
+removes the CA root on exit. Pass `--ignore-spki-list VALUE` to override the computed value. On
+Windows, prefer trusting the generated CA in the OS store for local probes; the SPKI switch is
+passed for Chromium-compatible builds, but official NaiveProxy can still require platform trust.
+Without that trust the `quic://` probe can close before returning HTTP response headers.
 The generated `runtime/interop-matrix/interop-summary.json` includes per-case probe telemetry:
 round count, probe count, retry attempts, planned client restarts, and p50/p95/p99/max probe
 latency. Treat a rising retry count or p99 over a long H3/weak-network run as a signal to inspect
@@ -374,11 +377,11 @@ in this matrix, such as HTTPUpgrade, Trojan plain TCP, AnyTLS, Mieru, and Naive.
 The NaiveProxy client verifies the native `naive-h2-tls` case with a generated
 `listen=socks://127.0.0.1:<port>` and `proxy=https://user:pass@localhost:<port>`
 configuration. Because the matrix uses a temporary self-signed localhost certificate by default,
-official NaiveProxy runs may require the generated certificate to be trusted by the host OS or a
-trusted local test certificate to be wired in before recording the result as production interop.
-Use `--tls-cert`, `--tls-key`, and `--naive-server-name` for that path. When the Naive server name
-is not localhost, the matrix passes a NaiveProxy host-resolver rule so the official client still
-connects to the loopback core listener.
+official NaiveProxy runs may require the generated CA to be trusted by the host OS before recording
+the result as production interop. Use `--tls-cert`, `--tls-key`, `--naive-server-name`, and
+optionally `--naive-ignore-spki-list` for that path. When the Naive server name is not localhost,
+the matrix passes a NaiveProxy host-resolver rule so the official client still connects to the
+loopback core listener.
 
 Latest official NaiveProxy Windows x64 interop/short-soak sample:
 
@@ -424,11 +427,12 @@ SKIP naive official-client: pass --client naive --naive <naive> --only naive
 The same matrix is available from GitHub Actions as the manual `Native Interop Matrix`
 workflow. Use the optional `case_filter` input to run one protocol family before a focused
 gray release, or leave it empty to run all supported sing-box cases. Enable `include_naive` to
-download the pinned official NaiveProxy Linux client, install a temporary trusted local certificate,
-and run both `naive-h2-tls` and `naive-h3-quic` by default. Set `case_filter` to one exact case name
-when you only want H2 or H3. Increase `probe_rounds` and set `probe_interval_ms` for a short CI soak
-before a gray release. For reconnect and weak-network Naive coverage, set
-`naive_restart_every_rounds` and optionally `naive_netem`, for example `delay 80ms 20ms loss 1%`.
+download the pinned official NaiveProxy Linux client, install a temporary trusted local CA, compute
+a leaf SPKI allowlist for Chromium QUIC/H3, and run both `naive-h2-tls` and `naive-h3-quic` by
+default. Set `case_filter` to one exact case name when you only want H2 or H3.
+Increase `probe_rounds` and set `probe_interval_ms` for a short CI soak before a gray release. For
+reconnect and weak-network Naive coverage, set `naive_restart_every_rounds` and optionally
+`naive_netem`, for example `delay 80ms 20ms loss 1%`.
 The NaiveProxy job timeout is intentionally longer than the default so a 30 minute or 6 hour soak
 can run from the manual workflow. Mihomo coverage is currently a local matrix until the CI image has
 a pinned mihomo binary.
