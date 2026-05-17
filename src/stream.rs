@@ -168,35 +168,62 @@ fn relay_tcp_streams_unlimited_native(
     remote: TcpStream,
     close_peer_on_eof: bool,
 ) -> io::Result<(u64, u64)> {
-    let mut client_read = client.try_clone()?;
-    let client_read_shutdown = if close_peer_on_eof {
-        Some(client_read.try_clone()?)
+    let close_client_from_upload = if close_peer_on_eof {
+        Some(client.try_clone()?)
     } else {
         None
     };
+    let close_remote_from_upload = if close_peer_on_eof {
+        Some(remote.try_clone()?)
+    } else {
+        None
+    };
+    let close_client_from_download = if close_peer_on_eof {
+        Some(client.try_clone()?)
+    } else {
+        None
+    };
+    let close_remote_from_download = if close_peer_on_eof {
+        Some(remote.try_clone()?)
+    } else {
+        None
+    };
+    let mut client_read = client.try_clone()?;
     let mut client_write = client;
     let mut remote_read = remote.try_clone()?;
-    let remote_read_shutdown = if close_peer_on_eof {
-        Some(remote_read.try_clone()?)
-    } else {
-        None
-    };
     let mut remote_write = remote;
     let upload_task = spawn_native_blocking_relay(move || {
         let copied = copy_count_best_effort(&mut client_read, &mut remote_write);
-        let _ = remote_write.shutdown(Shutdown::Write);
-        if let Some(remote_read_shutdown) = remote_read_shutdown {
-            let _ = remote_read_shutdown.shutdown(Shutdown::Read);
+        if close_peer_on_eof {
+            shutdown_tcp_pair(
+                close_client_from_upload.as_ref(),
+                close_remote_from_upload.as_ref(),
+            );
+        } else {
+            let _ = remote_write.shutdown(Shutdown::Write);
         }
         copied
     })?;
     let download = copy_count_best_effort(&mut remote_read, &mut client_write);
-    let _ = client_write.shutdown(Shutdown::Write);
-    if let Some(client_read_shutdown) = client_read_shutdown {
-        let _ = client_read_shutdown.shutdown(Shutdown::Read);
+    if close_peer_on_eof {
+        shutdown_tcp_pair(
+            close_client_from_download.as_ref(),
+            close_remote_from_download.as_ref(),
+        );
+    } else {
+        let _ = client_write.shutdown(Shutdown::Write);
     }
     let upload = join_native_blocking_relay(upload_task, "tcp upload relay task panicked")?;
     Ok((upload, download))
+}
+
+fn shutdown_tcp_pair(client: Option<&TcpStream>, remote: Option<&TcpStream>) {
+    if let Some(client) = client {
+        let _ = client.shutdown(Shutdown::Both);
+    }
+    if let Some(remote) = remote {
+        let _ = remote.shutdown(Shutdown::Both);
+    }
 }
 
 fn tcp_relay_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
@@ -689,6 +716,47 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(200)))
             .expect("remote timeout");
         let mut byte = [0u8; 1];
+        assert!(matches!(remote_peer.read(&mut byte), Ok(0) | Err(_)));
+        relay.join().expect("relay thread");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlimited_tcp_relay_close_on_eof_exits_when_client_half_closes() {
+        let client_listener = TcpListener::bind("127.0.0.1:0").expect("client bind");
+        let remote_listener = TcpListener::bind("127.0.0.1:0").expect("remote bind");
+        let client_addr = client_listener.local_addr().expect("client addr");
+        let remote_addr = remote_listener.local_addr().expect("remote addr");
+        let client_peer = thread::spawn(move || TcpStream::connect(client_addr).expect("client"));
+        let remote_peer = thread::spawn(move || TcpStream::connect(remote_addr).expect("remote"));
+        let (client, _) = client_listener.accept().expect("client accept");
+        let (remote, _) = remote_listener.accept().expect("remote accept");
+        let mut client_peer = client_peer.join().expect("client thread");
+        let mut remote_peer = remote_peer.join().expect("remote thread");
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let relay = thread::spawn(move || {
+            let result = relay_tcp_fast_unlimited_close_on_eof(client, remote);
+            done_tx.send(result).expect("send relay result");
+        });
+
+        client_peer
+            .shutdown(Shutdown::Write)
+            .expect("client half close");
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("relay should exit after client half close")
+            .expect("relay result");
+        assert_eq!(result, (0, 0));
+
+        let mut byte = [0u8; 1];
+        client_peer
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("client timeout");
+        assert!(matches!(client_peer.read(&mut byte), Ok(0) | Err(_)));
+        remote_peer
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("remote timeout");
         assert!(matches!(remote_peer.read(&mut byte), Ok(0) | Err(_)));
         relay.join().expect("relay thread");
     }
