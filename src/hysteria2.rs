@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env;
 use std::io;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
@@ -9,7 +10,7 @@ use bytes::Bytes;
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::Runtime;
 use socket2::SockRef;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
 use crate::limits::{
@@ -57,6 +58,10 @@ const HY2_INVALID_AUTH_BACKOFF_THRESHOLD: u32 = 8;
 const HY2_INVALID_AUTH_BACKOFF_WINDOW: Duration = Duration::from_secs(30);
 const HY2_INVALID_AUTH_BACKOFF_DURATION: Duration = Duration::from_secs(30);
 const HY2_INVALID_AUTH_BACKOFF_MAX_ENTRIES: usize = 4096;
+const HY2_AUTH_TIMEOUT_SECS_ENV: &str = "KELI_CORE_HY2_AUTH_TIMEOUT_SECS";
+const DEFAULT_HY2_AUTH_TIMEOUT_SECS: u64 = 5;
+const HY2_RELAY_IO_TIMEOUT_SECS_ENV: &str = "KELI_CORE_HY2_RELAY_IO_TIMEOUT_SECS";
+const DEFAULT_HY2_RELAY_IO_TIMEOUT_SECS: u64 = 15;
 const QUIC_ENDPOINT_STOP_WAIT: Duration = Duration::from_secs(3);
 static HY2_ACTIVE_UDP_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 static HY2_UDP_SESSION_LIMIT: OnceLock<usize> = OnceLock::new();
@@ -276,24 +281,51 @@ impl Hysteria2Server {
     }
 
     async fn handle_incoming(&self, incoming: quinn::Incoming) -> io::Result<()> {
-        let connection = incoming.await.map_err(io_other)?;
-        let client_ip = connection.remote_address().ip();
+        let client_ip = incoming.remote_address().ip();
         if self.auth_backoff.is_blocked(client_ip) {
-            connection.close(0u32.into(), b"auth backoff");
+            incoming.refuse();
             return Ok(());
         }
-        let auth = match self.authenticate_http3(&connection).await {
-            Ok(auth) => {
-                self.auth_backoff.record_success(client_ip);
-                auth
-            }
-            Err(error) => {
-                if is_hysteria2_invalid_auth_error(&error) {
-                    self.auth_backoff.record_invalid(client_ip);
-                }
-                return Err(error);
+
+        let connecting = incoming.accept().map_err(io_other)?;
+        let connection = match tokio::time::timeout(hy2_auth_timeout(), connecting).await {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(error)) => return Err(io_other(error)),
+            Err(_) => {
+                self.auth_backoff.record_invalid(client_ip);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "hysteria2 handshake timed out",
+                ));
             }
         };
+
+        let auth =
+            match tokio::time::timeout(hy2_auth_timeout(), self.authenticate_http3(&connection))
+                .await
+            {
+                Ok(Ok(auth)) => {
+                    self.auth_backoff.record_success(client_ip);
+                    auth
+                }
+                Ok(Err(error)) => {
+                    if is_hysteria2_invalid_auth_error(&error) {
+                        self.auth_backoff.record_invalid(client_ip);
+                        connection.close(0u32.into(), b"invalid auth");
+                    } else {
+                        connection.close(0u32.into(), b"auth failed");
+                    }
+                    return Err(error);
+                }
+                Err(_) => {
+                    self.auth_backoff.record_invalid(client_ip);
+                    connection.close(0u32.into(), b"auth timeout");
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "hysteria2 authentication timed out",
+                    ));
+                }
+            };
         let _session = self.acquire_user_session(auth.user.as_ref(), Some(client_ip))?;
         let bandwidth = self.connection_limiters(
             self.bandwidth.limiter_for(Some(auth.user.as_ref())),
@@ -1551,7 +1583,9 @@ async fn relay_streams(
                 close_tcp_socket(&upload_remote_shutdown);
                 return Ok::<u64, io::Error>(total);
             }
-            if let Err(error) = remote_write.write_all(&buffer[..read]).await {
+            if let Err(error) =
+                hy2_write_all_with_timeout(&mut remote_write, &buffer[..read], "upload").await
+            {
                 flush_pending_traffic(&mut pending, &mut on_upload);
                 let _ = remote_write.shutdown().await;
                 close_tcp_socket(&upload_remote_shutdown);
@@ -1602,7 +1636,8 @@ async fn relay_streams(
                 close_tcp_socket(&download_remote_shutdown);
                 return Ok::<u64, io::Error>(total);
             }
-            if let Err(error) = send.write_all(&buffer[..read]).await.map_err(io_other) {
+            if let Err(error) = hy2_write_all_with_timeout(send, &buffer[..read], "download").await
+            {
                 flush_pending_traffic(&mut pending, &mut on_download);
                 let _ = send.finish();
                 close_tcp_socket(&download_remote_shutdown);
@@ -1648,7 +1683,9 @@ async fn relay_streams_unlimited(
                 let _ = remote_write.shutdown().await;
                 return Ok::<u64, io::Error>(total);
             };
-            if let Err(error) = remote_write.write_all(&buffer[..read]).await {
+            if let Err(error) =
+                hy2_write_all_with_timeout(&mut remote_write, &buffer[..read], "upload").await
+            {
                 flush_pending_traffic(&mut pending, &mut on_upload);
                 let _ = remote_write.shutdown().await;
                 close_tcp_socket(&upload_remote_shutdown);
@@ -1682,7 +1719,8 @@ async fn relay_streams_unlimited(
                 close_tcp_socket(&download_remote_shutdown);
                 return Ok::<u64, io::Error>(total);
             }
-            if let Err(error) = send.write_all(&buffer[..read]).await.map_err(io_other) {
+            if let Err(error) = hy2_write_all_with_timeout(send, &buffer[..read], "download").await
+            {
                 flush_pending_traffic(&mut pending, &mut on_download);
                 let _ = send.finish();
                 close_tcp_socket(&download_remote_shutdown);
@@ -1713,6 +1751,43 @@ fn clone_tokio_tcp_stream_for_shutdown(socket: &tokio::net::TcpStream) -> io::Re
 
 fn close_tcp_socket(socket: &TcpStream) {
     let _ = socket.shutdown(Shutdown::Both);
+}
+
+async fn hy2_write_all_with_timeout<W>(
+    writer: &mut W,
+    buffer: &[u8],
+    direction: &'static str,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(hy2_relay_io_timeout(), writer.write_all(buffer)).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("hysteria2 {direction} write timed out"),
+        )),
+    }
+}
+
+fn hy2_auth_timeout() -> Duration {
+    env_duration_seconds(HY2_AUTH_TIMEOUT_SECS_ENV, DEFAULT_HY2_AUTH_TIMEOUT_SECS)
+}
+
+fn hy2_relay_io_timeout() -> Duration {
+    env_duration_seconds(
+        HY2_RELAY_IO_TIMEOUT_SECS_ENV,
+        DEFAULT_HY2_RELAY_IO_TIMEOUT_SECS,
+    )
+}
+
+fn env_duration_seconds(name: &str, default_seconds: u64) -> Duration {
+    let seconds = env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(default_seconds);
+    Duration::from_secs(seconds)
 }
 
 async fn read_varint(stream: &mut quinn::RecvStream) -> io::Result<u64> {
