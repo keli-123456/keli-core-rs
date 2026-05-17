@@ -287,6 +287,17 @@ struct BenchSummary {
     roundtrip_mbps_max: f64,
     p95_us_avg: f64,
     p99_us_avg: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    phases: Vec<BenchPhaseSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BenchPhaseSummary {
+    name: String,
+    count_total: usize,
+    avg_us_avg: f64,
+    p95_us_avg: f64,
+    p99_us_avg: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -310,6 +321,19 @@ struct BenchComparisonRow {
     candidate_errors_total: usize,
     baseline_retries_total: usize,
     candidate_retries_total: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    phases: Vec<BenchPhaseComparisonRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchPhaseComparisonRow {
+    name: String,
+    baseline_p99_us: f64,
+    candidate_p99_us: f64,
+    p99_change_percent: Option<f64>,
+    baseline_avg_us: f64,
+    candidate_avg_us: f64,
+    avg_change_percent: Option<f64>,
 }
 
 pub fn run_bench(args: impl Iterator<Item = String>) -> Result<(), String> {
@@ -1526,7 +1550,40 @@ fn summarize_reports(command: &str, reports: &[&BenchReport]) -> Option<BenchSum
             .fold(0.0, f64::max),
         p95_us_avg: avg_f64(reports.iter().map(|report| report.latency.p95_us as f64)),
         p99_us_avg: avg_f64(reports.iter().map(|report| report.latency.p99_us as f64)),
+        phases: summarize_phase_reports(reports),
     })
+}
+
+fn summarize_phase_reports(reports: &[&BenchReport]) -> Vec<BenchPhaseSummary> {
+    let mut names = Vec::<String>::new();
+    for report in reports {
+        for phase in &report.phases {
+            if !names.contains(&phase.name) {
+                names.push(phase.name.clone());
+            }
+        }
+    }
+    names.sort();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let phases = reports
+                .iter()
+                .flat_map(|report| report.phases.iter())
+                .filter(|phase| phase.name == name)
+                .collect::<Vec<_>>();
+            if phases.is_empty() {
+                return None;
+            }
+            Some(BenchPhaseSummary {
+                name,
+                count_total: phases.iter().map(|phase| phase.count).sum(),
+                avg_us_avg: avg_f64(phases.iter().map(|phase| phase.avg_us)),
+                p95_us_avg: avg_f64(phases.iter().map(|phase| phase.p95_us as f64)),
+                p99_us_avg: avg_f64(phases.iter().map(|phase| phase.p99_us as f64)),
+            })
+        })
+        .collect()
 }
 
 fn compare_bench_suites(options: &BenchCompareOptions) -> io::Result<BenchComparisonReport> {
@@ -1557,6 +1614,10 @@ fn compare_bench_suites(options: &BenchCompareOptions) -> io::Result<BenchCompar
                 candidate_errors_total: candidate_summary.errors_total,
                 baseline_retries_total: baseline_summary.retries_total,
                 candidate_retries_total: candidate_summary.retries_total,
+                phases: compare_phase_summaries(
+                    &baseline_summary.phases,
+                    &candidate_summary.phases,
+                ),
             });
         }
     }
@@ -1566,6 +1627,35 @@ fn compare_bench_suites(options: &BenchCompareOptions) -> io::Result<BenchCompar
         candidate_label: candidate.label,
         rows,
     })
+}
+
+fn compare_phase_summaries(
+    baseline: &[BenchPhaseSummary],
+    candidate: &[BenchPhaseSummary],
+) -> Vec<BenchPhaseComparisonRow> {
+    baseline
+        .iter()
+        .filter_map(|baseline_phase| {
+            let candidate_phase = candidate
+                .iter()
+                .find(|phase| phase.name == baseline_phase.name)?;
+            Some(BenchPhaseComparisonRow {
+                name: baseline_phase.name.clone(),
+                baseline_p99_us: baseline_phase.p99_us_avg,
+                candidate_p99_us: candidate_phase.p99_us_avg,
+                p99_change_percent: percent_change(
+                    baseline_phase.p99_us_avg,
+                    candidate_phase.p99_us_avg,
+                ),
+                baseline_avg_us: baseline_phase.avg_us_avg,
+                candidate_avg_us: candidate_phase.avg_us_avg,
+                avg_change_percent: percent_change(
+                    baseline_phase.avg_us_avg,
+                    candidate_phase.avg_us_avg,
+                ),
+            })
+        })
+        .collect()
 }
 
 fn read_bench_suite(path: &Path) -> io::Result<BenchSuiteReport> {
@@ -5106,15 +5196,16 @@ fn join_server(handle: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_bench_command, parse_bench_options, parse_bench_suite_options,
-        parse_external_bench_suite_options, percent_change, run_anytls_tcp_stream_bench,
-        run_direct_tcp_proxy_stream_bench, run_direct_tcp_stream_bench,
-        run_external_vless_tcp_stream_bench, run_http_connect_stream_bench, run_hy2_udp_bench,
-        run_shadowsocks_tcp_stream_bench, run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench,
-        run_tuic_tcp_bench, run_tuic_tcp_stream_bench, run_tuic_udp_bench, run_vless_tcp_bench,
+        canonical_bench_command, compare_phase_summaries, parse_bench_options,
+        parse_bench_suite_options, parse_external_bench_suite_options, percent_change,
+        run_anytls_tcp_stream_bench, run_direct_tcp_proxy_stream_bench,
+        run_direct_tcp_stream_bench, run_external_vless_tcp_stream_bench,
+        run_http_connect_stream_bench, run_hy2_udp_bench, run_shadowsocks_tcp_stream_bench,
+        run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench, run_tuic_tcp_bench,
+        run_tuic_tcp_stream_bench, run_tuic_udp_bench, run_vless_tcp_bench,
         run_vless_tcp_stream_bench, run_vmess_tcp_stream_bench, summarize_bench_runs,
-        validate_udp_bench_payload, BenchCert, BenchOptions, BenchReport, BenchSuiteRun,
-        LatencyReport,
+        validate_udp_bench_payload, BenchCert, BenchOptions, BenchPhaseReport, BenchPhaseSummary,
+        BenchReport, BenchSuiteRun, LatencyReport,
     };
     use std::net::{SocketAddr, TcpStream};
     use std::path::PathBuf;
@@ -5377,12 +5468,12 @@ mod tests {
             BenchSuiteRun {
                 command: "hy2-tcp".to_string(),
                 repeat: 1,
-                report: synthetic_report("hy2-tcp", 10.0, 100, 0, 1),
+                report: synthetic_report_with_phase("hy2-tcp", 10.0, 100, 0, 1, 30),
             },
             BenchSuiteRun {
                 command: "hy2-tcp".to_string(),
                 repeat: 2,
-                report: synthetic_report("hy2-tcp", 20.0, 300, 1, 2),
+                report: synthetic_report_with_phase("hy2-tcp", 20.0, 300, 1, 2, 70),
             },
             BenchSuiteRun {
                 command: "tuic-udp".to_string(),
@@ -5404,6 +5495,13 @@ mod tests {
         assert_eq!(hy2.retries_total, 3);
         assert!((hy2.roundtrip_mbps_avg - 15.0).abs() < f64::EPSILON);
         assert!((hy2.p99_us_avg - 200.0).abs() < f64::EPSILON);
+        let phase = hy2
+            .phases
+            .iter()
+            .find(|phase| phase.name == "relay_roundtrip")
+            .expect("relay phase summary");
+        assert_eq!(phase.count_total, 2);
+        assert!((phase.p99_us_avg - 50.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -5411,6 +5509,31 @@ mod tests {
         assert_eq!(percent_change(0.0, 10.0), None);
         assert_eq!(percent_change(100.0, 125.0), Some(25.0));
         assert_eq!(percent_change(100.0, 80.0), Some(-20.0));
+    }
+
+    #[test]
+    fn compares_phase_summaries() {
+        let rows = compare_phase_summaries(
+            &[BenchPhaseSummary {
+                name: "relay_roundtrip".to_string(),
+                count_total: 10,
+                avg_us_avg: 100.0,
+                p95_us_avg: 150.0,
+                p99_us_avg: 200.0,
+            }],
+            &[BenchPhaseSummary {
+                name: "relay_roundtrip".to_string(),
+                count_total: 10,
+                avg_us_avg: 80.0,
+                p95_us_avg: 120.0,
+                p99_us_avg: 160.0,
+            }],
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "relay_roundtrip");
+        assert_eq!(rows[0].p99_change_percent, Some(-20.0));
+        assert_eq!(rows[0].avg_change_percent, Some(-20.0));
     }
 
     #[test]
@@ -5841,6 +5964,28 @@ mod tests {
             },
             phases: Vec::new(),
         }
+    }
+
+    fn synthetic_report_with_phase(
+        protocol: &str,
+        roundtrip_mbps: f64,
+        p99_us: u128,
+        errors: usize,
+        retries: usize,
+        phase_p99_us: u128,
+    ) -> BenchReport {
+        let mut report = synthetic_report(protocol, roundtrip_mbps, p99_us, errors, retries);
+        report.phases = vec![BenchPhaseReport {
+            name: "relay_roundtrip".to_string(),
+            count: 1,
+            total_us: phase_p99_us,
+            avg_us: phase_p99_us as f64,
+            p50_us: phase_p99_us,
+            p95_us: phase_p99_us,
+            p99_us: phase_p99_us,
+            max_us: phase_p99_us,
+        }];
+        report
     }
 
     fn assert_phase(report: &BenchReport, name: &str) {

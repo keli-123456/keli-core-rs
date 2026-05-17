@@ -17,7 +17,7 @@ use crate::limits::{
 };
 use crate::quic_resources::SharedQuicConnectionLimiter;
 use crate::quic_tuning::{
-    apply_proxy_quic_transport_defaults, apply_quic_congestion_control,
+    apply_proxy_quic_transport_defaults, apply_quic_congestion_control, proxy_quic_tuning_snapshot,
     server_endpoint_with_tuned_udp_socket,
 };
 use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
@@ -145,6 +145,16 @@ impl TuicServer {
             resource.active_connections,
             resource.listener_count,
             resource.per_listener_soft_limit
+        );
+        let tuning = proxy_quic_tuning_snapshot();
+        println!(
+            "INFO  core   tuic quic tuning stream_window_mib={} conn_window_mib={} max_streams={} udp_socket_buffer_mib={} initial_rtt_ms={} idle_timeout_secs={}",
+            tuning.stream_receive_window_mib,
+            tuning.receive_window_mib,
+            tuning.max_concurrent_streams,
+            tuning.udp_socket_buffer_mib,
+            tuning.initial_rtt_ms,
+            tuning.max_idle_timeout_secs
         );
         server_config.transport_config(Arc::new(transport));
         server_endpoint_with_tuned_udp_socket(server_config, self.config.listen)
