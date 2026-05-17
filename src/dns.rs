@@ -16,6 +16,8 @@ static DNS_POSITIVE_CACHE: OnceLock<Mutex<HashMap<DnsCacheKey, DnsPositiveCacheE
     OnceLock::new();
 static DNS_NEGATIVE_CACHE: OnceLock<Mutex<HashMap<DnsCacheKey, DnsNegativeCacheEntry>>> =
     OnceLock::new();
+static TCP_CONNECT_FAILURE_BACKOFF: OnceLock<Mutex<HashMap<DnsCacheKey, TcpConnectFailureEntry>>> =
+    OnceLock::new();
 static DNS_RESOLVE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DNS_SYSTEM_QUERY_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DNS_CONFIGURED_QUERY_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -28,6 +30,10 @@ const DNS_POSITIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const DNS_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(15);
 const DNS_POSITIVE_CACHE_MAX_ENTRIES: usize = 8192;
 const DNS_NEGATIVE_CACHE_MAX_ENTRIES: usize = 4096;
+const TCP_CONNECT_FAILURE_THRESHOLD: u32 = 3;
+const TCP_CONNECT_FAILURE_WINDOW: Duration = Duration::from_secs(10);
+const TCP_CONNECT_FAILURE_BLOCK_DURATION: Duration = Duration::from_secs(5);
+const TCP_CONNECT_FAILURE_MAX_ENTRIES: usize = 8192;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsMetricsSnapshot {
@@ -60,11 +66,19 @@ struct DnsNegativeCacheEntry {
     message: String,
 }
 
+#[derive(Clone, Debug)]
+struct TcpConnectFailureEntry {
+    failures: u32,
+    window_started: Instant,
+    blocked_until: Option<Instant>,
+}
+
 pub fn configure(config: DnsConfig) {
     let lock = DNS_CONFIG.get_or_init(|| RwLock::new(DnsConfig::default()));
     *lock.write().expect("dns config lock poisoned") = config;
     clear_positive_cache();
     clear_negative_cache();
+    clear_tcp_connect_failure_backoff();
 }
 
 pub fn dns_metrics_snapshot() -> DnsMetricsSnapshot {
@@ -83,23 +97,30 @@ pub fn dns_metrics_snapshot() -> DnsMetricsSnapshot {
 }
 
 pub fn connect_tcp(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
+    let backoff_key = dns_cache_key(host, port);
+    if let Some(error) = tcp_connect_backoff_error(&backoff_key, Instant::now()) {
+        return Err(error);
+    }
     let addrs = resolve_socket_addrs(host, port, timeout)?;
     let mut last_error = None;
     for addr in addrs {
         match TcpStream::connect_timeout(&addr, timeout) {
             Ok(stream) => {
+                record_tcp_connect_success(&backoff_key);
                 tune_tcp_stream(&stream);
                 return Ok(stream);
             }
             Err(error) => last_error = Some(error),
         }
     }
-    Err(last_error.unwrap_or_else(|| {
+    let error = last_error.unwrap_or_else(|| {
         io::Error::new(
             io::ErrorKind::AddrNotAvailable,
             "target did not resolve to any socket address",
         )
-    }))
+    });
+    record_tcp_connect_failure(&backoff_key);
+    Err(error)
 }
 
 pub async fn connect_tcp_tokio(
@@ -107,11 +128,16 @@ pub async fn connect_tcp_tokio(
     port: u16,
     timeout: Duration,
 ) -> io::Result<tokio::net::TcpStream> {
+    let backoff_key = dns_cache_key(host, port);
+    if let Some(error) = tcp_connect_backoff_error(&backoff_key, Instant::now()) {
+        return Err(error);
+    }
     let addrs = resolve_socket_addrs_tokio(host, port, timeout).await?;
     let mut last_error = None;
     for addr in addrs {
         match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
             Ok(Ok(stream)) => {
+                record_tcp_connect_success(&backoff_key);
                 tune_tokio_tcp_stream(&stream);
                 return Ok(stream);
             }
@@ -124,12 +150,14 @@ pub async fn connect_tcp_tokio(
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| {
+    let error = last_error.unwrap_or_else(|| {
         io::Error::new(
             io::ErrorKind::AddrNotAvailable,
             "target did not resolve to any socket address",
         )
-    }))
+    });
+    record_tcp_connect_failure(&backoff_key);
+    Err(error)
 }
 
 fn tune_tcp_stream(stream: &TcpStream) {
@@ -219,10 +247,7 @@ pub fn resolve_socket_addrs(
     }
 
     let host = host.trim().trim_matches(['[', ']']);
-    let cache_key = DnsCacheKey {
-        host: host.to_ascii_lowercase(),
-        port,
-    };
+    let cache_key = dns_cache_key(host, port);
     if let Some(addrs) = cached_positive_addrs(&cache_key) {
         return Ok(addrs);
     }
@@ -286,6 +311,104 @@ pub fn resolve_socket_addrs(
             record_negative_cache(&cache_key, &error);
             Err(error)
         }
+    }
+}
+
+fn dns_cache_key(host: &str, port: u16) -> DnsCacheKey {
+    DnsCacheKey {
+        host: host.trim().trim_matches(['[', ']']).to_ascii_lowercase(),
+        port,
+    }
+}
+
+fn tcp_connect_failure_backoff() -> &'static Mutex<HashMap<DnsCacheKey, TcpConnectFailureEntry>> {
+    TCP_CONNECT_FAILURE_BACKOFF.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn tcp_connect_backoff_error(key: &DnsCacheKey, now: Instant) -> Option<io::Error> {
+    let mut entries = tcp_connect_failure_backoff()
+        .lock()
+        .expect("tcp connect failure backoff poisoned");
+    let entry = entries.get_mut(key)?;
+    let Some(blocked_until) = entry.blocked_until else {
+        return None;
+    };
+    if now < blocked_until {
+        return Some(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "target {}:{} is temporarily backed off after repeated connect failures",
+                key.host, key.port
+            ),
+        ));
+    }
+    entry.failures = 0;
+    entry.window_started = now;
+    entry.blocked_until = None;
+    None
+}
+
+fn record_tcp_connect_success(key: &DnsCacheKey) {
+    tcp_connect_failure_backoff()
+        .lock()
+        .expect("tcp connect failure backoff poisoned")
+        .remove(key);
+}
+
+fn record_tcp_connect_failure(key: &DnsCacheKey) {
+    record_tcp_connect_failure_at(key, Instant::now());
+}
+
+fn record_tcp_connect_failure_at(key: &DnsCacheKey, now: Instant) {
+    let mut entries = tcp_connect_failure_backoff()
+        .lock()
+        .expect("tcp connect failure backoff poisoned");
+    if entries.len() >= TCP_CONNECT_FAILURE_MAX_ENTRIES {
+        entries.retain(|_, entry| !entry.is_expired(now));
+    }
+    let entry = entries
+        .entry(key.clone())
+        .or_insert_with(|| TcpConnectFailureEntry {
+            failures: 0,
+            window_started: now,
+            blocked_until: None,
+        });
+    let in_window = now
+        .checked_duration_since(entry.window_started)
+        .map(|elapsed| elapsed <= TCP_CONNECT_FAILURE_WINDOW)
+        .unwrap_or(false);
+    if !in_window {
+        entry.failures = 0;
+        entry.window_started = now;
+        entry.blocked_until = None;
+    }
+    entry.failures = entry.failures.saturating_add(1);
+    if entry.failures >= TCP_CONNECT_FAILURE_THRESHOLD {
+        entry.blocked_until = Some(now + TCP_CONNECT_FAILURE_BLOCK_DURATION);
+    }
+}
+
+fn clear_tcp_connect_failure_backoff() {
+    if let Some(cache) = TCP_CONNECT_FAILURE_BACKOFF.get() {
+        cache
+            .lock()
+            .expect("tcp connect failure backoff poisoned")
+            .clear();
+    }
+}
+
+impl TcpConnectFailureEntry {
+    fn is_expired(&self, now: Instant) -> bool {
+        if let Some(blocked_until) = self.blocked_until {
+            return now >= blocked_until
+                && now
+                    .checked_duration_since(blocked_until)
+                    .map(|elapsed| elapsed > TCP_CONNECT_FAILURE_WINDOW)
+                    .unwrap_or(false);
+        }
+        now.checked_duration_since(self.window_started)
+            .map(|elapsed| elapsed > TCP_CONNECT_FAILURE_WINDOW * 2)
+            .unwrap_or(false)
     }
 }
 
@@ -1036,5 +1159,44 @@ mod tests {
 
         configure(DnsConfig::default());
         assert!(cached_positive_addrs(&key).is_none());
+    }
+
+    #[test]
+    fn tcp_connect_backoff_blocks_repeated_target_failures() {
+        clear_tcp_connect_failure_backoff();
+        let key = dns_cache_key("156.246.66.34", 80);
+        let now = Instant::now();
+
+        record_tcp_connect_failure_at(&key, now);
+        record_tcp_connect_failure_at(&key, now + Duration::from_secs(1));
+        assert!(tcp_connect_backoff_error(&key, now + Duration::from_secs(2)).is_none());
+
+        record_tcp_connect_failure_at(&key, now + Duration::from_secs(2));
+        let error = tcp_connect_backoff_error(&key, now + Duration::from_secs(3))
+            .expect("target should be temporarily backed off");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            error.to_string().contains("temporarily backed off"),
+            "unexpected backoff error: {error}"
+        );
+
+        assert!(tcp_connect_backoff_error(&key, now + Duration::from_secs(8)).is_none());
+        clear_tcp_connect_failure_backoff();
+    }
+
+    #[test]
+    fn tcp_connect_success_clears_target_backoff() {
+        clear_tcp_connect_failure_backoff();
+        let key = dns_cache_key("[2607:f358:1a:e::d4d9:5831]", 443);
+        let now = Instant::now();
+
+        record_tcp_connect_failure_at(&key, now);
+        record_tcp_connect_failure_at(&key, now + Duration::from_secs(1));
+        record_tcp_connect_failure_at(&key, now + Duration::from_secs(2));
+        assert!(tcp_connect_backoff_error(&key, now + Duration::from_secs(3)).is_some());
+
+        record_tcp_connect_success(&key);
+        assert!(tcp_connect_backoff_error(&key, now + Duration::from_secs(4)).is_none());
+        clear_tcp_connect_failure_backoff();
     }
 }
