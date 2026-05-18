@@ -57,6 +57,7 @@ const FLOW_XTLS_RPRX_VISION: &str = "xtls-rprx-vision";
 const MAX_UDP_PACKET_SIZE: usize = 65_535;
 const ASYNC_TRAFFIC_FLUSH_BYTES: u64 = 4 * 1024 * 1024;
 const VLESS_TRACE_ENV: &str = "KELI_CORE_VLESS_TRACE";
+const VLESS_VISION_DRAIN_MS_ENV: &str = "KELI_CORE_VLESS_VISION_DRAIN_MS";
 const VLESS_VISION_DRAIN_SECS_ENV: &str = "KELI_CORE_VLESS_VISION_DRAIN_SECS";
 const VLESS_ASYNC_RELAY_IO_TIMEOUT_SECS_ENV: &str = "KELI_CORE_VLESS_RELAY_IO_TIMEOUT_SECS";
 const DEFAULT_VLESS_ASYNC_RELAY_IO_TIMEOUT_SECS: u64 = 15;
@@ -2866,14 +2867,21 @@ fn relay_sleep_idle_timeout_ms(idle_rounds: &mut u8) -> i32 {
 }
 
 fn vless_vision_drain_after_client_eof() -> Duration {
-    const DEFAULT_DRAIN_SECS: u64 = 3;
+    const DEFAULT_DRAIN_MS: u64 = 250;
+    const MAX_DRAIN_MS: u64 = 30_000;
     const MAX_DRAIN_SECS: u64 = 30;
-    let seconds = env::var(VLESS_VISION_DRAIN_SECS_ENV)
+    if let Some(milliseconds) = env::var(VLESS_VISION_DRAIN_MS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return Duration::from_millis(milliseconds.min(MAX_DRAIN_MS));
+    }
+    env::var(VLESS_VISION_DRAIN_SECS_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map(|value| value.min(MAX_DRAIN_SECS))
-        .unwrap_or(DEFAULT_DRAIN_SECS);
-    Duration::from_secs(seconds)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_DRAIN_MS))
 }
 
 fn write_all_wait_or_cancel(

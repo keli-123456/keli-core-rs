@@ -34,6 +34,8 @@ const TCP_CONNECT_FAILURE_THRESHOLD: u32 = 3;
 const TCP_CONNECT_FAILURE_WINDOW: Duration = Duration::from_secs(10);
 const TCP_CONNECT_FAILURE_BLOCK_DURATION: Duration = Duration::from_secs(5);
 const TCP_CONNECT_FAILURE_MAX_ENTRIES: usize = 8192;
+const DEFAULT_TCP_FAST_FALLBACK_MS: u64 = 750;
+static TCP_FAST_FALLBACK_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsMetricsSnapshot {
@@ -102,25 +104,17 @@ pub fn connect_tcp(host: &str, port: u16, timeout: Duration) -> io::Result<TcpSt
         return Err(error);
     }
     let addrs = resolve_socket_addrs(host, port, timeout)?;
-    let mut last_error = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(stream) => {
-                record_tcp_connect_success(&backoff_key);
-                tune_tcp_stream(&stream);
-                return Ok(stream);
-            }
-            Err(error) => last_error = Some(error),
+    match connect_tcp_addrs(&addrs, timeout) {
+        Ok(stream) => {
+            record_tcp_connect_success(&backoff_key);
+            tune_tcp_stream(&stream);
+            Ok(stream)
+        }
+        Err(error) => {
+            record_tcp_connect_failure(&backoff_key);
+            Err(error)
         }
     }
-    let error = last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            "target did not resolve to any socket address",
-        )
-    });
-    record_tcp_connect_failure(&backoff_key);
-    Err(error)
 }
 
 pub async fn connect_tcp_tokio(
@@ -133,14 +127,45 @@ pub async fn connect_tcp_tokio(
         return Err(error);
     }
     let addrs = resolve_socket_addrs_tokio(host, port, timeout).await?;
+    match connect_tcp_addrs_tokio(&addrs, timeout).await {
+        Ok(stream) => {
+            record_tcp_connect_success(&backoff_key);
+            tune_tokio_tcp_stream(&stream);
+            Ok(stream)
+        }
+        Err(error) => {
+            record_tcp_connect_failure(&backoff_key);
+            Err(error)
+        }
+    }
+}
+
+fn connect_tcp_addrs(addrs: &[SocketAddr], timeout: Duration) -> io::Result<TcpStream> {
+    let attempt_timeout = tcp_connect_attempt_timeout(timeout, addrs.len());
     let mut last_error = None;
     for addr in addrs {
-        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => {
-                record_tcp_connect_success(&backoff_key);
-                tune_tokio_tcp_stream(&stream);
-                return Ok(stream);
-            }
+        match TcpStream::connect_timeout(addr, attempt_timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "target did not resolve to any socket address",
+        )
+    }))
+}
+
+async fn connect_tcp_addrs_tokio(
+    addrs: &[SocketAddr],
+    timeout: Duration,
+) -> io::Result<tokio::net::TcpStream> {
+    let attempt_timeout = tcp_connect_attempt_timeout(timeout, addrs.len());
+    let mut last_error = None;
+    for addr in addrs {
+        match tokio::time::timeout(attempt_timeout, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(error)) => last_error = Some(error),
             Err(_) => {
                 last_error = Some(io::Error::new(
@@ -150,14 +175,26 @@ pub async fn connect_tcp_tokio(
             }
         }
     }
-    let error = last_error.unwrap_or_else(|| {
+    Err(last_error.unwrap_or_else(|| {
         io::Error::new(
             io::ErrorKind::AddrNotAvailable,
             "target did not resolve to any socket address",
         )
-    });
-    record_tcp_connect_failure(&backoff_key);
-    Err(error)
+    }))
+}
+
+fn tcp_connect_attempt_timeout(timeout: Duration, address_count: usize) -> Duration {
+    if address_count <= 1 {
+        return timeout;
+    }
+    timeout.min(*TCP_FAST_FALLBACK_TIMEOUT.get_or_init(|| {
+        std::env::var("KELI_CORE_TCP_FAST_FALLBACK_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_millis(DEFAULT_TCP_FAST_FALLBACK_MS))
+    }))
 }
 
 fn tune_tcp_stream(stream: &TcpStream) {
@@ -1159,6 +1196,58 @@ mod tests {
 
         configure(DnsConfig::default());
         assert!(cached_positive_addrs(&key).is_none());
+    }
+
+    #[test]
+    fn tcp_connect_addrs_falls_back_to_later_address() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let good = listener.local_addr().expect("listener addr");
+        let bad_port = {
+            let unused = TcpListener::bind(("127.0.0.1", 0)).expect("bind unused");
+            unused.local_addr().expect("unused addr").port()
+        };
+        let bad = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bad_port);
+        let accepted = thread::spawn(move || listener.accept().expect("accept"));
+
+        let stream = connect_tcp_addrs(&[bad, good], Duration::from_secs(2))
+            .expect("fallback connect");
+
+        assert_eq!(stream.peer_addr().expect("peer addr"), good);
+        let _ = accepted.join().expect("join accept");
+    }
+
+    #[tokio::test]
+    async fn async_tcp_connect_addrs_falls_back_to_later_address() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let good = listener.local_addr().expect("listener addr");
+        let bad_port = {
+            let unused = TcpListener::bind(("127.0.0.1", 0)).expect("bind unused");
+            unused.local_addr().expect("unused addr").port()
+        };
+        let bad = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bad_port);
+        let accepted = thread::spawn(move || listener.accept().expect("accept"));
+
+        let stream = connect_tcp_addrs_tokio(&[bad, good], Duration::from_secs(2))
+            .await
+            .expect("fallback connect");
+
+        assert_eq!(stream.peer_addr().expect("peer addr"), good);
+        let _ = accepted.join().expect("join accept");
+    }
+
+    #[test]
+    fn tcp_connect_attempt_timeout_uses_fast_fallback_only_for_multiple_addresses() {
+        assert_eq!(
+            tcp_connect_attempt_timeout(Duration::from_secs(3), 1),
+            Duration::from_secs(3)
+        );
+        assert!(
+            tcp_connect_attempt_timeout(Duration::from_secs(3), 2) <= Duration::from_millis(750)
+        );
+        assert_eq!(
+            tcp_connect_attempt_timeout(Duration::from_millis(250), 2),
+            Duration::from_millis(250)
+        );
     }
 
     #[test]

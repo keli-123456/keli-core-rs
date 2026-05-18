@@ -185,23 +185,7 @@ fn freedom_target(outbound: &OutboundConfig, target: &SocksTarget) -> SocksTarge
 }
 
 fn connect_direct(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStream> {
-    let addrs = crate::dns::resolve_socket_addrs(&target.host, target.port, timeout)?;
-    let mut last_error = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(stream) => {
-                let _ = stream.set_nodelay(true);
-                return Ok(stream);
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            "target did not resolve to any socket address",
-        )
-    }))
+    crate::dns::connect_tcp(&target.host, target.port, timeout)
 }
 
 fn connect_proxy(outbound: &OutboundConfig, timeout: Duration) -> io::Result<TcpStream> {
