@@ -2178,6 +2178,8 @@ fn classify_hysteria2_error_text(error: &io::Error, text: &str) -> Hysteria2Erro
         || text.contains("Reset")
         || text.contains("Broken pipe")
         || text.contains("FinishedEarly")
+        || text.contains("connection lost")
+        || text.contains("Connection lost")
         || text.contains("RemoteTerminate")
         || text.contains("H3_REQUEST_CANCELLED")
         || text.contains("got two control streams")
@@ -3440,6 +3442,10 @@ mod tests {
                 "tcp connect failed target=example.com:443 error=Connection refused (os error 111)",
             )),
             Hysteria2ErrorClass::TargetFailure
+        );
+        assert_eq!(
+            classify_hysteria2_error(&io::Error::new(io::ErrorKind::Other, "connection lost")),
+            Hysteria2ErrorClass::Transport
         );
         assert_eq!(
             classify_hysteria2_error(&io::Error::new(io::ErrorKind::Other, "Timeout")),
