@@ -1634,9 +1634,7 @@ async fn relay_streams(
                 close_tcp_socket(&upload_remote_shutdown);
                 return Ok::<u64, io::Error>(total);
             }
-            if let Err(error) =
-                hy2_write_all_with_timeout(&mut remote_write, &buffer[..read], "upload").await
-            {
+            if let Err(error) = hy2_write_all_fast(&mut remote_write, &buffer[..read]).await {
                 flush_pending_traffic(&mut pending, &mut on_upload);
                 let _ = remote_write.shutdown().await;
                 close_tcp_socket(&upload_remote_shutdown);
@@ -1687,8 +1685,7 @@ async fn relay_streams(
                 close_tcp_socket(&download_remote_shutdown);
                 return Ok::<u64, io::Error>(total);
             }
-            if let Err(error) = hy2_write_all_with_timeout(send, &buffer[..read], "download").await
-            {
+            if let Err(error) = hy2_write_all_fast(send, &buffer[..read]).await {
                 flush_pending_traffic(&mut pending, &mut on_download);
                 let _ = send.finish();
                 close_tcp_socket(&download_remote_shutdown);
@@ -1819,6 +1816,13 @@ where
             format!("hysteria2 {direction} write timed out"),
         )),
     }
+}
+
+async fn hy2_write_all_fast<W>(writer: &mut W, buffer: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(buffer).await.map_err(io_other)
 }
 
 fn hy2_auth_timeout() -> Duration {
