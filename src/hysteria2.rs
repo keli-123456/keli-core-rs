@@ -111,6 +111,7 @@ pub struct Hysteria2Server {
     quic_connections: SharedQuicConnectionLimiter,
     listener_connections: Arc<Semaphore>,
     listener_connection_limit: usize,
+    last_quic_limit_log_ms: Arc<AtomicU64>,
     auth_backoff: Arc<Hysteria2AuthBackoff>,
 }
 
@@ -154,7 +155,7 @@ impl Hysteria2Server {
         let listener_connection_limit = quic_connections
             .snapshot()
             .per_listener_soft_limit
-            .clamp(32, 1024);
+            .clamp(16, 512);
         Self {
             router,
             config,
@@ -165,6 +166,7 @@ impl Hysteria2Server {
             quic_connections,
             listener_connections: Arc::new(Semaphore::new(listener_connection_limit)),
             listener_connection_limit,
+            last_quic_limit_log_ms: Arc::new(AtomicU64::new(0)),
             auth_backoff: Arc::new(Hysteria2AuthBackoff::default()),
         }
     }
@@ -253,11 +255,7 @@ impl Hysteria2Server {
                         break;
                     };
                     let Some(connection_slot) = self.try_acquire_connection_slot() else {
-                        eprintln!(
-                            "WARN  core   hysteria2 quic limit reached total={} listener_limit={}",
-                            self.quic_connections.total_limit(),
-                            self.listener_connection_limit
-                        );
+                        self.log_quic_limit_reached();
                         continue;
                     };
                     let server = self.clone();
@@ -305,6 +303,26 @@ impl Hysteria2Server {
             _global: global,
             _listener: listener,
         })
+    }
+
+    fn log_quic_limit_reached(&self) {
+        let now = now_millis();
+        let last = self.last_quic_limit_log_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < HY2_ERROR_LOG_INTERVAL_MS {
+            return;
+        }
+        if self
+            .last_quic_limit_log_ms
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let resource = self.quic_connections.snapshot();
+        eprintln!(
+            "WARN  core   hysteria2 quic limit reached total={} active={} listener_limit={}",
+            resource.total_limit, resource.active_connections, self.listener_connection_limit
+        );
     }
 
     async fn handle_incoming(&self, incoming: quinn::Incoming) -> io::Result<()> {
