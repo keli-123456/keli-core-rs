@@ -11,6 +11,7 @@ use quinn::crypto::rustls::QuicServerConfig;
 use quinn::Runtime;
 use socket2::SockRef;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::net::UdpSocket;
 
 use crate::limits::{
@@ -69,6 +70,11 @@ const QUIC_ENDPOINT_STOP_WAIT: Duration = Duration::from_secs(3);
 static HY2_ACTIVE_UDP_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 static HY2_UDP_SESSION_LIMIT: OnceLock<usize> = OnceLock::new();
 
+struct Hy2ConnectionPermit {
+    _global: QuicConnectionPermit,
+    _listener: OwnedSemaphorePermit,
+}
+
 #[derive(Clone, Debug)]
 pub struct Hysteria2ServerConfig {
     pub node_tag: String,
@@ -103,6 +109,8 @@ pub struct Hysteria2Server {
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
     quic_connections: SharedQuicConnectionLimiter,
+    listener_connections: Arc<Semaphore>,
+    listener_connection_limit: usize,
     auth_backoff: Arc<Hysteria2AuthBackoff>,
 }
 
@@ -143,6 +151,10 @@ impl Hysteria2Server {
         let router = RouteMatcher::new(config.routes.clone());
         config.users.clear();
         config.routes.clear();
+        let listener_connection_limit = quic_connections
+            .snapshot()
+            .per_listener_soft_limit
+            .clamp(32, 1024);
         Self {
             router,
             config,
@@ -151,6 +163,8 @@ impl Hysteria2Server {
             sessions,
             bandwidth,
             quic_connections,
+            listener_connections: Arc::new(Semaphore::new(listener_connection_limit)),
+            listener_connection_limit,
             auth_backoff: Arc::new(Hysteria2AuthBackoff::default()),
         }
     }
@@ -240,8 +254,9 @@ impl Hysteria2Server {
                     };
                     let Some(connection_slot) = self.try_acquire_connection_slot() else {
                         eprintln!(
-                            "WARN  core   hysteria2 shared quic limit reached total={}",
-                            self.quic_connections.total_limit()
+                            "WARN  core   hysteria2 quic limit reached total={} listener_limit={}",
+                            self.quic_connections.total_limit(),
+                            self.listener_connection_limit
                         );
                         continue;
                     };
@@ -279,8 +294,17 @@ impl Hysteria2Server {
         self.users.get_arc(auth)
     }
 
-    fn try_acquire_connection_slot(&self) -> Option<QuicConnectionPermit> {
-        self.quic_connections.try_acquire()
+    fn try_acquire_connection_slot(&self) -> Option<Hy2ConnectionPermit> {
+        let global = self.quic_connections.try_acquire()?;
+        let listener = self
+            .listener_connections
+            .clone()
+            .try_acquire_owned()
+            .ok()?;
+        Some(Hy2ConnectionPermit {
+            _global: global,
+            _listener: listener,
+        })
     }
 
     async fn handle_incoming(&self, incoming: quinn::Incoming) -> io::Result<()> {
