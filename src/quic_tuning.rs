@@ -156,7 +156,7 @@ fn proxy_quic_tuning() -> ProxyQuicTuning {
 }
 
 fn proxy_quic_tuning_from_resources(
-    cpu_count: usize,
+    _cpu_count: usize,
     memory_limit_mib: Option<usize>,
     fd_limit: Option<usize>,
 ) -> ProxyQuicTuning {
@@ -169,22 +169,6 @@ fn proxy_quic_tuning_from_resources(
             send_window_mib: 10,
             max_concurrent_streams: 256,
             udp_socket_buffer_mib: 2,
-            ack_eliciting_threshold: DEFAULT_PROXY_ACK_ELICITING_THRESHOLD,
-            ack_max_delay_ms: DEFAULT_PROXY_ACK_MAX_DELAY_MS,
-            initial_rtt_ms: DEFAULT_PROXY_INITIAL_RTT_MS,
-            max_idle_timeout_secs: DEFAULT_PROXY_MAX_IDLE_TIMEOUT_SECS,
-        };
-    }
-
-    let mid_memory = memory_limit_mib.is_some_and(|mib| mib <= 4096);
-    let mid_fd = fd_limit.is_some_and(|limit| limit <= 32_768);
-    if cpu_count <= 2 || mid_memory || mid_fd {
-        return ProxyQuicTuning {
-            stream_receive_window_mib: 6,
-            receive_window_mib: 15,
-            send_window_mib: 15,
-            max_concurrent_streams: 512,
-            udp_socket_buffer_mib: DEFAULT_PROXY_UDP_SOCKET_BUFFER_MIB,
             ack_eliciting_threshold: DEFAULT_PROXY_ACK_ELICITING_THRESHOLD,
             ack_max_delay_ms: DEFAULT_PROXY_ACK_MAX_DELAY_MS,
             initial_rtt_ms: DEFAULT_PROXY_INITIAL_RTT_MS,
@@ -319,16 +303,16 @@ mod tests {
     }
 
     #[test]
-    fn proxy_quic_tuning_uses_mid_profile_for_low_cpu_or_mid_memory() {
+    fn proxy_quic_tuning_keeps_official_defaults_on_normal_nodes() {
         let low_cpu = proxy_quic_tuning_from_resources(2, Some(64_000), Some(1_000_000));
-        assert_eq!(low_cpu.stream_receive_window_mib, 6);
-        assert_eq!(low_cpu.receive_window_mib, 15);
-        assert_eq!(low_cpu.max_concurrent_streams, 512);
+        assert_eq!(low_cpu.stream_receive_window_mib, 8);
+        assert_eq!(low_cpu.receive_window_mib, 20);
+        assert_eq!(low_cpu.max_concurrent_streams, 1024);
 
         let mid_memory = proxy_quic_tuning_from_resources(8, Some(4096), Some(1_000_000));
-        assert_eq!(mid_memory.stream_receive_window_mib, 6);
-        assert_eq!(mid_memory.receive_window_mib, 15);
-        assert_eq!(mid_memory.max_concurrent_streams, 512);
+        assert_eq!(mid_memory.stream_receive_window_mib, 8);
+        assert_eq!(mid_memory.receive_window_mib, 20);
+        assert_eq!(mid_memory.max_concurrent_streams, 1024);
     }
 
     #[test]

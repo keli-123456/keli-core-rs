@@ -152,10 +152,7 @@ impl Hysteria2Server {
         let router = RouteMatcher::new(config.routes.clone());
         config.users.clear();
         config.routes.clear();
-        let listener_connection_limit = quic_connections
-            .snapshot()
-            .per_listener_soft_limit
-            .clamp(16, 512);
+        let listener_connection_limit = quic_connections.total_limit();
         Self {
             router,
             config,
@@ -197,11 +194,12 @@ impl Hysteria2Server {
         )?;
         let resource = self.quic_connections.snapshot();
         println!(
-            "INFO  core   hysteria2 shared quic limit total={} active={} listeners={} per_listener_soft={}",
+            "INFO  core   hysteria2 shared quic limit total={} active={} listeners={} per_listener_soft={} listener_limit={}",
             resource.total_limit,
             resource.active_connections,
             resource.listener_count,
-            resource.per_listener_soft_limit
+            resource.per_listener_soft_limit,
+            self.listener_connection_limit
         );
         let tuning = proxy_quic_tuning_snapshot();
         println!(
