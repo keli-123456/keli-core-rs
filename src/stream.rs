@@ -168,53 +168,7 @@ fn relay_tcp_streams_unlimited_native(
     remote: TcpStream,
     close_peer_on_eof: bool,
 ) -> io::Result<(u64, u64)> {
-    let close_client_from_upload = if close_peer_on_eof {
-        Some(client.try_clone()?)
-    } else {
-        None
-    };
-    let close_remote_from_upload = if close_peer_on_eof {
-        Some(remote.try_clone()?)
-    } else {
-        None
-    };
-    let close_client_from_download = if close_peer_on_eof {
-        Some(client.try_clone()?)
-    } else {
-        None
-    };
-    let close_remote_from_download = if close_peer_on_eof {
-        Some(remote.try_clone()?)
-    } else {
-        None
-    };
-    let mut client_read = client.try_clone()?;
-    let mut client_write = client;
-    let mut remote_read = remote.try_clone()?;
-    let mut remote_write = remote;
-    let upload_task = spawn_native_blocking_relay(move || {
-        let copied = copy_count_best_effort(&mut client_read, &mut remote_write);
-        if close_peer_on_eof {
-            shutdown_tcp_pair(
-                close_client_from_upload.as_ref(),
-                close_remote_from_upload.as_ref(),
-            );
-        } else {
-            let _ = remote_write.shutdown(Shutdown::Write);
-        }
-        copied
-    })?;
-    let download = copy_count_best_effort(&mut remote_read, &mut client_write);
-    if close_peer_on_eof {
-        shutdown_tcp_pair(
-            close_client_from_download.as_ref(),
-            close_remote_from_download.as_ref(),
-        );
-    } else {
-        let _ = client_write.shutdown(Shutdown::Write);
-    }
-    let upload = join_native_blocking_relay(upload_task, "tcp upload relay task panicked")?;
-    Ok((upload, download))
+    relay_tcp_streams_unlimited_tokio(client, remote, close_peer_on_eof)
 }
 
 fn shutdown_tcp_pair(client: Option<&TcpStream>, remote: Option<&TcpStream>) {
@@ -224,6 +178,77 @@ fn shutdown_tcp_pair(client: Option<&TcpStream>, remote: Option<&TcpStream>) {
     if let Some(remote) = remote {
         let _ = remote.shutdown(Shutdown::Both);
     }
+}
+
+fn relay_tcp_streams_unlimited_tokio(
+    client: TcpStream,
+    remote: TcpStream,
+    close_peer_on_eof: bool,
+) -> io::Result<(u64, u64)> {
+    let upload_client_shutdown = client.try_clone()?;
+    let upload_remote_shutdown = remote.try_clone()?;
+    let download_client_shutdown = client.try_clone()?;
+    let download_remote_shutdown = remote.try_clone()?;
+
+    client.set_nonblocking(true)?;
+    remote.set_nonblocking(true)?;
+
+    tcp_relay_runtime()?.block_on(async move {
+        let client = tokio::net::TcpStream::from_std(client)?;
+        let remote = tokio::net::TcpStream::from_std(remote)?;
+        let (mut client_read, mut client_write) = client.into_split();
+        let (mut remote_read, mut remote_write) = remote.into_split();
+
+        let upload = relay_copy_unlimited_async(
+            &mut client_read,
+            &mut remote_write,
+            upload_client_shutdown,
+            upload_remote_shutdown,
+            close_peer_on_eof,
+        );
+        let download = relay_copy_unlimited_async(
+            &mut remote_read,
+            &mut client_write,
+            download_client_shutdown,
+            download_remote_shutdown,
+            close_peer_on_eof,
+        );
+        let (upload, download) = tokio::join!(upload, download);
+        Ok((upload, download))
+    })
+}
+
+async fn relay_copy_unlimited_async<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    client_shutdown: TcpStream,
+    remote_shutdown: TcpStream,
+    close_peer_on_eof: bool,
+) -> u64
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut total = 0u64;
+    let mut buffer = [0u8; RELAY_COPY_BUFFER_SIZE];
+    loop {
+        let read = match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => break,
+        };
+        if writer.write_all(&buffer[..read]).await.is_err() {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+    }
+
+    if close_peer_on_eof {
+        shutdown_tcp_pair(Some(&client_shutdown), Some(&remote_shutdown));
+    } else {
+        let _ = writer.shutdown().await;
+    }
+    total
 }
 
 fn tcp_relay_runtime() -> io::Result<&'static tokio::runtime::Runtime> {

@@ -43,15 +43,18 @@ use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult};
 use crate::vless::{VlessServer, VlessServerConfig};
 use crate::vmess::{VmessServer, VmessServerConfig};
 
-const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 256;
+const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 512;
 const MAX_AUTO_CONNECTION_WORKERS: usize = 4096;
 const MIN_AUTO_CONNECTION_WORKERS: usize = 16;
-const CONNECTION_WORKERS_PER_CPU: usize = 128;
+const CONNECTION_WORKERS_PER_CPU: usize = 160;
 const CONNECTION_WORKER_MEMORY_MIB: usize = 6;
 const CONNECTION_WORKER_RESERVED_FDS: usize = 512;
 const CONNECTION_WORKER_FDS_PER_CONN: usize = 2;
 const CONNECTION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_CONNECTION_WORKER_STACK_KIB: usize = 2048;
+const MIN_CONNECTION_WORKER_STACK_KIB: usize = 256;
+const MAX_CONNECTION_WORKER_STACK_KIB: usize = 8192;
 const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS: u64 = 3;
 const QUIC_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 static TCP_ACCEPT_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -2313,7 +2316,20 @@ fn connection_worker_threads() -> usize {
 }
 
 fn connection_worker_stack_size() -> usize {
-    256 * 1024
+    connection_worker_stack_size_from_env(
+        std::env::var("KELI_CORE_CONNECTION_WORKER_STACK_KIB").ok(),
+    )
+}
+
+fn connection_worker_stack_size_from_env(value: Option<String>) -> usize {
+    let stack_kib = value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CONNECTION_WORKER_STACK_KIB)
+        .clamp(
+            MIN_CONNECTION_WORKER_STACK_KIB,
+            MAX_CONNECTION_WORKER_STACK_KIB,
+        );
+    stack_kib * 1024
 }
 
 fn available_parallelism_count() -> usize {
@@ -2765,7 +2781,7 @@ mod tests {
     fn connection_worker_count_scales_with_cpu_when_resources_allow() {
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(4096), Some(100_000)),
-            512
+            640
         );
         assert_eq!(
             super::connection_worker_threads_from_resources(32, Some(128_000), Some(1_000_000)),
@@ -2794,6 +2810,26 @@ mod tests {
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(4096), Some(600)),
             44
+        );
+    }
+
+    #[test]
+    fn connection_worker_stack_defaults_and_clamps_env_value() {
+        assert_eq!(
+            super::connection_worker_stack_size_from_env(None),
+            2048 * 1024
+        );
+        assert_eq!(
+            super::connection_worker_stack_size_from_env(Some("128".to_string())),
+            256 * 1024
+        );
+        assert_eq!(
+            super::connection_worker_stack_size_from_env(Some("2048".to_string())),
+            2048 * 1024
+        );
+        assert_eq!(
+            super::connection_worker_stack_size_from_env(Some("99999".to_string())),
+            8192 * 1024
         );
     }
 
