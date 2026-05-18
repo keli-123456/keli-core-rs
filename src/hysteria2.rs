@@ -11,8 +11,8 @@ use quinn::crypto::rustls::QuicServerConfig;
 use quinn::Runtime;
 use socket2::SockRef;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::net::UdpSocket;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::limits::{
     sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard,
@@ -292,11 +292,7 @@ impl Hysteria2Server {
 
     fn try_acquire_connection_slot(&self) -> Option<Hy2ConnectionPermit> {
         let global = self.quic_connections.try_acquire()?;
-        let listener = self
-            .listener_connections
-            .clone()
-            .try_acquire_owned()
-            .ok()?;
+        let listener = self.listener_connections.clone().try_acquire_owned().ok()?;
         Some(Hy2ConnectionPermit {
             _global: global,
             _listener: listener,
@@ -2040,6 +2036,7 @@ enum Hysteria2ErrorClass {
     ExpectedClose,
     InvalidAuth,
     InvalidRequest,
+    TargetFailure,
     Timeout,
     Transport,
     Other,
@@ -2051,6 +2048,7 @@ impl Hysteria2ErrorClass {
             Self::ExpectedClose => "closed",
             Self::InvalidAuth => "invalid-auth",
             Self::InvalidRequest => "invalid-request",
+            Self::TargetFailure => "target-failure",
             Self::Timeout => "timeout",
             Self::Transport => "transport",
             Self::Other => "error",
@@ -2059,7 +2057,11 @@ impl Hysteria2ErrorClass {
 
     fn log_level(self) -> &'static str {
         match self {
-            Self::InvalidAuth | Self::InvalidRequest | Self::Timeout | Self::Transport => "WARN",
+            Self::InvalidAuth
+            | Self::InvalidRequest
+            | Self::TargetFailure
+            | Self::Timeout
+            | Self::Transport => "WARN",
             Self::ExpectedClose | Self::Other => "ERROR",
         }
     }
@@ -2119,6 +2121,7 @@ fn is_expected_hysteria2_close_text(text: &str) -> bool {
         || text.contains("Connection reset by peer")
         || text.contains("Reset(0)")
         || text.contains("Reset(")
+        || text.contains("sending stopped by peer")
         || text.contains("got two control streams")
 }
 
@@ -2146,18 +2149,29 @@ fn classify_hysteria2_error_text(error: &io::Error, text: &str) -> Hysteria2Erro
     if is_expected_hysteria2_close_text(text) {
         return Hysteria2ErrorClass::ExpectedClose;
     }
-    if text.contains("invalid hysteria2 authentication") {
+    if text.contains("invalid hysteria2 authentication") || text.contains("authentication failed") {
         return Hysteria2ErrorClass::InvalidAuth;
     }
     if text.contains("invalid hysteria2 tcp request id")
         || text.contains("invalid hysteria2 udp")
         || text.contains("invalid hysteria2 address")
         || text.contains("invalid hysteria2 padding")
+        || text.contains("hysteria2 target missing port")
     {
         return Hysteria2ErrorClass::InvalidRequest;
     }
     if is_hysteria2_timeout_text(error, text) {
         return Hysteria2ErrorClass::Timeout;
+    }
+    if text.contains("tcp connect failed")
+        || text.contains("tcp outbound connect failed")
+        || text.contains("dns response indicates failure")
+        || text.contains("configured dns servers returned no target address")
+        || text.contains("Connection refused")
+        || text.contains("Network is unreachable")
+        || text.contains("No route to host")
+    {
+        return Hysteria2ErrorClass::TargetFailure;
     }
     if text.contains("Connection reset")
         || text.contains("ConnectionReset")
@@ -3361,6 +3375,7 @@ mod tests {
             "ConnectionClosed(ConnectionClose { error_code: APPLICATION_ERROR, frame_type: None, reason: b\"\" })",
             "hysteria2 connection closed before authentication",
             "Reset(268)",
+            "sending stopped by peer: error 0",
             "Local { error: Application { code: H3_STREAM_CREATION_ERROR, reason: \"got two control streams\" } }",
         ] {
             let error = io::Error::new(io::ErrorKind::Other, message);
@@ -3395,8 +3410,36 @@ mod tests {
             Hysteria2ErrorClass::InvalidRequest
         );
         assert_eq!(
+            classify_hysteria2_error(&io::Error::new(
+                io::ErrorKind::InvalidData,
+                "hysteria2 target missing port",
+            )),
+            Hysteria2ErrorClass::InvalidRequest
+        );
+        assert_eq!(
             classify_hysteria2_error(&quinn_timeout),
             Hysteria2ErrorClass::Timeout
+        );
+        assert_eq!(
+            classify_hysteria2_error(&io::Error::new(
+                io::ErrorKind::Other,
+                "TransportError(Error { code: PROTOCOL_VIOLATION, frame: None, reason: \"authentication failed\" })",
+            )),
+            Hysteria2ErrorClass::InvalidAuth
+        );
+        assert_eq!(
+            classify_hysteria2_error(&io::Error::new(
+                io::ErrorKind::Other,
+                "tcp connect failed target=example.com:443 error=dns response indicates failure",
+            )),
+            Hysteria2ErrorClass::TargetFailure
+        );
+        assert_eq!(
+            classify_hysteria2_error(&io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "tcp connect failed target=example.com:443 error=Connection refused (os error 111)",
+            )),
+            Hysteria2ErrorClass::TargetFailure
         );
         assert_eq!(
             classify_hysteria2_error(&io::Error::new(io::ErrorKind::Other, "Timeout")),
