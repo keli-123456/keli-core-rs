@@ -1004,12 +1004,6 @@ impl InboundConfig {
                 )));
             }
             validate_quic_tls_config("tuic", &self.tag, self.tls.as_ref())?;
-            if self.users.is_empty() {
-                return Err(ValidationError::new(format!(
-                    "{} tuic requires at least one user",
-                    self.tag
-                )));
-            }
             validate_tuic_transport_options(&self.tag, &self.transport)?;
         }
         if self.protocol == Protocol::Hysteria2 {
@@ -1021,12 +1015,6 @@ impl InboundConfig {
                 )));
             }
             validate_quic_tls_config("hysteria2", &self.tag, self.tls.as_ref())?;
-            if self.users.is_empty() {
-                return Err(ValidationError::new(format!(
-                    "{} hysteria2 requires at least one user",
-                    self.tag
-                )));
-            }
             if self.transport.ignore_client_bandwidth
                 && (self.transport.up_mbps > 0 || self.transport.down_mbps > 0)
             {
@@ -2796,6 +2784,70 @@ mod tests {
                 .validate()
                 .expect("hysteria2 congestion should validate");
         }
+    }
+
+    #[test]
+    fn allows_tuic_without_users_for_empty_snapshot() {
+        let inbound = InboundConfig {
+            tag: "panel|tuic|1".to_string(),
+            protocol: Protocol::Tuic,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: Vec::new(),
+            cipher: None,
+            flow: String::new(),
+            padding_scheme: Vec::new(),
+            transport: TransportConfig {
+                network: "tuic".to_string(),
+                ..TransportConfig::default()
+            },
+            tls: Some(TlsConfig {
+                server_name: "tuic.example.test".to_string(),
+                cert_file: Some("/tmp/tuic.crt".to_string()),
+                key_file: Some("/tmp/tuic.key".to_string()),
+                alpn: vec!["h3".to_string()],
+                reject_unknown_sni: false,
+                reality: None,
+            }),
+            sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
+        };
+
+        inbound
+            .validate()
+            .expect("tuic empty user snapshot should keep listener alive");
+    }
+
+    #[test]
+    fn allows_hysteria2_without_users_for_empty_snapshot() {
+        let inbound = InboundConfig {
+            tag: "panel|hysteria2|1".to_string(),
+            protocol: Protocol::Hysteria2,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            users: Vec::new(),
+            cipher: None,
+            flow: String::new(),
+            padding_scheme: Vec::new(),
+            transport: TransportConfig {
+                network: "hysteria2".to_string(),
+                ..TransportConfig::default()
+            },
+            tls: Some(TlsConfig {
+                server_name: "hy2.example.test".to_string(),
+                cert_file: Some("/tmp/hy2.crt".to_string()),
+                key_file: Some("/tmp/hy2.key".to_string()),
+                alpn: vec!["h3".to_string()],
+                reject_unknown_sni: false,
+                reality: None,
+            }),
+            sniffing: SniffingConfig::default(),
+            routes: Vec::new(),
+        };
+
+        inbound
+            .validate()
+            .expect("hysteria2 empty user snapshot should keep listener alive");
     }
 
     #[test]
