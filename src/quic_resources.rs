@@ -76,6 +76,11 @@ impl SharedQuicConnectionLimiter {
         self.inner.listener_count
     }
 
+    pub fn per_listener_soft_limit(&self) -> usize {
+        let soft_limit = self.inner.total_limit / self.inner.listener_count.max(1);
+        soft_limit.clamp(64, self.inner.total_limit)
+    }
+
     pub fn snapshot(&self) -> QuicResourceSnapshot {
         let available_connections = self.inner.slots.available_permits();
         QuicResourceSnapshot {
@@ -83,7 +88,7 @@ impl SharedQuicConnectionLimiter {
             active_connections: self.inner.total_limit.saturating_sub(available_connections),
             available_connections,
             listener_count: self.inner.listener_count,
-            per_listener_soft_limit: self.inner.total_limit / self.inner.listener_count.max(1),
+            per_listener_soft_limit: self.per_listener_soft_limit(),
             cpu_count: self.inner.cpu_count,
             memory_limit_mib: self.inner.memory_limit_mib,
             fd_limit: self.inner.fd_limit,
@@ -247,6 +252,10 @@ mod tests {
 
         let snapshot = limiter.snapshot();
         assert_eq!(snapshot.listener_count, 3);
+        assert_eq!(
+            snapshot.per_listener_soft_limit,
+            snapshot.total_limit / snapshot.listener_count
+        );
         assert_eq!(snapshot.active_connections, 1);
         assert_eq!(
             snapshot.available_connections,

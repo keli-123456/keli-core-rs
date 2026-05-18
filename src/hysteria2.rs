@@ -152,7 +152,7 @@ impl Hysteria2Server {
         let router = RouteMatcher::new(config.routes.clone());
         config.users.clear();
         config.routes.clear();
-        let listener_connection_limit = quic_connections.total_limit();
+        let listener_connection_limit = quic_connections.per_listener_soft_limit();
         Self {
             router,
             config,
