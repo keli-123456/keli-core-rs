@@ -44,15 +44,15 @@ const UDP_TRAFFIC_FLUSH_BYTES: u64 = 64 * 1024;
 const UDP_FRAGMENT_IDLE_TIMEOUT_MS: u64 = 10_000;
 const UDP_MAX_FRAGMENT_SETS: usize = 4096;
 const UDP_MAX_REASSEMBLED_BYTES: usize = UDP_PACKET_BUFFER_SIZE;
-const UDP_SESSION_IDLE_TIMEOUT_MS: u64 = 60_000;
-const UDP_SESSION_CLEANUP_INTERVAL_MS: u64 = 10_000;
-const UDP_MAX_SESSIONS_PER_CONNECTION: usize = 256;
-const UDP_GLOBAL_SESSIONS_PER_CPU: usize = 256;
-const UDP_GLOBAL_MIN_SESSIONS: usize = 256;
-const UDP_GLOBAL_MAX_SESSIONS: usize = 8192;
+const UDP_SESSION_IDLE_TIMEOUT_MS: u64 = 20_000;
+const UDP_SESSION_CLEANUP_INTERVAL_MS: u64 = 5_000;
+const UDP_MAX_SESSIONS_PER_CONNECTION: usize = 64;
+const UDP_GLOBAL_SESSIONS_PER_CPU: usize = 96;
+const UDP_GLOBAL_MIN_SESSIONS: usize = 96;
+const UDP_GLOBAL_MAX_SESSIONS: usize = 4096;
 const UDP_GLOBAL_RESERVED_FDS: usize = 1024;
 const UDP_GLOBAL_FDS_PER_SESSION: usize = 1;
-const UDP_GLOBAL_MEMORY_MIB_PER_SESSION: usize = 2;
+const UDP_GLOBAL_MEMORY_MIB_PER_SESSION: usize = 8;
 const HY2_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
 const HY2_STOP_POLL_INTERVAL_MS: u64 = 250;
 const HY2_INVALID_AUTH_BACKOFF_THRESHOLD: u32 = 8;
@@ -3308,19 +3308,19 @@ mod tests {
     fn hysteria2_udp_session_limit_scales_with_machine_resources() {
         assert_eq!(
             super::hy2_udp_session_limit_from_resources(1, Some(64_000), Some(100_000)),
-            256
+            96
         );
         assert_eq!(
             super::hy2_udp_session_limit_from_resources(4, Some(64_000), Some(100_000)),
-            1024
+            384
         );
         assert_eq!(
             super::hy2_udp_session_limit_from_resources(64, Some(64_000), Some(100_000)),
-            8192
+            4096
         );
         assert_eq!(
             super::hy2_udp_session_limit_from_resources(16, Some(1024), Some(100_000)),
-            512
+            128
         );
         assert_eq!(
             super::hy2_udp_session_limit_from_resources(16, Some(64_000), Some(1500)),

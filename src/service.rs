@@ -43,10 +43,11 @@ use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult};
 use crate::vless::{VlessServer, VlessServerConfig};
 use crate::vmess::{VmessServer, VmessServerConfig};
 
-const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 1024;
-const MIN_AUTO_CONNECTION_WORKERS: usize = 32;
-const CONNECTION_WORKERS_PER_CPU: usize = 64;
-const CONNECTION_WORKER_MEMORY_MIB: usize = 4;
+const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 256;
+const MAX_AUTO_CONNECTION_WORKERS: usize = 1024;
+const MIN_AUTO_CONNECTION_WORKERS: usize = 16;
+const CONNECTION_WORKERS_PER_CPU: usize = 24;
+const CONNECTION_WORKER_MEMORY_MIB: usize = 16;
 const CONNECTION_WORKER_RESERVED_FDS: usize = 512;
 const CONNECTION_WORKER_FDS_PER_CONN: usize = 2;
 const CONNECTION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2301,7 +2302,7 @@ fn naive_uses_quic(inbound: &InboundConfig) -> bool {
 fn connection_worker_threads() -> usize {
     if let Ok(value) = std::env::var("KELI_CORE_CONNECTION_WORKERS") {
         if let Ok(parsed) = value.trim().parse::<usize>() {
-            return parsed.clamp(4, MAX_CONNECTION_WORKERS_PER_LISTENER);
+            return parsed.clamp(4, MAX_AUTO_CONNECTION_WORKERS);
         }
     }
     connection_worker_threads_from_resources(
@@ -2334,20 +2335,20 @@ fn connection_worker_threads_from_resources(
     let memory_target = memory_limit_mib
         .map(|mib| mib / CONNECTION_WORKER_MEMORY_MIB)
         .filter(|target| *target > 0)
-        .unwrap_or(MAX_CONNECTION_WORKERS_PER_LISTENER);
+        .unwrap_or(MAX_AUTO_CONNECTION_WORKERS);
     let fd_target = open_file_soft_limit
         .map(|limit| {
             limit.saturating_sub(CONNECTION_WORKER_RESERVED_FDS) / CONNECTION_WORKER_FDS_PER_CONN
         })
         .filter(|target| *target > 0)
-        .unwrap_or(MAX_CONNECTION_WORKERS_PER_LISTENER);
+        .unwrap_or(MAX_AUTO_CONNECTION_WORKERS);
     let resource_cap = cpu_target
         .min(memory_target)
         .min(fd_target)
-        .min(MAX_CONNECTION_WORKERS_PER_LISTENER);
+        .min(MAX_AUTO_CONNECTION_WORKERS);
     resource_cap.clamp(
         MIN_AUTO_CONNECTION_WORKERS.min(resource_cap),
-        MAX_CONNECTION_WORKERS_PER_LISTENER,
+        MAX_AUTO_CONNECTION_WORKERS,
     )
 }
 
@@ -2424,7 +2425,7 @@ fn parse_proc_limits_open_files(content: &str) -> Option<usize> {
         let soft = parts.next()?;
         if soft == "unlimited" {
             return Some(
-                MAX_CONNECTION_WORKERS_PER_LISTENER * CONNECTION_WORKER_FDS_PER_CONN
+                MAX_AUTO_CONNECTION_WORKERS * CONNECTION_WORKER_FDS_PER_CONN
                     + CONNECTION_WORKER_RESERVED_FDS,
             );
         }
@@ -2764,11 +2765,11 @@ mod tests {
     fn connection_worker_count_scales_with_cpu_when_resources_allow() {
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(4096), Some(100_000)),
-            256
+            96
         );
         assert_eq!(
             super::connection_worker_threads_from_resources(32, Some(128_000), Some(1_000_000)),
-            super::MAX_CONNECTION_WORKERS_PER_LISTENER
+            768
         );
     }
 
@@ -2776,11 +2777,11 @@ mod tests {
     fn connection_worker_count_respects_memory_and_fd_caps() {
         assert_eq!(
             super::connection_worker_threads_from_resources(8, Some(512), Some(100_000)),
-            128
+            32
         );
         assert_eq!(
             super::connection_worker_threads_from_resources(32, Some(8192), Some(4096)),
-            1024
+            512
         );
     }
 
@@ -2788,7 +2789,7 @@ mod tests {
     fn connection_worker_count_handles_small_resource_limits() {
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(64), Some(100_000)),
-            16
+            4
         );
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(4096), Some(600)),
