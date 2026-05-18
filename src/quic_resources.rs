@@ -9,6 +9,8 @@ const QUIC_CONNECTIONS_PER_CPU: usize = 128;
 const QUIC_RESERVED_FDS: usize = 1024;
 const QUIC_FDS_PER_CONNECTION: usize = 4;
 const QUIC_MEMORY_MIB_PER_CONNECTION: usize = 8;
+const MIN_QUIC_PER_LISTENER_SOFT_LIMIT: usize = 256;
+const QUIC_PER_LISTENER_BURST_MULTIPLIER: usize = 2;
 
 pub type QuicConnectionPermit = OwnedSemaphorePermit;
 
@@ -77,7 +79,10 @@ impl SharedQuicConnectionLimiter {
     }
 
     pub fn per_listener_soft_limit(&self) -> usize {
-        let soft_limit = self.inner.total_limit / self.inner.listener_count.max(1);
+        let even_share = self.inner.total_limit / self.inner.listener_count.max(1);
+        let soft_limit = even_share
+            .saturating_mul(QUIC_PER_LISTENER_BURST_MULTIPLIER)
+            .max(MIN_QUIC_PER_LISTENER_SOFT_LIMIT);
         soft_limit.clamp(64, self.inner.total_limit)
     }
 
@@ -252,10 +257,8 @@ mod tests {
 
         let snapshot = limiter.snapshot();
         assert_eq!(snapshot.listener_count, 3);
-        assert_eq!(
-            snapshot.per_listener_soft_limit,
-            snapshot.total_limit / snapshot.listener_count
-        );
+        assert!(snapshot.per_listener_soft_limit >= snapshot.total_limit / snapshot.listener_count);
+        assert!(snapshot.per_listener_soft_limit <= snapshot.total_limit);
         assert_eq!(snapshot.active_connections, 1);
         assert_eq!(
             snapshot.available_connections,
@@ -264,6 +267,14 @@ mod tests {
 
         drop(permit);
         assert_eq!(limiter.snapshot().active_connections, 0);
+    }
+
+    #[test]
+    fn per_listener_soft_limit_allows_burst_above_even_share() {
+        let limiter = SharedQuicConnectionLimiter::for_listener_count(5);
+        let snapshot = limiter.snapshot();
+        assert!(snapshot.per_listener_soft_limit >= 256.min(snapshot.total_limit));
+        assert!(snapshot.per_listener_soft_limit > snapshot.total_limit / snapshot.listener_count);
     }
 
     #[test]
