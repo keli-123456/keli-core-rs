@@ -59,8 +59,11 @@ const HY2_INVALID_AUTH_BACKOFF_THRESHOLD: u32 = 4;
 const HY2_INVALID_AUTH_BACKOFF_WINDOW: Duration = Duration::from_secs(30);
 const HY2_INVALID_AUTH_BACKOFF_DURATION: Duration = Duration::from_secs(60);
 const HY2_INVALID_AUTH_BACKOFF_MAX_ENTRIES: usize = 4096;
+const HY2_PREAUTH_LIMIT_ENV: &str = "KELI_CORE_HY2_PREAUTH_CONNECTIONS";
+const HY2_PREAUTH_MIN: usize = 32;
+const HY2_PREAUTH_MAX: usize = 128;
 const HY2_AUTH_TIMEOUT_SECS_ENV: &str = "KELI_CORE_HY2_AUTH_TIMEOUT_SECS";
-const DEFAULT_HY2_AUTH_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_HY2_AUTH_TIMEOUT_SECS: u64 = 3;
 const HY2_RELAY_IO_TIMEOUT_SECS_ENV: &str = "KELI_CORE_HY2_RELAY_IO_TIMEOUT_SECS";
 const DEFAULT_HY2_RELAY_IO_TIMEOUT_SECS: u64 = 15;
 const HY2_SOFTWARE_BANDWIDTH_LIMIT_MAX_MBPS_ENV: &str =
@@ -111,6 +114,8 @@ pub struct Hysteria2Server {
     quic_connections: SharedQuicConnectionLimiter,
     listener_connections: Arc<Semaphore>,
     listener_connection_limit: usize,
+    preauth_connections: Arc<Semaphore>,
+    preauth_connection_limit: usize,
     last_quic_limit_log_ms: Arc<AtomicU64>,
     auth_backoff: Arc<Hysteria2AuthBackoff>,
 }
@@ -153,6 +158,7 @@ impl Hysteria2Server {
         config.users.clear();
         config.routes.clear();
         let listener_connection_limit = quic_connections.per_listener_soft_limit();
+        let preauth_connection_limit = hy2_preauth_connection_limit(listener_connection_limit);
         Self {
             router,
             config,
@@ -163,6 +169,8 @@ impl Hysteria2Server {
             quic_connections,
             listener_connections: Arc::new(Semaphore::new(listener_connection_limit)),
             listener_connection_limit,
+            preauth_connections: Arc::new(Semaphore::new(preauth_connection_limit)),
+            preauth_connection_limit,
             last_quic_limit_log_ms: Arc::new(AtomicU64::new(0)),
             auth_backoff: Arc::new(Hysteria2AuthBackoff::default()),
         }
@@ -194,12 +202,13 @@ impl Hysteria2Server {
         )?;
         let resource = self.quic_connections.snapshot();
         println!(
-            "INFO  core   hysteria2 shared quic limit total={} active={} listeners={} per_listener_soft={} listener_limit={}",
+            "INFO  core   hysteria2 shared quic limit total={} active={} listeners={} per_listener_soft={} listener_limit={} preauth_limit={}",
             resource.total_limit,
             resource.active_connections,
             resource.listener_count,
             resource.per_listener_soft_limit,
-            self.listener_connection_limit
+            self.listener_connection_limit,
+            self.preauth_connection_limit
         );
         let tuning = proxy_quic_tuning_snapshot();
         println!(
@@ -252,14 +261,20 @@ impl Hysteria2Server {
                     let Some(incoming) = incoming else {
                         break;
                     };
+                    let Some(preauth_slot) = self.try_acquire_preauth_slot() else {
+                        incoming.refuse();
+                        self.log_preauth_limit_reached();
+                        continue;
+                    };
                     let Some(connection_slot) = self.try_acquire_connection_slot() else {
+                        drop(preauth_slot);
                         self.log_quic_limit_reached();
                         continue;
                     };
                     let server = self.clone();
                     tokio::spawn(async move {
                         let _connection_slot = connection_slot;
-                        if let Err(error) = server.handle_incoming(incoming).await {
+                        if let Err(error) = server.handle_incoming(incoming, preauth_slot).await {
                             log_hysteria2_error("connection", &error);
                         }
                     });
@@ -299,6 +314,29 @@ impl Hysteria2Server {
         })
     }
 
+    fn try_acquire_preauth_slot(&self) -> Option<OwnedSemaphorePermit> {
+        self.preauth_connections.clone().try_acquire_owned().ok()
+    }
+
+    fn log_preauth_limit_reached(&self) {
+        let now = now_millis();
+        let last = self.last_quic_limit_log_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < HY2_ERROR_LOG_INTERVAL_MS {
+            return;
+        }
+        if self
+            .last_quic_limit_log_ms
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        eprintln!(
+            "WARN  core   hysteria2 preauth limit reached limit={}",
+            self.preauth_connection_limit
+        );
+    }
+
     fn log_quic_limit_reached(&self) {
         let now = now_millis();
         let last = self.last_quic_limit_log_ms.load(Ordering::Relaxed);
@@ -319,7 +357,11 @@ impl Hysteria2Server {
         );
     }
 
-    async fn handle_incoming(&self, incoming: quinn::Incoming) -> io::Result<()> {
+    async fn handle_incoming(
+        &self,
+        incoming: quinn::Incoming,
+        preauth_slot: OwnedSemaphorePermit,
+    ) -> io::Result<()> {
         let client_ip = incoming.remote_address().ip();
         if self.auth_backoff.is_blocked(client_ip) {
             incoming.refuse();
@@ -365,6 +407,7 @@ impl Hysteria2Server {
                     ));
                 }
             };
+        drop(preauth_slot);
         let _session = self.acquire_user_session(auth.user.as_ref(), Some(client_ip))?;
         let bandwidth = self.connection_limiters(
             self.bandwidth.limiter_for(Some(auth.user.as_ref())),
@@ -1827,6 +1870,18 @@ where
 
 fn hy2_auth_timeout() -> Duration {
     env_duration_seconds(HY2_AUTH_TIMEOUT_SECS_ENV, DEFAULT_HY2_AUTH_TIMEOUT_SECS)
+}
+
+fn hy2_preauth_connection_limit(listener_connection_limit: usize) -> usize {
+    if let Ok(value) = env::var(HY2_PREAUTH_LIMIT_ENV) {
+        if let Ok(parsed) = value.trim().parse::<usize>() {
+            return parsed.clamp(8, listener_connection_limit.max(8));
+        }
+    }
+    (listener_connection_limit / 3)
+        .clamp(HY2_PREAUTH_MIN, HY2_PREAUTH_MAX)
+        .min(listener_connection_limit)
+        .max(8)
 }
 
 fn hy2_relay_io_timeout() -> Duration {
@@ -3370,6 +3425,13 @@ mod tests {
             super::hy2_udp_session_limit_from_resources(16, Some(64_000), Some(1500)),
             476
         );
+    }
+
+    #[test]
+    fn hysteria2_preauth_limit_scales_below_connection_limit() {
+        assert_eq!(super::hy2_preauth_connection_limit(64), 32);
+        assert_eq!(super::hy2_preauth_connection_limit(195), 65);
+        assert_eq!(super::hy2_preauth_connection_limit(1024), 128);
     }
 
     #[test]
