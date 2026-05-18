@@ -2013,6 +2013,9 @@ where
             } else {
                 match remote.read(&mut decode_buffer) {
                     Ok(0) => {
+                        if let Some(frame) = vision_encoder.finish_padding() {
+                            let _ = write_all_wait_tls_bridge(&mut remote, &frame);
+                        }
                         vision_decoder.finish();
                         let decoded = vision_decoder.read_decoded(&mut download_buffer)?;
                         if decoded > 0 {
@@ -2694,6 +2697,11 @@ where
         if !download_done {
             match remote.read(&mut remote_buffer) {
                 Ok(0) => {
+                    if !downlink_direct {
+                        if let Some(frame) = vision_encoder.finish_padding() {
+                            let _ = client.write_plain_all_wait(&frame);
+                        }
+                    }
                     download_done = true;
                     upload_done = true;
                     let _ = client.shutdown(Shutdown::Both);

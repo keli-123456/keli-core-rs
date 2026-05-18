@@ -547,6 +547,31 @@ mod tests {
         assert_eq!(decoded, coalesced);
     }
 
+    #[test]
+    fn vision_encoder_can_finish_short_plain_response_padding() {
+        let user_id = [0x11; 16];
+        let mut encoder = VisionEncoder::new(user_id);
+        let response = b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+
+        let first = encoder.encode(response);
+        assert_eq!(&first[..16], &user_id);
+        assert_eq!(first[16], super::COMMAND_PADDING_CONTINUE);
+
+        let end = encoder
+            .finish_padding()
+            .expect("short plain response should still need padding end");
+        assert_eq!(end[0], super::COMMAND_PADDING_END);
+
+        let mut decoded = Vec::new();
+        let mut framed = first;
+        framed.extend_from_slice(&end);
+        VisionReader::new(Cursor::new(framed), user_id)
+            .read_to_end(&mut decoded)
+            .expect("vision read");
+
+        assert_eq!(decoded, response);
+    }
+
     struct SlowReader {
         input: Cursor<Vec<u8>>,
         chunk: usize,
