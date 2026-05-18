@@ -46,8 +46,8 @@ use crate::vmess::{VmessServer, VmessServerConfig};
 const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 256;
 const MAX_AUTO_CONNECTION_WORKERS: usize = 2048;
 const MIN_AUTO_CONNECTION_WORKERS: usize = 16;
-const CONNECTION_WORKERS_PER_CPU: usize = 96;
-const CONNECTION_WORKER_MEMORY_MIB: usize = 12;
+const CONNECTION_WORKERS_PER_CPU: usize = 64;
+const CONNECTION_WORKER_MEMORY_MIB: usize = 16;
 const CONNECTION_WORKER_RESERVED_FDS: usize = 512;
 const CONNECTION_WORKER_FDS_PER_CONN: usize = 2;
 const CONNECTION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2781,7 +2781,7 @@ mod tests {
     fn connection_worker_count_scales_with_cpu_when_resources_allow() {
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(4096), Some(100_000)),
-            341
+            256
         );
         assert_eq!(
             super::connection_worker_threads_from_resources(32, Some(128_000), Some(1_000_000)),
@@ -2793,11 +2793,11 @@ mod tests {
     fn connection_worker_count_respects_memory_and_fd_caps() {
         assert_eq!(
             super::connection_worker_threads_from_resources(8, Some(512), Some(100_000)),
-            42
+            32
         );
         assert_eq!(
             super::connection_worker_threads_from_resources(32, Some(8192), Some(4096)),
-            682
+            512
         );
     }
 
@@ -2805,7 +2805,7 @@ mod tests {
     fn connection_worker_count_handles_small_resource_limits() {
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(64), Some(100_000)),
-            5
+            4
         );
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(4096), Some(600)),

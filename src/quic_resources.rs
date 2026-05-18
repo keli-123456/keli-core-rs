@@ -3,12 +3,12 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-const MIN_QUIC_CONNECTION_LIMIT: usize = 256;
+const MIN_QUIC_CONNECTION_LIMIT: usize = 128;
 const MAX_QUIC_CONNECTION_LIMIT: usize = 8192;
-const QUIC_CONNECTIONS_PER_CPU: usize = 256;
+const QUIC_CONNECTIONS_PER_CPU: usize = 128;
 const QUIC_RESERVED_FDS: usize = 1024;
 const QUIC_FDS_PER_CONNECTION: usize = 4;
-const QUIC_MEMORY_MIB_PER_CONNECTION: usize = 4;
+const QUIC_MEMORY_MIB_PER_CONNECTION: usize = 8;
 
 pub type QuicConnectionPermit = OwnedSemaphorePermit;
 
@@ -216,19 +216,19 @@ mod tests {
     fn quic_connection_limit_scales_with_machine_resources() {
         assert_eq!(
             quic_connection_limit_from_resources(1, Some(64_000), Some(1_000_000)),
-            256
+            128
         );
         assert_eq!(
             quic_connection_limit_from_resources(4, Some(64_000), Some(1_000_000)),
-            1024
+            512
         );
         assert_eq!(
             quic_connection_limit_from_resources(16, Some(64_000), Some(1_000_000)),
-            4096
+            2048
         );
         assert_eq!(
             quic_connection_limit_from_resources(128, Some(64_000), Some(1_000_000)),
-            8192
+            8000
         );
     }
 
@@ -236,7 +236,7 @@ mod tests {
     fn quic_connection_limit_respects_memory_and_fd_caps() {
         assert_eq!(
             quic_connection_limit_from_resources(16, Some(2048), Some(1_000_000)),
-            512
+            256
         );
         assert_eq!(
             quic_connection_limit_from_resources(16, Some(64_000), Some(4096)),
