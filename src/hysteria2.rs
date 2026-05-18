@@ -1072,6 +1072,14 @@ fn hy2_udp_session_limit() -> usize {
     })
 }
 
+pub(crate) fn hy2_udp_session_limit_for_metrics() -> usize {
+    hy2_udp_session_limit()
+}
+
+pub(crate) fn hy2_active_udp_sessions() -> usize {
+    HY2_ACTIVE_UDP_SESSIONS.load(Ordering::Acquire)
+}
+
 fn hy2_udp_session_limit_from_resources(
     cpu_count: usize,
     memory_limit_mib: Option<usize>,

@@ -27,6 +27,8 @@ pub struct CoreMetricsSnapshot {
     pub keli_core_tcp_auth_backoff_reject_total: u64,
     pub keli_core_tcp_auth_backoff_active_ips: usize,
     pub keli_core_tcp_auth_backoff_blocked_ips: usize,
+    pub keli_core_hy2_udp_active_sessions: usize,
+    pub keli_core_hy2_udp_session_limit: usize,
     #[serde(default)]
     pub keli_core_connection_error_total: BTreeMap<String, u64>,
     pub keli_core_dns: DnsMetricsSnapshot,
@@ -82,6 +84,9 @@ impl CoreMetrics {
             snapshot.keli_core_tcp_auth_backoff_active_ips = tcp_auth.active_ips;
             snapshot.keli_core_tcp_auth_backoff_blocked_ips = tcp_auth.blocked_ips;
         }
+        snapshot.keli_core_hy2_udp_active_sessions = crate::hysteria2::hy2_active_udp_sessions();
+        snapshot.keli_core_hy2_udp_session_limit =
+            crate::hysteria2::hy2_udp_session_limit_for_metrics();
         snapshot.keli_core_connection_error_total = connection_error_metrics_snapshot();
         snapshot
     }
@@ -323,6 +328,16 @@ mod tests {
         let snapshot = metrics.snapshot_with_runtime_metrics(None, None, None);
 
         assert_eq!(snapshot.keli_core_dns, dns);
+    }
+
+    #[test]
+    fn snapshots_include_hy2_udp_session_metrics_without_user_labels() {
+        let metrics = CoreMetrics::default();
+
+        let snapshot = metrics.snapshot_with_runtime_metrics(None, None, None);
+
+        assert_eq!(snapshot.keli_core_hy2_udp_active_sessions, 0);
+        assert!(snapshot.keli_core_hy2_udp_session_limit >= 64);
     }
 
     #[test]
