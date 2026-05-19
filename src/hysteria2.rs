@@ -60,8 +60,8 @@ const HY2_INVALID_AUTH_BACKOFF_WINDOW: Duration = Duration::from_secs(30);
 const HY2_INVALID_AUTH_BACKOFF_DURATION: Duration = Duration::from_secs(60);
 const HY2_INVALID_AUTH_BACKOFF_MAX_ENTRIES: usize = 4096;
 const HY2_PREAUTH_LIMIT_ENV: &str = "KELI_CORE_HY2_PREAUTH_CONNECTIONS";
-const HY2_PREAUTH_MIN: usize = 32;
-const HY2_PREAUTH_MAX: usize = 128;
+const HY2_PREAUTH_MIN: usize = 16;
+const HY2_PREAUTH_MAX: usize = 64;
 const HY2_AUTH_TIMEOUT_SECS_ENV: &str = "KELI_CORE_HY2_AUTH_TIMEOUT_SECS";
 const DEFAULT_HY2_AUTH_TIMEOUT_SECS: u64 = 3;
 const HY2_RELAY_IO_TIMEOUT_SECS_ENV: &str = "KELI_CORE_HY2_RELAY_IO_TIMEOUT_SECS";
@@ -1878,7 +1878,7 @@ fn hy2_preauth_connection_limit(listener_connection_limit: usize) -> usize {
             return parsed.clamp(8, listener_connection_limit.max(8));
         }
     }
-    (listener_connection_limit / 3)
+    (listener_connection_limit / 6)
         .clamp(HY2_PREAUTH_MIN, HY2_PREAUTH_MAX)
         .min(listener_connection_limit)
         .max(8)
@@ -3429,9 +3429,9 @@ mod tests {
 
     #[test]
     fn hysteria2_preauth_limit_scales_below_connection_limit() {
-        assert_eq!(super::hy2_preauth_connection_limit(64), 32);
-        assert_eq!(super::hy2_preauth_connection_limit(195), 65);
-        assert_eq!(super::hy2_preauth_connection_limit(1024), 128);
+        assert_eq!(super::hy2_preauth_connection_limit(64), 16);
+        assert_eq!(super::hy2_preauth_connection_limit(195), 32);
+        assert_eq!(super::hy2_preauth_connection_limit(1024), 64);
     }
 
     #[test]

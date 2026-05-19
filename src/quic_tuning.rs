@@ -156,7 +156,7 @@ fn proxy_quic_tuning() -> ProxyQuicTuning {
 }
 
 fn proxy_quic_tuning_from_resources(
-    _cpu_count: usize,
+    cpu_count: usize,
     memory_limit_mib: Option<usize>,
     fd_limit: Option<usize>,
 ) -> ProxyQuicTuning {
@@ -176,11 +176,19 @@ fn proxy_quic_tuning_from_resources(
         };
     }
 
+    let max_concurrent_streams = if cpu_count <= 4 {
+        256
+    } else if cpu_count <= 8 {
+        512
+    } else {
+        DEFAULT_PROXY_MAX_CONCURRENT_STREAMS
+    };
+
     ProxyQuicTuning {
         stream_receive_window_mib: DEFAULT_PROXY_STREAM_RECEIVE_WINDOW_MIB,
         receive_window_mib: DEFAULT_PROXY_RECEIVE_WINDOW_MIB,
         send_window_mib: DEFAULT_PROXY_RECEIVE_WINDOW_MIB,
-        max_concurrent_streams: DEFAULT_PROXY_MAX_CONCURRENT_STREAMS,
+        max_concurrent_streams,
         udp_socket_buffer_mib: DEFAULT_PROXY_UDP_SOCKET_BUFFER_MIB,
         ack_eliciting_threshold: DEFAULT_PROXY_ACK_ELICITING_THRESHOLD,
         ack_max_delay_ms: DEFAULT_PROXY_ACK_MAX_DELAY_MS,
@@ -287,8 +295,15 @@ mod tests {
         assert!(debug.contains("mtu_discovery_config: Some"));
         assert!(debug.contains("send_fairness: false"));
         assert!(debug.contains("ack_frequency_config: Some"));
-        assert!(debug.contains("max_concurrent_bidi_streams: 1024"));
-        assert!(debug.contains("max_concurrent_uni_streams: 1024"));
+        let tuning = proxy_quic_tuning_snapshot();
+        assert!(debug.contains(&format!(
+            "max_concurrent_bidi_streams: {}",
+            tuning.max_concurrent_streams
+        )));
+        assert!(debug.contains(&format!(
+            "max_concurrent_uni_streams: {}",
+            tuning.max_concurrent_streams
+        )));
     }
 
     #[test]
@@ -307,17 +322,17 @@ mod tests {
         let low_cpu = proxy_quic_tuning_from_resources(2, Some(64_000), Some(1_000_000));
         assert_eq!(low_cpu.stream_receive_window_mib, 8);
         assert_eq!(low_cpu.receive_window_mib, 20);
-        assert_eq!(low_cpu.max_concurrent_streams, 1024);
+        assert_eq!(low_cpu.max_concurrent_streams, 256);
 
         let mid_memory = proxy_quic_tuning_from_resources(8, Some(4096), Some(1_000_000));
         assert_eq!(mid_memory.stream_receive_window_mib, 8);
         assert_eq!(mid_memory.receive_window_mib, 20);
-        assert_eq!(mid_memory.max_concurrent_streams, 1024);
+        assert_eq!(mid_memory.max_concurrent_streams, 512);
     }
 
     #[test]
     fn proxy_quic_tuning_keeps_hy2_style_defaults_on_capable_machines() {
-        let tuning = proxy_quic_tuning_from_resources(8, Some(16_384), Some(1_000_000));
+        let tuning = proxy_quic_tuning_from_resources(16, Some(16_384), Some(1_000_000));
 
         assert_eq!(tuning.stream_receive_window_mib, 8);
         assert_eq!(tuning.receive_window_mib, 20);
