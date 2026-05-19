@@ -1202,7 +1202,8 @@ fn classify_vless_connection_error(error: &io::Error) -> &'static str {
     if matches!(
         error.kind(),
         io::ErrorKind::ConnectionRefused | io::ErrorKind::AddrNotAvailable
-    ) {
+    ) || is_vless_upstream_connect_failure_text(&text)
+    {
         return "upstream_connect_failed";
     }
     if matches!(
@@ -1221,6 +1222,18 @@ fn classify_vless_connection_error(error: &io::Error) -> &'static str {
         return "invalid_request";
     }
     "error"
+}
+
+fn is_vless_upstream_connect_failure_text(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("tcp connect failed")
+        || text.contains("tcp outbound connect failed")
+        || text.contains("dns response indicates failure")
+        || text.contains("configured dns servers returned no target address")
+        || text.contains("target did not resolve to any socket address")
+        || text.contains("connection refused")
+        || text.contains("network is unreachable")
+        || text.contains("no route to host")
 }
 
 impl VlessUdpRelayState {
@@ -3158,6 +3171,20 @@ mod tests {
                 "private ip blocked by dns guard",
             )),
             "dns_private_blocked"
+        );
+        assert_eq!(
+            super::classify_vless_connection_error(&io::Error::new(
+                io::ErrorKind::Other,
+                "tcp connect failed: Connection refused",
+            )),
+            "upstream_connect_failed"
+        );
+        assert_eq!(
+            super::classify_vless_connection_error(&io::Error::new(
+                io::ErrorKind::Other,
+                "dns response indicates failure",
+            )),
+            "upstream_connect_failed"
         );
         assert_eq!(
             super::classify_vless_connection_error(&io::Error::new(
