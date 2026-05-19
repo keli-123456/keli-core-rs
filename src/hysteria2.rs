@@ -63,7 +63,7 @@ const HY2_PREAUTH_LIMIT_ENV: &str = "KELI_CORE_HY2_PREAUTH_CONNECTIONS";
 const HY2_PREAUTH_MIN: usize = 16;
 const HY2_PREAUTH_MAX: usize = 64;
 const HY2_AUTH_TIMEOUT_SECS_ENV: &str = "KELI_CORE_HY2_AUTH_TIMEOUT_SECS";
-const DEFAULT_HY2_AUTH_TIMEOUT_SECS: u64 = 3;
+const DEFAULT_HY2_AUTH_TIMEOUT_SECS: u64 = 10;
 const HY2_RELAY_IO_TIMEOUT_SECS_ENV: &str = "KELI_CORE_HY2_RELAY_IO_TIMEOUT_SECS";
 const DEFAULT_HY2_RELAY_IO_TIMEOUT_SECS: u64 = 15;
 const HY2_SOFTWARE_BANDWIDTH_LIMIT_MAX_MBPS_ENV: &str =
@@ -373,7 +373,6 @@ impl Hysteria2Server {
             Ok(Ok(connection)) => connection,
             Ok(Err(error)) => return Err(io_other(error)),
             Err(_) => {
-                self.auth_backoff.record_invalid(client_ip);
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "hysteria2 handshake timed out",
@@ -390,7 +389,7 @@ impl Hysteria2Server {
                     auth
                 }
                 Ok(Err(error)) => {
-                    if is_hysteria2_invalid_auth_error(&error) {
+                    if should_record_hysteria2_auth_backoff(&error) {
                         self.auth_backoff.record_invalid(client_ip);
                         connection.close(0u32.into(), b"invalid auth");
                     } else {
@@ -399,7 +398,6 @@ impl Hysteria2Server {
                     return Err(error);
                 }
                 Err(_) => {
-                    self.auth_backoff.record_invalid(client_ip);
                     connection.close(0u32.into(), b"auth timeout");
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -2255,6 +2253,10 @@ fn is_hysteria2_invalid_auth_error(error: &io::Error) -> bool {
             .contains("invalid hysteria2 authentication")
 }
 
+fn should_record_hysteria2_auth_backoff(error: &io::Error) -> bool {
+    is_hysteria2_invalid_auth_error(error)
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3566,5 +3568,26 @@ mod tests {
 
         backoff.record_success(ip);
         assert!(!backoff.is_blocked_at(ip, start + Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn hysteria2_auth_backoff_policy_ignores_timeouts() {
+        assert!(should_record_hysteria2_auth_backoff(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid hysteria2 authentication",
+        )));
+        assert!(!should_record_hysteria2_auth_backoff(&io::Error::new(
+            io::ErrorKind::TimedOut,
+            "hysteria2 handshake timed out",
+        )));
+        assert!(!should_record_hysteria2_auth_backoff(&io::Error::new(
+            io::ErrorKind::TimedOut,
+            "hysteria2 authentication timed out",
+        )));
+    }
+
+    #[test]
+    fn hysteria2_auth_timeout_default_is_not_rust_only_three_second_gate() {
+        assert_eq!(DEFAULT_HY2_AUTH_TIMEOUT_SECS, 10);
     }
 }
