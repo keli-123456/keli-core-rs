@@ -5,10 +5,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MIN_QUIC_CONNECTION_LIMIT: usize = 128;
 const MAX_QUIC_CONNECTION_LIMIT: usize = 8192;
-const QUIC_CONNECTIONS_PER_CPU: usize = 80;
+const QUIC_CONNECTIONS_PER_CPU: usize = 256;
 const QUIC_RESERVED_FDS: usize = 1024;
 const QUIC_FDS_PER_CONNECTION: usize = 4;
-const QUIC_MEMORY_MIB_PER_CONNECTION: usize = 8;
+const QUIC_MEMORY_MIB_PER_CONNECTION: usize = 4;
 
 pub type QuicConnectionPermit = OwnedSemaphorePermit;
 
@@ -215,19 +215,19 @@ mod tests {
     fn quic_connection_limit_scales_with_machine_resources() {
         assert_eq!(
             quic_connection_limit_from_resources(1, Some(64_000), Some(1_000_000)),
-            128
+            256
         );
         assert_eq!(
             quic_connection_limit_from_resources(4, Some(64_000), Some(1_000_000)),
-            320
+            1024
         );
         assert_eq!(
             quic_connection_limit_from_resources(16, Some(64_000), Some(1_000_000)),
-            1280
+            4096
         );
         assert_eq!(
             quic_connection_limit_from_resources(128, Some(64_000), Some(1_000_000)),
-            8000
+            8192
         );
     }
 
@@ -235,11 +235,23 @@ mod tests {
     fn quic_connection_limit_respects_memory_and_fd_caps() {
         assert_eq!(
             quic_connection_limit_from_resources(16, Some(2048), Some(1_000_000)),
-            256
+            512
         );
         assert_eq!(
             quic_connection_limit_from_resources(16, Some(64_000), Some(4096)),
             768
+        );
+    }
+
+    #[test]
+    fn quic_connection_limit_does_not_pin_four_core_nodes_to_legacy_320() {
+        assert_eq!(
+            quic_connection_limit_from_resources(4, Some(3914), Some(999_999)),
+            978
+        );
+        assert_eq!(
+            quic_connection_limit_from_resources(4, Some(7934), Some(1_048_576)),
+            1024
         );
     }
 
