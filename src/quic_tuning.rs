@@ -287,15 +287,27 @@ mod tests {
         apply_proxy_quic_transport_defaults(&mut transport);
 
         let debug = format!("{transport:?}");
-        assert!(debug.contains("stream_receive_window: 8388608"));
-        assert!(debug.contains("receive_window: 20971520"));
-        assert!(debug.contains("send_window: 20971520"));
-        assert!(debug.contains("initial_rtt: 50ms"));
-        assert!(debug.contains("max_idle_timeout: Some(30000)"));
+        let tuning = proxy_quic_tuning_snapshot();
+        assert!(debug.contains(&format!(
+            "stream_receive_window: {}",
+            tuning.stream_receive_window_mib.saturating_mul(MIB_U32)
+        )));
+        assert!(debug.contains(&format!(
+            "receive_window: {}",
+            tuning.receive_window_mib.saturating_mul(MIB_U32)
+        )));
+        assert!(debug.contains(&format!(
+            "send_window: {}",
+            u64::from(tuning.send_window_mib).saturating_mul(MIB_U64)
+        )));
+        assert!(debug.contains(&format!("initial_rtt: {}ms", tuning.initial_rtt_ms)));
+        assert!(debug.contains(&format!(
+            "max_idle_timeout: Some({})",
+            tuning.max_idle_timeout_secs.saturating_mul(1000)
+        )));
         assert!(debug.contains("mtu_discovery_config: Some"));
         assert!(debug.contains("send_fairness: false"));
         assert!(debug.contains("ack_frequency_config: Some"));
-        let tuning = proxy_quic_tuning_snapshot();
         assert!(debug.contains(&format!(
             "max_concurrent_bidi_streams: {}",
             tuning.max_concurrent_streams
