@@ -909,6 +909,7 @@ mod tests {
 
     #[test]
     fn resolves_with_configured_dns_server() {
+        let _guard = crate::test_support::network_test_lock();
         let dns = UdpSocket::bind("127.0.0.1:0").expect("dns bind");
         dns.set_read_timeout(Some(Duration::from_secs(2)))
             .expect("dns timeout");
@@ -952,6 +953,7 @@ mod tests {
 
     #[test]
     fn resolves_with_configured_tcp_dns_server() {
+        let _guard = crate::test_support::network_test_lock();
         let dns = TcpListener::bind("127.0.0.1:0").expect("dns bind");
         let dns_addr = dns.local_addr().expect("dns addr");
         let server = thread::spawn(move || {
@@ -999,6 +1001,7 @@ mod tests {
 
     #[test]
     fn blocks_private_dns_answers_when_enabled() {
+        let _guard = crate::test_support::network_test_lock();
         let before = dns_metrics_snapshot();
         let (dns_addr, server) = spawn_udp_a_dns([127, 0, 0, 1]);
         configure(DnsConfig {
@@ -1036,6 +1039,7 @@ mod tests {
 
     #[test]
     fn private_dns_answer_allowlist_preserves_compatibility() {
+        let _guard = crate::test_support::network_test_lock();
         let (dns_addr, server) = spawn_udp_a_dns([127, 0, 0, 1]);
         configure(DnsConfig {
             servers: vec![DnsServerConfig {
@@ -1057,6 +1061,7 @@ mod tests {
 
     #[test]
     fn blocks_private_literal_targets_when_enabled() {
+        let _guard = crate::test_support::network_test_lock();
         let before = dns_metrics_snapshot();
         configure(DnsConfig {
             block_private_ips: true,
@@ -1077,6 +1082,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_blocks_private_literal_targets_when_enabled() {
+        let _guard = crate::test_support::network_test_lock();
         let before = dns_metrics_snapshot();
         configure(DnsConfig {
             block_private_ips: true,
@@ -1098,6 +1104,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_resolves_literal_ips_without_dns_lookup() {
+        let _guard = crate::test_support::network_test_lock();
         configure(DnsConfig {
             servers: vec![DnsServerConfig {
                 address: "udp://192.0.2.1:53".to_string(),
@@ -1151,6 +1158,7 @@ mod tests {
 
     #[test]
     fn negative_dns_cache_reuses_recent_failures_and_clears_on_configure() {
+        let _guard = crate::test_support::network_test_lock();
         let before = dns_metrics_snapshot();
         let key = DnsCacheKey {
             host: "missing.example.test".to_string(),
@@ -1176,6 +1184,7 @@ mod tests {
 
     #[test]
     fn positive_dns_cache_reuses_recent_answers_and_clears_on_configure() {
+        let _guard = crate::test_support::network_test_lock();
         let before = dns_metrics_snapshot();
         let key = DnsCacheKey {
             host: "cached.example.test".to_string(),
@@ -1200,6 +1209,7 @@ mod tests {
 
     #[test]
     fn tcp_connect_addrs_falls_back_to_later_address() {
+        let _guard = crate::test_support::network_test_lock();
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
         let good = listener.local_addr().expect("listener addr");
         let bad_port = {
@@ -1209,8 +1219,8 @@ mod tests {
         let bad = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bad_port);
         let accepted = thread::spawn(move || listener.accept().expect("accept"));
 
-        let stream = connect_tcp_addrs(&[bad, good], Duration::from_secs(2))
-            .expect("fallback connect");
+        let stream =
+            connect_tcp_addrs(&[bad, good], Duration::from_secs(2)).expect("fallback connect");
 
         assert_eq!(stream.peer_addr().expect("peer addr"), good);
         let _ = accepted.join().expect("join accept");
@@ -1218,6 +1228,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_tcp_connect_addrs_falls_back_to_later_address() {
+        let _guard = crate::test_support::network_test_lock();
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
         let good = listener.local_addr().expect("listener addr");
         let bad_port = {
@@ -1252,6 +1263,7 @@ mod tests {
 
     #[test]
     fn tcp_connect_backoff_blocks_repeated_target_failures() {
+        let _guard = crate::test_support::network_test_lock();
         clear_tcp_connect_failure_backoff();
         let key = dns_cache_key("156.246.66.34", 80);
         let now = Instant::now();
@@ -1275,6 +1287,7 @@ mod tests {
 
     #[test]
     fn tcp_connect_success_clears_target_backoff() {
+        let _guard = crate::test_support::network_test_lock();
         clear_tcp_connect_failure_backoff();
         let key = dns_cache_key("[2607:f358:1a:e::d4d9:5831]", 443);
         let now = Instant::now();
