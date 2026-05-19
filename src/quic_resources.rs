@@ -5,7 +5,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MIN_QUIC_CONNECTION_LIMIT: usize = 128;
 const MAX_QUIC_CONNECTION_LIMIT: usize = 8192;
-const QUIC_CONNECTIONS_PER_CPU: usize = 64;
+const QUIC_CONNECTIONS_PER_CPU: usize = 96;
 const QUIC_RESERVED_FDS: usize = 1024;
 const QUIC_FDS_PER_CONNECTION: usize = 4;
 const QUIC_MEMORY_MIB_PER_CONNECTION: usize = 8;
@@ -219,11 +219,11 @@ mod tests {
         );
         assert_eq!(
             quic_connection_limit_from_resources(4, Some(64_000), Some(1_000_000)),
-            256
+            384
         );
         assert_eq!(
             quic_connection_limit_from_resources(16, Some(64_000), Some(1_000_000)),
-            1024
+            1536
         );
         assert_eq!(
             quic_connection_limit_from_resources(128, Some(64_000), Some(1_000_000)),
