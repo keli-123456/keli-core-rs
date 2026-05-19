@@ -44,10 +44,10 @@ use crate::vless::{VlessServer, VlessServerConfig};
 use crate::vmess::{VmessServer, VmessServerConfig};
 
 const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 256;
-const MAX_AUTO_CONNECTION_WORKERS: usize = 2048;
+const MAX_AUTO_CONNECTION_WORKERS: usize = 1024;
 const MIN_AUTO_CONNECTION_WORKERS: usize = 16;
-const CONNECTION_WORKERS_PER_CPU: usize = 64;
-const CONNECTION_WORKER_MEMORY_MIB: usize = 16;
+const CONNECTION_WORKERS_PER_CPU: usize = 32;
+const CONNECTION_WORKER_MEMORY_MIB: usize = 32;
 const CONNECTION_WORKER_RESERVED_FDS: usize = 512;
 const CONNECTION_WORKER_FDS_PER_CONN: usize = 2;
 const CONNECTION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1829,23 +1829,14 @@ fn start_vless_reality_listener(
     let workers = ConnectionWorkerGroup::new();
     let workers_for_thread = workers.clone();
     let runtime_server = server.clone();
-    let join = spawn_async_tcp_accept_loop(
+    let join = spawn_tcp_accept_loop(
         listener,
         stop_for_thread,
         workers_for_thread,
         move |stream| {
             let gateway = reality_gateway_for_connection(&gateway);
             let server = server.clone();
-            async move {
-                let Ok(stream) = stream.into_std() else {
-                    return;
-                };
-                let _ = stream.set_nonblocking(false);
-                let _ = tokio::task::spawn_blocking(move || {
-                    handle_vless_reality_connection(stream, gateway, server);
-                })
-                .await;
-            }
+            handle_vless_reality_connection(stream, gateway, server);
         },
     );
 
@@ -2792,11 +2783,11 @@ mod tests {
     fn connection_worker_count_scales_with_cpu_when_resources_allow() {
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(4096), Some(100_000)),
-            256
+            128
         );
         assert_eq!(
             super::connection_worker_threads_from_resources(32, Some(128_000), Some(1_000_000)),
-            2048
+            1024
         );
     }
 
@@ -2804,11 +2795,19 @@ mod tests {
     fn connection_worker_count_respects_memory_and_fd_caps() {
         assert_eq!(
             super::connection_worker_threads_from_resources(8, Some(512), Some(100_000)),
-            32
+            16
         );
         assert_eq!(
             super::connection_worker_threads_from_resources(32, Some(8192), Some(4096)),
-            512
+            256
+        );
+    }
+
+    #[test]
+    fn connection_worker_count_matches_problem_node_pressure_profile() {
+        assert_eq!(
+            super::connection_worker_threads_from_resources(4, Some(3914), Some(999_999)),
+            122
         );
     }
 
@@ -2816,7 +2815,7 @@ mod tests {
     fn connection_worker_count_handles_small_resource_limits() {
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(64), Some(100_000)),
-            4
+            2
         );
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(4096), Some(600)),
