@@ -4,11 +4,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MIN_QUIC_CONNECTION_LIMIT: usize = 128;
-const MAX_QUIC_CONNECTION_LIMIT: usize = 8192;
-const QUIC_CONNECTIONS_PER_CPU: usize = 512;
+const MAX_QUIC_CONNECTION_LIMIT: usize = 32768;
+const QUIC_CONNECTIONS_PER_CPU: usize = 2048;
 const QUIC_RESERVED_FDS: usize = 1024;
-const QUIC_FDS_PER_CONNECTION: usize = 4;
-const QUIC_MEMORY_MIB_PER_CONNECTION: usize = 4;
+const QUIC_FDS_PER_CONNECTION: usize = 2;
+const QUIC_MEMORY_MIB_PER_CONNECTION: usize = 1;
 
 pub type QuicConnectionPermit = OwnedSemaphorePermit;
 
@@ -215,19 +215,19 @@ mod tests {
     fn quic_connection_limit_scales_with_machine_resources() {
         assert_eq!(
             quic_connection_limit_from_resources(1, Some(64_000), Some(1_000_000)),
-            512
-        );
-        assert_eq!(
-            quic_connection_limit_from_resources(4, Some(64_000), Some(1_000_000)),
             2048
         );
         assert_eq!(
-            quic_connection_limit_from_resources(16, Some(64_000), Some(1_000_000)),
+            quic_connection_limit_from_resources(4, Some(64_000), Some(1_000_000)),
             8192
         );
         assert_eq!(
+            quic_connection_limit_from_resources(16, Some(64_000), Some(1_000_000)),
+            32768
+        );
+        assert_eq!(
             quic_connection_limit_from_resources(128, Some(64_000), Some(1_000_000)),
-            8192
+            32768
         );
     }
 
@@ -235,11 +235,11 @@ mod tests {
     fn quic_connection_limit_respects_memory_and_fd_caps() {
         assert_eq!(
             quic_connection_limit_from_resources(16, Some(2048), Some(1_000_000)),
-            512
+            2048
         );
         assert_eq!(
             quic_connection_limit_from_resources(16, Some(64_000), Some(4096)),
-            768
+            1536
         );
     }
 
@@ -247,11 +247,11 @@ mod tests {
     fn quic_connection_limit_does_not_pin_four_core_nodes_to_legacy_320() {
         assert_eq!(
             quic_connection_limit_from_resources(4, Some(3914), Some(999_999)),
-            978
+            3914
         );
         assert_eq!(
             quic_connection_limit_from_resources(4, Some(7934), Some(1_048_576)),
-            1983
+            7934
         );
     }
 

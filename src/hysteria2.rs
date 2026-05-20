@@ -61,7 +61,7 @@ const HY2_INVALID_AUTH_BACKOFF_DURATION: Duration = Duration::from_secs(60);
 const HY2_INVALID_AUTH_BACKOFF_MAX_ENTRIES: usize = 4096;
 const HY2_PREAUTH_LIMIT_ENV: &str = "KELI_CORE_HY2_PREAUTH_CONNECTIONS";
 const HY2_PREAUTH_MIN: usize = 32;
-const HY2_PREAUTH_MAX: usize = 512;
+const HY2_PREAUTH_MAX: usize = 4096;
 const HY2_AUTH_TIMEOUT_SECS_ENV: &str = "KELI_CORE_HY2_AUTH_TIMEOUT_SECS";
 const DEFAULT_HY2_AUTH_TIMEOUT_SECS: u64 = 10;
 const HY2_RELAY_IO_TIMEOUT_SECS_ENV: &str = "KELI_CORE_HY2_RELAY_IO_TIMEOUT_SECS";
@@ -3435,6 +3435,8 @@ mod tests {
         assert_eq!(super::hy2_preauth_connection_limit(195), 97);
         assert_eq!(super::hy2_preauth_connection_limit(978), 489);
         assert_eq!(super::hy2_preauth_connection_limit(1024), 512);
+        assert_eq!(super::hy2_preauth_connection_limit(3914), 1957);
+        assert_eq!(super::hy2_preauth_connection_limit(7934), 3967);
     }
 
     #[test]
