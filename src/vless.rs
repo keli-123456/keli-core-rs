@@ -160,7 +160,7 @@ impl VlessServer {
     pub fn handle_tcp_client(&self, client: TcpStream) -> io::Result<()> {
         let result = self.handle_tcp_client_inner(client);
         if let Err(error) = &result {
-            record_vless_connection_error("tcp", error);
+            record_vless_connection_error(&self.config.node_tag, "tcp", error);
         }
         result
     }
@@ -202,7 +202,8 @@ impl VlessServer {
                     }
                 }
                 RouteDecision::Outbound(outbound) => {
-                    match connect_tcp_outbound(
+                    match connect_vless_route_tcp_outbound(
+                        &self.config.node_tag,
                         &outbound,
                         &request.target,
                         self.config.connect_timeout,
@@ -239,7 +240,7 @@ impl VlessServer {
     pub async fn handle_tcp_client_async(&self, client: tokio::net::TcpStream) -> io::Result<()> {
         let result = self.handle_tcp_client_async_inner(client).await;
         if let Err(error) = &result {
-            record_vless_connection_error("tcp", error);
+            record_vless_connection_error(&self.config.node_tag, "tcp", error);
         }
         result
     }
@@ -293,7 +294,8 @@ impl VlessServer {
                     }
                 }
                 RouteDecision::Outbound(outbound) => {
-                    match connect_tcp_outbound_tokio(
+                    match connect_vless_route_tcp_outbound_tokio(
+                        &self.config.node_tag,
                         &outbound,
                         &request.target,
                         self.config.connect_timeout,
@@ -338,6 +340,18 @@ impl VlessServer {
     }
 
     pub fn handle_websocket_client(&self, client: TcpStream, path: Option<&str>) -> io::Result<()> {
+        let result = self.handle_websocket_client_inner(client, path);
+        if let Err(error) = &result {
+            record_vless_connection_error(&self.config.node_tag, "websocket", error);
+        }
+        result
+    }
+
+    fn handle_websocket_client_inner(
+        &self,
+        client: TcpStream,
+        path: Option<&str>,
+    ) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let (reader, writer) = accept_websocket(client, path)?;
         self.handle_split_client_with_ip(reader, writer, client_ip)
@@ -348,7 +362,11 @@ impl VlessServer {
         R: Read + Send + 'static,
         W: Write,
     {
-        self.handle_split_client_with_ip(reader, writer, None)
+        let result = self.handle_split_client_with_ip(reader, writer, None);
+        if let Err(error) = &result {
+            record_vless_connection_error(&self.config.node_tag, "split", error);
+        }
+        result
     }
 
     fn handle_split_client_with_ip<R, W>(
@@ -382,9 +400,12 @@ impl VlessServer {
                 RouteDecision::Direct => {
                     connect_target(&request.target, self.config.connect_timeout)?
                 }
-                RouteDecision::Outbound(outbound) => {
-                    connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
-                }
+                RouteDecision::Outbound(outbound) => connect_vless_route_tcp_outbound(
+                    &self.config.node_tag,
+                    &outbound,
+                    &request.target,
+                    self.config.connect_timeout,
+                )?,
                 RouteDecision::Block => {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -402,7 +423,18 @@ impl VlessServer {
         self.relay_websocket(reader, writer, remote, request, bandwidth)
     }
 
-    pub fn handle_tls_client<S>(&self, mut client: TlsConnection<S>) -> io::Result<()>
+    pub fn handle_tls_client<S>(&self, client: TlsConnection<S>) -> io::Result<()>
+    where
+        S: TlsSocket + RawTcpStreamAccess + Send + 'static,
+    {
+        let result = self.handle_tls_client_inner(client);
+        if let Err(error) = &result {
+            record_vless_connection_error(&self.config.node_tag, "tls", error);
+        }
+        result
+    }
+
+    fn handle_tls_client_inner<S>(&self, mut client: TlsConnection<S>) -> io::Result<()>
     where
         S: TlsSocket + RawTcpStreamAccess + Send + 'static,
     {
@@ -430,9 +462,12 @@ impl VlessServer {
                 RouteDecision::Direct => {
                     connect_target(&request.target, self.config.connect_timeout)?
                 }
-                RouteDecision::Outbound(outbound) => {
-                    connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
-                }
+                RouteDecision::Outbound(outbound) => connect_vless_route_tcp_outbound(
+                    &self.config.node_tag,
+                    &outbound,
+                    &request.target,
+                    self.config.connect_timeout,
+                )?,
                 RouteDecision::Block => {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -461,6 +496,18 @@ impl VlessServer {
         client: TlsConnection,
         path: Option<&str>,
     ) -> io::Result<()> {
+        let result = self.handle_tls_websocket_client_inner(client, path);
+        if let Err(error) = &result {
+            record_vless_connection_error(&self.config.node_tag, "tls_websocket", error);
+        }
+        result
+    }
+
+    fn handle_tls_websocket_client_inner(
+        &self,
+        client: TlsConnection,
+        path: Option<&str>,
+    ) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let mut websocket = accept_websocket_tls(client, path)?;
         let mut request = self.read_request(&mut websocket)?;
@@ -484,9 +531,12 @@ impl VlessServer {
                 RouteDecision::Direct => {
                     connect_target(&request.target, self.config.connect_timeout)?
                 }
-                RouteDecision::Outbound(outbound) => {
-                    connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
-                }
+                RouteDecision::Outbound(outbound) => connect_vless_route_tcp_outbound(
+                    &self.config.node_tag,
+                    &outbound,
+                    &request.target,
+                    self.config.connect_timeout,
+                )?,
                 RouteDecision::Block => {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -1006,7 +1056,13 @@ impl VlessServer {
         }
 
         if let Some(outbound) = outbound {
-            return match send_udp_outbound(outbound, target, payload, self.config.connect_timeout) {
+            return match send_vless_route_udp_outbound(
+                &self.config.node_tag,
+                outbound,
+                target,
+                payload,
+                self.config.connect_timeout,
+            ) {
                 Ok((_, response)) => {
                     write_vless_udp_payload(writer, &response)?;
                     Ok((payload.len() as u64, response.len() as u64))
@@ -1080,7 +1136,8 @@ impl VlessServer {
         }
 
         if let Some(outbound) = outbound {
-            return match send_udp_outbound_tokio(
+            return match send_vless_route_udp_outbound_tokio(
+                &self.config.node_tag,
                 outbound,
                 target,
                 payload,
@@ -1173,12 +1230,17 @@ fn sync_delta_bandwidth(
     sync_user_limit_delta(bandwidth, sessions, delta);
 }
 
-fn record_vless_connection_error(scope: &'static str, error: &io::Error) {
-    crate::metrics::record_connection_error("vless", scope, classify_vless_connection_error(error));
+fn record_vless_connection_error(node_tag: &str, scope: &'static str, error: &io::Error) {
+    let reason = classify_vless_connection_error(error);
+    crate::metrics::record_connection_error("vless", scope, reason);
+    log_vless_route_outbound_error(node_tag, scope, reason, error);
 }
 
 fn classify_vless_connection_error(error: &io::Error) -> &'static str {
     let text = error.to_string();
+    if is_vless_outbound_auth_failure_text(&text) {
+        return "outbound_auth_failed";
+    }
     if error.kind() == io::ErrorKind::PermissionDenied {
         if text.contains("target blocked by route") {
             return "route_blocked";
@@ -1224,6 +1286,38 @@ fn classify_vless_connection_error(error: &io::Error) -> &'static str {
     "error"
 }
 
+fn log_vless_route_outbound_error(
+    node_tag: &str,
+    scope: &'static str,
+    reason: &'static str,
+    error: &io::Error,
+) {
+    let text = error.to_string();
+    if !text.contains("route outbound failed") {
+        return;
+    }
+    if text.contains("node_tag=") {
+        eprintln!(
+            "WARN  core   vless connection failed scope={scope} reason={reason} {}",
+            vless_log_message(&text)
+        );
+    } else {
+        eprintln!(
+            "WARN  core   vless connection failed node_tag={} scope={scope} reason={reason} error={}",
+            vless_log_field(node_tag),
+            vless_log_message(&text)
+        );
+    }
+}
+
+fn is_vless_outbound_auth_failure_text(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("socks5 outbound rejected authentication methods")
+        || text.contains("no authentication method was acceptable")
+        || text.contains("outbound auth failed")
+        || text.contains("outbound authentication failed")
+}
+
 fn is_vless_upstream_connect_failure_text(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
     text.contains("tcp connect failed")
@@ -1234,6 +1328,26 @@ fn is_vless_upstream_connect_failure_text(text: &str) -> bool {
         || text.contains("connection refused")
         || text.contains("network is unreachable")
         || text.contains("no route to host")
+}
+
+fn vless_log_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_control() || ch.is_whitespace() {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn vless_log_message(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_ascii_control() { ' ' } else { ch })
+        .collect()
 }
 
 impl VlessUdpRelayState {
@@ -1381,6 +1495,70 @@ async fn connect_target_async(
     timeout: Duration,
 ) -> io::Result<tokio::net::TcpStream> {
     crate::dns::connect_tcp_tokio(&target.host, target.port, timeout).await
+}
+
+fn connect_vless_route_tcp_outbound(
+    node_tag: &str,
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    connect_tcp_outbound(outbound, target, timeout)
+        .map_err(|error| annotate_vless_route_outbound_error(node_tag, outbound, target, error))
+}
+
+async fn connect_vless_route_tcp_outbound_tokio(
+    node_tag: &str,
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<tokio::net::TcpStream> {
+    connect_tcp_outbound_tokio(outbound, target, timeout)
+        .await
+        .map_err(|error| annotate_vless_route_outbound_error(node_tag, outbound, target, error))
+}
+
+fn send_vless_route_udp_outbound(
+    node_tag: &str,
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    payload: &[u8],
+    timeout: Duration,
+) -> io::Result<(SocketAddr, Vec<u8>)> {
+    send_udp_outbound(outbound, target, payload, timeout)
+        .map_err(|error| annotate_vless_route_outbound_error(node_tag, outbound, target, error))
+}
+
+async fn send_vless_route_udp_outbound_tokio(
+    node_tag: &str,
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    payload: &[u8],
+    timeout: Duration,
+) -> io::Result<(SocketAddr, Vec<u8>)> {
+    send_udp_outbound_tokio(outbound, target, payload, timeout)
+        .await
+        .map_err(|error| annotate_vless_route_outbound_error(node_tag, outbound, target, error))
+}
+
+fn annotate_vless_route_outbound_error(
+    node_tag: &str,
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    error: io::Error,
+) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "route outbound failed node_tag={} outbound={} protocol={} target={}:{} error={}",
+            vless_log_field(node_tag),
+            vless_log_field(&outbound.tag),
+            vless_log_field(&outbound.protocol),
+            vless_log_field(&target.host),
+            target.port,
+            vless_log_message(&error.to_string())
+        ),
+    )
 }
 
 pub(crate) fn connect_vless_tcp_outbound(
@@ -3174,6 +3352,13 @@ mod tests {
         );
         assert_eq!(
             super::classify_vless_connection_error(&io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "route outbound failed node_tag=panel|vless|1 outbound=tw protocol=socks target=chatgpt.com:443 error=socks5 outbound rejected authentication methods",
+            )),
+            "outbound_auth_failed"
+        );
+        assert_eq!(
+            super::classify_vless_connection_error(&io::Error::new(
                 io::ErrorKind::Other,
                 "tcp connect failed: Connection refused",
             )),
@@ -3245,6 +3430,73 @@ mod tests {
             server.router.decide("blocked.example"),
             crate::RouteDecision::Block
         ));
+    }
+
+    #[test]
+    fn vless_route_outbound_errors_include_safe_context() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let proxy_thread = thread::spawn(move || {
+            let (mut stream, _) = proxy.accept().expect("proxy accept");
+            let mut hello = [0u8; 4];
+            stream.read_exact(&mut hello).expect("socks hello");
+            assert_eq!(hello, [0x05, 0x02, 0x00, 0x02]);
+            stream.write_all(&[0x05, 0xff]).expect("reject auth");
+        });
+        let target = "127.0.0.1:443"
+            .parse::<std::net::SocketAddr>()
+            .expect("target addr");
+        let server = VlessServer::new(VlessServerConfig {
+            node_tag: "panel|vless|1".to_string(),
+            listen: "127.0.0.1:0".parse().expect("listen addr"),
+            users: vec![user()],
+            routes: vec![RouteRule {
+                targets: vec!["ip:127.0.0.1/32".to_string()],
+                action: RouteAction::Outbound("tw".to_string()),
+                outbound: Some(OutboundConfig {
+                    tag: "tw".to_string(),
+                    protocol: "socks".to_string(),
+                    method: None,
+                    alter_id: None,
+                    address: Some(proxy_addr.ip().to_string()),
+                    port: Some(proxy_addr.port()),
+                    username: Some("secret-user".to_string()),
+                    password: Some("secret-pass".to_string()),
+                    tls: None,
+                    transport: None,
+                }),
+            }],
+            flow: String::new(),
+            connect_timeout: Duration::from_secs(2),
+        });
+        let listener = server.bind().expect("vless bind");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vless accept");
+            server.handle_tcp_client(stream)
+        });
+
+        let mut client = TcpStream::connect(vless_addr).expect("client connect");
+        client
+            .write_all(&vless_request(target))
+            .expect("vless request");
+        drop(client);
+
+        let error = server_thread
+            .join()
+            .expect("server thread")
+            .expect_err("route outbound should fail");
+        let text = error.to_string();
+        assert!(text.contains("route outbound failed"));
+        assert!(text.contains("node_tag=panel|vless|1"));
+        assert!(text.contains("outbound=tw"));
+        assert!(text.contains("protocol=socks"));
+        assert!(text.contains("target=127.0.0.1:443"));
+        assert!(text.contains("socks5 outbound rejected authentication methods"));
+        assert!(!text.contains("secret-user"));
+        assert!(!text.contains("secret-pass"));
+
+        proxy_thread.join().expect("proxy thread");
     }
 
     #[test]
