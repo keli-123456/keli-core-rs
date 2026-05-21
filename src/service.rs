@@ -47,7 +47,7 @@ const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 256;
 const MAX_AUTO_CONNECTION_WORKERS: usize = 2048;
 const MIN_AUTO_CONNECTION_WORKERS: usize = 16;
 const CONNECTION_WORKERS_PER_CPU: usize = 64;
-const CONNECTION_WORKER_MEMORY_MIB: usize = 16;
+const CONNECTION_WORKER_MEMORY_MIB: usize = 32;
 const CONNECTION_WORKER_RESERVED_FDS: usize = 512;
 const CONNECTION_WORKER_FDS_PER_CONN: usize = 2;
 const CONNECTION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2783,7 +2783,7 @@ mod tests {
     fn connection_worker_count_scales_with_cpu_when_resources_allow() {
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(4096), Some(100_000)),
-            256
+            128
         );
         assert_eq!(
             super::connection_worker_threads_from_resources(32, Some(128_000), Some(1_000_000)),
@@ -2795,19 +2795,19 @@ mod tests {
     fn connection_worker_count_respects_memory_and_fd_caps() {
         assert_eq!(
             super::connection_worker_threads_from_resources(8, Some(512), Some(100_000)),
-            32
+            16
         );
         assert_eq!(
             super::connection_worker_threads_from_resources(32, Some(8192), Some(4096)),
-            512
+            256
         );
     }
 
     #[test]
-    fn connection_worker_count_matches_problem_node_observed_capacity() {
+    fn connection_worker_count_avoids_problem_node_thread_bloat() {
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(3914), Some(999_999)),
-            244
+            122
         );
     }
 
@@ -2815,7 +2815,7 @@ mod tests {
     fn connection_worker_count_handles_small_resource_limits() {
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(64), Some(100_000)),
-            4
+            2
         );
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(4096), Some(600)),

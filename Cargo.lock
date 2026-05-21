@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "keli-core-rs"
-version = "0.1.52"
+version = "0.1.53"
 dependencies = [
  "aes",
  "aes-gcm",
