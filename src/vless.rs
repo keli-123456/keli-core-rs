@@ -61,6 +61,7 @@ const VLESS_VISION_DRAIN_MS_ENV: &str = "KELI_CORE_VLESS_VISION_DRAIN_MS";
 const VLESS_VISION_DRAIN_SECS_ENV: &str = "KELI_CORE_VLESS_VISION_DRAIN_SECS";
 const VLESS_ASYNC_RELAY_IO_TIMEOUT_SECS_ENV: &str = "KELI_CORE_VLESS_RELAY_IO_TIMEOUT_SECS";
 const DEFAULT_VLESS_ASYNC_RELAY_IO_TIMEOUT_SECS: u64 = 15;
+const VLESS_ROUTE_SLOW_LOG_MS: u128 = 1_000;
 
 #[cfg(test)]
 static VLESS_VISION_RAW_RELAY_SWITCHES: AtomicUsize = AtomicUsize::new(0);
@@ -1503,8 +1504,20 @@ fn connect_vless_route_tcp_outbound(
     target: &SocksTarget,
     timeout: Duration,
 ) -> io::Result<TcpStream> {
-    connect_tcp_outbound(outbound, target, timeout)
-        .map_err(|error| annotate_vless_route_outbound_error(node_tag, outbound, target, error))
+    let started = Instant::now();
+    match connect_tcp_outbound(outbound, target, timeout) {
+        Ok(stream) => {
+            log_vless_route_outbound_connected(node_tag, outbound, target, started.elapsed());
+            Ok(stream)
+        }
+        Err(error) => Err(annotate_vless_route_outbound_error(
+            node_tag,
+            outbound,
+            target,
+            started.elapsed(),
+            error,
+        )),
+    }
 }
 
 async fn connect_vless_route_tcp_outbound_tokio(
@@ -1513,9 +1526,20 @@ async fn connect_vless_route_tcp_outbound_tokio(
     target: &SocksTarget,
     timeout: Duration,
 ) -> io::Result<tokio::net::TcpStream> {
-    connect_tcp_outbound_tokio(outbound, target, timeout)
-        .await
-        .map_err(|error| annotate_vless_route_outbound_error(node_tag, outbound, target, error))
+    let started = Instant::now();
+    match connect_tcp_outbound_tokio(outbound, target, timeout).await {
+        Ok(stream) => {
+            log_vless_route_outbound_connected(node_tag, outbound, target, started.elapsed());
+            Ok(stream)
+        }
+        Err(error) => Err(annotate_vless_route_outbound_error(
+            node_tag,
+            outbound,
+            target,
+            started.elapsed(),
+            error,
+        )),
+    }
 }
 
 fn send_vless_route_udp_outbound(
@@ -1525,8 +1549,10 @@ fn send_vless_route_udp_outbound(
     payload: &[u8],
     timeout: Duration,
 ) -> io::Result<(SocketAddr, Vec<u8>)> {
-    send_udp_outbound(outbound, target, payload, timeout)
-        .map_err(|error| annotate_vless_route_outbound_error(node_tag, outbound, target, error))
+    let started = Instant::now();
+    send_udp_outbound(outbound, target, payload, timeout).map_err(|error| {
+        annotate_vless_route_outbound_error(node_tag, outbound, target, started.elapsed(), error)
+    })
 }
 
 async fn send_vless_route_udp_outbound_tokio(
@@ -1536,29 +1562,77 @@ async fn send_vless_route_udp_outbound_tokio(
     payload: &[u8],
     timeout: Duration,
 ) -> io::Result<(SocketAddr, Vec<u8>)> {
+    let started = Instant::now();
     send_udp_outbound_tokio(outbound, target, payload, timeout)
         .await
-        .map_err(|error| annotate_vless_route_outbound_error(node_tag, outbound, target, error))
+        .map_err(|error| {
+            annotate_vless_route_outbound_error(
+                node_tag,
+                outbound,
+                target,
+                started.elapsed(),
+                error,
+            )
+        })
 }
 
 fn annotate_vless_route_outbound_error(
     node_tag: &str,
     outbound: &OutboundConfig,
     target: &SocksTarget,
+    elapsed: Duration,
     error: io::Error,
 ) -> io::Error {
+    let endpoint = vless_outbound_endpoint(outbound);
     io::Error::new(
         error.kind(),
         format!(
-            "route outbound failed node_tag={} outbound={} protocol={} target={}:{} error={}",
+            "route outbound failed node_tag={} outbound={} protocol={} endpoint={} target={}:{} elapsed_ms={} error={}",
             vless_log_field(node_tag),
             vless_log_field(&outbound.tag),
             vless_log_field(&outbound.protocol),
+            vless_log_field(&endpoint),
             vless_log_field(&target.host),
             target.port,
+            elapsed.as_millis(),
             vless_log_message(&error.to_string())
         ),
     )
+}
+
+fn log_vless_route_outbound_connected(
+    node_tag: &str,
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    elapsed: Duration,
+) {
+    if elapsed.as_millis() < VLESS_ROUTE_SLOW_LOG_MS && !vless_trace_enabled() {
+        return;
+    }
+    let endpoint = vless_outbound_endpoint(outbound);
+    eprintln!(
+        "INFO  core   vless route outbound connected node_tag={} outbound={} protocol={} endpoint={} target={}:{} elapsed_ms={}",
+        vless_log_field(node_tag),
+        vless_log_field(&outbound.tag),
+        vless_log_field(&outbound.protocol),
+        vless_log_field(&endpoint),
+        vless_log_field(&target.host),
+        target.port,
+        elapsed.as_millis()
+    );
+}
+
+fn vless_outbound_endpoint(outbound: &OutboundConfig) -> String {
+    let host = outbound
+        .address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-");
+    match outbound.port {
+        Some(port) => format!("{host}:{port}"),
+        None => format!("{host}:-"),
+    }
 }
 
 pub(crate) fn connect_vless_tcp_outbound(
@@ -3491,7 +3565,9 @@ mod tests {
         assert!(text.contains("node_tag=panel|vless|1"));
         assert!(text.contains("outbound=tw"));
         assert!(text.contains("protocol=socks"));
+        assert!(text.contains("endpoint=127.0.0.1:"));
         assert!(text.contains("target=127.0.0.1:443"));
+        assert!(text.contains("elapsed_ms="));
         assert!(text.contains("socks5 outbound rejected authentication methods"));
         assert!(!text.contains("secret-user"));
         assert!(!text.contains("secret-pass"));

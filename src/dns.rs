@@ -435,7 +435,10 @@ fn record_tcp_connect_failure_error_at(key: &DnsCacheKey, error: &io::Error, now
 }
 
 fn is_transient_tcp_connect_error(error: &io::Error) -> bool {
-    matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
 }
 
 fn clear_tcp_connect_failure_backoff() {

@@ -69,6 +69,8 @@ const DEFAULT_HY2_RELAY_IO_TIMEOUT_SECS: u64 = 15;
 const HY2_SOFTWARE_BANDWIDTH_LIMIT_MAX_MBPS_ENV: &str =
     "KELI_CORE_HY2_SOFTWARE_BANDWIDTH_LIMIT_MAX_MBPS";
 const DEFAULT_HY2_SOFTWARE_BANDWIDTH_LIMIT_MAX_MBPS: u32 = 200;
+const HY2_ROUTE_SLOW_LOG_MS: u128 = 1_000;
+const ROUTE_TRACE_ENV: &str = "KELI_CORE_ROUTE_TRACE";
 const QUIC_ENDPOINT_STOP_WAIT: Duration = Duration::from_secs(3);
 static HY2_ACTIVE_UDP_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 static HY2_UDP_SESSION_LIMIT: OnceLock<usize> = OnceLock::new();
@@ -567,10 +569,19 @@ impl Hysteria2Server {
                 }
             }
             RouteDecision::Outbound(outbound) => {
+                let started = Instant::now();
                 match connect_tcp_outbound_tokio(outbound, &target, self.config.connect_timeout)
                     .await
                 {
-                    Ok(stream) => stream,
+                    Ok(stream) => {
+                        log_hysteria2_route_outbound_connected(
+                            &self.config.node_tag,
+                            outbound,
+                            &target,
+                            started.elapsed(),
+                        );
+                        stream
+                    }
                     Err(error) => {
                         let response = if error.kind() == io::ErrorKind::TimedOut {
                             "connect timed out"
@@ -579,12 +590,12 @@ impl Hysteria2Server {
                         };
                         write_tcp_response(&mut send, RESPONSE_ERROR, response).await?;
                         let _ = send.finish();
-                        return Err(io::Error::new(
-                            error.kind(),
-                            format!(
-                                "tcp outbound connect failed target={}:{} error={error}",
-                                target.host, target.port
-                            ),
+                        return Err(annotate_hysteria2_route_outbound_error(
+                            &self.config.node_tag,
+                            outbound,
+                            &target,
+                            started.elapsed(),
+                            error,
                         ));
                     }
                 }
@@ -2222,6 +2233,7 @@ fn classify_hysteria2_error_text(error: &io::Error, text: &str) -> Hysteria2Erro
     }
     if text.contains("tcp connect failed")
         || text.contains("tcp outbound connect failed")
+        || text.contains("route outbound failed")
         || text.contains("dns response indicates failure")
         || text.contains("configured dns servers returned no target address")
         || text.contains("Connection refused")
@@ -2244,6 +2256,89 @@ fn classify_hysteria2_error_text(error: &io::Error, text: &str) -> Hysteria2Erro
         return Hysteria2ErrorClass::Transport;
     }
     Hysteria2ErrorClass::Other
+}
+
+fn annotate_hysteria2_route_outbound_error(
+    node_tag: &str,
+    outbound: &crate::config::OutboundConfig,
+    target: &SocksTarget,
+    elapsed: Duration,
+    error: io::Error,
+) -> io::Error {
+    let endpoint = hysteria2_outbound_endpoint(outbound);
+    io::Error::new(
+        error.kind(),
+        format!(
+            "route outbound failed node_tag={} outbound={} protocol={} endpoint={} target={}:{} elapsed_ms={} error={}",
+            hysteria2_log_field(node_tag),
+            hysteria2_log_field(&outbound.tag),
+            hysteria2_log_field(&outbound.protocol),
+            hysteria2_log_field(&endpoint),
+            hysteria2_log_field(&target.host),
+            target.port,
+            elapsed.as_millis(),
+            hysteria2_log_message(&error.to_string())
+        ),
+    )
+}
+
+fn log_hysteria2_route_outbound_connected(
+    node_tag: &str,
+    outbound: &crate::config::OutboundConfig,
+    target: &SocksTarget,
+    elapsed: Duration,
+) {
+    if elapsed.as_millis() < HY2_ROUTE_SLOW_LOG_MS && !route_trace_enabled() {
+        return;
+    }
+    let endpoint = hysteria2_outbound_endpoint(outbound);
+    eprintln!(
+        "INFO  core   hysteria2 route outbound connected node_tag={} outbound={} protocol={} endpoint={} target={}:{} elapsed_ms={}",
+        hysteria2_log_field(node_tag),
+        hysteria2_log_field(&outbound.tag),
+        hysteria2_log_field(&outbound.protocol),
+        hysteria2_log_field(&endpoint),
+        hysteria2_log_field(&target.host),
+        target.port,
+        elapsed.as_millis()
+    );
+}
+
+fn route_trace_enabled() -> bool {
+    env::var_os(ROUTE_TRACE_ENV).is_some()
+}
+
+fn hysteria2_outbound_endpoint(outbound: &crate::config::OutboundConfig) -> String {
+    let host = outbound
+        .address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-");
+    match outbound.port {
+        Some(port) => format!("{host}:{port}"),
+        None => format!("{host}:-"),
+    }
+}
+
+fn hysteria2_log_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_control() || ch.is_whitespace() {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn hysteria2_log_message(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_ascii_control() { ' ' } else { ch })
+        .collect()
 }
 
 fn is_hysteria2_invalid_auth_error(error: &io::Error) -> bool {
@@ -2275,7 +2370,7 @@ mod tests {
     use quinn::crypto::rustls::QuicClientConfig;
     use rustls::pki_types::CertificateDer;
 
-    use crate::config::{RouteAction, RouteRule};
+    use crate::config::{OutboundConfig, RouteAction, RouteRule};
 
     use super::*;
 
@@ -3533,6 +3628,48 @@ mod tests {
         assert_eq!(
             classify_hysteria2_error(&io::Error::new(io::ErrorKind::Other, "Reset(268)")),
             Hysteria2ErrorClass::ExpectedClose
+        );
+    }
+
+    #[test]
+    fn hysteria2_route_outbound_errors_include_safe_context() {
+        let outbound = OutboundConfig {
+            tag: "tw".to_string(),
+            protocol: "socks".to_string(),
+            method: None,
+            alter_id: None,
+            address: Some("dns.huhu.icu".to_string()),
+            port: Some(22223),
+            username: Some("secret-user".to_string()),
+            password: Some("secret-pass".to_string()),
+            tls: None,
+            transport: None,
+        };
+        let target = SocksTarget {
+            host: "chatgpt.com".to_string(),
+            port: 443,
+        };
+        let error = super::annotate_hysteria2_route_outbound_error(
+            "panel|hy2|1",
+            &outbound,
+            &target,
+            Duration::from_millis(1234),
+            io::Error::new(io::ErrorKind::TimedOut, "connection timed out"),
+        );
+        let text = error.to_string();
+
+        assert!(text.contains("route outbound failed"));
+        assert!(text.contains("node_tag=panel|hy2|1"));
+        assert!(text.contains("outbound=tw"));
+        assert!(text.contains("protocol=socks"));
+        assert!(text.contains("endpoint=dns.huhu.icu:22223"));
+        assert!(text.contains("target=chatgpt.com:443"));
+        assert!(text.contains("elapsed_ms=1234"));
+        assert!(!text.contains("secret-user"));
+        assert!(!text.contains("secret-pass"));
+        assert_eq!(
+            classify_hysteria2_error(&error),
+            Hysteria2ErrorClass::Timeout
         );
     }
 
