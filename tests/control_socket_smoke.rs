@@ -149,8 +149,15 @@ fn send_control(addr: &str, command: Value) -> Value {
 fn wait_for_control(addr: &str) {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        if TcpStream::connect(addr).is_ok() {
-            return;
+        if let Ok(mut stream) = TcpStream::connect(addr) {
+            if writeln!(stream, r#"{{"type":"status"}}"#).is_ok() {
+                let mut line = String::new();
+                if BufReader::new(stream).read_line(&mut line).is_ok()
+                    && serde_json::from_str::<Value>(line.trim()).is_ok()
+                {
+                    return;
+                }
+            }
         }
         if Instant::now() >= deadline {
             panic!("control socket did not open at {addr}");

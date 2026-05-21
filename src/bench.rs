@@ -876,12 +876,24 @@ fn run_named_bench_isolated(command: &str, options: &BenchOptions) -> io::Result
         ));
     }
 
-    serde_json::from_slice(&output.stdout).map_err(|error| {
+    parse_isolated_bench_stdout(&output.stdout).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("bench {command} subprocess returned invalid JSON: {error}"),
         )
     })
+}
+
+fn parse_isolated_bench_stdout(stdout: &[u8]) -> Result<BenchReport, serde_json::Error> {
+    match serde_json::from_slice(stdout) {
+        Ok(report) => Ok(report),
+        Err(first_error) => {
+            let Some(start) = stdout.iter().position(|byte| *byte == b'{') else {
+                return Err(first_error);
+            };
+            serde_json::from_slice(&stdout[start..])
+        }
+    }
 }
 
 fn run_external_bench_suite(options: &ExternalBenchSuiteOptions) -> io::Result<BenchSuiteReport> {
@@ -5447,8 +5459,8 @@ fn join_server(handle: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
 mod tests {
     use super::{
         canonical_bench_command, compare_phase_summaries, parse_bench_options,
-        parse_bench_suite_options, parse_external_bench_suite_options, percent_change,
-        run_anytls_tcp_stream_bench, run_direct_tcp_proxy_stream_bench,
+        parse_bench_suite_options, parse_external_bench_suite_options, parse_isolated_bench_stdout,
+        percent_change, run_anytls_tcp_stream_bench, run_direct_tcp_proxy_stream_bench,
         run_direct_tcp_stream_bench, run_external_vless_tcp_stream_bench,
         run_http_connect_stream_bench, run_hy2_udp_bench, run_naive_tcp_stream_bench,
         run_shadowsocks_tcp_stream_bench, run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench,
@@ -5820,6 +5832,19 @@ mod tests {
         .expect("legacy report");
 
         assert!(report.phases.is_empty());
+    }
+
+    #[test]
+    fn isolated_bench_stdout_skips_startup_logs_before_json_report() {
+        let json =
+            serde_json::to_vec(&synthetic_report("tuic-tcp", 100.0, 10, 0, 0)).expect("json");
+        let mut stdout = b"INFO  core   tuic shared quic limit total=1 active=0\n".to_vec();
+        stdout.extend_from_slice(&json);
+
+        let report = parse_isolated_bench_stdout(&stdout).expect("report");
+
+        assert_eq!(report.protocol, "tuic-tcp");
+        assert_eq!(report.completed_requests, 10);
     }
 
     #[test]
