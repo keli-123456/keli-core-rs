@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{
@@ -59,6 +61,11 @@ const MIERU_UDP_MARKER_END: u8 = 0xff;
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[cfg(test)]
+thread_local! {
+    static MIERU_KEY_DERIVATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
 #[derive(Clone, Debug)]
 pub struct MieruServerConfig {
     pub node_tag: String,
@@ -83,7 +90,6 @@ pub struct MieruServer {
 struct MieruCredential {
     user: CoreUser,
     username: String,
-    password: String,
     key: [u8; 32],
 }
 
@@ -232,7 +238,8 @@ impl MieruServer {
         let _connection = self
             .bandwidth
             .register_tcp_connection(Some(&user.uuid), &[&client])?;
-        let mut writer = MieruWriter::server(client, &user, reader.session_id())?;
+        let mut writer =
+            MieruWriter::server_with_key(client, &user, reader.session_id(), reader.key())?;
         let Some(initial) = reader.take_initial_segment() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -637,6 +644,10 @@ impl MieruReader {
         self.session_id
     }
 
+    fn key(&self) -> [u8; 32] {
+        self.key
+    }
+
     fn set_poll_timeout(&self, timeout: Duration) -> io::Result<()> {
         self.stream.set_read_timeout(Some(timeout))
     }
@@ -789,16 +800,28 @@ impl MieruInput for MieruSessionReader {
 }
 
 impl MieruWriter {
+    #[cfg(test)]
     fn server(stream: TcpStream, user: &CoreUser, session_id: u32) -> io::Result<Self> {
         let username = mieru_username(user);
         let password = mieru_password(user);
+        let key = derive_mieru_key(&username, &password, rounded_unix_time(now_unix_secs()));
+        Self::server_with_key(stream, user, session_id, key)
+    }
+
+    fn server_with_key(
+        stream: TcpStream,
+        user: &CoreUser,
+        session_id: u32,
+        key: [u8; 32],
+    ) -> io::Result<Self> {
+        let username = mieru_username(user);
         let mut nonce = [0u8; NONCE_LEN];
         getrandom::getrandom(&mut nonce)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
         apply_nonce_user_hint(&mut nonce, &username);
         Ok(Self {
             stream,
-            key: derive_mieru_key(&username, &password, rounded_unix_time(now_unix_secs())),
+            key,
             nonce,
             session_id,
             sequence: 0,
@@ -1162,23 +1185,23 @@ fn candidate_credentials(users: &[CoreUser], input: &[u8]) -> Vec<MieruCredentia
     let time_slots = [now - KEY_WINDOW_SECS, now, now + KEY_WINDOW_SECS];
     users
         .iter()
-        .flat_map(|user| {
+        .filter_map(|user| {
             let username = mieru_username(user);
+            let has_nonce_hint = input
+                .windows(NONCE_LEN)
+                .any(|nonce| nonce_matches_user_hint(nonce, &username));
+            has_nonce_hint.then_some((user, username))
+        })
+        .flat_map(|user| {
+            let (user, username) = user;
             let password = mieru_password(user);
             time_slots
                 .into_iter()
                 .map(move |time_slot| MieruCredential {
                     user: user.clone(),
                     username: username.clone(),
-                    password: password.clone(),
                     key: derive_mieru_key(&username, &password, time_slot),
                 })
-        })
-        .filter(|credential| {
-            input.windows(NONCE_LEN).any(|nonce| {
-                nonce_matches_user_hint(nonce, &credential.username)
-                    && credential.password == mieru_password(&credential.user)
-            })
         })
         .collect()
 }
@@ -1192,6 +1215,9 @@ fn mieru_password(user: &CoreUser) -> String {
 }
 
 fn derive_mieru_key(username: &str, password: &str, rounded_unix: i64) -> [u8; 32] {
+    #[cfg(test)]
+    MIERU_KEY_DERIVATIONS.with(|count| count.set(count.get().saturating_add(1)));
+
     let mut password_hasher = Sha256::new();
     password_hasher.update(password.as_bytes());
     password_hasher.update([0]);
@@ -1761,6 +1787,33 @@ mod tests {
     }
 
     #[test]
+    fn candidate_credentials_derives_keys_only_for_nonce_hint_matches() {
+        let users = (0..2000)
+            .map(|index| CoreUser {
+                id: index,
+                uuid: format!("user-{index:04}"),
+                password: None,
+                email: None,
+                speed_limit: 0,
+                device_limit: 0,
+            })
+            .collect::<Vec<_>>();
+        let target = &users[1379];
+        let mut nonce = [7u8; super::NONCE_LEN];
+        nonce[..16].copy_from_slice(b"keli-mieru-hint!");
+        apply_nonce_user_hint(&mut nonce, &target.uuid);
+
+        super::MIERU_KEY_DERIVATIONS.with(|count| count.set(0));
+        let credentials = super::candidate_credentials(&users, &nonce);
+
+        assert_eq!(credentials.len(), 3);
+        assert!(credentials
+            .iter()
+            .all(|credential| credential.user == *target));
+        super::MIERU_KEY_DERIVATIONS.with(|count| assert_eq!(count.get(), 3));
+    }
+
+    #[test]
     fn apply_user_delta_updates_mieru_users_from_snapshot() {
         let server = MieruServer::new(MieruServerConfig {
             node_tag: "panel|mieru|1".to_string(),
@@ -1865,6 +1918,71 @@ mod tests {
         assert_eq!(initial.metadata.protocol_type, OPEN_SESSION_REQUEST);
         assert_eq!(initial.payload, b"ping");
         sender.join().expect("sender");
+    }
+
+    #[test]
+    fn server_response_uses_accepted_time_slot_key() {
+        let user = user();
+        let accepted_key = derive_mieru_key(
+            &user.uuid,
+            &user.uuid,
+            rounded_unix_time(super::now_unix_secs()) - super::KEY_WINDOW_SECS,
+        );
+        let mut stream_bytes = Vec::new();
+        let mut nonce = [9u8; super::NONCE_LEN];
+        apply_nonce_user_hint(&mut nonce, &user.uuid);
+        stream_bytes.extend_from_slice(&nonce);
+        let mut write_nonce = nonce;
+        let metadata = MieruMetadata {
+            protocol_type: OPEN_SESSION_REQUEST,
+            session_id: 44,
+            sequence: 0,
+            status_code: STATUS_OK,
+            payload_len: 0,
+            prefix_len: 0,
+            suffix_len: 0,
+        };
+        encode_segment_body(
+            &mut stream_bytes,
+            &accepted_key,
+            &mut write_nonce,
+            &metadata,
+            b"",
+        )
+        .expect("encode open");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client_thread = thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).expect("connect");
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("timeout");
+            client.write_all(&stream_bytes).expect("write open");
+            let mut response = vec![0u8; super::NONCE_LEN + super::ENCRYPTED_METADATA_LEN];
+            client.read_exact(&mut response).expect("read response");
+            response
+        });
+        let (server, _) = listener.accept().expect("accept");
+        let writer_stream = server.try_clone().expect("clone");
+        let reader = MieruReader::accept(server, &[user.clone()]).expect("accept mieru");
+        let mut writer =
+            MieruWriter::server_with_key(writer_stream, &user, reader.session_id(), reader.key())
+                .expect("writer");
+        writer.write_open_response().expect("write response");
+        let response = client_thread.join().expect("client");
+        let mut response_nonce = [0u8; super::NONCE_LEN];
+        response_nonce.copy_from_slice(&response[..super::NONCE_LEN]);
+
+        let decoded = super::try_decode_segment(&response, 0, true, &accepted_key, response_nonce);
+
+        match decoded {
+            super::SegmentAttempt::Complete { segment, .. } => {
+                assert_eq!(segment.metadata.protocol_type, OPEN_SESSION_RESPONSE);
+                assert_eq!(segment.metadata.session_id, 44);
+            }
+            other => panic!("expected accepted-key response, got {other:?}"),
+        }
     }
 
     #[test]
