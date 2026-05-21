@@ -111,7 +111,7 @@ pub fn connect_tcp(host: &str, port: u16, timeout: Duration) -> io::Result<TcpSt
             Ok(stream)
         }
         Err(error) => {
-            record_tcp_connect_failure(&backoff_key);
+            record_tcp_connect_failure(&backoff_key, &error);
             Err(error)
         }
     }
@@ -134,7 +134,7 @@ pub async fn connect_tcp_tokio(
             Ok(stream)
         }
         Err(error) => {
-            record_tcp_connect_failure(&backoff_key);
+            record_tcp_connect_failure(&backoff_key, &error);
             Err(error)
         }
     }
@@ -392,11 +392,20 @@ fn record_tcp_connect_success(key: &DnsCacheKey) {
         .remove(key);
 }
 
-fn record_tcp_connect_failure(key: &DnsCacheKey) {
-    record_tcp_connect_failure_at(key, Instant::now());
+fn record_tcp_connect_failure(key: &DnsCacheKey, error: &io::Error) {
+    record_tcp_connect_failure_error_at(key, error, Instant::now());
 }
 
+#[cfg(test)]
 fn record_tcp_connect_failure_at(key: &DnsCacheKey, now: Instant) {
+    let error = io::Error::new(io::ErrorKind::ConnectionRefused, "target connect failed");
+    record_tcp_connect_failure_error_at(key, &error, now);
+}
+
+fn record_tcp_connect_failure_error_at(key: &DnsCacheKey, error: &io::Error, now: Instant) {
+    if is_transient_tcp_connect_error(error) {
+        return;
+    }
     let mut entries = tcp_connect_failure_backoff()
         .lock()
         .expect("tcp connect failure backoff poisoned");
@@ -423,6 +432,10 @@ fn record_tcp_connect_failure_at(key: &DnsCacheKey, now: Instant) {
     if entry.failures >= TCP_CONNECT_FAILURE_THRESHOLD {
         entry.blocked_until = Some(now + TCP_CONNECT_FAILURE_BLOCK_DURATION);
     }
+}
+
+fn is_transient_tcp_connect_error(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
 }
 
 fn clear_tcp_connect_failure_backoff() {
@@ -1282,6 +1295,22 @@ mod tests {
         );
 
         assert!(tcp_connect_backoff_error(&key, now + Duration::from_secs(8)).is_none());
+        clear_tcp_connect_failure_backoff();
+    }
+
+    #[test]
+    fn tcp_connect_backoff_ignores_transient_timeouts() {
+        let _guard = crate::test_support::network_test_lock();
+        clear_tcp_connect_failure_backoff();
+        let key = dns_cache_key("dns.huhu.icu", 22223);
+        let now = Instant::now();
+        let timeout = io::Error::new(io::ErrorKind::TimedOut, "target connect timed out");
+
+        record_tcp_connect_failure_error_at(&key, &timeout, now);
+        record_tcp_connect_failure_error_at(&key, &timeout, now + Duration::from_secs(1));
+        record_tcp_connect_failure_error_at(&key, &timeout, now + Duration::from_secs(2));
+
+        assert!(tcp_connect_backoff_error(&key, now + Duration::from_secs(3)).is_none());
         clear_tcp_connect_failure_backoff();
     }
 

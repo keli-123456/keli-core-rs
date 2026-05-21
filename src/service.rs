@@ -47,9 +47,6 @@ const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 256;
 const MAX_AUTO_CONNECTION_WORKERS: usize = 2048;
 const MIN_AUTO_CONNECTION_WORKERS: usize = 16;
 const CONNECTION_WORKERS_PER_CPU: usize = 64;
-const CONNECTION_WORKER_MEMORY_MIB: usize = 32;
-const CONNECTION_WORKER_RESERVED_FDS: usize = 512;
-const CONNECTION_WORKER_FDS_PER_CONN: usize = 2;
 const CONNECTION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_CONNECTION_WORKER_STACK_KIB: usize = 2048;
@@ -2343,27 +2340,14 @@ fn available_parallelism_count() -> usize {
 
 fn connection_worker_threads_from_resources(
     cpu_count: usize,
-    memory_limit_mib: Option<usize>,
-    open_file_soft_limit: Option<usize>,
+    _memory_limit_mib: Option<usize>,
+    _open_file_soft_limit: Option<usize>,
 ) -> usize {
     let cpu_target = cpu_count
         .max(1)
         .saturating_mul(CONNECTION_WORKERS_PER_CPU)
         .max(MIN_AUTO_CONNECTION_WORKERS);
-    let memory_target = memory_limit_mib
-        .map(|mib| mib / CONNECTION_WORKER_MEMORY_MIB)
-        .filter(|target| *target > 0)
-        .unwrap_or(MAX_AUTO_CONNECTION_WORKERS);
-    let fd_target = open_file_soft_limit
-        .map(|limit| {
-            limit.saturating_sub(CONNECTION_WORKER_RESERVED_FDS) / CONNECTION_WORKER_FDS_PER_CONN
-        })
-        .filter(|target| *target > 0)
-        .unwrap_or(MAX_AUTO_CONNECTION_WORKERS);
-    let resource_cap = cpu_target
-        .min(memory_target)
-        .min(fd_target)
-        .min(MAX_AUTO_CONNECTION_WORKERS);
+    let resource_cap = cpu_target.min(MAX_AUTO_CONNECTION_WORKERS);
     resource_cap.clamp(
         MIN_AUTO_CONNECTION_WORKERS.min(resource_cap),
         MAX_AUTO_CONNECTION_WORKERS,
@@ -2442,10 +2426,7 @@ fn parse_proc_limits_open_files(content: &str) -> Option<usize> {
         let mut parts = rest.split_whitespace();
         let soft = parts.next()?;
         if soft == "unlimited" {
-            return Some(
-                MAX_AUTO_CONNECTION_WORKERS * CONNECTION_WORKER_FDS_PER_CONN
-                    + CONNECTION_WORKER_RESERVED_FDS,
-            );
+            return Some(usize::MAX);
         }
         return soft.parse::<usize>().ok();
     }
@@ -2783,7 +2764,7 @@ mod tests {
     fn connection_worker_count_scales_with_cpu_when_resources_allow() {
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(4096), Some(100_000)),
-            128
+            256
         );
         assert_eq!(
             super::connection_worker_threads_from_resources(32, Some(128_000), Some(1_000_000)),
@@ -2792,34 +2773,34 @@ mod tests {
     }
 
     #[test]
-    fn connection_worker_count_respects_memory_and_fd_caps() {
+    fn connection_worker_count_ignores_memory_and_fd_caps_for_throughput() {
         assert_eq!(
             super::connection_worker_threads_from_resources(8, Some(512), Some(100_000)),
-            16
+            512
         );
         assert_eq!(
             super::connection_worker_threads_from_resources(32, Some(8192), Some(4096)),
+            2048
+        );
+    }
+
+    #[test]
+    fn connection_worker_count_keeps_problem_node_throughput_like_go() {
+        assert_eq!(
+            super::connection_worker_threads_from_resources(4, Some(3914), Some(999_999)),
             256
         );
     }
 
     #[test]
-    fn connection_worker_count_avoids_problem_node_thread_bloat() {
-        assert_eq!(
-            super::connection_worker_threads_from_resources(4, Some(3914), Some(999_999)),
-            122
-        );
-    }
-
-    #[test]
-    fn connection_worker_count_handles_small_resource_limits() {
+    fn connection_worker_count_keeps_cpu_capacity_on_small_resource_limits() {
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(64), Some(100_000)),
-            2
+            256
         );
         assert_eq!(
             super::connection_worker_threads_from_resources(4, Some(4096), Some(600)),
-            44
+            256
         );
     }
 
