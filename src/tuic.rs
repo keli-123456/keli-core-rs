@@ -24,7 +24,9 @@ use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
-use crate::user::{apply_user_delta_to_keyed_map, CoreUser, CoreUserDelta, CoreUserDeltaResult};
+use crate::user::{
+    apply_user_delta_to_keyed_arc_map, CoreUser, CoreUserDelta, CoreUserDeltaResult,
+};
 use crate::{connect_tcp_outbound_tokio, send_udp_outbound_tokio};
 
 const VERSION: u8 = 0x05;
@@ -59,7 +61,7 @@ pub struct TuicServerConfig {
 #[derive(Clone, Debug)]
 pub struct TuicServer {
     config: TuicServerConfig,
-    users: Arc<ArcSwap<HashMap<[u8; 16], CoreUser>>>,
+    users: Arc<ArcSwap<HashMap<[u8; 16], Arc<CoreUser>>>>,
     user_updates: Arc<Mutex<()>>,
     router: RouteMatcher,
     traffic: SharedTrafficRegistry,
@@ -210,14 +212,14 @@ impl TuicServer {
             .lock()
             .expect("tuic users write lock poisoned");
         let mut current = self.users.load_full().as_ref().clone();
-        let result = apply_user_delta_to_keyed_map(&mut current, delta, |user| {
+        let result = apply_user_delta_to_keyed_arc_map(&mut current, delta, |user| {
             parse_uuid_bytes(&user.uuid).ok()
         });
         self.users.store(Arc::new(current));
         result
     }
 
-    fn user_for_uuid(&self, uuid: &[u8; 16]) -> Option<CoreUser> {
+    fn user_for_uuid(&self, uuid: &[u8; 16]) -> Option<Arc<CoreUser>> {
         self.users.load().get(uuid).cloned()
     }
 
@@ -309,7 +311,7 @@ impl TuicServer {
         &self,
         connection: &quinn::Connection,
         stream: &mut quinn::RecvStream,
-    ) -> io::Result<CoreUser> {
+    ) -> io::Result<Arc<CoreUser>> {
         let mut header = [0u8; 2];
         read_exact(stream, &mut header).await?;
         if header != [VERSION, COMMAND_AUTHENTICATE] {
@@ -1344,13 +1346,13 @@ fn parse_uuid_bytes(value: &str) -> io::Result<[u8; 16]> {
     Ok(output)
 }
 
-fn tuic_user_map(users: &[CoreUser]) -> HashMap<[u8; 16], CoreUser> {
+fn tuic_user_map(users: &[CoreUser]) -> HashMap<[u8; 16], Arc<CoreUser>> {
     users
         .iter()
         .filter_map(|user| {
             parse_uuid_bytes(&user.uuid)
                 .ok()
-                .map(|uuid| (uuid, user.clone()))
+                .map(|uuid| (uuid, Arc::new(user.clone())))
         })
         .collect()
 }

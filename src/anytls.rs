@@ -20,7 +20,9 @@ use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::SocksTarget;
 use crate::stream::{join_native_blocking_relay, spawn_native_blocking_relay, NativeRelayHandle};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
-use crate::user::{apply_user_delta_to_keyed_map, CoreUser, CoreUserDelta, CoreUserDeltaResult};
+use crate::user::{
+    apply_user_delta_to_keyed_arc_map, CoreUser, CoreUserDelta, CoreUserDeltaResult,
+};
 use crate::{
     connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
 };
@@ -59,7 +61,7 @@ pub struct AnyTlsServerConfig {
 #[derive(Clone, Debug)]
 pub struct AnyTlsServer {
     config: AnyTlsServerConfig,
-    users: Arc<ArcSwap<HashMap<[u8; 32], CoreUser>>>,
+    users: Arc<ArcSwap<HashMap<[u8; 32], Arc<CoreUser>>>>,
     user_updates: Arc<Mutex<()>>,
     router: RouteMatcher,
     traffic: SharedTrafficRegistry,
@@ -76,7 +78,7 @@ struct FrameHeader {
 
 #[derive(Debug)]
 struct AnyTlsSession {
-    user: CoreUser,
+    user: Arc<CoreUser>,
     client_ip: Option<IpAddr>,
     writer: Arc<Mutex<TcpStream>>,
     remotes: HashMap<u32, AnyTlsRemote>,
@@ -210,7 +212,7 @@ impl AnyTlsServer {
         if upload > 0 || download > 0 {
             self.traffic.add_with_user_id(
                 self.config.node_tag.clone(),
-                session.user.uuid,
+                session.user.uuid.clone(),
                 Some(session.user.id),
                 upload,
                 download,
@@ -240,18 +242,18 @@ impl AnyTlsServer {
             .lock()
             .expect("anytls users write lock poisoned");
         let mut current = self.users.load_full().as_ref().clone();
-        let result = apply_user_delta_to_keyed_map(&mut current, delta, |user| {
+        let result = apply_user_delta_to_keyed_arc_map(&mut current, delta, |user| {
             Some(sha256(user.credential()))
         });
         self.users.store(Arc::new(current));
         result
     }
 
-    fn user_for_password_hash(&self, password_hash: &[u8; 32]) -> Option<CoreUser> {
+    fn user_for_password_hash(&self, password_hash: &[u8; 32]) -> Option<Arc<CoreUser>> {
         self.users.load().get(password_hash).cloned()
     }
 
-    fn read_auth(&self, client: &mut TcpStream) -> io::Result<CoreUser> {
+    fn read_auth(&self, client: &mut TcpStream) -> io::Result<Arc<CoreUser>> {
         let mut auth = [0u8; 34];
         client.read_exact(&mut auth)?;
         let mut password_hash = [0u8; 32];
@@ -1044,11 +1046,11 @@ fn sha256(password: &str) -> [u8; 32] {
     output
 }
 
-fn anytls_user_map(users: &[CoreUser]) -> HashMap<[u8; 32], CoreUser> {
+fn anytls_user_map(users: &[CoreUser]) -> HashMap<[u8; 32], Arc<CoreUser>> {
     users
         .iter()
         .filter(|user| !user.is_empty())
-        .map(|user| (sha256(user.credential()), user.clone()))
+        .map(|user| (sha256(user.credential()), Arc::new(user.clone())))
         .collect()
 }
 

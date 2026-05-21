@@ -342,6 +342,83 @@ where
     result
 }
 
+pub fn apply_user_delta_to_keyed_arc_map<K, F>(
+    users: &mut HashMap<K, Arc<CoreUser>>,
+    delta: &CoreUserDelta,
+    key: F,
+) -> CoreUserDeltaResult
+where
+    K: Clone + Eq + Hash,
+    F: Fn(&CoreUser) -> Option<K>,
+{
+    if let Some(full) = delta.full.as_ref() {
+        users.clear();
+        for user in full {
+            if !user.is_empty() {
+                if let Some(key) = key(user) {
+                    users.insert(key, Arc::new(user.clone()));
+                }
+            }
+        }
+        return CoreUserDeltaResult {
+            active_users: users.len(),
+            full_applied: true,
+            ..CoreUserDeltaResult::default()
+        };
+    }
+
+    let mut result = CoreUserDeltaResult::default();
+    let mut uuid_keys = users
+        .iter()
+        .map(|(key, user)| (user.uuid.clone(), key.clone()))
+        .collect::<HashMap<_, _>>();
+    for user in &delta.added {
+        if user.is_empty() {
+            continue;
+        }
+        let Some(key) = key(user) else {
+            continue;
+        };
+        if let Some(old_key) = uuid_keys.insert(user.uuid.clone(), key.clone()) {
+            users.remove(&old_key);
+            result.updated += 1;
+        } else {
+            result.added += 1;
+        }
+        users.insert(key, Arc::new(user.clone()));
+    }
+    for user in &delta.updated {
+        if user.is_empty() {
+            continue;
+        }
+        let Some(key) = key(user) else {
+            result.missing_updated += 1;
+            continue;
+        };
+        if let Some(old_key) = uuid_keys.insert(user.uuid.clone(), key.clone()) {
+            users.remove(&old_key);
+            users.insert(key, Arc::new(user.clone()));
+            result.updated += 1;
+        } else {
+            uuid_keys.remove(&user.uuid);
+            result.missing_updated += 1;
+        }
+    }
+    for uuid in &delta.deleted {
+        if let Some(key) = uuid_keys.remove(uuid) {
+            if users.remove(&key).is_some() {
+                result.deleted += 1;
+            } else {
+                result.missing_deleted += 1;
+            }
+        } else {
+            result.missing_deleted += 1;
+        }
+    }
+    result.active_users = users.len();
+    result
+}
+
 fn active_user_vec(users: &[CoreUser]) -> Vec<CoreUser> {
     let mut users = users
         .iter()
@@ -375,8 +452,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        apply_user_delta_to_keyed_map, apply_user_delta_to_vec, CoreUser, CoreUserDelta, UserStore,
+        apply_user_delta_to_keyed_arc_map, apply_user_delta_to_keyed_map, apply_user_delta_to_vec,
+        CoreUser, CoreUserDelta, UserStore,
     };
+    use std::sync::Arc;
 
     fn user(uuid: &str) -> CoreUser {
         CoreUser {
@@ -387,6 +466,61 @@ mod tests {
             speed_limit: 0,
             device_limit: 0,
         }
+    }
+
+    #[test]
+    fn apply_user_delta_to_keyed_arc_map_preserves_unchanged_user_arcs() {
+        let user_a = Arc::new(user("user-a"));
+        let mut users = HashMap::from([("user-a".to_string(), Arc::clone(&user_a))]);
+
+        let result = apply_user_delta_to_keyed_arc_map(
+            &mut users,
+            &CoreUserDelta {
+                added: vec![user("user-b")],
+                ..CoreUserDelta::default()
+            },
+            |user| Some(user.uuid.clone()),
+        );
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.active_users, 2);
+        assert!(Arc::ptr_eq(
+            &user_a,
+            users.get("user-a").expect("existing user should remain")
+        ));
+    }
+
+    #[test]
+    fn apply_user_delta_to_keyed_arc_map_replaces_only_updated_user_arc() {
+        let user_a = Arc::new(user("user-a"));
+        let user_b = Arc::new(user("user-b"));
+        let mut users = HashMap::from([
+            ("user-a".to_string(), Arc::clone(&user_a)),
+            ("user-b".to_string(), Arc::clone(&user_b)),
+        ]);
+        let mut updated_a = user("user-a");
+        updated_a.password = Some("rotated".to_string());
+
+        let result = apply_user_delta_to_keyed_arc_map(
+            &mut users,
+            &CoreUserDelta {
+                updated: vec![updated_a],
+                ..CoreUserDelta::default()
+            },
+            |user| Some(user.credential().to_string()),
+        );
+
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.active_users, 2);
+        assert!(users.get("user-a").is_none());
+        assert!(!Arc::ptr_eq(
+            &user_a,
+            users.get("rotated").expect("updated user should move keys")
+        ));
+        assert!(Arc::ptr_eq(
+            &user_b,
+            users.get("user-b").expect("unchanged user should remain")
+        ));
     }
 
     fn limited_user(uuid: &str, speed_limit: u64) -> CoreUser {
