@@ -52,7 +52,7 @@ const CONNECTION_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_CONNECTION_WORKER_STACK_KIB: usize = 2048;
 const MIN_CONNECTION_WORKER_STACK_KIB: usize = 256;
 const MAX_CONNECTION_WORKER_STACK_KIB: usize = 8192;
-const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS: u64 = 3;
+const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS: u64 = 15;
 const QUIC_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 static TCP_ACCEPT_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static CONNECTION_WORKER_POOL: OnceLock<ConnectionWorkerPool> = OnceLock::new();
@@ -2744,11 +2744,11 @@ mod tests {
     fn outbound_connect_timeout_defaults_and_clamps_env_value() {
         assert_eq!(
             super::outbound_connect_timeout_from_env(None),
-            Duration::from_secs(super::DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS)
+            Duration::from_secs(15)
         );
         assert_eq!(
             super::outbound_connect_timeout_from_env(Some("0".to_string())),
-            Duration::from_secs(super::DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS)
+            Duration::from_secs(15)
         );
         assert_eq!(
             super::outbound_connect_timeout_from_env(Some("2".to_string())),
