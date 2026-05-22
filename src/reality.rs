@@ -561,6 +561,25 @@ impl RawTcpStreamAccess for PrefixedTcpStream {
         (self.prefix.position() as usize) >= self.prefix.get_ref().len()
     }
 
+    fn wait_readable_with(
+        &self,
+        other: &TcpStream,
+        wait_self: bool,
+        wait_other: bool,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        if wait_self && !self.raw_tcp_stream_ready() {
+            return Ok(());
+        }
+        RawTcpStreamAccess::wait_readable_with(
+            &self.socket,
+            other,
+            wait_self,
+            wait_other,
+            timeout,
+        )
+    }
+
     fn into_raw_tcp_stream(self) -> TcpStream {
         self.socket
     }

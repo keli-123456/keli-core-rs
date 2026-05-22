@@ -1,5 +1,5 @@
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{IpAddr, Shutdown, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -71,12 +71,21 @@ pub fn connect_websocket_client<S: Read + Write>(
 }
 
 pub fn accept_websocket(
-    mut stream: TcpStream,
+    stream: TcpStream,
     expected_path: Option<&str>,
 ) -> io::Result<(WebSocketReader, WebSocketWriter)> {
+    let (reader, writer, _) = accept_websocket_with_client_ip(stream, expected_path)?;
+    Ok((reader, writer))
+}
+
+pub fn accept_websocket_with_client_ip(
+    mut stream: TcpStream,
+    expected_path: Option<&str>,
+) -> io::Result<(WebSocketReader, WebSocketWriter, Option<IpAddr>)> {
     let request = read_http_upgrade(&mut stream)?;
     let (path, key) = parse_upgrade_request(&request)?;
     validate_path(path, expected_path)?;
+    let forwarded_ip = forwarded_client_ip(&request);
 
     let accept = websocket_accept_key(key);
     let response = format!(
@@ -94,16 +103,26 @@ pub fn accept_websocket(
         WebSocketWriter {
             writer: control_writer,
         },
+        forwarded_ip,
     ))
 }
 
 pub fn accept_websocket_tls(
-    mut stream: TlsConnection,
+    stream: TlsConnection,
     expected_path: Option<&str>,
 ) -> io::Result<WebSocketTlsStream> {
+    let (stream, _) = accept_websocket_tls_with_client_ip(stream, expected_path)?;
+    Ok(stream)
+}
+
+pub fn accept_websocket_tls_with_client_ip(
+    mut stream: TlsConnection,
+    expected_path: Option<&str>,
+) -> io::Result<(WebSocketTlsStream, Option<IpAddr>)> {
     let request = read_http_upgrade(&mut stream)?;
     let (path, key) = parse_upgrade_request(&request)?;
     validate_path(path, expected_path)?;
+    let forwarded_ip = forwarded_client_ip(&request);
 
     let accept = websocket_accept_key(key);
     let response = format!(
@@ -111,11 +130,14 @@ pub fn accept_websocket_tls(
     );
     stream.write_plain_all_wait(response.as_bytes())?;
 
-    Ok(WebSocketTlsStream {
-        stream,
-        input: Vec::new(),
-        buffer: Vec::new(),
-    })
+    Ok((
+        WebSocketTlsStream {
+            stream,
+            input: Vec::new(),
+            buffer: Vec::new(),
+        },
+        forwarded_ip,
+    ))
 }
 
 pub fn relay_websocket_tls_stream(
@@ -132,6 +154,7 @@ pub fn relay_websocket_tls_stream(
     let mut download_done = false;
     let mut client_buffer = [0u8; 16 * 1024];
     let mut remote_buffer = [0u8; 16 * 1024];
+    let mut idle_rounds = 0u8;
 
     while !upload_done || !download_done {
         let mut progressed = false;
@@ -140,14 +163,16 @@ pub fn relay_websocket_tls_stream(
             match client.read(&mut client_buffer) {
                 Ok(0) => {
                     upload_done = true;
-                    let _ = remote.shutdown(Shutdown::Write);
+                    download_done = true;
+                    shutdown_websocket_tls_pair(&mut client, &remote);
                     progressed = true;
                 }
                 Ok(read) => {
                     if let Some(limiter) = limiter.as_deref() {
                         if !limiter.wait_for(read) {
                             upload_done = true;
-                            let _ = remote.shutdown(Shutdown::Write);
+                            download_done = true;
+                            shutdown_websocket_tls_pair(&mut client, &remote);
                             continue;
                         }
                     }
@@ -158,7 +183,8 @@ pub fn relay_websocket_tls_stream(
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => {
                     upload_done = true;
-                    let _ = remote.shutdown(Shutdown::Write);
+                    download_done = true;
+                    shutdown_websocket_tls_pair(&mut client, &remote);
                     progressed = true;
                 }
             }
@@ -168,7 +194,8 @@ pub fn relay_websocket_tls_stream(
             match remote.read(&mut remote_buffer) {
                 Ok(0) => {
                     download_done = true;
-                    let _ = client.close_notify_wait();
+                    upload_done = true;
+                    shutdown_websocket_tls_pair(&mut client, &remote);
                     progressed = true;
                 }
                 Ok(read) => {
@@ -179,18 +206,27 @@ pub fn relay_websocket_tls_stream(
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => {
                     download_done = true;
-                    let _ = client.close_notify_wait();
+                    upload_done = true;
+                    shutdown_websocket_tls_pair(&mut client, &remote);
                     progressed = true;
                 }
             }
         }
 
         if !progressed {
-            thread::sleep(Duration::from_millis(1));
+            let timeout = websocket_tls_relay_idle_timeout(&mut idle_rounds);
+            client.wait_readable_with_remote(&remote, !upload_done, !download_done, timeout)?;
+        } else {
+            idle_rounds = 0;
         }
     }
 
     Ok((upload, download))
+}
+
+fn shutdown_websocket_tls_pair(client: &mut WebSocketTlsStream, remote: &TcpStream) {
+    let _ = client.shutdown();
+    let _ = remote.shutdown(Shutdown::Both);
 }
 
 impl Read for WebSocketReader {
@@ -242,9 +278,32 @@ impl WebSocketTlsStream {
             .write_plain_all_wait(&frame_bytes(OPCODE_BINARY, payload))
     }
 
-    fn close_notify_wait(&mut self) -> io::Result<()> {
-        self.stream.close_notify_wait()
+    fn shutdown(&self) -> io::Result<()> {
+        self.stream.shutdown(Shutdown::Both)
     }
+
+    fn wait_readable_with_remote(
+        &self,
+        remote: &TcpStream,
+        wait_client: bool,
+        wait_remote: bool,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        if wait_client && !self.buffer.is_empty() {
+            return Ok(());
+        }
+        self.stream
+            .wait_raw_readable_with(remote, wait_client, wait_remote, timeout)
+    }
+}
+
+fn websocket_tls_relay_idle_timeout(idle_rounds: &mut u8) -> Duration {
+    const BACKOFF_MS: [u64; 5] = [25, 50, 100, 250, 1000];
+    let idx = usize::from((*idle_rounds).min((BACKOFF_MS.len() - 1) as u8));
+    *idle_rounds = idle_rounds
+        .saturating_add(1)
+        .min((BACKOFF_MS.len() - 1) as u8);
+    Duration::from_millis(BACKOFF_MS[idx])
 }
 
 impl Read for WebSocketTlsStream {
@@ -379,6 +438,33 @@ fn validate_path(path: &str, expected_path: Option<&str>) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn forwarded_client_ip(request: &str) -> Option<IpAddr> {
+    header_value(request, "x-forwarded-for")
+        .and_then(first_forwarded_for_ip)
+        .or_else(|| header_value(request, "cf-connecting-ip").and_then(parse_header_ip))
+        .or_else(|| header_value(request, "true-client-ip").and_then(parse_header_ip))
+        .or_else(|| header_value(request, "x-real-ip").and_then(parse_header_ip))
+}
+
+fn first_forwarded_for_ip(value: &str) -> Option<IpAddr> {
+    value.split(',').find_map(parse_header_ip)
+}
+
+fn header_value<'a>(request: &'a str, header_name: &str) -> Option<&'a str> {
+    request.split("\r\n").skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case(header_name) {
+            Some(value.trim())
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_header_ip(value: &str) -> Option<IpAddr> {
+    value.trim().trim_matches('"').parse().ok()
 }
 
 fn parse_upgrade_request(request: &str) -> io::Result<(&str, &str)> {
@@ -706,8 +792,11 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
+    use std::time::Duration;
 
-    use crate::websocket::{accept_websocket, websocket_accept_key};
+    use crate::websocket::{
+        accept_websocket, accept_websocket_with_client_ip, websocket_accept_key,
+    };
 
     fn masked_frame(payload: &[u8]) -> Vec<u8> {
         let mask = [1u8, 2, 3, 4];
@@ -767,5 +856,56 @@ mod tests {
         client.read_exact(&mut body).expect("frame body");
         assert_eq!(&body, b"pong");
         server.join().expect("server");
+    }
+
+    #[test]
+    fn accepts_upgrade_and_uses_forwarded_for_client_ip() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let (_, _, forwarded_ip) =
+                accept_websocket_with_client_ip(stream, Some("/ws")).expect("upgrade");
+            assert_eq!(forwarded_ip, Some("198.51.100.8".parse().unwrap()));
+        });
+
+        let mut client = TcpStream::connect(addr).expect("client");
+        client
+            .write_all(
+                b"GET /ws HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-Forwarded-For: 198.51.100.8, 203.0.113.9\r\n\r\n",
+            )
+            .expect("request");
+        let response = read_http_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn websocket_tls_relay_idle_timeout_uses_poll_scale_backoff() {
+        let mut idle_rounds = 0u8;
+        assert_eq!(
+            super::websocket_tls_relay_idle_timeout(&mut idle_rounds),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            super::websocket_tls_relay_idle_timeout(&mut idle_rounds),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            super::websocket_tls_relay_idle_timeout(&mut idle_rounds),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            super::websocket_tls_relay_idle_timeout(&mut idle_rounds),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            super::websocket_tls_relay_idle_timeout(&mut idle_rounds),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            super::websocket_tls_relay_idle_timeout(&mut idle_rounds),
+            Duration::from_secs(1)
+        );
     }
 }

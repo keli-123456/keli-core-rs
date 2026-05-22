@@ -6,6 +6,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::{CertifiedKey, Signer, SigningKey, SingleCertAndKey};
@@ -37,6 +40,13 @@ pub trait TlsSocket: Read + Write {
 
 pub trait RawTcpStreamAccess: TlsSocket {
     fn raw_tcp_stream_ready(&self) -> bool;
+    fn wait_readable_with(
+        &self,
+        other: &TcpStream,
+        wait_self: bool,
+        wait_other: bool,
+        timeout: Duration,
+    ) -> io::Result<()>;
     fn into_raw_tcp_stream(self) -> TcpStream;
 }
 
@@ -76,6 +86,16 @@ impl TlsSocket for TcpStream {
 impl RawTcpStreamAccess for TcpStream {
     fn raw_tcp_stream_ready(&self) -> bool {
         true
+    }
+
+    fn wait_readable_with(
+        &self,
+        other: &TcpStream,
+        wait_self: bool,
+        wait_other: bool,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        wait_tcp_streams_readable(self, other, wait_self, wait_other, timeout)
     }
 
     fn into_raw_tcp_stream(self) -> TcpStream {
@@ -369,11 +389,6 @@ where
         self.connection.read_tls(&mut cursor)
     }
 
-    pub(crate) fn close_notify_wait(&mut self) -> io::Result<()> {
-        self.connection.send_close_notify();
-        self.flush_tls_wait()
-    }
-
     pub(crate) fn into_socket(self) -> S {
         self.socket
     }
@@ -384,6 +399,87 @@ where
     {
         self.socket.raw_tcp_stream_ready()
     }
+
+    pub(crate) fn wait_raw_readable_with(
+        &self,
+        other: &TcpStream,
+        wait_self: bool,
+        wait_other: bool,
+        timeout: Duration,
+    ) -> io::Result<()>
+    where
+        S: RawTcpStreamAccess,
+    {
+        self.socket
+            .wait_readable_with(other, wait_self, wait_other, timeout)
+    }
+}
+
+#[cfg(unix)]
+fn wait_tcp_streams_readable(
+    this: &TcpStream,
+    other: &TcpStream,
+    wait_self: bool,
+    wait_other: bool,
+    timeout: Duration,
+) -> io::Result<()> {
+    let mut fds = Vec::with_capacity(2);
+    if wait_self {
+        fds.push(libc::pollfd {
+            fd: this.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        });
+    }
+    if wait_other {
+        fds.push(libc::pollfd {
+            fd: other.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        });
+    }
+    if fds.is_empty() {
+        return Ok(());
+    }
+    loop {
+        let result = unsafe {
+            libc::poll(
+                fds.as_mut_ptr(),
+                fds.len() as libc::nfds_t,
+                poll_timeout_ms(timeout),
+            )
+        };
+        if result >= 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_tcp_streams_readable(
+    _this: &TcpStream,
+    _other: &TcpStream,
+    wait_self: bool,
+    wait_other: bool,
+    timeout: Duration,
+) -> io::Result<()> {
+    if wait_self || wait_other {
+        thread::sleep(timeout.min(Duration::from_millis(10)));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn poll_timeout_ms(timeout: Duration) -> libc::c_int {
+    timeout
+        .as_millis()
+        .min(libc::c_int::MAX as u128)
+        .try_into()
+        .unwrap_or(libc::c_int::MAX)
 }
 
 impl<S> Read for TlsConnection<S>
@@ -439,7 +535,7 @@ pub fn relay_tls_stream<S>(
     limiter: Option<Arc<BandwidthLimiter>>,
 ) -> io::Result<(u64, u64)>
 where
-    S: TlsSocket,
+    S: TlsSocket + RawTcpStreamAccess,
 {
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
@@ -527,7 +623,8 @@ where
         }
 
         if !progressed {
-            relay_idle_sleep(&mut idle_rounds);
+            let timeout = relay_idle_timeout(&mut idle_rounds);
+            client.wait_raw_readable_with(&remote, !upload_done, !download_done, timeout)?;
         } else {
             idle_rounds = 0;
         }
@@ -538,13 +635,13 @@ where
     Ok((upload, download))
 }
 
-fn relay_idle_sleep(idle_rounds: &mut u8) {
-    const BACKOFF_MS: [u64; 5] = [1, 2, 4, 8, 16];
+fn relay_idle_timeout(idle_rounds: &mut u8) -> Duration {
+    const BACKOFF_MS: [u64; 5] = [25, 50, 100, 250, 1000];
     let idx = usize::from((*idle_rounds).min((BACKOFF_MS.len() - 1) as u8));
-    thread::sleep(Duration::from_millis(BACKOFF_MS[idx]));
     *idle_rounds = idle_rounds
         .saturating_add(1)
         .min((BACKOFF_MS.len() - 1) as u8);
+    Duration::from_millis(BACKOFF_MS[idx])
 }
 
 fn reality_ed25519_certified_key(
@@ -713,6 +810,11 @@ pub(crate) fn classify_tls_handshake_error(error: &io::Error) -> TlsHandshakeErr
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use rustls::SignatureScheme;
 
@@ -720,7 +822,7 @@ mod tests {
 
     use super::{
         classify_tls_handshake_error, reality_ed25519_certified_key, server_config_from_files,
-        sni_matches, TlsHandshakeErrorClass,
+        sni_matches, RawTcpStreamAccess, TlsHandshakeErrorClass,
     };
 
     #[test]
@@ -796,6 +898,58 @@ mod tests {
         assert_eq!(
             classify_tls_handshake_error(&invalid),
             TlsHandshakeErrorClass::InvalidHandshake
+        );
+    }
+
+    #[test]
+    fn raw_tcp_stream_wait_readable_returns_when_peer_writes() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let mut client = TcpStream::connect(addr).expect("connect client");
+        let (mut server, _) = listener.accept().expect("accept server");
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            server.write_all(b"x").expect("write server byte");
+        });
+
+        let start = Instant::now();
+        client
+            .wait_readable_with(&client, true, false, Duration::from_secs(2))
+            .expect("wait readable");
+        assert!(start.elapsed() < Duration::from_millis(1500));
+
+        let mut byte = [0u8; 1];
+        client.read_exact(&mut byte).expect("read client byte");
+        assert_eq!(byte, *b"x");
+        writer.join().expect("writer thread");
+    }
+
+    #[test]
+    fn tls_relay_idle_timeout_uses_poll_scale_backoff() {
+        let mut idle_rounds = 0u8;
+        assert_eq!(
+            super::relay_idle_timeout(&mut idle_rounds),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            super::relay_idle_timeout(&mut idle_rounds),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            super::relay_idle_timeout(&mut idle_rounds),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            super::relay_idle_timeout(&mut idle_rounds),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            super::relay_idle_timeout(&mut idle_rounds),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            super::relay_idle_timeout(&mut idle_rounds),
+            Duration::from_secs(1)
         );
     }
 

@@ -46,7 +46,9 @@ use crate::stream::{
 use crate::tls::TlsConnection;
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
-use crate::websocket::{accept_websocket, accept_websocket_tls, connect_websocket_client};
+use crate::websocket::{
+    accept_websocket_tls_with_client_ip, accept_websocket_with_client_ip, connect_websocket_client,
+};
 use crate::{connect_tcp_outbound, send_udp_outbound, RouteDecision, RouteDispatcher};
 
 const VERSION: u8 = 0x01;
@@ -232,8 +234,8 @@ impl VmessServer {
 
     pub fn handle_websocket_client(&self, client: TcpStream, path: Option<&str>) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
-        let (reader, writer) = accept_websocket(client, path)?;
-        self.handle_split_client_with_ip(reader, writer, client_ip)
+        let (reader, writer, forwarded_ip) = accept_websocket_with_client_ip(client, path)?;
+        self.handle_split_client_with_ip(reader, writer, forwarded_ip.or(client_ip))
     }
 
     pub fn handle_split_client<R, W>(&self, reader: R, writer: W) -> io::Result<()>
@@ -299,11 +301,11 @@ impl VmessServer {
         path: Option<&str>,
     ) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
-        let mut websocket = accept_websocket_tls(client, path)?;
+        let (mut websocket, forwarded_ip) = accept_websocket_tls_with_client_ip(client, path)?;
         let mut request = self.read_request(&mut websocket)?;
-        request.client_ip = client_ip;
+        request.client_ip = forwarded_ip.or(client_ip);
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let _session = self.acquire_user_session(user.as_ref(), request.client_ip)?;
         let bandwidth = if request.command == VmessCommand::Udp {
             self.bandwidth.limiter_for(user.as_ref())
         } else {

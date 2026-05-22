@@ -39,8 +39,8 @@ use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::vision::{VisionDecoder, VisionEncoder, VisionReader, VisionWriter};
 use crate::websocket::{
-    accept_websocket, accept_websocket_tls, connect_websocket_client, relay_websocket_tls_stream,
-    WebSocketClientStream,
+    accept_websocket_tls_with_client_ip, accept_websocket_with_client_ip, connect_websocket_client,
+    relay_websocket_tls_stream, WebSocketClientStream,
 };
 use crate::{
     connect_tcp_outbound, connect_tcp_outbound_tokio, send_udp_outbound, send_udp_outbound_tokio,
@@ -353,8 +353,8 @@ impl VlessServer {
         path: Option<&str>,
     ) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
-        let (reader, writer) = accept_websocket(client, path)?;
-        self.handle_split_client_with_ip(reader, writer, client_ip)
+        let (reader, writer, forwarded_ip) = accept_websocket_with_client_ip(client, path)?;
+        self.handle_split_client_with_ip(reader, writer, forwarded_ip.or(client_ip))
     }
 
     pub fn handle_split_client<R, W>(&self, reader: R, writer: W) -> io::Result<()>
@@ -503,11 +503,11 @@ impl VlessServer {
         path: Option<&str>,
     ) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
-        let mut websocket = accept_websocket_tls(client, path)?;
+        let (mut websocket, forwarded_ip) = accept_websocket_tls_with_client_ip(client, path)?;
         let mut request = self.read_request(&mut websocket)?;
-        request.client_ip = client_ip;
+        request.client_ip = forwarded_ip.or(client_ip);
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let _session = self.acquire_user_session(user.as_ref(), request.client_ip)?;
         let bandwidth = if request.command == VlessCommand::Udp {
             self.bandwidth.limiter_for(user.as_ref())
         } else {
@@ -3104,26 +3104,32 @@ fn trace_vless(message: impl FnOnce() -> String) {
 }
 
 fn relay_vision_wait_readable<S>(
-    _client: &TlsConnection<S>,
-    _remote: &TcpStream,
+    client: &TlsConnection<S>,
+    remote: &TcpStream,
     wait_client: bool,
     wait_remote: bool,
     idle_rounds: &mut u8,
 ) where
-    S: TlsSocket,
+    S: TlsSocket + RawTcpStreamAccess,
 {
     if wait_client || wait_remote {
-        relay_idle_sleep(idle_rounds);
+        let timeout_ms = relay_sleep_idle_timeout_ms(idle_rounds);
+        if client
+            .wait_raw_readable_with(
+                remote,
+                wait_client,
+                wait_remote,
+                Duration::from_millis(timeout_ms as u64),
+            )
+            .is_err()
+        {
+            thread::sleep(Duration::from_millis(timeout_ms as u64));
+        }
     }
 }
 
-fn relay_idle_sleep(idle_rounds: &mut u8) {
-    let timeout_ms = relay_sleep_idle_timeout_ms(idle_rounds);
-    thread::sleep(Duration::from_millis(timeout_ms as u64));
-}
-
 fn relay_sleep_idle_timeout_ms(idle_rounds: &mut u8) -> i32 {
-    const BACKOFF_MS: [i32; 5] = [1, 2, 4, 8, 16];
+    const BACKOFF_MS: [i32; 5] = [25, 50, 100, 250, 1000];
     let idx = usize::from((*idle_rounds).min((BACKOFF_MS.len() - 1) as u8));
     *idle_rounds = idle_rounds
         .saturating_add(1)

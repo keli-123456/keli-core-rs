@@ -34,8 +34,8 @@ use crate::tls::{relay_tls_stream, TlsConnection};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::websocket::{
-    accept_websocket, accept_websocket_tls, connect_websocket_client, relay_websocket_tls_stream,
-    WebSocketClientStream,
+    accept_websocket_tls_with_client_ip, accept_websocket_with_client_ip, connect_websocket_client,
+    relay_websocket_tls_stream, WebSocketClientStream,
 };
 use crate::{connect_tcp_outbound, send_udp_outbound, RouteDecision, RouteDispatcher};
 
@@ -171,8 +171,8 @@ impl TrojanServer {
 
     pub fn handle_websocket_client(&self, client: TcpStream, path: Option<&str>) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
-        let (reader, writer) = accept_websocket(client, path)?;
-        self.handle_split_client_with_ip(reader, writer, client_ip)
+        let (reader, writer, forwarded_ip) = accept_websocket_with_client_ip(client, path)?;
+        self.handle_split_client_with_ip(reader, writer, forwarded_ip.or(client_ip))
     }
 
     pub fn handle_split_client<R, W>(&self, reader: R, writer: W) -> io::Result<()>
@@ -273,11 +273,11 @@ impl TrojanServer {
         path: Option<&str>,
     ) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
-        let mut websocket = accept_websocket_tls(client, path)?;
+        let (mut websocket, forwarded_ip) = accept_websocket_tls_with_client_ip(client, path)?;
         let mut request = self.read_request(&mut websocket)?;
-        request.client_ip = client_ip;
+        request.client_ip = forwarded_ip.or(client_ip);
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let _session = self.acquire_user_session(user.as_ref(), request.client_ip)?;
         let bandwidth = if request.command == TrojanCommand::UdpAssociate {
             self.bandwidth.limiter_for(user.as_ref())
         } else {
@@ -1978,9 +1978,9 @@ mod tests {
         StreamOwned::new(connection, socket)
     }
 
-    fn websocket_request(path: &str) -> Vec<u8> {
+    fn websocket_request_with_forwarded_for(path: &str, forwarded_for: &str) -> Vec<u8> {
         format!(
-            "GET {path} HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            "GET {path} HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-Forwarded-For: {forwarded_for}\r\n\r\n"
         )
         .into_bytes()
     }
@@ -2631,7 +2631,10 @@ mod tests {
 
         let mut client = tls_client(trojan_addr, cert.cert_der.clone());
         client
-            .write_all(&websocket_request("/trojan"))
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.44, 203.0.113.7",
+            ))
             .expect("websocket request");
         let response = read_websocket_response(&mut client);
         assert!(response.contains("101 Switching Protocols"));
@@ -2655,6 +2658,63 @@ mod tests {
         assert_eq!(records[0].user_uuid, "trojan-password");
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+        assert_eq!(records[0].online_ips, vec!["198.51.100.44"]);
+    }
+
+    #[test]
+    fn tls_websocket_client_close_terminates_trojan_relay() {
+        let cert = test_cert("trojan-ws-close");
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (remote_done_tx, remote_done_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+            thread::sleep(Duration::from_secs(3));
+            remote_done_tx.send(()).expect("send remote done");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            let result = server_clone.handle_tls_websocket_client(client, Some("/trojan"));
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = tls_client(trojan_addr, cert.cert_der.clone());
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.45",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame(&trojan_request(echo_addr)))
+            .expect("trojan request frame");
+        client.write_all(&masked_frame(b"ping")).expect("payload");
+        assert_eq!(read_binary_frame(&mut client), b"ping");
+        drop(client);
+
+        let handled = handled_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("trojan relay exits after websocket client close");
+        handled.expect("trojan relay result");
+        remote_done_rx
+            .recv_timeout(Duration::from_secs(4))
+            .expect("remote done");
+        server_thread.join().expect("server thread");
+        echo_thread.join().expect("echo thread");
     }
 
     #[test]
@@ -2679,7 +2739,10 @@ mod tests {
 
         let mut client = TcpStream::connect(trojan_addr).expect("client connect");
         client
-            .write_all(&websocket_request("/trojan"))
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.43, 203.0.113.7",
+            ))
             .expect("websocket request");
         let response = read_websocket_response(&mut client);
         assert!(response.contains("101 Switching Protocols"));
@@ -2703,5 +2766,6 @@ mod tests {
         assert_eq!(records[0].user_uuid, "trojan-password");
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+        assert_eq!(records[0].online_ips, vec!["198.51.100.43"]);
     }
 }
