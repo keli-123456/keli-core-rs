@@ -2,7 +2,7 @@ use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
@@ -46,6 +46,8 @@ const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
 const TROJAN_PASSWORD_HEX_LEN: usize = 56;
 const MAX_UDP_PACKET_SIZE: usize = 65_535;
+const CLIENT_CLOSE_CONNECT_POLL: Duration = Duration::from_millis(10);
+const TROJAN_CONNECT_THREAD_STACK: usize = 256 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct TrojanServerConfig {
@@ -290,26 +292,8 @@ impl TrojanServer {
         if request.command == TrojanCommand::UdpAssociate {
             return self.relay_udp_tls_websocket(websocket, request, bandwidth);
         }
-        let remote = match self
-            .router
-            .decide_tcp(&request.target.host, request.target.port, &[])
-        {
-            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
-            RouteDecision::Outbound(outbound) => {
-                connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
-            }
-            RouteDecision::Block => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target blocked by route",
-                ));
-            }
-            RouteDecision::UnsupportedOutbound(tag) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("outbound route {tag} is not implemented"),
-                ));
-            }
+        let Some(remote) = self.connect_tcp_for_tls_websocket(&websocket, &request)? else {
+            return Ok(());
         };
         self.relay_tls_websocket(websocket, remote, request, bandwidth)
     }
@@ -475,6 +459,61 @@ impl TrojanServer {
             request.client_ip,
         );
         Ok(())
+    }
+
+    fn connect_tcp_for_tls_websocket(
+        &self,
+        client: &crate::websocket::WebSocketTlsStream,
+        request: &TrojanRequest,
+    ) -> io::Result<Option<TcpStream>> {
+        let router = self.router.clone();
+        let target = request.target.clone();
+        let timeout = self.config.connect_timeout;
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("keli-core-trojan-connect".to_string())
+            .stack_size(TROJAN_CONNECT_THREAD_STACK)
+            .spawn(move || {
+                let result = match router.decide_tcp(&target.host, target.port, &[]) {
+                    RouteDecision::Direct => connect_target(&target, timeout),
+                    RouteDecision::Outbound(outbound) => {
+                        connect_tcp_outbound(&outbound, &target, timeout)
+                    }
+                    RouteDecision::Block => Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "target blocked by route",
+                    )),
+                    RouteDecision::UnsupportedOutbound(tag) => Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("outbound route {tag} is not implemented"),
+                    )),
+                };
+                let _ = sender.send(result);
+            })
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("failed to spawn trojan outbound connector: {error}"),
+                )
+            })?;
+
+        loop {
+            match receiver.recv_timeout(CLIENT_CLOSE_CONNECT_POLL) {
+                Ok(result) => return result.map(Some),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if client.peer_closed_nonblocking()? {
+                        let _ = client.shutdown();
+                        return Ok(None);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "trojan outbound connector exited without result",
+                    ));
+                }
+            }
+        }
     }
 
     fn relay_udp_stream<S>(
@@ -3203,6 +3242,78 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(700));
         server_thread.join().expect("server thread");
         drop(proxy);
+    }
+
+    #[test]
+    fn tls_websocket_client_close_during_outbound_connect_does_not_wait_for_timeout() {
+        let cert = test_cert("trojan-ws-connect-mid-close");
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let (proxy_accepted_tx, proxy_accepted_rx) = mpsc::channel();
+        let proxy_thread = thread::spawn(move || {
+            let (_stream, _) = proxy.accept().expect("proxy accept");
+            proxy_accepted_tx.send(()).expect("send proxy accepted");
+            thread::sleep(Duration::from_secs(3));
+        });
+
+        let target = "127.0.0.1:443".parse::<SocketAddr>().expect("target addr");
+        let server = server_with_routes(
+            vec![RouteRule {
+                targets: vec!["ip:127.0.0.1/32".to_string()],
+                action: RouteAction::Outbound("tw".to_string()),
+                outbound: Some(OutboundConfig {
+                    tag: "tw".to_string(),
+                    protocol: "socks".to_string(),
+                    method: None,
+                    alter_id: None,
+                    address: Some(proxy_addr.ip().to_string()),
+                    port: Some(proxy_addr.port()),
+                    username: None,
+                    password: None,
+                    tls: None,
+                    transport: None,
+                }),
+            }],
+            Duration::from_secs(2),
+        );
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            let result = server.handle_tls_websocket_client(client, Some("/trojan"));
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = tls_client(trojan_addr, cert.cert_der.clone());
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.47",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame(&trojan_request(target)))
+            .expect("trojan request");
+        proxy_accepted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("proxy should receive outbound connection");
+
+        let started = Instant::now();
+        drop(client);
+
+        let handled = handled_rx
+            .recv_timeout(Duration::from_millis(700))
+            .expect("server should stop waiting once tls-websocket client closes mid-connect");
+        handled.expect("client close during outbound connect is not a route error");
+        assert!(started.elapsed() < Duration::from_millis(700));
+        server_thread.join().expect("server thread");
+        proxy_thread.join().expect("proxy thread");
     }
 
     #[test]
