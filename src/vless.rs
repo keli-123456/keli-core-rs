@@ -481,9 +481,7 @@ impl VlessServer {
                 request.target.host, request.target.port, request.flow, request.user_key
             )
         });
-        if request.flow != FLOW_XTLS_RPRX_VISION {
-            client.write_all(&[VERSION, 0x00])?;
-        }
+        client.write_all(&[VERSION, 0x00])?;
         self.relay_tls(client, remote, request, bandwidth)
     }
 
@@ -850,7 +848,7 @@ impl VlessServer {
         S: TlsSocket + RawTcpStreamAccess,
     {
         let (upload, download) = if request.flow == FLOW_XTLS_RPRX_VISION {
-            relay_tls_vision_stream(client, remote, request.user_id, bandwidth, &[VERSION, 0x00])?
+            relay_tls_vision_stream(client, remote, request.user_id, bandwidth, true)?
         } else {
             relay_tls_stream(client, remote, bandwidth)?
         };
@@ -2797,7 +2795,7 @@ fn relay_tls_vision_stream<S>(
     mut remote: TcpStream,
     user_id: [u8; 16],
     limiter: Option<Arc<BandwidthLimiter>>,
-    response_header: &[u8],
+    write_initial_padding: bool,
 ) -> io::Result<(u64, u64)>
 where
     S: TlsSocket + RawTcpStreamAccess,
@@ -2824,8 +2822,10 @@ where
         eprintln!("keli-core-rs vless trace: vision relay start");
     }
 
-    if !response_header.is_empty() {
-        let frame = vision_encoder.encode_with_long_padding(response_header);
+    if write_initial_padding {
+        let frame = vision_encoder
+            .empty_long_padding_frame()
+            .expect("new vision encoder should emit initial padding");
         client.write_plain_all_wait(&frame)?;
     }
 
@@ -5040,6 +5040,10 @@ mod tests {
         client
             .write_all(&vless_request_with_flow(echo_addr, "xtls-rprx-vision"))
             .expect("client request");
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).expect("client response");
+        assert_eq!(response, [0x00, 0x00]);
+
         let mut encoded = Vec::new();
         VisionWriter::new(&mut encoded, [0x11; 16])
             .write_all(b"ping")
@@ -5047,11 +5051,6 @@ mod tests {
         client.write_all(&encoded).expect("client write payload");
 
         let mut vision_reader = VisionReader::new(&mut client, [0x11; 16]);
-        let mut response = [0u8; 2];
-        vision_reader
-            .read_exact(&mut response)
-            .expect("client response");
-        assert_eq!(response, [0x00, 0x00]);
         let mut echoed = [0u8; 4];
         vision_reader
             .read_exact(&mut echoed)
@@ -5072,6 +5071,69 @@ mod tests {
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn tls_vision_raw_response_header_is_followed_by_empty_padding_frame() {
+        let cert = test_cert("vless-vision-response-padding");
+        let remote = TcpListener::bind("127.0.0.1:0").expect("remote bind");
+        let remote_addr = remote.local_addr().expect("remote addr");
+        let remote_thread = thread::spawn(move || {
+            let (mut stream, _) = remote.accept().expect("remote accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("remote timeout");
+            let mut byte = [0u8; 1];
+            let _ = stream.read(&mut byte);
+        });
+
+        let server = server_with_flow("xtls-rprx-vision");
+        let listener = server.bind().expect("vless bind");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vless accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            server_clone.handle_tls_client(client)
+        });
+
+        let mut client = tls_client(vless_addr, cert.cert_der.clone());
+        client
+            .sock
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("client timeout");
+        client
+            .write_all(&vless_request_with_flow(remote_addr, "xtls-rprx-vision"))
+            .expect("client request");
+
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).expect("client response");
+        assert_eq!(response, [super::VERSION, 0x00]);
+
+        let mut frame_header = [0u8; 21];
+        client
+            .read_exact(&mut frame_header)
+            .expect("initial vision padding frame");
+        assert_eq!(&frame_header[..16], &[0x11; 16]);
+        assert_eq!(frame_header[16], 0x00);
+        let content_len = u16::from_be_bytes([frame_header[17], frame_header[18]]);
+        let padding_len = u16::from_be_bytes([frame_header[19], frame_header[20]]);
+        assert_eq!(content_len, 0);
+        assert!(padding_len >= 900);
+
+        let mut padding = vec![0u8; padding_len as usize];
+        client
+            .read_exact(&mut padding)
+            .expect("initial vision padding");
+        drop(client);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        remote_thread.join().expect("remote thread");
     }
 
     #[test]
@@ -5116,6 +5178,9 @@ mod tests {
         client
             .write_all(&vless_request_with_flow(echo_addr, "xtls-rprx-vision"))
             .expect("client request");
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).expect("client response");
+        assert_eq!(response, [0x00, 0x00]);
 
         let mut encoder = VisionEncoder::new([0x11; 16]);
         let first_encoded = encoder.encode(&client_hello);
@@ -5129,11 +5194,6 @@ mod tests {
             .expect("client write app data");
 
         let mut vision_reader = VisionReader::new(&mut client, [0x11; 16]);
-        let mut response = [0u8; 2];
-        vision_reader
-            .read_exact(&mut response)
-            .expect("client response");
-        assert_eq!(response, [0x00, 0x00]);
         let mut echoed = vec![0u8; expected_len];
         vision_reader
             .read_exact(&mut echoed)
@@ -5168,7 +5228,7 @@ mod tests {
             let client = acceptor.accept(stream).expect("tls accept");
             let remote_stream = TcpStream::connect(remote_addr).expect("connect remote");
             let result =
-                super::relay_tls_vision_stream(client, remote_stream, [0x11; 16], None, &[]);
+                super::relay_tls_vision_stream(client, remote_stream, [0x11; 16], None, false);
             relay_tx.send(result).expect("send relay result");
         });
 
@@ -5212,7 +5272,7 @@ mod tests {
             let client = acceptor.accept(stream).expect("tls accept");
             let remote_stream = TcpStream::connect(remote_addr).expect("connect remote");
             let result =
-                super::relay_tls_vision_stream(client, remote_stream, [0x11; 16], None, &[]);
+                super::relay_tls_vision_stream(client, remote_stream, [0x11; 16], None, false);
             relay_tx.send(result).expect("send relay result");
         });
 
@@ -5278,14 +5338,13 @@ mod tests {
         client
             .write_all(&vless_request_with_flow(echo_addr, "xtls-rprx-vision"))
             .expect("client request");
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).expect("client response");
+        assert_eq!(response, [0x00, 0x00]);
+
         client.write_all(&payload).expect("plain payload");
 
         let mut vision_reader = VisionReader::new(&mut client, [0x11; 16]);
-        let mut response = [0u8; 2];
-        vision_reader
-            .read_exact(&mut response)
-            .expect("client response");
-        assert_eq!(response, [0x00, 0x00]);
         let mut echoed = vec![0u8; payload.len()];
         vision_reader
             .read_exact(&mut echoed)

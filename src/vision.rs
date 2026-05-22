@@ -143,14 +143,6 @@ impl VisionEncoder {
     }
 
     pub fn encode(&mut self, input: &[u8]) -> Vec<u8> {
-        self.encode_inner(input, false)
-    }
-
-    pub(crate) fn encode_with_long_padding(&mut self, input: &[u8]) -> Vec<u8> {
-        self.encode_inner(input, true)
-    }
-
-    fn encode_inner(&mut self, input: &[u8], force_long_padding: bool) -> Vec<u8> {
         if !self.padding_active || input.is_empty() {
             return input.to_vec();
         }
@@ -161,7 +153,7 @@ impl VisionEncoder {
         let complete_application_data = is_complete_tls_application_data_records(payload);
         let (command, keep_padding, long_padding, switch_to_direct) =
             self.next_command(complete_application_data);
-        let padding = self.padding_len(payload.len(), force_long_padding || long_padding);
+        let padding = self.padding_len(payload.len(), long_padding);
         let mut frame = Vec::with_capacity(16 + 5 + input.len() + padding);
         if let Some(user_id) = self.user_id.take() {
             frame.extend_from_slice(&user_id);
@@ -177,6 +169,23 @@ impl VisionEncoder {
             frame.extend_from_slice(&input[split_at..]);
         }
         frame
+    }
+
+    pub(crate) fn empty_long_padding_frame(&mut self) -> Option<Vec<u8>> {
+        if !self.padding_active {
+            return None;
+        }
+
+        let padding = self.padding_len(0, true);
+        let mut frame = Vec::with_capacity(16 + 5 + padding);
+        if let Some(user_id) = self.user_id.take() {
+            frame.extend_from_slice(&user_id);
+        }
+        frame.push(COMMAND_PADDING_CONTINUE);
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        frame.extend_from_slice(&(padding as u16).to_be_bytes());
+        append_random_padding(&mut frame, padding);
+        Some(frame)
     }
 
     pub fn finish_padding(&mut self) -> Option<Vec<u8>> {
