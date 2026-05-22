@@ -37,9 +37,7 @@ use crate::websocket::{
     accept_websocket, accept_websocket_tls, connect_websocket_client, relay_websocket_tls_stream,
     WebSocketClientStream,
 };
-use crate::{
-    connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
-};
+use crate::{connect_tcp_outbound, send_udp_outbound, RouteDecision, RouteDispatcher};
 
 const COMMAND_TCP: u8 = 0x01;
 const COMMAND_UDP_ASSOCIATE: u8 = 0x03;
@@ -62,7 +60,7 @@ pub struct TrojanServerConfig {
 pub struct TrojanServer {
     config: TrojanServerConfig,
     users: UserStore,
-    router: RouteMatcher,
+    router: RouteDispatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -115,7 +113,8 @@ impl TrojanServer {
         let users = UserStore::from_keyed_users(&config.users, |user| {
             trojan_password_hash(user.credential())
         });
-        let router = RouteMatcher::new(config.routes.clone());
+        let router =
+            RouteDispatcher::with_connect_timeout(config.routes.clone(), config.connect_timeout);
         config.users.clear();
         config.routes.clear();
         Self {
@@ -146,30 +145,27 @@ impl TrojanServer {
         if request.command == TrojanCommand::UdpAssociate {
             return self.relay_udp_stream(client, request, bandwidth);
         }
-        let remote =
-            match self
-                .router
-                .decide_target(&request.target.host, request.target.port, "tcp")
-            {
-                RouteDecision::Direct => {
-                    connect_target(&request.target, self.config.connect_timeout)?
-                }
-                RouteDecision::Outbound(outbound) => {
-                    connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
-                }
-                RouteDecision::Block => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "target blocked by route",
-                    ));
-                }
-                RouteDecision::UnsupportedOutbound(tag) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("outbound route {tag} is not implemented"),
-                    ));
-                }
-            };
+        let remote = match self
+            .router
+            .decide_tcp(&request.target.host, request.target.port, &[])
+        {
+            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
+            RouteDecision::Outbound(outbound) => {
+                connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
+            }
+            RouteDecision::Block => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target blocked by route",
+                ));
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
         self.relay(client, remote, request, bandwidth)
     }
 
@@ -209,30 +205,27 @@ impl TrojanServer {
         if request.command == TrojanCommand::UdpAssociate {
             return self.relay_udp_split(reader, writer, request, bandwidth);
         }
-        let remote =
-            match self
-                .router
-                .decide_target(&request.target.host, request.target.port, "tcp")
-            {
-                RouteDecision::Direct => {
-                    connect_target(&request.target, self.config.connect_timeout)?
-                }
-                RouteDecision::Outbound(outbound) => {
-                    connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
-                }
-                RouteDecision::Block => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "target blocked by route",
-                    ));
-                }
-                RouteDecision::UnsupportedOutbound(tag) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("outbound route {tag} is not implemented"),
-                    ));
-                }
-            };
+        let remote = match self
+            .router
+            .decide_tcp(&request.target.host, request.target.port, &[])
+        {
+            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
+            RouteDecision::Outbound(outbound) => {
+                connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
+            }
+            RouteDecision::Block => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target blocked by route",
+                ));
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
         self.relay_websocket(reader, writer, remote, request, bandwidth)
     }
 
@@ -250,30 +243,27 @@ impl TrojanServer {
         if request.command == TrojanCommand::UdpAssociate {
             return self.relay_udp_stream(client, request, bandwidth);
         }
-        let remote =
-            match self
-                .router
-                .decide_target(&request.target.host, request.target.port, "tcp")
-            {
-                RouteDecision::Direct => {
-                    connect_target(&request.target, self.config.connect_timeout)?
-                }
-                RouteDecision::Outbound(outbound) => {
-                    connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
-                }
-                RouteDecision::Block => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "target blocked by route",
-                    ));
-                }
-                RouteDecision::UnsupportedOutbound(tag) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("outbound route {tag} is not implemented"),
-                    ));
-                }
-            };
+        let remote = match self
+            .router
+            .decide_tcp(&request.target.host, request.target.port, &[])
+        {
+            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
+            RouteDecision::Outbound(outbound) => {
+                connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
+            }
+            RouteDecision::Block => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target blocked by route",
+                ));
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
         self.relay_tls(client, remote, request, bandwidth)
     }
 
@@ -296,30 +286,27 @@ impl TrojanServer {
         if request.command == TrojanCommand::UdpAssociate {
             return self.relay_udp_stream(websocket, request, bandwidth);
         }
-        let remote =
-            match self
-                .router
-                .decide_target(&request.target.host, request.target.port, "tcp")
-            {
-                RouteDecision::Direct => {
-                    connect_target(&request.target, self.config.connect_timeout)?
-                }
-                RouteDecision::Outbound(outbound) => {
-                    connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
-                }
-                RouteDecision::Block => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "target blocked by route",
-                    ));
-                }
-                RouteDecision::UnsupportedOutbound(tag) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("outbound route {tag} is not implemented"),
-                    ));
-                }
-            };
+        let remote = match self
+            .router
+            .decide_tcp(&request.target.host, request.target.port, &[])
+        {
+            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
+            RouteDecision::Outbound(outbound) => {
+                connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
+            }
+            RouteDecision::Block => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target blocked by route",
+                ));
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
         self.relay_tls_websocket(websocket, remote, request, bandwidth)
     }
 
@@ -585,10 +572,7 @@ impl TrojanServer {
     where
         W: Write,
     {
-        let protocol_labels = route_protocol_labels("udp", payload);
-        let decision = self
-            .router
-            .decide_target(&target.host, target.port, &protocol_labels);
+        let decision = self.router.decide_udp(&target.host, target.port, payload);
         let outbound = match &decision {
             RouteDecision::Direct => None,
             RouteDecision::Outbound(outbound) => Some(outbound),

@@ -47,9 +47,7 @@ use crate::tls::TlsConnection;
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::websocket::{accept_websocket, accept_websocket_tls, connect_websocket_client};
-use crate::{
-    connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
-};
+use crate::{connect_tcp_outbound, send_udp_outbound, RouteDecision, RouteDispatcher};
 
 const VERSION: u8 = 0x01;
 const COMMAND_TCP: u8 = 0x01;
@@ -99,7 +97,7 @@ pub struct VmessServer {
     users: UserStore,
     auth_users: Arc<ArcSwap<Vec<VmessAuthUser>>>,
     replay: Arc<Mutex<HashMap<[u8; 16], Instant>>>,
-    router: RouteMatcher,
+    router: RouteDispatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -186,7 +184,8 @@ impl VmessServer {
     ) -> Self {
         let users = valid_vmess_users(&config.users);
         let auth_users = vmess_auth_users(&users);
-        let router = RouteMatcher::new(config.routes.clone());
+        let router =
+            RouteDispatcher::with_connect_timeout(config.routes.clone(), config.connect_timeout);
         config.users.clear();
         config.routes.clear();
 
@@ -442,7 +441,7 @@ impl VmessServer {
     fn connect_for_request(&self, request: &VmessRequest) -> io::Result<TcpStream> {
         let decision = self
             .router
-            .decide_target(&request.target.host, request.target.port, "tcp");
+            .decide_tcp(&request.target.host, request.target.port, &[]);
         match &decision {
             RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout),
             RouteDecision::Outbound(outbound) => {
@@ -767,10 +766,7 @@ impl VmessServer {
         payload: &[u8],
         bandwidth: Option<&BandwidthLimiter>,
     ) -> io::Result<(u64, Option<Vec<u8>>)> {
-        let protocol_labels = route_protocol_labels("udp", payload);
-        let decision = self
-            .router
-            .decide_target(&target.host, target.port, &protocol_labels);
+        let decision = self.router.decide_udp(&target.host, target.port, payload);
         let outbound = match &decision {
             RouteDecision::Direct => None,
             RouteDecision::Outbound(outbound) => Some(outbound),

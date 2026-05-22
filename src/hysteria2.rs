@@ -26,12 +26,13 @@ use crate::quic_tuning::{
     apply_proxy_quic_transport_defaults, apply_quic_congestion_control, bind_quic_udp_socket,
     proxy_quic_tuning_snapshot, server_endpoint_with_tuned_udp_socket, tune_quic_udp_socket,
 };
-use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
+use crate::routing::RouteDecision;
 use crate::salamander::SalamanderUdpSocket;
 use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
+use crate::RouteDispatcher;
 use crate::{connect_tcp_outbound_tokio, send_udp_outbound_tokio};
 
 const TCP_REQUEST_ID: u64 = 0x401;
@@ -109,7 +110,7 @@ pub struct Hysteria2ObfsConfig {
 pub struct Hysteria2Server {
     config: Hysteria2ServerConfig,
     users: UserStore,
-    router: RouteMatcher,
+    router: RouteDispatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -156,7 +157,8 @@ impl Hysteria2Server {
     ) -> Self {
         let users =
             UserStore::from_keyed_users(&config.users, |user| user.credential().to_string());
-        let router = RouteMatcher::new(config.routes.clone());
+        let router =
+            RouteDispatcher::with_connect_timeout(config.routes.clone(), config.connect_timeout);
         config.users.clear();
         config.routes.clear();
         let listener_connection_limit = quic_connections.per_listener_soft_limit();
@@ -533,7 +535,7 @@ impl Hysteria2Server {
         client_ip: IpAddr,
     ) -> io::Result<()> {
         let target = read_tcp_target(&mut recv).await?;
-        let decision = self.router.decide_target(&target.host, target.port, "tcp");
+        let decision = self.router.decide_tcp(&target.host, target.port, &[]);
         let remote = match &decision {
             RouteDecision::Direct => {
                 match crate::dns::connect_tcp_tokio(
@@ -717,9 +719,8 @@ impl Hysteria2Server {
         let decision = if self.router.is_empty() {
             RouteDecision::Direct
         } else {
-            let protocol_labels = route_protocol_labels("udp", &message.data);
             self.router
-                .decide_target(&message.target.host, message.target.port, &protocol_labels)
+                .decide_udp(&message.target.host, message.target.port, &message.data)
         };
         let outbound = match &decision {
             RouteDecision::Direct => None,

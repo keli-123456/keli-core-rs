@@ -28,9 +28,7 @@ use crate::stream::{
 };
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{apply_user_delta_to_vec, CoreUser, CoreUserDelta, CoreUserDeltaResult};
-use crate::{
-    connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
-};
+use crate::{send_udp_outbound, RouteDecision, RouteDispatcher};
 
 const NONCE_LEN: usize = 24;
 const METADATA_LEN: usize = 32;
@@ -80,7 +78,7 @@ pub struct MieruServer {
     config: MieruServerConfig,
     users: Arc<ArcSwap<Vec<CoreUser>>>,
     user_updates: Arc<Mutex<()>>,
-    router: RouteMatcher,
+    router: RouteDispatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -212,7 +210,8 @@ impl MieruServer {
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
         let users = active_user_list(&config.users);
-        let router = RouteMatcher::new(config.routes.clone());
+        let router =
+            RouteDispatcher::with_connect_timeout(config.routes.clone(), config.connect_timeout);
         config.users.clear();
         config.routes.clear();
         Self {
@@ -378,7 +377,7 @@ fn sync_delta_bandwidth(
 #[derive(Clone)]
 struct MieruSessionRuntime {
     node_tag: String,
-    router: RouteMatcher,
+    router: RouteDispatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -498,29 +497,9 @@ fn handle_mieru_session(
             bandwidth,
         )?
     } else {
-        let protocol_labels = route_protocol_labels("tcp", &initial_payload);
-        let mut remote = match runtime.router.decide_target(
-            &request.target.host,
-            request.target.port,
-            &protocol_labels,
-        ) {
-            RouteDecision::Direct => connect_target(&request.target, runtime.timeout)?,
-            RouteDecision::Outbound(outbound) => {
-                connect_tcp_outbound(&outbound, &request.target, runtime.timeout)?
-            }
-            RouteDecision::Block => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target blocked by route",
-                ));
-            }
-            RouteDecision::UnsupportedOutbound(tag) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("outbound route {tag} is not implemented"),
-                ));
-            }
-        };
+        let mut remote = runtime
+            .router
+            .connect_tcp(&request.target, &initial_payload)?;
         writer.write_open_response()?;
         writer.write_all(&SOCKS_CONNECT_SUCCESS)?;
         let mut upload = 0u64;
@@ -1449,15 +1428,11 @@ fn socks_request_offset(input: &[u8]) -> io::Result<Option<usize>> {
     Ok(Some(greeting_len))
 }
 
-fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStream> {
-    crate::dns::connect_tcp(&target.host, target.port, timeout)
-}
-
 fn relay_mieru_udp_associate<R, W>(
     mut reader: R,
     mut writer: W,
     mut pending: Vec<u8>,
-    router: &RouteMatcher,
+    router: &RouteDispatcher,
     timeout: Duration,
     limiter: Option<Arc<BandwidthLimiter>>,
 ) -> io::Result<(u64, u64)>
@@ -1474,8 +1449,7 @@ where
                 break;
             }
         }
-        let protocol_labels = route_protocol_labels("udp", &payload);
-        let response = match router.decide_target(&target.host, target.port, &protocol_labels) {
+        let response = match router.decide_udp(&target.host, target.port, &payload) {
             RouteDecision::Direct => send_direct_mieru_udp(&target, &payload, timeout),
             RouteDecision::Outbound(outbound) => {
                 send_udp_outbound(&outbound, &target, &payload, timeout)

@@ -14,9 +14,7 @@ use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::stream::{relay_tcp_fast_unlimited, relay_tcp_limited};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
-use crate::{
-    connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
-};
+use crate::{connect_tcp_outbound, send_udp_outbound, RouteDecision, RouteDispatcher};
 
 const SOCKS5_VERSION: u8 = 0x05;
 const AUTH_NONE: u8 = 0x00;
@@ -52,7 +50,7 @@ pub struct Socks5Server {
     config: Socks5ServerConfig,
     users: UserStore,
     auth_required: bool,
-    router: RouteMatcher,
+    router: RouteDispatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -95,7 +93,8 @@ impl Socks5Server {
     ) -> Self {
         let auth_required = !config.users.is_empty();
         let users = UserStore::from_uuid_users(&config.users);
-        let router = RouteMatcher::new(config.routes.clone());
+        let router =
+            RouteDispatcher::with_connect_timeout(config.routes.clone(), config.connect_timeout);
         config.users.clear();
         config.routes.clear();
         Self {
@@ -140,7 +139,7 @@ impl Socks5Server {
         }
         let decision = self
             .router
-            .decide_target(&request.target.host, request.target.port, "tcp");
+            .decide_tcp(&request.target.host, request.target.port, &[]);
         let remote = match &decision {
             RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
             RouteDecision::Outbound(outbound) => {
@@ -385,10 +384,7 @@ impl Socks5Server {
                     }
                     if Some(source) == client_udp_addr {
                         let (target, payload) = parse_udp_request(&buffer[..read])?;
-                        let protocol_labels = route_protocol_labels("udp", payload);
-                        let decision =
-                            self.router
-                                .decide_target(&target.host, target.port, &protocol_labels);
+                        let decision = self.router.decide_udp(&target.host, target.port, payload);
                         match &decision {
                             RouteDecision::Direct => {
                                 if let Some(limiter) = bandwidth.as_deref() {

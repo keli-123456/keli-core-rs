@@ -29,9 +29,7 @@ use crate::stream::{
 };
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{apply_user_delta_to_vec, CoreUser, CoreUserDelta, CoreUserDeltaResult};
-use crate::{
-    connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
-};
+use crate::{send_udp_outbound, RouteDecision, RouteDispatcher};
 
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
@@ -57,7 +55,7 @@ pub struct ShadowsocksServer {
     config: ShadowsocksServerConfig,
     users: Arc<ArcSwap<Vec<CoreUser>>>,
     user_updates: Arc<Mutex<()>>,
-    router: RouteMatcher,
+    router: RouteDispatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -140,7 +138,8 @@ impl ShadowsocksServer {
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
         let users = active_user_list(&config.users);
-        let router = RouteMatcher::new(config.routes.clone());
+        let router =
+            RouteDispatcher::with_connect_timeout(config.routes.clone(), config.connect_timeout);
         config.users.clear();
         config.routes.clear();
         Self {
@@ -169,29 +168,9 @@ impl ShadowsocksServer {
         request.client_ip = client_ip;
         let _session = self.acquire_user_session(&request.user, client_ip)?;
         let bandwidth = self.bandwidth.limiter_for_limited(Some(&request.user));
-        let protocol_labels = route_protocol_labels("tcp", &request.initial_payload);
-        let remote = match self.router.decide_target(
-            &request.target.host,
-            request.target.port,
-            &protocol_labels,
-        ) {
-            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
-            RouteDecision::Outbound(outbound) => {
-                connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
-            }
-            RouteDecision::Block => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target blocked by route",
-                ));
-            }
-            RouteDecision::UnsupportedOutbound(tag) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("outbound route {tag} is not implemented"),
-                ));
-            }
-        };
+        let remote = self
+            .router
+            .connect_tcp(&request.target, &request.initial_payload)?;
         self.relay(method, request, remote, bandwidth)
     }
 
@@ -350,10 +329,9 @@ impl ShadowsocksServer {
         remotes: &mut HashMap<SocketAddr, UdpClientContext>,
         client_sessions: &mut HashMap<SocketAddr, UdpClientSession>,
     ) -> io::Result<()> {
-        let protocol_labels = route_protocol_labels("udp", &request.payload);
         let decision =
             self.router
-                .decide_target(&request.target.host, request.target.port, &protocol_labels);
+                .decide_udp(&request.target.host, request.target.port, &request.payload);
         let outbound = match &decision {
             RouteDecision::Direct => None,
             RouteDecision::Outbound(outbound) => Some(outbound),
@@ -984,10 +962,6 @@ fn parse_request_payload(payload: Vec<u8>) -> io::Result<(SocksTarget, Vec<u8>)>
         },
         payload[position..].to_vec(),
     ))
-}
-
-fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStream> {
-    crate::dns::connect_tcp(&target.host, target.port, timeout)
 }
 
 fn connect_target_with_timeout(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStream> {

@@ -1,4 +1,4 @@
-﻿use std::fs;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -6,8 +6,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use keli_core_rs::config::{
-    CoreConfig, DnsConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig,
-    TransportConfig,
+    CoreConfig, DnsConfig, InboundConfig, OutboundConfig, PolicyConfig, SniffingConfig,
+    StatsConfig, TransportConfig,
 };
 use keli_core_rs::protocol::Protocol;
 use keli_core_rs::user::CoreUser;
@@ -71,6 +71,7 @@ fn config(port: u16, user_uuid: &str) -> CoreConfig {
         instance_id: "smoke".to_string(),
         log_level: "info".to_string(),
         dns: DnsConfig::default(),
+        policy: PolicyConfig::default(),
         inbounds: vec![InboundConfig {
             tag: "panel|socks|1".to_string(),
             protocol: Protocol::Socks,

@@ -17,7 +17,7 @@ use crate::stream::{
 };
 use crate::traffic::{SharedTrafficRegistry, TrafficDelta, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
-use crate::{connect_tcp_outbound, RouteDecision, RouteMatcher, SocksTarget};
+use crate::{RouteDispatcher, SocksTarget};
 
 #[derive(Clone, Debug)]
 pub struct HttpProxyServerConfig {
@@ -33,7 +33,7 @@ pub struct HttpProxyServer {
     config: HttpProxyServerConfig,
     users: UserStore,
     auth_required: bool,
-    router: RouteMatcher,
+    router: RouteDispatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -78,7 +78,8 @@ impl HttpProxyServer {
     ) -> Self {
         let auth_required = !config.users.is_empty();
         let users = UserStore::from_uuid_users(&config.users);
-        let router = RouteMatcher::new(config.routes.clone());
+        let router =
+            RouteDispatcher::with_connect_timeout(config.routes.clone(), config.connect_timeout);
         config.users.clear();
         config.routes.clear();
         Self {
@@ -290,28 +291,13 @@ impl HttpProxyServer {
         target: &HttpTarget,
         protocol_labels: &str,
     ) -> io::Result<TcpStream> {
-        let decision = self
-            .router
-            .decide_target(&target.host, target.port, protocol_labels);
-        match &decision {
-            RouteDecision::Direct => connect_target(target, self.config.connect_timeout),
-            RouteDecision::Outbound(outbound) => connect_tcp_outbound(
-                outbound,
-                &SocksTarget {
-                    host: target.host.clone(),
-                    port: target.port,
-                },
-                self.config.connect_timeout,
-            ),
-            RouteDecision::Block => Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "target blocked by route",
-            )),
-            RouteDecision::UnsupportedOutbound(tag) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("outbound route {tag} is not implemented"),
-            )),
-        }
+        self.router.connect_tcp_with_labels(
+            &SocksTarget {
+                host: target.host.clone(),
+                port: target.port,
+            },
+            protocol_labels,
+        )
     }
 
     fn record_traffic(
@@ -366,10 +352,6 @@ fn sync_delta_bandwidth(
     delta: &CoreUserDelta,
 ) {
     sync_user_limit_delta(bandwidth, sessions, delta);
-}
-
-fn connect_target(target: &HttpTarget, timeout: Duration) -> io::Result<TcpStream> {
-    crate::dns::connect_tcp(&target.host, target.port, timeout)
 }
 
 fn parse_basic_auth(value: &str) -> Option<(String, String)> {

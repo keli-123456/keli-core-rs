@@ -5,6 +5,7 @@ pub mod config;
 pub mod config_io;
 pub mod control;
 pub mod control_server;
+pub mod dispatcher;
 pub mod dns;
 pub mod grpc;
 pub mod http2;
@@ -58,7 +59,7 @@ pub(crate) mod test_support {
 pub use abuse::{ClientFailureBackoff, ClientFailureBackoffPolicy, ClientFailureBackoffSnapshot};
 pub use anytls::{AnyTlsServer, AnyTlsServerConfig};
 pub use config::{
-    CoreConfig, InboundConfig, OutboundConfig, RealityConfig, RouteAction, RouteRule,
+    CoreConfig, InboundConfig, OutboundConfig, PolicyConfig, RealityConfig, RouteAction, RouteRule,
     SniffingConfig, StatsConfig, TlsConfig, TransportConfig, ValidationError,
 };
 pub use config_io::load_core_config_json;
@@ -66,6 +67,7 @@ pub use control::{CoreCommand, CoreController, CoreResponse};
 pub use control_server::{
     start_control_server, start_control_server_with_token, ControlServerError, ControlServerHandle,
 };
+pub use dispatcher::RouteDispatcher;
 pub use dns::DnsMetricsSnapshot;
 pub use http_proxy::{HttpProxyServer, HttpProxyServerConfig};
 pub use hysteria2::{Hysteria2Server, Hysteria2ServerConfig};

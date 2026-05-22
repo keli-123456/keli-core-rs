@@ -43,8 +43,8 @@ use crate::websocket::{
     WebSocketClientStream,
 };
 use crate::{
-    connect_tcp_outbound, connect_tcp_outbound_tokio, route_protocol_labels, send_udp_outbound,
-    send_udp_outbound_tokio, RouteDecision, RouteMatcher,
+    connect_tcp_outbound, connect_tcp_outbound_tokio, send_udp_outbound, send_udp_outbound_tokio,
+    RouteDecision, RouteDispatcher,
 };
 
 const VERSION: u8 = 0x00;
@@ -80,7 +80,7 @@ pub struct VlessServerConfig {
 pub struct VlessServer {
     config: VlessServerConfig,
     users: UserStore,
-    router: RouteMatcher,
+    router: RouteDispatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -141,7 +141,8 @@ impl VlessServer {
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
         let users = UserStore::from_keyed_users(&config.users, |user| compact_uuid(&user.uuid));
-        let router = RouteMatcher::new(config.routes.clone());
+        let router =
+            RouteDispatcher::with_connect_timeout(config.routes.clone(), config.connect_timeout);
         config.users.clear();
         config.routes.clear();
         Self {
@@ -188,49 +189,48 @@ impl VlessServer {
             return self.relay_udp_stream(client, request, bandwidth);
         }
         let bandwidth = self.bandwidth.limiter_for_limited(user.as_ref());
-        let remote =
-            match self
-                .router
-                .decide_target(&request.target.host, request.target.port, "tcp")
-            {
-                RouteDecision::Direct => {
-                    match connect_target(&request.target, self.config.connect_timeout) {
-                        Ok(remote) => remote,
-                        Err(error) => {
-                            let _ = client.shutdown(Shutdown::Both);
-                            return Err(error);
-                        }
+        let remote = match self
+            .router
+            .decide_tcp(&request.target.host, request.target.port, &[])
+        {
+            RouteDecision::Direct => {
+                match connect_target(&request.target, self.config.connect_timeout) {
+                    Ok(remote) => remote,
+                    Err(error) => {
+                        let _ = client.shutdown(Shutdown::Both);
+                        return Err(error);
                     }
                 }
-                RouteDecision::Outbound(outbound) => {
-                    match connect_vless_route_tcp_outbound(
-                        &self.config.node_tag,
-                        &outbound,
-                        &request.target,
-                        self.config.connect_timeout,
-                    ) {
-                        Ok(remote) => remote,
-                        Err(error) => {
-                            let _ = client.shutdown(Shutdown::Both);
-                            return Err(error);
-                        }
+            }
+            RouteDecision::Outbound(outbound) => {
+                match connect_vless_route_tcp_outbound(
+                    &self.config.node_tag,
+                    &outbound,
+                    &request.target,
+                    self.config.connect_timeout,
+                ) {
+                    Ok(remote) => remote,
+                    Err(error) => {
+                        let _ = client.shutdown(Shutdown::Both);
+                        return Err(error);
                     }
                 }
-                RouteDecision::Block => {
-                    let _ = client.shutdown(Shutdown::Both);
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "target blocked by route",
-                    ));
-                }
-                RouteDecision::UnsupportedOutbound(tag) => {
-                    let _ = client.shutdown(Shutdown::Both);
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("outbound route {tag} is not implemented"),
-                    ));
-                }
-            };
+            }
+            RouteDecision::Block => {
+                let _ = client.shutdown(Shutdown::Both);
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target blocked by route",
+                ));
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                let _ = client.shutdown(Shutdown::Both);
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
         if let Err(error) = client.write_all(&[VERSION, 0x00]) {
             let _ = client.shutdown(Shutdown::Both);
             return Err(error);
@@ -278,59 +278,58 @@ impl VlessServer {
                 "vless vision requires the tls handler",
             ));
         }
-        let remote =
-            match self
-                .router
-                .decide_target(&request.target.host, request.target.port, "tcp")
-            {
-                RouteDecision::Direct => {
-                    match connect_target_async(&request.target, self.config.connect_timeout).await {
-                        Ok(remote) => remote,
-                        Err(error) => {
-                            if let Some(socket) = &client_shutdown {
-                                let _ = socket.shutdown(Shutdown::Both);
-                            }
-                            return Err(error);
+        let remote = match self
+            .router
+            .decide_tcp(&request.target.host, request.target.port, &[])
+        {
+            RouteDecision::Direct => {
+                match connect_target_async(&request.target, self.config.connect_timeout).await {
+                    Ok(remote) => remote,
+                    Err(error) => {
+                        if let Some(socket) = &client_shutdown {
+                            let _ = socket.shutdown(Shutdown::Both);
                         }
+                        return Err(error);
                     }
                 }
-                RouteDecision::Outbound(outbound) => {
-                    match connect_vless_route_tcp_outbound_tokio(
-                        &self.config.node_tag,
-                        &outbound,
-                        &request.target,
-                        self.config.connect_timeout,
-                    )
-                    .await
-                    {
-                        Ok(remote) => remote,
-                        Err(error) => {
-                            if let Some(socket) = &client_shutdown {
-                                let _ = socket.shutdown(Shutdown::Both);
-                            }
-                            return Err(error);
+            }
+            RouteDecision::Outbound(outbound) => {
+                match connect_vless_route_tcp_outbound_tokio(
+                    &self.config.node_tag,
+                    &outbound,
+                    &request.target,
+                    self.config.connect_timeout,
+                )
+                .await
+                {
+                    Ok(remote) => remote,
+                    Err(error) => {
+                        if let Some(socket) = &client_shutdown {
+                            let _ = socket.shutdown(Shutdown::Both);
                         }
+                        return Err(error);
                     }
                 }
-                RouteDecision::Block => {
-                    if let Some(socket) = &client_shutdown {
-                        let _ = socket.shutdown(Shutdown::Both);
-                    }
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "target blocked by route",
-                    ));
+            }
+            RouteDecision::Block => {
+                if let Some(socket) = &client_shutdown {
+                    let _ = socket.shutdown(Shutdown::Both);
                 }
-                RouteDecision::UnsupportedOutbound(tag) => {
-                    if let Some(socket) = &client_shutdown {
-                        let _ = socket.shutdown(Shutdown::Both);
-                    }
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("outbound route {tag} is not implemented"),
-                    ));
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target blocked by route",
+                ));
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                if let Some(socket) = &client_shutdown {
+                    let _ = socket.shutdown(Shutdown::Both);
                 }
-            };
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
         if let Err(error) = client.write_all(&[VERSION, 0x00]).await {
             if let Some(socket) = &client_shutdown {
                 let _ = socket.shutdown(Shutdown::Both);
@@ -393,33 +392,30 @@ impl VlessServer {
             writer.write_all(&[VERSION, 0x00])?;
             return self.relay_udp_split(reader, writer, request, bandwidth);
         }
-        let remote =
-            match self
-                .router
-                .decide_target(&request.target.host, request.target.port, "tcp")
-            {
-                RouteDecision::Direct => {
-                    connect_target(&request.target, self.config.connect_timeout)?
-                }
-                RouteDecision::Outbound(outbound) => connect_vless_route_tcp_outbound(
-                    &self.config.node_tag,
-                    &outbound,
-                    &request.target,
-                    self.config.connect_timeout,
-                )?,
-                RouteDecision::Block => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "target blocked by route",
-                    ));
-                }
-                RouteDecision::UnsupportedOutbound(tag) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("outbound route {tag} is not implemented"),
-                    ));
-                }
-            };
+        let remote = match self
+            .router
+            .decide_tcp(&request.target.host, request.target.port, &[])
+        {
+            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
+            RouteDecision::Outbound(outbound) => connect_vless_route_tcp_outbound(
+                &self.config.node_tag,
+                &outbound,
+                &request.target,
+                self.config.connect_timeout,
+            )?,
+            RouteDecision::Block => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target blocked by route",
+                ));
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
         writer.write_all(&[VERSION, 0x00])?;
         self.relay_websocket(reader, writer, remote, request, bandwidth)
     }
@@ -455,33 +451,30 @@ impl VlessServer {
             client.write_all(&[VERSION, 0x00])?;
             return self.relay_udp_stream(client, request, bandwidth);
         }
-        let remote =
-            match self
-                .router
-                .decide_target(&request.target.host, request.target.port, "tcp")
-            {
-                RouteDecision::Direct => {
-                    connect_target(&request.target, self.config.connect_timeout)?
-                }
-                RouteDecision::Outbound(outbound) => connect_vless_route_tcp_outbound(
-                    &self.config.node_tag,
-                    &outbound,
-                    &request.target,
-                    self.config.connect_timeout,
-                )?,
-                RouteDecision::Block => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "target blocked by route",
-                    ));
-                }
-                RouteDecision::UnsupportedOutbound(tag) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("outbound route {tag} is not implemented"),
-                    ));
-                }
-            };
+        let remote = match self
+            .router
+            .decide_tcp(&request.target.host, request.target.port, &[])
+        {
+            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
+            RouteDecision::Outbound(outbound) => connect_vless_route_tcp_outbound(
+                &self.config.node_tag,
+                &outbound,
+                &request.target,
+                self.config.connect_timeout,
+            )?,
+            RouteDecision::Block => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target blocked by route",
+                ));
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
         trace_vless(|| {
             format!(
                 "tls request target={}:{} flow={} user={}",
@@ -524,33 +517,30 @@ impl VlessServer {
             websocket.write_all(&[VERSION, 0x00])?;
             return self.relay_udp_stream(websocket, request, bandwidth);
         }
-        let remote =
-            match self
-                .router
-                .decide_target(&request.target.host, request.target.port, "tcp")
-            {
-                RouteDecision::Direct => {
-                    connect_target(&request.target, self.config.connect_timeout)?
-                }
-                RouteDecision::Outbound(outbound) => connect_vless_route_tcp_outbound(
-                    &self.config.node_tag,
-                    &outbound,
-                    &request.target,
-                    self.config.connect_timeout,
-                )?,
-                RouteDecision::Block => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "target blocked by route",
-                    ));
-                }
-                RouteDecision::UnsupportedOutbound(tag) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("outbound route {tag} is not implemented"),
-                    ));
-                }
-            };
+        let remote = match self
+            .router
+            .decide_tcp(&request.target.host, request.target.port, &[])
+        {
+            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
+            RouteDecision::Outbound(outbound) => connect_vless_route_tcp_outbound(
+                &self.config.node_tag,
+                &outbound,
+                &request.target,
+                self.config.connect_timeout,
+            )?,
+            RouteDecision::Block => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target blocked by route",
+                ));
+            }
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
         websocket.write_all(&[VERSION, 0x00])?;
         self.relay_tls_websocket(websocket, remote, request, bandwidth)
     }
@@ -1034,10 +1024,7 @@ impl VlessServer {
     where
         W: Write,
     {
-        let protocol_labels = route_protocol_labels("udp", payload);
-        let decision = self
-            .router
-            .decide_target(&target.host, target.port, &protocol_labels);
+        let decision = self.router.decide_udp(&target.host, target.port, payload);
         let outbound = match &decision {
             RouteDecision::Direct => None,
             RouteDecision::Outbound(outbound) => Some(outbound),
@@ -1114,10 +1101,7 @@ impl VlessServer {
     where
         W: AsyncWrite + Unpin,
     {
-        let protocol_labels = route_protocol_labels("udp", payload);
-        let decision = self
-            .router
-            .decide_target(&target.host, target.port, &protocol_labels);
+        let decision = self.router.decide_udp(&target.host, target.port, payload);
         let outbound = match &decision {
             RouteDecision::Direct => None,
             RouteDecision::Outbound(outbound) => Some(outbound),

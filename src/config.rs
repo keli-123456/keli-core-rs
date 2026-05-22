@@ -18,6 +18,8 @@ pub struct CoreConfig {
     pub log_level: String,
     #[serde(default)]
     pub dns: DnsConfig,
+    #[serde(default)]
+    pub policy: PolicyConfig,
     pub inbounds: Vec<InboundConfig>,
     pub outbounds: Vec<OutboundConfig>,
     pub routes: Vec<RouteRule>,
@@ -183,6 +185,24 @@ pub struct SniffingConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyConfig {
+    #[serde(default = "default_handshake_secs")]
+    pub handshake_secs: u64,
+    #[serde(default = "default_connection_idle_secs")]
+    pub connection_idle_secs: u64,
+    #[serde(default = "default_uplink_only_secs")]
+    pub uplink_only_secs: u64,
+    #[serde(default = "default_downlink_only_secs")]
+    pub downlink_only_secs: u64,
+    #[serde(default = "default_buffer_size_kib")]
+    pub buffer_size_kib: usize,
+    #[serde(default = "default_sniffing_cache_millis")]
+    pub sniffing_cache_millis: u64,
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatsConfig {
     pub enabled: bool,
     pub per_user: bool,
@@ -231,6 +251,7 @@ impl CoreConfig {
         self.validate_outbounds()?;
         self.validate_dns()?;
         self.validate_routes()?;
+        validate_policy(&self.policy)?;
 
         Ok(())
     }
@@ -1395,6 +1416,40 @@ fn validate_hysteria2_transport_options(
     Ok(())
 }
 
+fn validate_policy(policy: &PolicyConfig) -> Result<(), ValidationError> {
+    if policy.handshake_secs == 0 {
+        return Err(ValidationError::new(
+            "policy handshake_secs must be greater than 0",
+        ));
+    }
+    if policy.connection_idle_secs == 0 {
+        return Err(ValidationError::new(
+            "policy connection_idle_secs must be greater than 0",
+        ));
+    }
+    if policy.buffer_size_kib == 0 {
+        return Err(ValidationError::new(
+            "policy buffer_size_kib must be greater than 0",
+        ));
+    }
+    if policy.sniffing_cache_millis == 0 {
+        return Err(ValidationError::new(
+            "policy sniffing_cache_millis must be greater than 0",
+        ));
+    }
+    if policy.connect_timeout_secs == 0 {
+        return Err(ValidationError::new(
+            "policy connect_timeout_secs must be greater than 0",
+        ));
+    }
+    if policy.connect_timeout_secs > 60 {
+        return Err(ValidationError::new(
+            "policy connect_timeout_secs must be at most 60",
+        ));
+    }
+    Ok(())
+}
+
 fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
@@ -1410,6 +1465,48 @@ impl Default for SniffingConfig {
             dest_override: vec!["http".to_string(), "tls".to_string()],
         }
     }
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            handshake_secs: default_handshake_secs(),
+            connection_idle_secs: default_connection_idle_secs(),
+            uplink_only_secs: default_uplink_only_secs(),
+            downlink_only_secs: default_downlink_only_secs(),
+            buffer_size_kib: default_buffer_size_kib(),
+            sniffing_cache_millis: default_sniffing_cache_millis(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+        }
+    }
+}
+
+fn default_handshake_secs() -> u64 {
+    4
+}
+
+fn default_connection_idle_secs() -> u64 {
+    120
+}
+
+fn default_uplink_only_secs() -> u64 {
+    2
+}
+
+fn default_downlink_only_secs() -> u64 {
+    4
+}
+
+fn default_buffer_size_kib() -> usize {
+    128
+}
+
+fn default_sniffing_cache_millis() -> u64 {
+    200
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    15
 }
 
 impl Default for StatsConfig {
@@ -1430,8 +1527,8 @@ mod tests {
 
     use super::{
         CoreConfig, DnsConfig, InboundConfig, OutboundConfig, OutboundTlsConfig,
-        OutboundTransportConfig, RealityConfig, SniffingConfig, StatsConfig, TlsConfig,
-        TransportConfig,
+        OutboundTransportConfig, PolicyConfig, RealityConfig, SniffingConfig, StatsConfig,
+        TlsConfig, TransportConfig,
     };
 
     fn user() -> CoreUser {
@@ -1446,11 +1543,25 @@ mod tests {
     }
 
     #[test]
+    fn policy_defaults_match_go_xray_runtime_policy() {
+        let policy = PolicyConfig::default();
+
+        assert_eq!(policy.handshake_secs, 4);
+        assert_eq!(policy.connection_idle_secs, 120);
+        assert_eq!(policy.uplink_only_secs, 2);
+        assert_eq!(policy.downlink_only_secs, 4);
+        assert_eq!(policy.buffer_size_kib, 128);
+        assert_eq!(policy.sniffing_cache_millis, 200);
+        assert_eq!(policy.connect_timeout_secs, 15);
+    }
+
+    #[test]
     fn validates_basic_core_plan() {
         let config = CoreConfig {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
             dns: DnsConfig::default(),
+            policy: PolicyConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|vless|1".to_string(),
                 protocol: Protocol::Vless,
@@ -1490,6 +1601,7 @@ mod tests {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
             dns: DnsConfig::default(),
+            policy: PolicyConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|vless|1".to_string(),
                 protocol: Protocol::Vless,
@@ -1594,6 +1706,7 @@ mod tests {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
             dns: DnsConfig::default(),
+            policy: PolicyConfig::default(),
             inbounds: vec![first, second],
             outbounds: vec![OutboundConfig {
                 tag: "direct".to_string(),
@@ -1637,6 +1750,7 @@ mod tests {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
             dns: DnsConfig::default(),
+            policy: PolicyConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|http|1".to_string(),
                 protocol: Protocol::Http,
@@ -1686,6 +1800,7 @@ mod tests {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
             dns: DnsConfig::default(),
+            policy: PolicyConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|http|1".to_string(),
                 protocol: Protocol::Http,
@@ -1744,6 +1859,7 @@ mod tests {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
             dns: DnsConfig::default(),
+            policy: PolicyConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|http|1".to_string(),
                 protocol: Protocol::Http,
@@ -1835,6 +1951,7 @@ mod tests {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
             dns: DnsConfig::default(),
+            policy: PolicyConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|http|1".to_string(),
                 protocol: Protocol::Http,
@@ -2005,6 +2122,7 @@ mod tests {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
             dns: DnsConfig::default(),
+            policy: PolicyConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|http|1".to_string(),
                 protocol: Protocol::Http,
@@ -2057,6 +2175,7 @@ mod tests {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
             dns: DnsConfig::default(),
+            policy: PolicyConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|http|1".to_string(),
                 protocol: Protocol::Http,

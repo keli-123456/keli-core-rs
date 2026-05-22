@@ -23,9 +23,7 @@ use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{
     apply_user_delta_to_keyed_arc_map, CoreUser, CoreUserDelta, CoreUserDeltaResult,
 };
-use crate::{
-    connect_tcp_outbound, route_protocol_labels, send_udp_outbound, RouteDecision, RouteMatcher,
-};
+use crate::{send_udp_outbound, RouteDecision, RouteDispatcher};
 
 const CMD_WASTE: u8 = 0;
 const CMD_SYN: u8 = 1;
@@ -63,7 +61,7 @@ pub struct AnyTlsServer {
     config: AnyTlsServerConfig,
     users: Arc<ArcSwap<HashMap<[u8; 32], Arc<CoreUser>>>>,
     user_updates: Arc<Mutex<()>>,
-    router: RouteMatcher,
+    router: RouteDispatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -162,7 +160,8 @@ impl AnyTlsServer {
         bandwidth: UserBandwidthLimiters,
     ) -> Self {
         let users = anytls_user_map(&config.users);
-        let router = RouteMatcher::new(config.routes.clone());
+        let router =
+            RouteDispatcher::with_connect_timeout(config.routes.clone(), config.connect_timeout);
         config.users.clear();
         config.routes.clear();
         Self {
@@ -434,28 +433,7 @@ impl AnyTlsServer {
         target: SocksTarget,
         initial_payload: &[u8],
     ) -> io::Result<()> {
-        let protocol_labels = route_protocol_labels("tcp", initial_payload);
-        let decision = self
-            .router
-            .decide_target(&target.host, target.port, &protocol_labels);
-        let remote = match &decision {
-            RouteDecision::Direct => connect_target(&target, self.config.connect_timeout)?,
-            RouteDecision::Outbound(outbound) => {
-                connect_tcp_outbound(outbound, &target, self.config.connect_timeout)?
-            }
-            RouteDecision::Block => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target blocked by route",
-                ));
-            }
-            RouteDecision::UnsupportedOutbound(tag) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("outbound route {tag} is not implemented"),
-                ));
-            }
-        };
+        let remote = self.router.connect_tcp(&target, initial_payload)?;
         let mut remote_read = remote.try_clone()?;
         let writer = session.writer.clone();
         let traffic = session.traffic.clone();
@@ -520,10 +498,7 @@ impl AnyTlsServer {
         target: &SocksTarget,
         payload: &[u8],
     ) -> io::Result<(u64, u64)> {
-        let protocol_labels = route_protocol_labels("udp", payload);
-        let decision = self
-            .router
-            .decide_target(&target.host, target.port, &protocol_labels);
+        let decision = self.router.decide_udp(&target.host, target.port, payload);
         let outbound = match &decision {
             RouteDecision::Direct => None,
             RouteDecision::Outbound(outbound) => Some(outbound),
@@ -1007,10 +982,6 @@ fn parse_socks_addr(bytes: &[u8]) -> io::Result<(SocksTarget, usize)> {
     let port = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
     offset += 2;
     Ok((SocksTarget { host, port }, offset))
-}
-
-fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStream> {
-    crate::dns::connect_tcp(&target.host, target.port, timeout)
 }
 
 fn resolve_udp_target(target: &SocksTarget) -> io::Result<SocketAddr> {

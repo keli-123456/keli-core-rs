@@ -30,7 +30,7 @@ use crate::tls::server_config_from_files;
 use crate::tls::{classify_tls_handshake_error, TlsHandshakeErrorClass};
 use crate::traffic::{SharedTrafficRegistry, TrafficDelta, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
-use crate::{connect_tcp_outbound_tokio, RouteDecision, RouteMatcher, SocksTarget};
+use crate::{connect_tcp_outbound_tokio, RouteDecision, RouteDispatcher, SocksTarget};
 
 const PADDING_FRAMES: u8 = 8;
 const MAX_PADDED_PAYLOAD: usize = u16::MAX as usize;
@@ -63,7 +63,7 @@ pub struct NaiveServerConfig {
 pub struct NaiveServer {
     config: NaiveServerConfig,
     users: UserStore,
-    router: RouteMatcher,
+    router: RouteDispatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -161,7 +161,8 @@ impl NaiveServer {
         auth_failures: ClientFailureBackoff,
     ) -> io::Result<Self> {
         let users = UserStore::from_uuid_users(&config.users);
-        let router = RouteMatcher::new(config.routes.clone());
+        let router =
+            RouteDispatcher::with_connect_timeout(config.routes.clone(), config.connect_timeout);
         let tls_acceptor = naive_tls_acceptor(&config)?;
         config.users.clear();
         config.routes.clear();
@@ -410,7 +411,7 @@ impl NaiveServer {
 
         let decision = self
             .router
-            .decide_target(&request.target.host, request.target.port, "tcp");
+            .decide_tcp(&request.target.host, request.target.port, &[]);
         let remote = match self.connect_remote(&request.target, &decision).await {
             Ok(remote) => remote,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
@@ -501,7 +502,7 @@ impl NaiveServer {
 
         let decision = self
             .router
-            .decide_target(&request.target.host, request.target.port, "tcp");
+            .decide_tcp(&request.target.host, request.target.port, &[]);
         let remote = match self.connect_remote(&request.target, &decision).await {
             Ok(remote) => remote,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {

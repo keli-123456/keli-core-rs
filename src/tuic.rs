@@ -20,13 +20,14 @@ use crate::quic_tuning::{
     apply_proxy_quic_transport_defaults, apply_quic_congestion_control, proxy_quic_tuning_snapshot,
     server_endpoint_with_tuned_udp_socket,
 };
-use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
+use crate::routing::RouteDecision;
 use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{
     apply_user_delta_to_keyed_arc_map, CoreUser, CoreUserDelta, CoreUserDeltaResult,
 };
+use crate::RouteDispatcher;
 use crate::{connect_tcp_outbound_tokio, send_udp_outbound_tokio};
 
 const VERSION: u8 = 0x05;
@@ -63,7 +64,7 @@ pub struct TuicServer {
     config: TuicServerConfig,
     users: Arc<ArcSwap<HashMap<[u8; 16], Arc<CoreUser>>>>,
     user_updates: Arc<Mutex<()>>,
-    router: RouteMatcher,
+    router: RouteDispatcher,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -103,7 +104,8 @@ impl TuicServer {
         quic_connections: SharedQuicConnectionLimiter,
     ) -> Self {
         let users = tuic_user_map(&config.users);
-        let router = RouteMatcher::new(config.routes.clone());
+        let router =
+            RouteDispatcher::with_connect_timeout(config.routes.clone(), config.connect_timeout);
         config.users.clear();
         config.routes.clear();
         Self {
@@ -357,7 +359,7 @@ impl TuicServer {
             ));
         }
         let target = read_address(&mut recv).await?;
-        let decision = self.router.decide_target(&target.host, target.port, "tcp");
+        let decision = self.router.decide_tcp(&target.host, target.port, &[]);
         let remote = match &decision {
             RouteDecision::Direct => {
                 crate::dns::connect_tcp_tokio(
@@ -543,10 +545,9 @@ impl TuicServer {
         let Some(target) = packet.target else {
             return Ok(());
         };
-        let protocol_labels = route_protocol_labels("udp", &packet.payload);
         let decision = self
             .router
-            .decide_target(&target.host, target.port, &protocol_labels);
+            .decide_udp(&target.host, target.port, &packet.payload);
         let outbound = match &decision {
             RouteDecision::Direct => None,
             RouteDecision::Outbound(outbound) => Some(outbound),

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::abuse::{ClientFailureBackoff, ClientFailureBackoffSnapshot};
 use crate::anytls::{AnyTlsServer, AnyTlsServerConfig};
-use crate::config::{CoreConfig, InboundConfig, TransportConfig, ValidationError};
+use crate::config::{CoreConfig, InboundConfig, PolicyConfig, TransportConfig, ValidationError};
 use crate::grpc::{
     run_grpc_listener, GrpcHunkReader, GrpcHunkWriter, GrpcStreamHandler, GrpcTlsConfig,
 };
@@ -49,7 +49,6 @@ const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 256;
 const DEFAULT_CONNECTION_WORKER_STACK_KIB: usize = 2048;
 const MIN_CONNECTION_WORKER_STACK_KIB: usize = 256;
 const MAX_CONNECTION_WORKER_STACK_KIB: usize = 8192;
-const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS: u64 = 15;
 const QUIC_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 static TCP_ACCEPT_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
@@ -168,6 +167,7 @@ impl CoreService {
         validate_unique_listener_binds(&config.inbounds)
             .map_err(CoreServiceError::InvalidConfig)?;
         crate::dns::configure(config.dns.clone());
+        let connect_timeout = outbound_connect_timeout(&config.policy);
         let active_config = config_without_users(&config);
 
         let traffic = TrafficRegistry::shared();
@@ -206,6 +206,7 @@ impl CoreService {
                 Protocol::Socks => start_socks_listener(
                     &inbound,
                     routes.clone(),
+                    connect_timeout,
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
@@ -213,6 +214,7 @@ impl CoreService {
                 Protocol::Http => start_http_listener(
                     &inbound,
                     routes.clone(),
+                    connect_timeout,
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
@@ -220,6 +222,7 @@ impl CoreService {
                 Protocol::Vless => start_vless_listener(
                     &inbound,
                     routes.clone(),
+                    connect_timeout,
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
@@ -228,6 +231,7 @@ impl CoreService {
                 Protocol::Vmess => start_vmess_listener(
                     &inbound,
                     routes.clone(),
+                    connect_timeout,
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
@@ -236,6 +240,7 @@ impl CoreService {
                 Protocol::Trojan => start_trojan_listener(
                     &inbound,
                     routes.clone(),
+                    connect_timeout,
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
@@ -244,6 +249,7 @@ impl CoreService {
                 Protocol::Shadowsocks => start_shadowsocks_listener(
                     &inbound,
                     routes.clone(),
+                    connect_timeout,
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
@@ -251,6 +257,7 @@ impl CoreService {
                 Protocol::AnyTls => start_anytls_listener(
                     &inbound,
                     routes.clone(),
+                    connect_timeout,
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
@@ -259,6 +266,7 @@ impl CoreService {
                 Protocol::Tuic => start_tuic_listener(
                     &inbound,
                     routes.clone(),
+                    connect_timeout,
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
@@ -270,6 +278,7 @@ impl CoreService {
                 Protocol::Hysteria2 => start_hysteria2_listener(
                     &inbound,
                     routes.clone(),
+                    connect_timeout,
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
@@ -281,6 +290,7 @@ impl CoreService {
                 Protocol::Mieru => start_mieru_listener(
                     &inbound,
                     routes.clone(),
+                    connect_timeout,
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
@@ -288,6 +298,7 @@ impl CoreService {
                 Protocol::Naive => start_naive_listener(
                     &inbound,
                     routes.clone(),
+                    connect_timeout,
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
@@ -443,17 +454,20 @@ fn config_without_users(config: &CoreConfig) -> CoreConfig {
     config
 }
 
-fn outbound_connect_timeout() -> Duration {
-    outbound_connect_timeout_from_env(std::env::var("KELI_CORE_OUTBOUND_CONNECT_TIMEOUT_SECS").ok())
+fn outbound_connect_timeout(policy: &PolicyConfig) -> Duration {
+    outbound_connect_timeout_from_env(
+        std::env::var("KELI_CORE_OUTBOUND_CONNECT_TIMEOUT_SECS").ok(),
+        policy.connect_timeout_secs,
+    )
 }
 
-fn outbound_connect_timeout_from_env(value: Option<String>) -> Duration {
+fn outbound_connect_timeout_from_env(value: Option<String>, default_secs: u64) -> Duration {
     value
         .as_deref()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
         .map(|seconds| Duration::from_secs(seconds.clamp(1, 60)))
-        .unwrap_or_else(|| Duration::from_secs(DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS))
+        .unwrap_or_else(|| Duration::from_secs(default_secs.clamp(1, 60)))
 }
 
 fn start_grpc_transport_listener(
@@ -542,6 +556,7 @@ fn start_grpc_transport_listener(
 fn start_vmess_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
+    connect_timeout: Duration,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -559,7 +574,7 @@ fn start_vmess_listener(
             listen,
             users: inbound.users.clone(),
             routes,
-            connect_timeout: outbound_connect_timeout(),
+            connect_timeout,
         },
         traffic,
         sessions,
@@ -619,18 +634,26 @@ fn start_vmess_listener(
             let tag = tag.clone();
             let _ = handle_tcp_connection_with_failure_backoff(stream, move |stream| {
                 if let Some(acceptor) = tls_acceptor {
-                    accept_tls_connection(&acceptor, stream, Protocol::Vmess, &tag, &tls_failures)
-                        .and_then(|client| match network.as_str() {
-                            "ws" => server
-                                .handle_tls_websocket_client(client, websocket_path.as_deref()),
-                            "httpupgrade" => accept_httpupgrade_tls(
-                                client,
-                                websocket_path.as_deref(),
-                                httpupgrade_host.as_deref(),
-                            )
-                            .and_then(|client| server.handle_tls_client(client)),
-                            _ => server.handle_tls_client(client),
-                        })
+                    accept_tls_connection(
+                        &acceptor,
+                        stream,
+                        Protocol::Vmess,
+                        &tag,
+                        &tls_failures,
+                        connect_timeout,
+                    )
+                    .and_then(|client| match network.as_str() {
+                        "ws" => {
+                            server.handle_tls_websocket_client(client, websocket_path.as_deref())
+                        }
+                        "httpupgrade" => accept_httpupgrade_tls(
+                            client,
+                            websocket_path.as_deref(),
+                            httpupgrade_host.as_deref(),
+                        )
+                        .and_then(|client| server.handle_tls_client(client)),
+                        _ => server.handle_tls_client(client),
+                    })
                 } else if network == "ws" {
                     server.handle_websocket_client(stream, websocket_path.as_deref())
                 } else if network == "httpupgrade" {
@@ -663,6 +686,7 @@ fn start_vmess_listener(
 fn start_hysteria2_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
+    connect_timeout: Duration,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -689,7 +713,7 @@ fn start_hysteria2_listener(
             server_name: tls.server_name.clone(),
             alpn: tls.alpn.clone(),
             reject_unknown_sni: tls.reject_unknown_sni,
-            connect_timeout: outbound_connect_timeout(),
+            connect_timeout,
             up_mbps: inbound.transport.up_mbps,
             down_mbps: inbound.transport.down_mbps,
             ignore_client_bandwidth: inbound.transport.ignore_client_bandwidth,
@@ -761,6 +785,7 @@ fn hysteria2_obfs_config(transport: &TransportConfig) -> Option<Hysteria2ObfsCon
 fn start_tuic_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
+    connect_timeout: Duration,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -788,7 +813,7 @@ fn start_tuic_listener(
             alpn: tls.alpn.clone(),
             reject_unknown_sni: tls.reject_unknown_sni,
             congestion_control: inbound.transport.congestion_control.clone(),
-            connect_timeout: outbound_connect_timeout(),
+            connect_timeout,
         },
         traffic,
         sessions,
@@ -843,6 +868,7 @@ fn start_tuic_listener(
 fn start_anytls_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
+    connect_timeout: Duration,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -860,7 +886,7 @@ fn start_anytls_listener(
             listen,
             users: inbound.users.clone(),
             routes,
-            connect_timeout: outbound_connect_timeout(),
+            connect_timeout,
             padding_scheme: inbound.padding_scheme.clone(),
         },
         traffic,
@@ -902,9 +928,16 @@ fn start_anytls_listener(
             let tag = tag.clone();
             let _ = handle_tcp_connection_with_failure_backoff(stream, move |stream| {
                 if let Some(acceptor) = tls_acceptor {
-                    accept_tls_connection(&acceptor, stream, Protocol::AnyTls, &tag, &tls_failures)
-                        .and_then(local_bridge_for_tls)
-                        .and_then(|stream| server.handle_tcp_client(stream))
+                    accept_tls_connection(
+                        &acceptor,
+                        stream,
+                        Protocol::AnyTls,
+                        &tag,
+                        &tls_failures,
+                        connect_timeout,
+                    )
+                    .and_then(local_bridge_for_tls)
+                    .and_then(|stream| server.handle_tcp_client(stream))
                 } else {
                     server.handle_tcp_client(stream)
                 }
@@ -944,6 +977,7 @@ fn accept_tls_connection(
     protocol: Protocol,
     tag: &str,
     failures: &ClientFailureBackoff,
+    connect_timeout: Duration,
 ) -> io::Result<TlsConnection> {
     let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
     if let Some(ip) = peer_ip {
@@ -955,7 +989,7 @@ fn accept_tls_connection(
             ));
         }
     }
-    match acceptor.accept_with_timeout(stream, outbound_connect_timeout()) {
+    match acceptor.accept_with_timeout(stream, connect_timeout) {
         Ok(client) => {
             if let Some(ip) = peer_ip {
                 failures.record_success(ip);
@@ -1041,6 +1075,7 @@ fn should_record_tcp_auth_failure(error: &io::Error) -> bool {
 fn start_shadowsocks_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
+    connect_timeout: Duration,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -1058,7 +1093,7 @@ fn start_shadowsocks_listener(
             method: inbound.cipher.clone().unwrap_or_default(),
             users: inbound.users.clone(),
             routes,
-            connect_timeout: outbound_connect_timeout(),
+            connect_timeout,
         },
         traffic,
         sessions,
@@ -1154,6 +1189,7 @@ fn shadowsocks_udp_enabled(transport: &TransportConfig) -> bool {
 fn start_trojan_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
+    connect_timeout: Duration,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -1171,7 +1207,7 @@ fn start_trojan_listener(
             listen,
             users: inbound.users.clone(),
             routes,
-            connect_timeout: outbound_connect_timeout(),
+            connect_timeout,
         },
         traffic,
         sessions,
@@ -1232,18 +1268,26 @@ fn start_trojan_listener(
             let tag = tag.clone();
             let _ = handle_tcp_connection_with_failure_backoff(stream, move |stream| {
                 if let Some(acceptor) = tls_acceptor {
-                    accept_tls_connection(&acceptor, stream, Protocol::Trojan, &tag, &tls_failures)
-                        .and_then(|client| match network.as_str() {
-                            "ws" => server
-                                .handle_tls_websocket_client(client, websocket_path.as_deref()),
-                            "httpupgrade" => accept_httpupgrade_tls(
-                                client,
-                                websocket_path.as_deref(),
-                                httpupgrade_host.as_deref(),
-                            )
-                            .and_then(|client| server.handle_tls_client(client)),
-                            _ => server.handle_tls_client(client),
-                        })
+                    accept_tls_connection(
+                        &acceptor,
+                        stream,
+                        Protocol::Trojan,
+                        &tag,
+                        &tls_failures,
+                        connect_timeout,
+                    )
+                    .and_then(|client| match network.as_str() {
+                        "ws" => {
+                            server.handle_tls_websocket_client(client, websocket_path.as_deref())
+                        }
+                        "httpupgrade" => accept_httpupgrade_tls(
+                            client,
+                            websocket_path.as_deref(),
+                            httpupgrade_host.as_deref(),
+                        )
+                        .and_then(|client| server.handle_tls_client(client)),
+                        _ => server.handle_tls_client(client),
+                    })
                 } else if network == "ws" {
                     server.handle_websocket_client(stream, websocket_path.as_deref())
                 } else if network == "httpupgrade" {
@@ -1276,6 +1320,7 @@ fn start_trojan_listener(
 fn start_vless_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
+    connect_timeout: Duration,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -1294,7 +1339,7 @@ fn start_vless_listener(
             users: inbound.users.clone(),
             routes,
             flow: inbound.flow.clone(),
-            connect_timeout: outbound_connect_timeout(),
+            connect_timeout,
         },
         traffic,
         sessions,
@@ -1319,7 +1364,7 @@ fn start_vless_listener(
         .and_then(|tls| tls.reality.as_ref())
         .is_some()
     {
-        return start_vless_reality_listener(inbound, listen, server);
+        return start_vless_reality_listener(inbound, listen, server, connect_timeout);
     }
     let listener =
         bind_dual_stack_tcp_listener(listen).map_err(|source| CoreServiceError::Bind {
@@ -1389,18 +1434,26 @@ fn start_vless_listener(
             let tag = tag.clone();
             let _ = handle_tcp_connection_with_failure_backoff(stream, move |stream| {
                 if let Some(acceptor) = tls_acceptor {
-                    accept_tls_connection(&acceptor, stream, Protocol::Vless, &tag, &tls_failures)
-                        .and_then(|client| match network.as_str() {
-                            "ws" => server
-                                .handle_tls_websocket_client(client, websocket_path.as_deref()),
-                            "httpupgrade" => accept_httpupgrade_tls(
-                                client,
-                                websocket_path.as_deref(),
-                                httpupgrade_host.as_deref(),
-                            )
-                            .and_then(|client| server.handle_tls_client(client)),
-                            _ => server.handle_tls_client(client),
-                        })
+                    accept_tls_connection(
+                        &acceptor,
+                        stream,
+                        Protocol::Vless,
+                        &tag,
+                        &tls_failures,
+                        connect_timeout,
+                    )
+                    .and_then(|client| match network.as_str() {
+                        "ws" => {
+                            server.handle_tls_websocket_client(client, websocket_path.as_deref())
+                        }
+                        "httpupgrade" => accept_httpupgrade_tls(
+                            client,
+                            websocket_path.as_deref(),
+                            httpupgrade_host.as_deref(),
+                        )
+                        .and_then(|client| server.handle_tls_client(client)),
+                        _ => server.handle_tls_client(client),
+                    })
                 } else if network == "ws" {
                     server.handle_websocket_client(stream, websocket_path.as_deref())
                 } else if network == "httpupgrade" {
@@ -1433,6 +1486,7 @@ fn start_vless_listener(
 fn start_socks_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
+    connect_timeout: Duration,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -1449,7 +1503,7 @@ fn start_socks_listener(
             listen,
             users: inbound.users.clone(),
             routes,
-            connect_timeout: outbound_connect_timeout(),
+            connect_timeout,
         },
         traffic,
         sessions,
@@ -1506,6 +1560,7 @@ fn start_socks_listener(
 fn start_mieru_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
+    connect_timeout: Duration,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -1522,7 +1577,7 @@ fn start_mieru_listener(
             listen,
             users: inbound.users.clone(),
             routes,
-            connect_timeout: outbound_connect_timeout(),
+            connect_timeout,
         },
         traffic,
         sessions,
@@ -1579,6 +1634,7 @@ fn start_mieru_listener(
 fn start_naive_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
+    connect_timeout: Duration,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -1606,7 +1662,7 @@ fn start_naive_listener(
             server_name: tls.server_name.clone(),
             alpn: tls.alpn.clone(),
             reject_unknown_sni: tls.reject_unknown_sni,
-            connect_timeout: outbound_connect_timeout(),
+            connect_timeout,
         },
         traffic,
         sessions,
@@ -1723,6 +1779,7 @@ fn start_naive_listener(
 fn start_http_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
+    connect_timeout: Duration,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -1739,7 +1796,7 @@ fn start_http_listener(
             listen,
             users: inbound.users.clone(),
             routes,
-            connect_timeout: outbound_connect_timeout(),
+            connect_timeout,
         },
         traffic,
         sessions,
@@ -1797,8 +1854,9 @@ fn start_vless_reality_listener(
     inbound: &InboundConfig,
     listen: SocketAddr,
     server: VlessServer,
+    connect_timeout: Duration,
 ) -> Result<ListenerHandle, CoreServiceError> {
-    let gateway = reality_gateway_config(inbound)?;
+    let gateway = reality_gateway_config(inbound, connect_timeout)?;
     let listener =
         bind_dual_stack_tcp_listener(listen).map_err(|source| CoreServiceError::Bind {
             tag: inbound.tag.clone(),
@@ -1829,7 +1887,7 @@ fn start_vless_reality_listener(
         move |stream| {
             let gateway = reality_gateway_for_connection(&gateway);
             let server = server.clone();
-            handle_vless_reality_connection(stream, gateway, server);
+            handle_vless_reality_connection(stream, gateway, server, connect_timeout);
         },
     );
 
@@ -1850,6 +1908,7 @@ fn handle_vless_reality_connection(
     stream: TcpStream,
     gateway: RealityGatewayConfig,
     server: VlessServer,
+    connect_timeout: Duration,
 ) {
     let trace = reality_trace_enabled();
     let peer = stream
@@ -1859,7 +1918,7 @@ fn handle_vless_reality_connection(
     if trace {
         eprintln!("keli-core-rs reality trace: accepted peer={peer}");
     }
-    let handshake_timeout = outbound_connect_timeout();
+    let handshake_timeout = connect_timeout;
     let _ = stream.set_read_timeout(Some(handshake_timeout));
     let _ = stream.set_write_timeout(Some(handshake_timeout));
     let result = handle_reality_preface(stream, &gateway);
@@ -1946,6 +2005,7 @@ fn reality_tls_acceptor(auth_key: &[u8; 32], server_name: &str) -> io::Result<Tl
 
 fn reality_gateway_config(
     inbound: &InboundConfig,
+    connect_timeout: Duration,
 ) -> Result<RealityGatewayConfig, CoreServiceError> {
     let tls = inbound.tls.as_ref().ok_or_else(|| CoreServiceError::Bind {
         tag: inbound.tag.clone(),
@@ -1980,7 +2040,7 @@ fn reality_gateway_config(
             now: SystemTime::now(),
         },
         dest,
-        connect_timeout: outbound_connect_timeout(),
+        connect_timeout,
         probe_dest_on_auth: false,
     })
 }
@@ -2442,8 +2502,8 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use crate::config::{
-        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, RealityConfig, SniffingConfig,
-        StatsConfig, TlsConfig, TransportConfig,
+        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, PolicyConfig, RealityConfig,
+        SniffingConfig, StatsConfig, TlsConfig, TransportConfig,
     };
     use crate::grpc::{decode_hunk_message, encode_grpc_hunk, take_grpc_message};
     use crate::protocol::Protocol;
@@ -2476,20 +2536,24 @@ mod tests {
     #[test]
     fn outbound_connect_timeout_defaults_and_clamps_env_value() {
         assert_eq!(
-            super::outbound_connect_timeout_from_env(None),
+            super::outbound_connect_timeout_from_env(None, 15),
             Duration::from_secs(15)
         );
         assert_eq!(
-            super::outbound_connect_timeout_from_env(Some("0".to_string())),
+            super::outbound_connect_timeout_from_env(Some("0".to_string()), 15),
             Duration::from_secs(15)
         );
         assert_eq!(
-            super::outbound_connect_timeout_from_env(Some("2".to_string())),
+            super::outbound_connect_timeout_from_env(Some("2".to_string()), 15),
             Duration::from_secs(2)
         );
         assert_eq!(
-            super::outbound_connect_timeout_from_env(Some("999".to_string())),
+            super::outbound_connect_timeout_from_env(Some("999".to_string()), 15),
             Duration::from_secs(60)
+        );
+        assert_eq!(
+            super::outbound_connect_timeout_from_env(None, 4),
+            Duration::from_secs(4)
         );
     }
 
@@ -2788,6 +2852,7 @@ mod tests {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
             dns: DnsConfig::default(),
+            policy: PolicyConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|socks|1".to_string(),
                 protocol: Protocol::Socks,
@@ -2899,6 +2964,7 @@ mod tests {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
             dns: DnsConfig::default(),
+            policy: PolicyConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|vless|reality|1".to_string(),
                 protocol: Protocol::Vless,
@@ -3584,6 +3650,7 @@ mod tests {
             Protocol::Vless,
             "tls-backoff-test",
             &failures,
+            Duration::from_secs(4),
         ) {
             Ok(_) => panic!("blocked peer should fail before TLS handshake"),
             Err(error) => error,
@@ -3756,7 +3823,8 @@ mod tests {
     fn vless_reality_refreshes_auth_time_per_connection() {
         let config = vless_reality_config(free_port());
         let mut gateway =
-            super::reality_gateway_config(&config.inbounds[0]).expect("reality gateway config");
+            super::reality_gateway_config(&config.inbounds[0], Duration::from_secs(15))
+                .expect("reality gateway config");
         gateway.auth.now = UNIX_EPOCH + Duration::from_secs(1);
 
         let refreshed = super::reality_gateway_for_connection(&gateway);
@@ -3774,8 +3842,8 @@ mod tests {
     #[test]
     fn vless_reality_uses_xray_default_without_time_diff_limit() {
         let config = vless_reality_config(free_port());
-        let gateway =
-            super::reality_gateway_config(&config.inbounds[0]).expect("reality gateway config");
+        let gateway = super::reality_gateway_config(&config.inbounds[0], Duration::from_secs(15))
+            .expect("reality gateway config");
 
         assert!(gateway.auth.max_time_diff.is_none());
     }

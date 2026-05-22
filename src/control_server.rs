@@ -286,8 +286,8 @@ mod tests {
 
     use super::read_control_line_with_limit;
     use crate::config::{
-        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, SniffingConfig, StatsConfig,
-        TransportConfig,
+        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, PolicyConfig, SniffingConfig,
+        StatsConfig, TransportConfig,
     };
     use crate::control::{CoreCommand, CoreController, CoreResponse};
     use crate::control_server::{start_control_server, start_control_server_with_token};
@@ -308,6 +308,7 @@ mod tests {
             instance_id: "node-a".to_string(),
             log_level: "info".to_string(),
             dns: DnsConfig::default(),
+            policy: PolicyConfig::default(),
             inbounds: vec![InboundConfig {
                 tag: "panel|socks|1".to_string(),
                 protocol: Protocol::Socks,

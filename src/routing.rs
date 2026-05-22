@@ -517,9 +517,10 @@ fn ipv6_mask(prefix: u8) -> u128 {
 mod tests {
     use std::env;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use crate::config::{OutboundConfig, RouteAction, RouteRule};
+    use crate::config::{OutboundConfig, RouteAction, RouteRule, SniffingConfig};
+    use crate::dispatcher::RouteDispatcher;
     use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
 
     use super::{matches_geoip_rule, matches_geosite_domain, matches_geosite_rule};
@@ -726,6 +727,77 @@ mod tests {
             ),
             "udp,bittorrent"
         );
+    }
+
+    #[test]
+    fn dispatcher_filters_sniffed_labels_through_dest_override() {
+        let dispatcher = RouteDispatcher::with_sniffing(
+            vec![RouteRule {
+                targets: vec!["protocol:tls".to_string(), "protocol:http".to_string()],
+                action: RouteAction::Block,
+                outbound: None,
+            }],
+            SniffingConfig {
+                enabled: true,
+                dest_override: vec!["http".to_string()],
+            },
+        );
+
+        assert_eq!(
+            dispatcher.decide_tcp("example.com", 443, &[0x16, 0x03, 0x01, 0x00, 0x2a]),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            dispatcher.decide_tcp("example.com", 80, b"GET / HTTP/1.1\r\n"),
+            RouteDecision::Block
+        );
+    }
+
+    #[test]
+    fn dispatcher_filters_udp_quic_labels_through_dest_override() {
+        let dispatcher = RouteDispatcher::with_sniffing(
+            vec![RouteRule {
+                targets: vec!["protocol:quic".to_string()],
+                action: RouteAction::Block,
+                outbound: None,
+            }],
+            SniffingConfig {
+                enabled: true,
+                dest_override: vec!["quic".to_string()],
+            },
+        );
+
+        assert_eq!(
+            dispatcher.decide_udp("example.com", 443, &[0xc3, 0x00, 0x00, 0x00, 0x01, 0x08]),
+            RouteDecision::Block
+        );
+    }
+
+    #[test]
+    fn dispatcher_ignores_payload_when_sniffing_is_disabled() {
+        let dispatcher = RouteDispatcher::with_sniffing(
+            vec![RouteRule {
+                targets: vec!["protocol:http".to_string()],
+                action: RouteAction::Block,
+                outbound: None,
+            }],
+            SniffingConfig {
+                enabled: false,
+                dest_override: vec!["http".to_string()],
+            },
+        );
+
+        assert_eq!(
+            dispatcher.decide_tcp("example.com", 80, b"GET / HTTP/1.1\r\n"),
+            RouteDecision::Direct
+        );
+    }
+
+    #[test]
+    fn dispatcher_inherits_protocol_connect_timeout_policy() {
+        let dispatcher = RouteDispatcher::with_connect_timeout(Vec::new(), Duration::from_secs(7));
+
+        assert_eq!(dispatcher.connect_timeout(), Duration::from_secs(7));
     }
 
     #[test]
