@@ -241,7 +241,7 @@ impl TrojanServer {
         let mut request = self.read_request(&mut reader)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let session = self.acquire_user_session(user.as_ref(), client_ip)?;
         let bandwidth = if request.command == TrojanCommand::UdpAssociate {
             self.bandwidth.limiter_for(user.as_ref())
         } else {
@@ -257,7 +257,7 @@ impl TrojanServer {
         let Some(remote) = self.connect_tcp_for_websocket(&reader, &request)? else {
             return Ok(());
         };
-        self.relay_plain_websocket(reader, writer, remote, request, bandwidth)
+        self.spawn_plain_websocket_relay(reader, writer, remote, request, bandwidth, session)
     }
 
     pub fn handle_tls_client(&self, mut client: TlsConnection) -> io::Result<()> {
@@ -561,6 +561,23 @@ impl TrojanServer {
             download,
             request.client_ip,
         );
+        Ok(())
+    }
+
+    fn spawn_plain_websocket_relay(
+        &self,
+        reader: WebSocketReader,
+        writer: WebSocketWriter,
+        remote: TcpStream,
+        request: TrojanRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+        session: Option<UserSessionGuard>,
+    ) -> io::Result<()> {
+        let server = self.clone();
+        let _ = spawn_native_blocking_relay(move || {
+            let _session = session;
+            server.relay_plain_websocket(reader, writer, remote, request, bandwidth)
+        })?;
         Ok(())
     }
 
@@ -2284,7 +2301,7 @@ mod tests {
             .expect("serve once");
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_trojan_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|trojan|1");
         assert_eq!(records[0].user_uuid, "trojan-password");
@@ -2325,6 +2342,20 @@ mod tests {
             }
         }
         false
+    }
+
+    fn drain_trojan_traffic_eventually(
+        server: &TrojanServer,
+        minimum_bytes: u64,
+    ) -> Vec<crate::traffic::TrafficDelta> {
+        for _ in 0..50 {
+            let records = server.drain_traffic(minimum_bytes);
+            if !records.is_empty() {
+                return records;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        server.drain_traffic(minimum_bytes)
     }
 
     fn trojan_request(target: std::net::SocketAddr) -> Vec<u8> {
@@ -3020,7 +3051,7 @@ mod tests {
             .expect("serve once");
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_trojan_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|trojan|1");
         assert_eq!(records[0].user_uuid, "trojan-password");
@@ -3070,7 +3101,7 @@ mod tests {
             .expect("serve once");
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_trojan_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|trojan|1");
         assert_eq!(records[0].user_uuid, "trojan-password");
@@ -3118,7 +3149,7 @@ mod tests {
             .expect("serve once");
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_trojan_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|trojan|1");
         assert_eq!(records[0].user_uuid, "trojan-password");
@@ -3430,6 +3461,56 @@ mod tests {
     }
 
     #[test]
+    fn websocket_tcp_relay_does_not_hold_connection_worker_after_start() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (release_remote_tx, release_remote_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+            let _ = release_remote_rx.recv_timeout(Duration::from_secs(3));
+        });
+
+        let server = server();
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let server_clone = server.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let result = server_clone.handle_websocket_client(stream, Some("/trojan"));
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = TcpStream::connect(trojan_addr).expect("client connect");
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.51",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame(&trojan_request(echo_addr)))
+            .expect("trojan request frame");
+        client.write_all(&masked_frame(b"ping")).expect("payload");
+        assert_eq!(read_binary_frame(&mut client), b"ping");
+
+        let handled = handled_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("websocket relay should move off the connection worker after start");
+        handled.expect("spawn background websocket relay");
+
+        drop(client);
+        release_remote_tx.send(()).expect("release remote");
+        server_thread.join().expect("server thread");
+        echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
     fn websocket_client_close_during_outbound_connect_does_not_wait_for_timeout() {
         let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
         let proxy_addr = proxy.local_addr().expect("proxy addr");
@@ -3674,7 +3755,7 @@ mod tests {
             .expect("serve once");
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_trojan_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|trojan|1");
         assert_eq!(records[0].user_uuid, "trojan-password");
