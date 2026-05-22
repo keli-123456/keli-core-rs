@@ -282,8 +282,15 @@ impl WebSocketTlsStream {
         self.stream.shutdown(Shutdown::Both)
     }
 
-    pub(crate) fn peer_closed(&self) -> io::Result<bool> {
-        self.stream.peer_closed()
+    pub(crate) fn peer_closed_nonblocking(&self) -> io::Result<bool> {
+        self.stream.set_nonblocking(true)?;
+        let result = self.stream.peer_closed();
+        let restore = self.stream.set_nonblocking(false);
+        match (result, restore) {
+            (Ok(closed), Ok(())) => Ok(closed),
+            (Err(error), _) => Err(error),
+            (_, Err(error)) => Err(error),
+        }
     }
 
     fn wait_readable_with_remote(

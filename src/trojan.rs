@@ -283,7 +283,7 @@ impl TrojanServer {
         } else {
             self.bandwidth.limiter_for_limited(user.as_ref())
         };
-        if websocket.peer_closed()? {
+        if websocket.peer_closed_nonblocking()? {
             let _ = websocket.shutdown();
             return Ok(());
         }
@@ -2003,7 +2003,16 @@ mod tests {
 
     fn masked_frame(payload: &[u8]) -> Vec<u8> {
         let mask = [1u8, 2, 3, 4];
-        let mut frame = vec![0x82, 0x80 | payload.len() as u8];
+        let mut frame = vec![0x82];
+        if payload.len() < 126 {
+            frame.push(0x80 | payload.len() as u8);
+        } else if payload.len() <= u16::MAX as usize {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            frame.push(0x80 | 127);
+            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
         frame.extend_from_slice(&mask);
         for (index, byte) in payload.iter().enumerate() {
             frame.push(*byte ^ mask[index % 4]);
@@ -2675,6 +2684,64 @@ mod tests {
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
         assert_eq!(records[0].online_ips, vec!["198.51.100.44"]);
+    }
+
+    #[test]
+    fn tls_websocket_extended_frame_can_carry_request_and_first_payload() {
+        let cert = test_cert("trojan-ws-extended-first-payload");
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let first_payload = vec![b'a'; 96];
+        let expected_payload = first_payload.clone();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = vec![0u8; expected_payload.len()];
+            stream.read_exact(&mut bytes).expect("echo read");
+            assert_eq!(bytes, expected_payload);
+            stream.write_all(&bytes).expect("echo write");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            server_clone.handle_tls_websocket_client(client, Some("/trojan"))
+        });
+
+        let mut client = tls_client(trojan_addr, cert.cert_der.clone());
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.47",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+
+        let mut first_frame_payload = trojan_request(echo_addr);
+        first_frame_payload.extend_from_slice(&first_payload);
+        assert!(first_frame_payload.len() > 125);
+        client
+            .write_all(&masked_frame(&first_frame_payload))
+            .expect("trojan request and payload frame");
+        assert_eq!(read_binary_frame(&mut client), first_payload);
+        drop(client);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].upload, 96);
+        assert_eq!(records[0].download, 96);
     }
 
     #[test]
