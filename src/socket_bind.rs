@@ -1,7 +1,13 @@
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
+use std::sync::OnceLock;
 
 use socket2::{Domain, Protocol, Socket, Type};
+
+const DEFAULT_TCP_LISTEN_BACKLOG: i32 = 4096;
+const MIN_TCP_LISTEN_BACKLOG: i32 = 128;
+const MAX_TCP_LISTEN_BACKLOG: i32 = 65535;
+static TCP_LISTEN_BACKLOG: OnceLock<i32> = OnceLock::new();
 
 pub(crate) fn bind_dual_stack_tcp_listener(listen: SocketAddr) -> io::Result<TcpListener> {
     let listen = dual_stack_wildcard_addr(listen);
@@ -48,7 +54,7 @@ fn bind_ipv6_tcp_listener(listen: SocketAddr) -> io::Result<TcpListener> {
     socket.set_reuse_address(true)?;
     socket.set_only_v6(false)?;
     socket.bind(&listen.into())?;
-    socket.listen(1024)?;
+    socket.listen(tcp_listen_backlog())?;
     Ok(socket.into())
 }
 
@@ -68,7 +74,7 @@ fn bind_tcp_listener(listen: SocketAddr) -> io::Result<TcpListener> {
     )?;
     socket.set_reuse_address(true)?;
     socket.bind(&listen.into())?;
-    socket.listen(1024)?;
+    socket.listen(tcp_listen_backlog())?;
     Ok(socket.into())
 }
 
@@ -98,6 +104,37 @@ fn bind_addr_error(listen: SocketAddr, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("at {listen}: {error}"))
 }
 
+fn tcp_listen_backlog() -> i32 {
+    *TCP_LISTEN_BACKLOG.get_or_init(|| {
+        tcp_listen_backlog_from_sources(
+            std::env::var("KELI_CORE_TCP_LISTEN_BACKLOG").ok(),
+            read_system_somaxconn(),
+        )
+    })
+}
+
+fn tcp_listen_backlog_from_sources(env_value: Option<String>, somaxconn: Option<String>) -> i32 {
+    env_value
+        .and_then(|value| parse_backlog(&value))
+        .or_else(|| somaxconn.and_then(|value| parse_backlog(&value)))
+        .unwrap_or(DEFAULT_TCP_LISTEN_BACKLOG)
+        .clamp(MIN_TCP_LISTEN_BACKLOG, MAX_TCP_LISTEN_BACKLOG)
+}
+
+fn parse_backlog(value: &str) -> Option<i32> {
+    value.trim().parse::<i32>().ok().filter(|value| *value > 0)
+}
+
+#[cfg(target_os = "linux")]
+fn read_system_somaxconn() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/net/core/somaxconn").ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_system_somaxconn() -> Option<String> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -106,6 +143,33 @@ mod tests {
     use std::time::Duration;
 
     use super::{bind_dual_stack_tcp_listener, bind_dual_stack_udp_socket};
+
+    #[test]
+    fn tcp_listen_backlog_prefers_env_then_somaxconn_and_clamps() {
+        assert_eq!(
+            super::tcp_listen_backlog_from_sources(None, Some("8192\n".to_string())),
+            8192
+        );
+        assert_eq!(
+            super::tcp_listen_backlog_from_sources(
+                Some("2048".to_string()),
+                Some("8192\n".to_string())
+            ),
+            2048
+        );
+        assert_eq!(
+            super::tcp_listen_backlog_from_sources(Some("0".to_string()), Some("64".to_string())),
+            super::MIN_TCP_LISTEN_BACKLOG
+        );
+        assert_eq!(
+            super::tcp_listen_backlog_from_sources(Some("999999".to_string()), None),
+            super::MAX_TCP_LISTEN_BACKLOG
+        );
+        assert_eq!(
+            super::tcp_listen_backlog_from_sources(Some("bad".to_string()), None),
+            super::DEFAULT_TCP_LISTEN_BACKLOG
+        );
+    }
 
     #[test]
     fn wildcard_tcp_listener_accepts_ipv4_clients() {
