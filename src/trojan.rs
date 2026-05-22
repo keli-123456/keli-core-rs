@@ -2,7 +2,10 @@ use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
-use std::sync::{mpsc, Arc};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc, Arc, Mutex,
+};
 use std::thread;
 use std::time::Duration;
 
@@ -252,7 +255,9 @@ impl TrojanServer {
             return Ok(());
         }
         if request.command == TrojanCommand::UdpAssociate {
-            return self.relay_udp_split(reader, writer, request, bandwidth);
+            return self.spawn_plain_websocket_udp_relay(
+                reader, writer, request, bandwidth, session,
+            );
         }
         let Some(remote) = self.connect_tcp_for_websocket(&reader, &request)? else {
             return Ok(());
@@ -581,6 +586,22 @@ impl TrojanServer {
         Ok(())
     }
 
+    fn spawn_plain_websocket_udp_relay(
+        &self,
+        reader: WebSocketReader,
+        writer: WebSocketWriter,
+        request: TrojanRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+        session: Option<UserSessionGuard>,
+    ) -> io::Result<()> {
+        let server = self.clone();
+        let _ = spawn_native_blocking_relay(move || {
+            let _session = session;
+            server.relay_udp_plain_websocket(reader, writer, request, bandwidth)
+        })?;
+        Ok(())
+    }
+
     fn relay_tls(
         &self,
         client: TlsConnection,
@@ -813,6 +834,151 @@ impl TrojanServer {
             download,
             request.client_ip,
         );
+        result
+    }
+
+    fn relay_udp_plain_websocket(
+        &self,
+        reader: WebSocketReader,
+        writer: WebSocketWriter,
+        request: TrojanRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()> {
+        let state = Arc::new(Mutex::new(TrojanUdpRelayState::new(
+            self.config.connect_timeout,
+        )));
+        let writer = Arc::new(Mutex::new(writer));
+        let stop = Arc::new(AtomicBool::new(false));
+        let upload = Arc::new(AtomicU64::new(0));
+        let download = Arc::new(AtomicU64::new(0));
+
+        let upload_task = {
+            let server = self.clone();
+            let state = state.clone();
+            let writer = writer.clone();
+            let stop = stop.clone();
+            let upload = upload.clone();
+            let download = download.clone();
+            spawn_native_blocking_relay(move || {
+                server.relay_udp_plain_websocket_upload(
+                    reader, state, writer, stop, upload, download, bandwidth,
+                )
+            })?
+        };
+
+        let mut idle_rounds = 0u8;
+        let mut result = Ok(());
+        while !stop.load(Ordering::SeqCst) {
+            let mut progressed = false;
+            loop {
+                let packet = {
+                    let state = state
+                        .lock()
+                        .map_err(|_| io::Error::new(io::ErrorKind::Other, "udp state poisoned"))?;
+                    state.recv_available()?
+                };
+                let Some((source, payload)) = packet else {
+                    break;
+                };
+                let packet = encode_trojan_udp_packet(source, &payload);
+                let write_result = writer
+                    .lock()
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "websocket writer poisoned"))?
+                    .write_all(&packet);
+                match write_result {
+                    Ok(()) => {
+                        download.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                        progressed = true;
+                    }
+                    Err(error) if is_stream_closed(&error) => {
+                        stop.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    Err(error) => {
+                        stop.store(true, Ordering::SeqCst);
+                        result = Err(error);
+                        break;
+                    }
+                }
+            }
+
+            if result.is_err() || stop.load(Ordering::SeqCst) {
+                break;
+            }
+            if !progressed {
+                let timeout = websocket_udp_relay_idle_timeout(&mut idle_rounds);
+                thread::sleep(timeout);
+            } else {
+                idle_rounds = 0;
+            }
+        }
+
+        let _ = writer
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "websocket writer poisoned"))
+            .and_then(|writer| writer.shutdown());
+        let upload_result = join_native_blocking_relay(
+            upload_task,
+            "trojan websocket UDP upload relay panicked",
+        )?;
+        if result.is_ok() {
+            result = upload_result;
+        }
+        self.record_traffic(
+            request.user_uuid,
+            request.user_id,
+            upload.load(Ordering::Relaxed),
+            download.load(Ordering::Relaxed),
+            request.client_ip,
+        );
+        result
+    }
+
+    fn relay_udp_plain_websocket_upload(
+        &self,
+        mut reader: WebSocketReader,
+        state: Arc<Mutex<TrojanUdpRelayState>>,
+        writer: Arc<Mutex<WebSocketWriter>>,
+        stop: Arc<AtomicBool>,
+        upload: Arc<AtomicU64>,
+        download: Arc<AtomicU64>,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()> {
+        let result = loop {
+            match read_trojan_udp_packet(&mut reader) {
+                Ok((target, payload)) => {
+                    let response = {
+                        let mut state = state.lock().map_err(|_| {
+                            io::Error::new(io::ErrorKind::Other, "udp state poisoned")
+                        })?;
+                        self.send_udp_packet(&mut state, &target, &payload, bandwidth.as_deref())
+                    };
+                    match response {
+                        Ok((sent, response)) => {
+                            upload.fetch_add(sent, Ordering::Relaxed);
+                            if let Some((source, payload)) = response {
+                                let packet = encode_trojan_udp_packet(source, &payload);
+                                writer
+                                    .lock()
+                                    .map_err(|_| {
+                                        io::Error::new(
+                                            io::ErrorKind::Other,
+                                            "websocket writer poisoned",
+                                        )
+                                    })?
+                                    .write_all(&packet)?;
+                                download.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                            }
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+                Err(error) if is_stream_closed(&error) => break Ok(()),
+                Err(error) => break Err(error),
+            }
+        };
+        stop.store(true, Ordering::SeqCst);
+        let _ = reader.shutdown();
         result
     }
 
@@ -3508,6 +3674,85 @@ mod tests {
         release_remote_tx.send(()).expect("release remote");
         server_thread.join().expect("server thread");
         echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
+    fn websocket_udp_continues_when_previous_datagram_has_no_response() {
+        let blackhole = UdpSocket::bind("127.0.0.1:0").expect("blackhole bind");
+        let blackhole_addr = blackhole.local_addr().expect("blackhole addr");
+        let (blackhole_seen_tx, blackhole_seen_rx) = mpsc::channel();
+        let blackhole_thread = thread::spawn(move || {
+            let mut bytes = [0u8; 128];
+            let (read, _) = blackhole.recv_from(&mut bytes).expect("blackhole read");
+            assert_eq!(&bytes[..read], b"drop");
+            blackhole_seen_tx.send(()).expect("blackhole seen");
+            thread::sleep(Duration::from_millis(500));
+        });
+
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let mut bytes = [0u8; 128];
+            let (read, source) = echo.recv_from(&mut bytes).expect("echo read");
+            assert_eq!(&bytes[..read], b"ping");
+            echo.send_to(b"pong", source).expect("echo write");
+        });
+
+        let server = server_with_routes(Vec::new(), Duration::from_secs(2));
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let server_clone = server.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let result = server_clone.handle_websocket_client(stream, Some("/trojan"));
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = TcpStream::connect(trojan_addr).expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("client timeout");
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.52",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+
+        client
+            .write_all(&masked_frame(&trojan_udp_associate_request(blackhole_addr)))
+            .expect("udp associate request");
+        client
+            .write_all(&masked_frame(&trojan_udp_packet(blackhole_addr, b"drop")))
+            .expect("blackhole datagram");
+        blackhole_seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blackhole should receive first datagram");
+        client
+            .write_all(&masked_frame(&trojan_udp_packet(echo_addr, b"ping")))
+            .expect("echo datagram");
+
+        let response_frame = read_binary_frame(&mut client);
+        let (source, payload) = read_trojan_udp_packet(&mut Cursor::new(response_frame));
+        assert_eq!(source, echo_addr);
+        assert_eq!(payload, b"pong");
+        let handled = handled_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("websocket UDP relay should move off the connection worker after start");
+        handled.expect("spawn background websocket UDP relay");
+        drop(client);
+
+        server_thread.join().expect("server thread");
+        blackhole_thread.join().expect("blackhole thread");
+        echo_thread.join().expect("echo thread");
+
+        let records = drain_trojan_traffic_eventually(&server, 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].upload, 8);
+        assert_eq!(records[0].download, 4);
     }
 
     #[test]
