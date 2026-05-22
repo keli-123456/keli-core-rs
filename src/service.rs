@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -43,19 +43,15 @@ use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult};
 use crate::vless::{VlessServer, VlessServerConfig};
 use crate::vmess::{VmessServer, VmessServerConfig};
 
-const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 256;
-const MAX_AUTO_CONNECTION_WORKERS: usize = 2048;
-const MIN_AUTO_CONNECTION_WORKERS: usize = 16;
-const CONNECTION_WORKERS_PER_CPU: usize = 64;
-const CONNECTION_WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 256;
 const DEFAULT_CONNECTION_WORKER_STACK_KIB: usize = 2048;
 const MIN_CONNECTION_WORKER_STACK_KIB: usize = 256;
 const MAX_CONNECTION_WORKER_STACK_KIB: usize = 8192;
 const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_SECS: u64 = 15;
 const QUIC_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 static TCP_ACCEPT_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-static CONNECTION_WORKER_POOL: OnceLock<ConnectionWorkerPool> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerStatus {
@@ -2017,8 +2013,6 @@ fn has_explicit_port(dest: &str) -> bool {
         .is_some()
 }
 
-type ConnectionWorkerJob = Box<dyn FnOnce() + Send + 'static>;
-
 #[derive(Debug, Clone)]
 struct ConnectionWorkerGroup {
     state: Arc<ConnectionWorkerGroupState>,
@@ -2028,27 +2022,6 @@ struct ConnectionWorkerGroup {
 struct ConnectionWorkerGroupState {
     active: Mutex<usize>,
     finished: Condvar,
-}
-
-struct ConnectionWorkerPool {
-    queue: Mutex<VecDeque<ConnectionWorkerJob>>,
-    ready: Condvar,
-    worker_count: std::sync::atomic::AtomicUsize,
-    idle_count: std::sync::atomic::AtomicUsize,
-    pending_count: std::sync::atomic::AtomicUsize,
-    max_workers: usize,
-}
-
-impl std::fmt::Debug for ConnectionWorkerPool {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ConnectionWorkerPool")
-            .field("worker_count", &self.worker_count.load(Ordering::Relaxed))
-            .field("idle_count", &self.idle_count.load(Ordering::Relaxed))
-            .field("pending_count", &self.pending_count.load(Ordering::Relaxed))
-            .field("max_workers", &self.max_workers)
-            .finish_non_exhaustive()
-    }
 }
 
 impl ConnectionWorkerGroup {
@@ -2070,12 +2043,17 @@ impl ConnectionWorkerGroup {
         }
 
         let state = Arc::clone(&self.state);
-        let job = Box::new(move || {
+        let job = move || {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
             state.release();
-        });
+        };
 
-        if connection_worker_pool().submit(job) {
+        if thread::Builder::new()
+            .name("keli-core-connection".to_string())
+            .stack_size(connection_worker_stack_size())
+            .spawn(job)
+            .is_ok()
+        {
             true
         } else {
             self.state.release();
@@ -2119,9 +2097,6 @@ impl Drop for ConnectionWorkerAsyncGuard {
 impl ConnectionWorkerGroupState {
     fn acquire(&self) -> bool {
         let mut active = self.active.lock().expect("worker group lock poisoned");
-        if *active >= MAX_CONNECTION_WORKERS_PER_LISTENER {
-            return false;
-        }
         *active += 1;
         true
     }
@@ -2156,133 +2131,6 @@ impl ConnectionWorkerGroupState {
     }
 }
 
-impl ConnectionWorkerPool {
-    fn new() -> Self {
-        let max_workers = connection_worker_threads();
-        println!(
-            "INFO  core   connection workers auto max={} stack_kib={} cpu={} mem_limit_mib={} fd_limit={}",
-            max_workers,
-            connection_worker_stack_size() / 1024,
-            available_parallelism_count(),
-            memory_limit_mib()
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
-            open_file_soft_limit()
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string())
-        );
-        Self {
-            queue: Mutex::new(VecDeque::new()),
-            ready: Condvar::new(),
-            worker_count: std::sync::atomic::AtomicUsize::new(0),
-            idle_count: std::sync::atomic::AtomicUsize::new(0),
-            pending_count: std::sync::atomic::AtomicUsize::new(0),
-            max_workers,
-        }
-    }
-
-    fn submit(&'static self, job: ConnectionWorkerJob) -> bool {
-        if !self.ensure_worker_available() {
-            return false;
-        }
-
-        self.pending_count.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut queue = self
-                .queue
-                .lock()
-                .expect("connection worker queue lock poisoned");
-            queue.push_back(job);
-        }
-        self.ready.notify_one();
-        self.spawn_extra_worker_if_needed();
-        true
-    }
-
-    fn ensure_worker_available(&'static self) -> bool {
-        if self.worker_count.load(Ordering::Acquire) > 0 {
-            return true;
-        }
-        self.spawn_worker()
-    }
-
-    fn spawn_extra_worker_if_needed(&'static self) {
-        let pending = self.pending_count.load(Ordering::Relaxed);
-        let idle = self.idle_count.load(Ordering::Relaxed);
-        if pending > idle {
-            let _ = self.spawn_worker();
-        }
-    }
-
-    fn spawn_worker(&'static self) -> bool {
-        loop {
-            let current = self.worker_count.load(Ordering::Acquire);
-            if current >= self.max_workers {
-                return current > 0;
-            }
-            if self
-                .worker_count
-                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                continue;
-            }
-            let pool = self;
-            let spawned = thread::Builder::new()
-                .name("keli-core-connection-worker".to_string())
-                .stack_size(connection_worker_stack_size())
-                .spawn(move || pool.run_worker());
-            if spawned.is_ok() {
-                return true;
-            }
-            self.worker_count.fetch_sub(1, Ordering::AcqRel);
-            return false;
-        }
-    }
-
-    fn run_worker(&'static self) {
-        loop {
-            let Some(job) = self.wait_for_job() else {
-                self.worker_count.fetch_sub(1, Ordering::AcqRel);
-                break;
-            };
-            self.pending_count.fetch_sub(1, Ordering::Relaxed);
-            job();
-        }
-    }
-
-    fn wait_for_job(&'static self) -> Option<ConnectionWorkerJob> {
-        let mut queue = self
-            .queue
-            .lock()
-            .expect("connection worker queue lock poisoned");
-        loop {
-            if let Some(job) = queue.pop_front() {
-                return Some(job);
-            }
-
-            self.idle_count.fetch_add(1, Ordering::Relaxed);
-            let (next_queue, wait_result) = self
-                .ready
-                .wait_timeout(queue, CONNECTION_WORKER_IDLE_TIMEOUT)
-                .expect("connection worker queue lock poisoned");
-            self.idle_count.fetch_sub(1, Ordering::Relaxed);
-            queue = next_queue;
-
-            if wait_result.timed_out()
-                && queue.is_empty()
-                && self.pending_count.load(Ordering::Acquire) == 0
-            {
-                return None;
-            }
-        }
-    }
-}
-
-fn connection_worker_pool() -> &'static ConnectionWorkerPool {
-    CONNECTION_WORKER_POOL.get_or_init(ConnectionWorkerPool::new)
-}
-
 fn inbound_binds_quic(inbound: &InboundConfig) -> bool {
     matches!(inbound.protocol, Protocol::Hysteria2 | Protocol::Tuic) || naive_uses_quic(inbound)
 }
@@ -2301,19 +2149,6 @@ fn naive_uses_quic(inbound: &InboundConfig) -> bool {
             }))
 }
 
-fn connection_worker_threads() -> usize {
-    if let Ok(value) = std::env::var("KELI_CORE_CONNECTION_WORKERS") {
-        if let Ok(parsed) = value.trim().parse::<usize>() {
-            return parsed.clamp(4, MAX_AUTO_CONNECTION_WORKERS);
-        }
-    }
-    connection_worker_threads_from_resources(
-        available_parallelism_count(),
-        memory_limit_mib(),
-        open_file_soft_limit(),
-    )
-}
-
 fn connection_worker_stack_size() -> usize {
     connection_worker_stack_size_from_env(
         std::env::var("KELI_CORE_CONNECTION_WORKER_STACK_KIB").ok(),
@@ -2329,108 +2164,6 @@ fn connection_worker_stack_size_from_env(value: Option<String>) -> usize {
             MAX_CONNECTION_WORKER_STACK_KIB,
         );
     stack_kib * 1024
-}
-
-fn available_parallelism_count() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(4)
-        .max(1)
-}
-
-fn connection_worker_threads_from_resources(
-    cpu_count: usize,
-    _memory_limit_mib: Option<usize>,
-    _open_file_soft_limit: Option<usize>,
-) -> usize {
-    let cpu_target = cpu_count
-        .max(1)
-        .saturating_mul(CONNECTION_WORKERS_PER_CPU)
-        .max(MIN_AUTO_CONNECTION_WORKERS);
-    let resource_cap = cpu_target.min(MAX_AUTO_CONNECTION_WORKERS);
-    resource_cap.clamp(
-        MIN_AUTO_CONNECTION_WORKERS.min(resource_cap),
-        MAX_AUTO_CONNECTION_WORKERS,
-    )
-}
-
-fn memory_limit_mib() -> Option<usize> {
-    let host_memory = proc_meminfo_total_mib();
-    match cgroup_memory_limit_mib() {
-        Some(cgroup_limit) => Some(host_memory.map_or(cgroup_limit, |host| host.min(cgroup_limit))),
-        None => host_memory,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn proc_meminfo_total_mib() -> Option<usize> {
-    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
-    parse_proc_meminfo_total_mib(&content)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn proc_meminfo_total_mib() -> Option<usize> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn cgroup_memory_limit_mib() -> Option<usize> {
-    let value = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
-    parse_cgroup_memory_limit_mib(&value)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn cgroup_memory_limit_mib() -> Option<usize> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn open_file_soft_limit() -> Option<usize> {
-    let content = std::fs::read_to_string("/proc/self/limits").ok()?;
-    parse_proc_limits_open_files(&content)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn open_file_soft_limit() -> Option<usize> {
-    None
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn parse_proc_meminfo_total_mib(content: &str) -> Option<usize> {
-    for line in content.lines() {
-        let Some(rest) = line.strip_prefix("MemTotal:") else {
-            continue;
-        };
-        let kb = rest.split_whitespace().next()?.parse::<usize>().ok()?;
-        return Some(kb / 1024);
-    }
-    None
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn parse_cgroup_memory_limit_mib(content: &str) -> Option<usize> {
-    let value = content.trim();
-    if value.is_empty() || value == "max" {
-        return None;
-    }
-    let bytes = value.parse::<usize>().ok()?;
-    Some(bytes / 1024 / 1024)
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn parse_proc_limits_open_files(content: &str) -> Option<usize> {
-    for line in content.lines() {
-        let Some(rest) = line.strip_prefix("Max open files") else {
-            continue;
-        };
-        let mut parts = rest.split_whitespace();
-        let soft = parts.next()?;
-        if soft == "unlimited" {
-            return Some(usize::MAX);
-        }
-        return soft.parse::<usize>().ok();
-    }
-    None
 }
 
 fn spawn_connection_worker<F>(workers: &ConnectionWorkerGroup, task: F) -> bool
@@ -2703,7 +2436,7 @@ mod tests {
     use std::io::{self, Read, Write};
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -2761,50 +2494,6 @@ mod tests {
     }
 
     #[test]
-    fn connection_worker_count_scales_with_cpu_when_resources_allow() {
-        assert_eq!(
-            super::connection_worker_threads_from_resources(4, Some(4096), Some(100_000)),
-            256
-        );
-        assert_eq!(
-            super::connection_worker_threads_from_resources(32, Some(128_000), Some(1_000_000)),
-            2048
-        );
-    }
-
-    #[test]
-    fn connection_worker_count_ignores_memory_and_fd_caps_for_throughput() {
-        assert_eq!(
-            super::connection_worker_threads_from_resources(8, Some(512), Some(100_000)),
-            512
-        );
-        assert_eq!(
-            super::connection_worker_threads_from_resources(32, Some(8192), Some(4096)),
-            2048
-        );
-    }
-
-    #[test]
-    fn connection_worker_count_keeps_problem_node_throughput_like_go() {
-        assert_eq!(
-            super::connection_worker_threads_from_resources(4, Some(3914), Some(999_999)),
-            256
-        );
-    }
-
-    #[test]
-    fn connection_worker_count_keeps_cpu_capacity_on_small_resource_limits() {
-        assert_eq!(
-            super::connection_worker_threads_from_resources(4, Some(64), Some(100_000)),
-            256
-        );
-        assert_eq!(
-            super::connection_worker_threads_from_resources(4, Some(4096), Some(600)),
-            256
-        );
-    }
-
-    #[test]
     fn connection_worker_stack_defaults_and_clamps_env_value() {
         assert_eq!(
             super::connection_worker_stack_size_from_env(None),
@@ -2821,27 +2510,6 @@ mod tests {
         assert_eq!(
             super::connection_worker_stack_size_from_env(Some("99999".to_string())),
             8192 * 1024
-        );
-    }
-
-    #[test]
-    fn parses_linux_memory_and_open_file_limits() {
-        assert_eq!(
-            super::parse_proc_meminfo_total_mib(
-                "MemTotal:        3984384 kB\nMemFree:          1000 kB\n"
-            ),
-            Some(3891)
-        );
-        assert_eq!(
-            super::parse_cgroup_memory_limit_mib("536870912\n"),
-            Some(512)
-        );
-        assert_eq!(super::parse_cgroup_memory_limit_mib("max\n"), None);
-        assert_eq!(
-            super::parse_proc_limits_open_files(
-                "Limit                     Soft Limit           Hard Limit           Units\nMax open files            1048576              1048576              files\n"
-            ),
-            Some(1_048_576)
         );
     }
 
@@ -3057,6 +2725,39 @@ mod tests {
         completed.sort_unstable();
 
         assert_eq!(completed, (0..64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn connection_worker_group_does_not_cap_long_connections_at_legacy_pool_size() {
+        let group = super::ConnectionWorkerGroup::new();
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut releases = Vec::new();
+
+        for _ in 0..=super::MAX_CONNECTION_WORKERS_PER_LISTENER {
+            let (release_tx, release_rx) = mpsc::channel();
+            let started_for_worker = started.clone();
+            releases.push(release_tx);
+            assert!(group.spawn(move || {
+                started_for_worker.fetch_add(1, Ordering::SeqCst);
+                let _ = release_rx.recv();
+            }));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while started.load(Ordering::SeqCst) <= super::MAX_CONNECTION_WORKERS_PER_LISTENER {
+            if Instant::now() >= deadline {
+                panic!(
+                    "expected more than {} long-lived connection workers to start",
+                    super::MAX_CONNECTION_WORKERS_PER_LISTENER
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        for release in releases {
+            let _ = release.send(());
+        }
+        assert!(group.join_timeout(Duration::from_secs(5)));
     }
 
     trait AsyncIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
