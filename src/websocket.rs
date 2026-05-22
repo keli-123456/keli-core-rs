@@ -238,6 +238,10 @@ fn shutdown_websocket_tls_pair(client: &mut WebSocketTlsStream, remote: &TcpStre
 }
 
 impl WebSocketReader {
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.reader.set_nonblocking(nonblocking)
+    }
+
     pub(crate) fn shutdown(&self) -> io::Result<()> {
         self.reader.shutdown(Shutdown::Both)
     }

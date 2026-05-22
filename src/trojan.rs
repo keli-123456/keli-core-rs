@@ -470,49 +470,80 @@ impl TrojanServer {
         let _connection = self
             .bandwidth
             .register_tcp_connection(Some(&request.user_uuid), &[&remote])?;
-        let upload_limiter = bandwidth.clone();
-        let (upload_done_tx, upload_done_rx) = mpsc::channel();
-        let upload_task = spawn_native_blocking_relay(move || {
-            let upload = match upload_limiter.as_deref() {
-                Some(limiter) => {
-                    copy_count_best_effort_limited(&mut reader, &mut remote_write, Some(limiter))
-                }
-                None => copy_count_best_effort(&mut reader, &mut remote_write),
-            };
-            let _ = remote_shutdown.shutdown(Shutdown::Both);
-            let _ = upload_done_tx.send(());
-            upload
-        })?;
-
+        reader.set_nonblocking(true)?;
         remote.set_nonblocking(true)?;
+        let _ = remote_write.set_nonblocking(true);
         let mut download = 0u64;
+        let mut upload = 0u64;
+        let mut upload_done = false;
+        let mut download_done = false;
+        let mut client_buffer = [0u8; 16 * 1024];
         let mut buffer = [0u8; 16 * 1024];
         let mut idle_rounds = 0u8;
-        loop {
+        while !upload_done || !download_done {
             let mut progressed = false;
-            match upload_done_rx.try_recv() {
-                Ok(()) => {
-                    let _ = writer.shutdown();
-                    break;
+
+            if !upload_done {
+                match reader.read(&mut client_buffer) {
+                    Ok(0) => {
+                        upload_done = true;
+                        download_done = true;
+                        let _ = reader.shutdown();
+                        let _ = writer.shutdown();
+                        let _ = remote_shutdown.shutdown(Shutdown::Both);
+                        progressed = true;
+                    }
+                    Ok(read) => {
+                        if let Some(limiter) = bandwidth.as_deref() {
+                            if !limiter.wait_for(read) {
+                                upload_done = true;
+                                download_done = true;
+                                let _ = reader.shutdown();
+                                let _ = writer.shutdown();
+                                let _ = remote_shutdown.shutdown(Shutdown::Both);
+                                continue;
+                            }
+                        }
+                        write_all_wait(&mut remote_write, &client_buffer[..read])?;
+                        upload = upload.saturating_add(read as u64);
+                        progressed = true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        upload_done = true;
+                        download_done = true;
+                        let _ = reader.shutdown();
+                        let _ = writer.shutdown();
+                        let _ = remote_shutdown.shutdown(Shutdown::Both);
+                        progressed = true;
+                    }
                 }
-                Err(mpsc::TryRecvError::Disconnected) => break,
-                Err(mpsc::TryRecvError::Empty) => {}
             }
 
-            match remote.read(&mut buffer) {
-                Ok(0) => {
-                    let _ = writer.shutdown();
-                    break;
-                }
-                Ok(read) => {
-                    writer.write_all(&buffer[..read])?;
-                    download = download.saturating_add(read as u64);
-                    progressed = true;
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(_) => {
-                    let _ = writer.shutdown();
-                    break;
+            if !download_done {
+                match remote.read(&mut buffer) {
+                    Ok(0) => {
+                        download_done = true;
+                        upload_done = true;
+                        let _ = reader.shutdown();
+                        let _ = writer.shutdown();
+                        let _ = remote_shutdown.shutdown(Shutdown::Both);
+                        progressed = true;
+                    }
+                    Ok(read) => {
+                        writer.write_all(&buffer[..read])?;
+                        download = download.saturating_add(read as u64);
+                        progressed = true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        download_done = true;
+                        upload_done = true;
+                        let _ = reader.shutdown();
+                        let _ = writer.shutdown();
+                        let _ = remote_shutdown.shutdown(Shutdown::Both);
+                        progressed = true;
+                    }
                 }
             }
 
@@ -522,7 +553,6 @@ impl TrojanServer {
                 idle_rounds = 0;
             }
         }
-        let upload = join_native_blocking_relay(upload_task, "upload relay task panicked")?;
         self.traffic.add_with_user_id(
             self.config.node_tag.clone(),
             request.user_uuid,
