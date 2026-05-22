@@ -86,10 +86,14 @@ pub fn accept_websocket_with_client_ip(
     let (path, key) = parse_upgrade_request(&request)?;
     validate_path(path, expected_path)?;
     let forwarded_ip = forwarded_client_ip(&request);
+    let (early_protocol, early_data) = websocket_early_data(&request);
 
     let accept = websocket_accept_key(key);
+    let protocol_header = early_protocol
+        .map(|protocol| format!("Sec-WebSocket-Protocol: {protocol}\r\n"))
+        .unwrap_or_default();
     let response = format!(
-        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n{protocol_header}\r\n"
     );
     stream.write_all(response.as_bytes())?;
 
@@ -98,7 +102,7 @@ pub fn accept_websocket_with_client_ip(
         WebSocketReader {
             reader: stream,
             control_writer: control_writer.clone(),
-            buffer: Vec::new(),
+            buffer: early_data,
         },
         WebSocketWriter {
             writer: control_writer,
@@ -123,10 +127,14 @@ pub fn accept_websocket_tls_with_client_ip(
     let (path, key) = parse_upgrade_request(&request)?;
     validate_path(path, expected_path)?;
     let forwarded_ip = forwarded_client_ip(&request);
+    let (early_protocol, early_data) = websocket_early_data(&request);
 
     let accept = websocket_accept_key(key);
+    let protocol_header = early_protocol
+        .map(|protocol| format!("Sec-WebSocket-Protocol: {protocol}\r\n"))
+        .unwrap_or_default();
     let response = format!(
-        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n{protocol_header}\r\n"
     );
     stream.write_plain_all_wait(response.as_bytes())?;
 
@@ -134,7 +142,7 @@ pub fn accept_websocket_tls_with_client_ip(
         WebSocketTlsStream {
             stream,
             input: Vec::new(),
-            buffer: Vec::new(),
+            buffer: early_data,
         },
         forwarded_ip,
     ))
@@ -229,6 +237,38 @@ fn shutdown_websocket_tls_pair(client: &mut WebSocketTlsStream, remote: &TcpStre
     let _ = remote.shutdown(Shutdown::Both);
 }
 
+impl WebSocketReader {
+    pub(crate) fn shutdown(&self) -> io::Result<()> {
+        self.reader.shutdown(Shutdown::Both)
+    }
+
+    pub(crate) fn peer_closed_nonblocking(&self) -> io::Result<bool> {
+        self.reader.set_nonblocking(true)?;
+        let mut byte = [0u8; 1];
+        let result = match self.reader.peek(&mut byte) {
+            Ok(0) => Ok(true),
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) => Err(error),
+        };
+        let restore = self.reader.set_nonblocking(false);
+        match (result, restore) {
+            (Ok(closed), Ok(())) => Ok(closed),
+            (Err(error), _) => Err(error),
+            (_, Err(error)) => Err(error),
+        }
+    }
+}
+
+impl WebSocketWriter {
+    pub(crate) fn shutdown(&self) -> io::Result<()> {
+        self.writer
+            .lock()
+            .expect("websocket writer lock poisoned")
+            .shutdown(Shutdown::Both)
+    }
+}
+
 impl Read for WebSocketReader {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         if output.is_empty() {
@@ -308,7 +348,7 @@ impl WebSocketTlsStream {
     }
 }
 
-fn websocket_tls_relay_idle_timeout(idle_rounds: &mut u8) -> Duration {
+pub(crate) fn websocket_tls_relay_idle_timeout(idle_rounds: &mut u8) -> Duration {
     const BACKOFF_MS: [u64; 5] = [25, 50, 100, 250, 1000];
     let idx = usize::from((*idle_rounds).min((BACKOFF_MS.len() - 1) as u8));
     *idle_rounds = idle_rounds
@@ -457,6 +497,24 @@ fn forwarded_client_ip(request: &str) -> Option<IpAddr> {
         .or_else(|| header_value(request, "cf-connecting-ip").and_then(parse_header_ip))
         .or_else(|| header_value(request, "true-client-ip").and_then(parse_header_ip))
         .or_else(|| header_value(request, "x-real-ip").and_then(parse_header_ip))
+}
+
+fn websocket_early_data(request: &str) -> (Option<String>, Vec<u8>) {
+    let Some(protocol) = header_value(request, "sec-websocket-protocol") else {
+        return (None, Vec::new());
+    };
+    let protocol = protocol.trim();
+    if protocol.is_empty() {
+        return (None, Vec::new());
+    }
+    let encoded = protocol
+        .replace('+', "-")
+        .replace('/', "_")
+        .replace('=', "");
+    match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded.as_bytes()) {
+        Ok(data) if !data.is_empty() => (Some(protocol.to_string()), data),
+        _ => (None, Vec::new()),
+    }
 }
 
 fn first_forwarded_for_ip(value: &str) -> Option<IpAddr> {
@@ -866,6 +924,31 @@ mod tests {
         let mut body = [0u8; 4];
         client.read_exact(&mut body).expect("frame body");
         assert_eq!(&body, b"pong");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn accepts_sec_websocket_protocol_early_data_like_xray() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let (mut reader, _) = accept_websocket(stream, Some("/ws")).expect("upgrade");
+            let mut payload = [0u8; 4];
+            reader.read_exact(&mut payload).expect("early payload");
+            assert_eq!(&payload, b"ping");
+        });
+
+        let mut client = TcpStream::connect(addr).expect("client");
+        client
+            .write_all(
+                b"GET /ws HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: cGluZw\r\n\r\n",
+            )
+            .expect("request");
+        let response = read_http_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        assert!(response.contains("Sec-WebSocket-Protocol: cGluZw"));
+        drop(client);
         server.join().expect("server");
     }
 

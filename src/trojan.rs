@@ -35,7 +35,8 @@ use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::websocket::{
     accept_websocket_tls_with_client_ip, accept_websocket_with_client_ip, connect_websocket_client,
-    relay_websocket_tls_stream, WebSocketClientStream,
+    relay_websocket_tls_stream, websocket_tls_relay_idle_timeout, WebSocketClientStream,
+    WebSocketReader, WebSocketWriter,
 };
 use crate::{connect_tcp_outbound, send_udp_outbound, RouteDecision, RouteDispatcher};
 
@@ -174,7 +175,7 @@ impl TrojanServer {
     pub fn handle_websocket_client(&self, client: TcpStream, path: Option<&str>) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let (reader, writer, forwarded_ip) = accept_websocket_with_client_ip(client, path)?;
-        self.handle_split_client_with_ip(reader, writer, forwarded_ip.or(client_ip))
+        self.handle_websocket_split_client_with_ip(reader, writer, forwarded_ip.or(client_ip))
     }
 
     pub fn handle_split_client<R, W>(&self, reader: R, writer: W) -> io::Result<()>
@@ -229,6 +230,34 @@ impl TrojanServer {
             }
         };
         self.relay_websocket(reader, writer, remote, request, bandwidth)
+    }
+
+    fn handle_websocket_split_client_with_ip(
+        &self,
+        mut reader: WebSocketReader,
+        writer: WebSocketWriter,
+        client_ip: Option<IpAddr>,
+    ) -> io::Result<()> {
+        let mut request = self.read_request(&mut reader)?;
+        request.client_ip = client_ip;
+        let user = self.request_user(&request);
+        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let bandwidth = if request.command == TrojanCommand::UdpAssociate {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
+        if reader.peer_closed_nonblocking()? {
+            let _ = reader.shutdown();
+            return Ok(());
+        }
+        if request.command == TrojanCommand::UdpAssociate {
+            return self.relay_udp_split(reader, writer, request, bandwidth);
+        }
+        let Some(remote) = self.connect_tcp_for_websocket(&reader, &request)? else {
+            return Ok(());
+        };
+        self.relay_plain_websocket(reader, writer, remote, request, bandwidth)
     }
 
     pub fn handle_tls_client(&self, mut client: TlsConnection) -> io::Result<()> {
@@ -394,16 +423,21 @@ impl TrojanServer {
         W: Write,
     {
         let mut remote_write = remote.try_clone()?;
+        let remote_shutdown = remote.try_clone()?;
         let mut remote_read = remote;
         let _connection = self
             .bandwidth
             .register_tcp_connection(Some(&request.user_uuid), &[&remote_read])?;
         let upload_limiter = bandwidth.clone();
-        let upload_task = spawn_native_blocking_relay(move || match upload_limiter.as_deref() {
-            Some(limiter) => {
-                copy_count_best_effort_limited(&mut reader, &mut remote_write, Some(limiter))
-            }
-            None => copy_count_best_effort(&mut reader, &mut remote_write),
+        let upload_task = spawn_native_blocking_relay(move || {
+            let result = match upload_limiter.as_deref() {
+                Some(limiter) => {
+                    copy_count_best_effort_limited(&mut reader, &mut remote_write, Some(limiter))
+                }
+                None => copy_count_best_effort(&mut reader, &mut remote_write),
+            };
+            let _ = remote_shutdown.shutdown(Shutdown::Both);
+            result
         })?;
         let download = match bandwidth.as_deref() {
             Some(limiter) => {
@@ -411,6 +445,83 @@ impl TrojanServer {
             }
             None => copy_count_best_effort(&mut remote_read, &mut writer),
         };
+        let upload = join_native_blocking_relay(upload_task, "upload relay task panicked")?;
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            request.user_uuid,
+            Some(request.user_id),
+            upload,
+            download,
+            request.client_ip,
+        );
+        Ok(())
+    }
+
+    fn relay_plain_websocket(
+        &self,
+        mut reader: WebSocketReader,
+        mut writer: WebSocketWriter,
+        mut remote: TcpStream,
+        request: TrojanRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()> {
+        let mut remote_write = remote.try_clone()?;
+        let remote_shutdown = remote.try_clone()?;
+        let _connection = self
+            .bandwidth
+            .register_tcp_connection(Some(&request.user_uuid), &[&remote])?;
+        let upload_limiter = bandwidth.clone();
+        let (upload_done_tx, upload_done_rx) = mpsc::channel();
+        let upload_task = spawn_native_blocking_relay(move || {
+            let upload = match upload_limiter.as_deref() {
+                Some(limiter) => {
+                    copy_count_best_effort_limited(&mut reader, &mut remote_write, Some(limiter))
+                }
+                None => copy_count_best_effort(&mut reader, &mut remote_write),
+            };
+            let _ = remote_shutdown.shutdown(Shutdown::Both);
+            let _ = upload_done_tx.send(());
+            upload
+        })?;
+
+        remote.set_nonblocking(true)?;
+        let mut download = 0u64;
+        let mut buffer = [0u8; 16 * 1024];
+        let mut idle_rounds = 0u8;
+        loop {
+            let mut progressed = false;
+            match upload_done_rx.try_recv() {
+                Ok(()) => {
+                    let _ = writer.shutdown();
+                    break;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+
+            match remote.read(&mut buffer) {
+                Ok(0) => {
+                    let _ = writer.shutdown();
+                    break;
+                }
+                Ok(read) => {
+                    writer.write_all(&buffer[..read])?;
+                    download = download.saturating_add(read as u64);
+                    progressed = true;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    let _ = writer.shutdown();
+                    break;
+                }
+            }
+
+            if !progressed {
+                thread::sleep(websocket_tls_relay_idle_timeout(&mut idle_rounds));
+            } else {
+                idle_rounds = 0;
+            }
+        }
         let upload = join_native_blocking_relay(upload_task, "upload relay task panicked")?;
         self.traffic.add_with_user_id(
             self.config.node_tag.clone(),
@@ -459,6 +570,60 @@ impl TrojanServer {
             request.client_ip,
         );
         Ok(())
+    }
+
+    fn connect_tcp_for_websocket(
+        &self,
+        client: &WebSocketReader,
+        request: &TrojanRequest,
+    ) -> io::Result<Option<TcpStream>> {
+        let router = self.router.clone();
+        let target = request.target.clone();
+        let timeout = self.config.connect_timeout;
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("keli-core-trojan-connect".to_string())
+            .stack_size(TROJAN_CONNECT_THREAD_STACK)
+            .spawn(move || {
+                let result = match router.decide_tcp(&target.host, target.port, &[]) {
+                    RouteDecision::Direct => connect_target(&target, timeout),
+                    RouteDecision::Outbound(outbound) => {
+                        connect_tcp_outbound(&outbound, &target, timeout)
+                    }
+                    RouteDecision::Block => Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "target blocked by route",
+                    )),
+                    RouteDecision::UnsupportedOutbound(tag) => Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("outbound route {tag} is not implemented"),
+                    )),
+                };
+                let _ = sender.send(result);
+            })
+            .map_err(|source| {
+                io::Error::new(
+                    source.kind(),
+                    format!("spawn trojan websocket connect worker: {source}"),
+                )
+            })?;
+
+        loop {
+            match receiver.try_recv() {
+                Ok(result) => return result.map(Some),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(io::Error::other(
+                        "trojan websocket connect worker stopped before sending result",
+                    ));
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            if client.peer_closed_nonblocking()? {
+                let _ = client.shutdown();
+                return Ok(None);
+            }
+            thread::sleep(CLIENT_CLOSE_CONNECT_POLL);
+        }
     }
 
     fn connect_tcp_for_tls_websocket(
@@ -3180,6 +3345,126 @@ mod tests {
             .expect("remote done");
         server_thread.join().expect("server thread");
         echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
+    fn websocket_client_close_terminates_trojan_relay() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (remote_done_tx, remote_done_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+            thread::sleep(Duration::from_secs(3));
+            remote_done_tx.send(()).expect("send remote done");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let server_clone = server.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let result = server_clone.handle_websocket_client(stream, Some("/trojan"));
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = TcpStream::connect(trojan_addr).expect("client connect");
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.49",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame(&trojan_request(echo_addr)))
+            .expect("trojan request frame");
+        client.write_all(&masked_frame(b"ping")).expect("payload");
+        assert_eq!(read_binary_frame(&mut client), b"ping");
+        drop(client);
+
+        let handled = handled_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("trojan relay exits after websocket client close");
+        handled.expect("trojan relay result");
+        remote_done_rx
+            .recv_timeout(Duration::from_secs(4))
+            .expect("remote done");
+        server_thread.join().expect("server thread");
+        echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
+    fn websocket_client_close_during_outbound_connect_does_not_wait_for_timeout() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let (proxy_accepted_tx, proxy_accepted_rx) = mpsc::channel();
+        let proxy_thread = thread::spawn(move || {
+            let (_stream, _) = proxy.accept().expect("proxy accept");
+            proxy_accepted_tx.send(()).expect("send proxy accepted");
+            thread::sleep(Duration::from_secs(3));
+        });
+
+        let target = "127.0.0.1:443".parse::<SocketAddr>().expect("target addr");
+        let server = server_with_routes(
+            vec![RouteRule {
+                targets: vec!["ip:127.0.0.1/32".to_string()],
+                action: RouteAction::Outbound("tw".to_string()),
+                outbound: Some(OutboundConfig {
+                    tag: "tw".to_string(),
+                    protocol: "socks".to_string(),
+                    method: None,
+                    alter_id: None,
+                    address: Some(proxy_addr.ip().to_string()),
+                    port: Some(proxy_addr.port()),
+                    username: None,
+                    password: None,
+                    tls: None,
+                    transport: None,
+                }),
+            }],
+            Duration::from_secs(2),
+        );
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let result = server.handle_websocket_client(stream, Some("/trojan"));
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = TcpStream::connect(trojan_addr).expect("client connect");
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.50",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame(&trojan_request(target)))
+            .expect("trojan request");
+        proxy_accepted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("proxy should receive outbound connection");
+
+        let started = Instant::now();
+        drop(client);
+
+        let handled = handled_rx
+            .recv_timeout(Duration::from_millis(700))
+            .expect("server should stop waiting once websocket client closes mid-connect");
+        handled.expect("client close during outbound connect is not a route error");
+        assert!(started.elapsed() < Duration::from_millis(700));
+        server_thread.join().expect("server thread");
+        proxy_thread.join().expect("proxy thread");
     }
 
     #[test]
