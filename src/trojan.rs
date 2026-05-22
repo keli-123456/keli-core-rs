@@ -288,7 +288,7 @@ impl TrojanServer {
             return Ok(());
         }
         if request.command == TrojanCommand::UdpAssociate {
-            return self.relay_udp_stream(websocket, request, bandwidth);
+            return self.relay_udp_tls_websocket(websocket, request, bandwidth);
         }
         let remote = match self
             .router
@@ -565,6 +565,78 @@ impl TrojanServer {
         result
     }
 
+    fn relay_udp_tls_websocket(
+        &self,
+        mut client: crate::websocket::WebSocketTlsStream,
+        request: TrojanRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()> {
+        client.set_nonblocking(true)?;
+        let mut state = TrojanUdpRelayState::new(self.config.connect_timeout);
+        let mut pending = Vec::new();
+        let mut upload = 0u64;
+        let mut download = 0u64;
+        let mut idle_rounds = 0u8;
+        let result = 'relay: loop {
+            let mut progressed = false;
+            let mut input = [0u8; 16 * 1024];
+
+            match client.read(&mut input) {
+                Ok(0) => break 'relay Ok(()),
+                Ok(read) => {
+                    pending.extend_from_slice(&input[..read]);
+                    progressed = true;
+                    while let Some((target, payload)) =
+                        parse_trojan_udp_packet_from_buffer(&mut pending)?
+                    {
+                        match self.send_udp_packet(
+                            &mut state,
+                            &target,
+                            &payload,
+                            bandwidth.as_deref(),
+                        ) {
+                            Ok((sent, response)) => {
+                                upload = upload.saturating_add(sent);
+                                if let Some((source, payload)) = response {
+                                    let packet = encode_trojan_udp_packet(source, &payload);
+                                    client.write_all(&packet)?;
+                                    download = download.saturating_add(payload.len() as u64);
+                                }
+                            }
+                            Err(error) => break 'relay Err(error),
+                        }
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) if is_stream_closed(&error) => break 'relay Ok(()),
+                Err(error) => break 'relay Err(error),
+            }
+
+            while let Some((source, payload)) = state.recv_available()? {
+                let packet = encode_trojan_udp_packet(source, &payload);
+                client.write_all(&packet)?;
+                download = download.saturating_add(payload.len() as u64);
+                progressed = true;
+            }
+
+            if !progressed {
+                let timeout = websocket_udp_relay_idle_timeout(&mut idle_rounds);
+                thread::sleep(timeout);
+            } else {
+                idle_rounds = 0;
+            }
+        };
+        let _ = client.set_nonblocking(false);
+        self.record_traffic(
+            request.user_uuid,
+            request.user_id,
+            upload,
+            download,
+            request.client_ip,
+        );
+        result
+    }
+
     fn forward_udp_packet<W>(
         &self,
         state: &mut TrojanUdpRelayState,
@@ -636,6 +708,53 @@ impl TrojanServer {
         };
 
         Ok((payload.len() as u64, download))
+    }
+
+    fn send_udp_packet(
+        &self,
+        state: &mut TrojanUdpRelayState,
+        target: &SocksTarget,
+        payload: &[u8],
+        bandwidth: Option<&BandwidthLimiter>,
+    ) -> io::Result<(u64, Option<(SocketAddr, Vec<u8>)>)> {
+        let decision = self.router.decide_udp(&target.host, target.port, payload);
+        let outbound = match &decision {
+            RouteDecision::Direct => None,
+            RouteDecision::Outbound(outbound) => Some(outbound),
+            RouteDecision::Block => return Ok((0, None)),
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
+
+        if let Some(limiter) = bandwidth {
+            if !limiter.wait_for(payload.len()) {
+                return Ok((0, None));
+            }
+        }
+
+        if let Some(outbound) = outbound {
+            return match send_udp_outbound(outbound, target, payload, self.config.connect_timeout) {
+                Ok((source, response)) => Ok((payload.len() as u64, Some((source, response)))),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    Ok((payload.len() as u64, None))
+                }
+                Err(error) => Err(error),
+            };
+        }
+
+        let remote_addr = state.remote_addr_for(target)?;
+        let udp = state.socket_for_nonblocking(remote_addr)?;
+        udp.send_to(payload, remote_addr)?;
+        Ok((payload.len() as u64, None))
     }
 
     fn record_traffic(
@@ -718,6 +837,27 @@ impl TrojanUdpRelayState {
             *slot = Some(socket);
         }
         Ok(slot.as_ref().expect("udp socket initialized"))
+    }
+
+    fn socket_for_nonblocking(&mut self, remote: SocketAddr) -> io::Result<&UdpSocket> {
+        let slot = if remote.is_ipv4() {
+            &mut self.ipv4
+        } else {
+            &mut self.ipv6
+        };
+        if slot.is_none() {
+            let socket = UdpSocket::bind(udp_bind_addr_for_remote(remote))?;
+            socket.set_nonblocking(true)?;
+            *slot = Some(socket);
+        }
+        Ok(slot.as_ref().expect("udp socket initialized"))
+    }
+
+    fn recv_available(&self) -> io::Result<Option<(SocketAddr, Vec<u8>)>> {
+        if let Some(packet) = recv_available_from_socket(self.ipv4.as_ref())? {
+            return Ok(Some(packet));
+        }
+        recv_available_from_socket(self.ipv6.as_ref())
     }
 }
 
@@ -1430,6 +1570,93 @@ fn read_trojan_udp_packet<R: Read>(reader: &mut R) -> io::Result<(SocksTarget, V
     Ok((target, payload))
 }
 
+fn parse_trojan_udp_packet_from_buffer(
+    buffer: &mut Vec<u8>,
+) -> io::Result<Option<(SocksTarget, Vec<u8>)>> {
+    let Some((target, target_len)) = parse_trojan_target_from_bytes(buffer)? else {
+        return Ok(None);
+    };
+    if buffer.len() < target_len + 4 {
+        return Ok(None);
+    }
+    let len_offset = target_len;
+    let payload_len = u16::from_be_bytes([buffer[len_offset], buffer[len_offset + 1]]) as usize;
+    let crlf_offset = len_offset + 2;
+    if &buffer[crlf_offset..crlf_offset + 2] != b"\r\n" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid trojan udp crlf",
+        ));
+    }
+    let payload_offset = crlf_offset + 2;
+    let total_len = payload_offset + payload_len;
+    if buffer.len() < total_len {
+        return Ok(None);
+    }
+    let payload = buffer[payload_offset..total_len].to_vec();
+    buffer.drain(..total_len);
+    Ok(Some((target, payload)))
+}
+
+fn parse_trojan_target_from_bytes(bytes: &[u8]) -> io::Result<Option<(SocksTarget, usize)>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let mut offset = 1usize;
+    let host = match bytes[0] {
+        ATYP_IPV4 => {
+            if bytes.len() < offset + 4 {
+                return Ok(None);
+            }
+            let ip = Ipv4Addr::new(
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            );
+            offset += 4;
+            ip.to_string()
+        }
+        ATYP_DOMAIN => {
+            if bytes.len() < offset + 1 {
+                return Ok(None);
+            }
+            let len = usize::from(bytes[offset]);
+            offset += 1;
+            if bytes.len() < offset + len {
+                return Ok(None);
+            }
+            let host = std::str::from_utf8(&bytes[offset..offset + len])
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid domain"))?
+                .to_string();
+            offset += len;
+            host
+        }
+        ATYP_IPV6 => {
+            if bytes.len() < offset + 16 {
+                return Ok(None);
+            }
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&bytes[offset..offset + 16]);
+            offset += 16;
+            Ipv6Addr::from(ip).to_string()
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported trojan address type",
+            ));
+        }
+    };
+
+    if bytes.len() < offset + 2 {
+        return Ok(None);
+    }
+    let port = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
+    offset += 2;
+    Ok(Some((SocksTarget { host, port }, offset)))
+}
+
 fn encode_trojan_udp_packet(source: SocketAddr, payload: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(22 + payload.len());
     match source.ip() {
@@ -1454,6 +1681,41 @@ fn udp_bind_addr_for_remote(remote: SocketAddr) -> SocketAddr {
         SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     }
+}
+
+fn recv_available_from_socket(
+    socket: Option<&UdpSocket>,
+) -> io::Result<Option<(SocketAddr, Vec<u8>)>> {
+    let Some(socket) = socket else {
+        return Ok(None);
+    };
+    let mut buffer = vec![0u8; MAX_UDP_PACKET_SIZE];
+    match socket.recv_from(&mut buffer) {
+        Ok((read, source)) => {
+            buffer.truncate(read);
+            Ok(Some((source, buffer)))
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn websocket_udp_relay_idle_timeout(idle_rounds: &mut u8) -> Duration {
+    const BACKOFF_MS: [u64; 4] = [1, 2, 5, 10];
+    let idx = usize::from((*idle_rounds).min((BACKOFF_MS.len() - 1) as u8));
+    *idle_rounds = idle_rounds
+        .saturating_add(1)
+        .min((BACKOFF_MS.len() - 1) as u8);
+    Duration::from_millis(BACKOFF_MS[idx])
 }
 
 fn is_stream_closed(error: &io::Error) -> bool {
@@ -2745,6 +3007,87 @@ mod tests {
     }
 
     #[test]
+    fn tls_websocket_udp_continues_when_previous_datagram_has_no_response() {
+        let cert = test_cert("trojan-ws-udp-nonblocking");
+        let blackhole = UdpSocket::bind("127.0.0.1:0").expect("blackhole bind");
+        let blackhole_addr = blackhole.local_addr().expect("blackhole addr");
+        let (blackhole_seen_tx, blackhole_seen_rx) = mpsc::channel();
+        let blackhole_thread = thread::spawn(move || {
+            let mut bytes = [0u8; 128];
+            let (read, _) = blackhole.recv_from(&mut bytes).expect("blackhole read");
+            assert_eq!(&bytes[..read], b"drop");
+            blackhole_seen_tx.send(()).expect("blackhole seen");
+            thread::sleep(Duration::from_millis(500));
+        });
+
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let mut bytes = [0u8; 128];
+            let (read, source) = echo.recv_from(&mut bytes).expect("echo read");
+            assert_eq!(&bytes[..read], b"ping");
+            echo.send_to(b"pong", source).expect("echo write");
+        });
+
+        let server = server_with_routes(Vec::new(), Duration::from_secs(2));
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            server_clone.handle_tls_websocket_client(client, Some("/trojan"))
+        });
+
+        let mut client = tls_client(trojan_addr, cert.cert_der.clone());
+        client
+            .sock
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("client timeout");
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.48",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+
+        client
+            .write_all(&masked_frame(&trojan_udp_associate_request(blackhole_addr)))
+            .expect("udp associate request");
+        client
+            .write_all(&masked_frame(&trojan_udp_packet(blackhole_addr, b"drop")))
+            .expect("blackhole datagram");
+        blackhole_seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blackhole should receive first datagram");
+        client
+            .write_all(&masked_frame(&trojan_udp_packet(echo_addr, b"ping")))
+            .expect("echo datagram");
+
+        let response_frame = read_binary_frame(&mut client);
+        let (source, payload) = read_trojan_udp_packet(&mut Cursor::new(response_frame));
+        assert_eq!(source, echo_addr);
+        assert_eq!(payload, b"pong");
+        drop(client);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        blackhole_thread.join().expect("blackhole thread");
+        echo_thread.join().expect("echo thread");
+
+        let records = server.drain_traffic(1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].upload, 8);
+        assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
     fn tls_websocket_client_close_terminates_trojan_relay() {
         let cert = test_cert("trojan-ws-close");
         let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
@@ -2806,9 +3149,7 @@ mod tests {
         let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
         let proxy_addr = proxy.local_addr().expect("proxy addr");
 
-        let target = "127.0.0.1:443"
-            .parse::<SocketAddr>()
-            .expect("target addr");
+        let target = "127.0.0.1:443".parse::<SocketAddr>().expect("target addr");
         let server = server_with_routes(
             vec![RouteRule {
                 targets: vec!["ip:127.0.0.1/32".to_string()],
