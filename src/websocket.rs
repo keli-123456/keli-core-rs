@@ -278,8 +278,12 @@ impl WebSocketTlsStream {
             .write_plain_all_wait(&frame_bytes(OPCODE_BINARY, payload))
     }
 
-    fn shutdown(&self) -> io::Result<()> {
+    pub(crate) fn shutdown(&self) -> io::Result<()> {
         self.stream.shutdown(Shutdown::Both)
+    }
+
+    pub(crate) fn peer_closed(&self) -> io::Result<bool> {
+        self.stream.peer_closed()
     }
 
     fn wait_readable_with_remote(

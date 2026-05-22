@@ -283,6 +283,10 @@ impl TrojanServer {
         } else {
             self.bandwidth.limiter_for_limited(user.as_ref())
         };
+        if websocket.peer_closed()? {
+            let _ = websocket.shutdown();
+            return Ok(());
+        }
         if request.command == TrojanCommand::UdpAssociate {
             return self.relay_udp_stream(websocket, request, bandwidth);
         }
@@ -1513,12 +1517,14 @@ mod tests {
         mpsc, Arc,
     };
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use rustls::pki_types::{CertificateDer, ServerName};
     use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
-    use crate::config::{OutboundConfig, OutboundTlsConfig, OutboundTransportConfig};
+    use crate::config::{
+        OutboundConfig, OutboundTlsConfig, OutboundTransportConfig, RouteAction, RouteRule,
+    };
     use crate::grpc::{run_grpc_listener, GrpcStreamHandler};
     use crate::http2::{run_http2_listener, Http2StreamHandler};
     use crate::httpupgrade::accept_httpupgrade;
@@ -1577,6 +1583,16 @@ mod tests {
             users: vec![user()],
             routes: Vec::new(),
             connect_timeout: Duration::from_secs(3),
+        })
+    }
+
+    fn server_with_routes(routes: Vec<RouteRule>, connect_timeout: Duration) -> TrojanServer {
+        TrojanServer::new(TrojanServerConfig {
+            node_tag: "panel|trojan|1".to_string(),
+            listen: "127.0.0.1:0".parse().expect("listen addr"),
+            users: vec![user()],
+            routes,
+            connect_timeout,
         })
     }
 
@@ -2715,6 +2731,70 @@ mod tests {
             .expect("remote done");
         server_thread.join().expect("server thread");
         echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
+    fn tls_websocket_client_close_before_route_connect_does_not_wait_for_socks_timeout() {
+        let cert = test_cert("trojan-ws-connect-close");
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+
+        let target = "127.0.0.1:443"
+            .parse::<SocketAddr>()
+            .expect("target addr");
+        let server = server_with_routes(
+            vec![RouteRule {
+                targets: vec!["ip:127.0.0.1/32".to_string()],
+                action: RouteAction::Outbound("tw".to_string()),
+                outbound: Some(OutboundConfig {
+                    tag: "tw".to_string(),
+                    protocol: "socks".to_string(),
+                    method: None,
+                    alter_id: None,
+                    address: Some(proxy_addr.ip().to_string()),
+                    port: Some(proxy_addr.port()),
+                    username: None,
+                    password: None,
+                    tls: None,
+                    transport: None,
+                }),
+            }],
+            Duration::from_secs(2),
+        );
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            let result = server.handle_tls_websocket_client(client, Some("/trojan"));
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = tls_client(trojan_addr, cert.cert_der.clone());
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.46",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame(&trojan_request(target)))
+            .expect("trojan request");
+        let started = Instant::now();
+        drop(client);
+
+        let handled = handled_rx
+            .recv_timeout(Duration::from_millis(700))
+            .expect("server should stop waiting once tls-websocket client closes");
+        handled.expect("client close before outbound connect is not a route error");
+        assert!(started.elapsed() < Duration::from_millis(700));
+        server_thread.join().expect("server thread");
+        drop(proxy);
     }
 
     #[test]
