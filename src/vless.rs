@@ -481,7 +481,9 @@ impl VlessServer {
                 request.target.host, request.target.port, request.flow, request.user_key
             )
         });
-        client.write_all(&[VERSION, 0x00])?;
+        if request.flow != FLOW_XTLS_RPRX_VISION {
+            client.write_all(&[VERSION, 0x00])?;
+        }
         self.relay_tls(client, remote, request, bandwidth)
     }
 
@@ -848,7 +850,7 @@ impl VlessServer {
         S: TlsSocket + RawTcpStreamAccess,
     {
         let (upload, download) = if request.flow == FLOW_XTLS_RPRX_VISION {
-            relay_tls_vision_stream(client, remote, request.user_id, bandwidth)?
+            relay_tls_vision_stream(client, remote, request.user_id, bandwidth, &[VERSION, 0x00])?
         } else {
             relay_tls_stream(client, remote, bandwidth)?
         };
@@ -2795,6 +2797,7 @@ fn relay_tls_vision_stream<S>(
     mut remote: TcpStream,
     user_id: [u8; 16],
     limiter: Option<Arc<BandwidthLimiter>>,
+    response_header: &[u8],
 ) -> io::Result<(u64, u64)>
 where
     S: TlsSocket + RawTcpStreamAccess,
@@ -2819,6 +2822,11 @@ where
 
     if trace {
         eprintln!("keli-core-rs vless trace: vision relay start");
+    }
+
+    if !response_header.is_empty() {
+        let frame = vision_encoder.encode_with_long_padding(response_header);
+        client.write_plain_all_wait(&frame)?;
     }
 
     while !upload_done || !download_done {
@@ -5032,10 +5040,6 @@ mod tests {
         client
             .write_all(&vless_request_with_flow(echo_addr, "xtls-rprx-vision"))
             .expect("client request");
-        let mut response = [0u8; 2];
-        client.read_exact(&mut response).expect("client response");
-        assert_eq!(response, [0x00, 0x00]);
-
         let mut encoded = Vec::new();
         VisionWriter::new(&mut encoded, [0x11; 16])
             .write_all(b"ping")
@@ -5043,6 +5047,11 @@ mod tests {
         client.write_all(&encoded).expect("client write payload");
 
         let mut vision_reader = VisionReader::new(&mut client, [0x11; 16]);
+        let mut response = [0u8; 2];
+        vision_reader
+            .read_exact(&mut response)
+            .expect("client response");
+        assert_eq!(response, [0x00, 0x00]);
         let mut echoed = [0u8; 4];
         vision_reader
             .read_exact(&mut echoed)
@@ -5107,9 +5116,6 @@ mod tests {
         client
             .write_all(&vless_request_with_flow(echo_addr, "xtls-rprx-vision"))
             .expect("client request");
-        let mut response = [0u8; 2];
-        client.read_exact(&mut response).expect("client response");
-        assert_eq!(response, [0x00, 0x00]);
 
         let mut encoder = VisionEncoder::new([0x11; 16]);
         let first_encoded = encoder.encode(&client_hello);
@@ -5123,6 +5129,11 @@ mod tests {
             .expect("client write app data");
 
         let mut vision_reader = VisionReader::new(&mut client, [0x11; 16]);
+        let mut response = [0u8; 2];
+        vision_reader
+            .read_exact(&mut response)
+            .expect("client response");
+        assert_eq!(response, [0x00, 0x00]);
         let mut echoed = vec![0u8; expected_len];
         vision_reader
             .read_exact(&mut echoed)
@@ -5156,7 +5167,8 @@ mod tests {
             let (stream, _) = inbound.accept().expect("accept inbound");
             let client = acceptor.accept(stream).expect("tls accept");
             let remote_stream = TcpStream::connect(remote_addr).expect("connect remote");
-            let result = super::relay_tls_vision_stream(client, remote_stream, [0x11; 16], None);
+            let result =
+                super::relay_tls_vision_stream(client, remote_stream, [0x11; 16], None, &[]);
             relay_tx.send(result).expect("send relay result");
         });
 
@@ -5199,7 +5211,8 @@ mod tests {
             let (stream, _) = inbound.accept().expect("accept inbound");
             let client = acceptor.accept(stream).expect("tls accept");
             let remote_stream = TcpStream::connect(remote_addr).expect("connect remote");
-            let result = super::relay_tls_vision_stream(client, remote_stream, [0x11; 16], None);
+            let result =
+                super::relay_tls_vision_stream(client, remote_stream, [0x11; 16], None, &[]);
             relay_tx.send(result).expect("send relay result");
         });
 
@@ -5265,12 +5278,14 @@ mod tests {
         client
             .write_all(&vless_request_with_flow(echo_addr, "xtls-rprx-vision"))
             .expect("client request");
-        let mut response = [0u8; 2];
-        client.read_exact(&mut response).expect("client response");
-        assert_eq!(response, [0x00, 0x00]);
-
         client.write_all(&payload).expect("plain payload");
+
         let mut vision_reader = VisionReader::new(&mut client, [0x11; 16]);
+        let mut response = [0u8; 2];
+        vision_reader
+            .read_exact(&mut response)
+            .expect("client response");
+        assert_eq!(response, [0x00, 0x00]);
         let mut echoed = vec![0u8; payload.len()];
         vision_reader
             .read_exact(&mut echoed)
