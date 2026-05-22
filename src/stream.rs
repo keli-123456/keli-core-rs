@@ -64,6 +64,80 @@ pub fn relay_tcp_fast_unlimited_close_on_eof(
     relay_tcp_streams_unlimited_native(client, remote, true)
 }
 
+pub fn spawn_tcp_relay_background<F>(
+    client: TcpStream,
+    remote: TcpStream,
+    limiter: Option<Arc<BandwidthLimiter>>,
+    close_peer_on_eof: bool,
+    on_finish: F,
+) -> io::Result<tokio::task::JoinHandle<()>>
+where
+    F: FnOnce(u64, u64) + Send + 'static,
+{
+    let upload_client_shutdown = client.try_clone()?;
+    let upload_remote_shutdown = remote.try_clone()?;
+    let download_client_shutdown = client.try_clone()?;
+    let download_remote_shutdown = remote.try_clone()?;
+
+    client.set_nonblocking(true)?;
+    remote.set_nonblocking(true)?;
+
+    spawn_background_io(async move {
+        let (upload, download) = match (
+            tokio::net::TcpStream::from_std(client),
+            tokio::net::TcpStream::from_std(remote),
+        ) {
+            (Ok(client), Ok(remote)) => {
+                let (mut client_read, mut client_write) = client.into_split();
+                let (mut remote_read, mut remote_write) = remote.into_split();
+                if let Some(limiter) = limiter {
+                    let upload = copy_count_best_effort_limited_async(
+                        &mut client_read,
+                        &mut remote_write,
+                        Some(limiter.as_ref()),
+                    );
+                    let download = copy_count_best_effort_limited_async(
+                        &mut remote_read,
+                        &mut client_write,
+                        Some(limiter.as_ref()),
+                    );
+                    tokio::join!(upload, download)
+                } else {
+                    let upload = relay_copy_unlimited_async(
+                        &mut client_read,
+                        &mut remote_write,
+                        upload_client_shutdown,
+                        upload_remote_shutdown,
+                        close_peer_on_eof,
+                    );
+                    let download = relay_copy_unlimited_async(
+                        &mut remote_read,
+                        &mut client_write,
+                        download_client_shutdown,
+                        download_remote_shutdown,
+                        close_peer_on_eof,
+                    );
+                    tokio::join!(upload, download)
+                }
+            }
+            (client_result, remote_result) => {
+                if let Ok(client) = client_result {
+                    let _ = client
+                        .into_std()
+                        .map(|stream| stream.shutdown(Shutdown::Both));
+                }
+                if let Ok(remote) = remote_result {
+                    let _ = remote
+                        .into_std()
+                        .map(|stream| stream.shutdown(Shutdown::Both));
+                }
+                (0, 0)
+            }
+        };
+        on_finish(upload, download);
+    })
+}
+
 pub fn relay_tcp_limited(
     client: TcpStream,
     remote: TcpStream,

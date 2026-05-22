@@ -5,7 +5,7 @@ use std::net::{
 };
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,7 @@ use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
     relay_tcp_fast_unlimited_close_on_eof, relay_tcp_limited, spawn_native_blocking_relay,
+    spawn_tcp_relay_background,
 };
 use crate::tls::{relay_tls_stream, RawTcpStreamAccess, TlsConnection, TlsSocket};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
@@ -40,7 +41,8 @@ use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::vision::{VisionDecoder, VisionEncoder, VisionReader, VisionWriter};
 use crate::websocket::{
     accept_websocket_tls_with_client_ip, accept_websocket_with_client_ip, connect_websocket_client,
-    relay_websocket_tls_stream, WebSocketClientStream,
+    relay_websocket_tls_stream, websocket_tls_relay_idle_timeout, WebSocketClientStream,
+    WebSocketReader, WebSocketWriter,
 };
 use crate::{
     connect_tcp_outbound, connect_tcp_outbound_tokio, send_udp_outbound, send_udp_outbound_tokio,
@@ -62,6 +64,8 @@ const VLESS_VISION_DRAIN_SECS_ENV: &str = "KELI_CORE_VLESS_VISION_DRAIN_SECS";
 const VLESS_ASYNC_RELAY_IO_TIMEOUT_SECS_ENV: &str = "KELI_CORE_VLESS_RELAY_IO_TIMEOUT_SECS";
 const DEFAULT_VLESS_ASYNC_RELAY_IO_TIMEOUT_SECS: u64 = 15;
 const VLESS_ROUTE_SLOW_LOG_MS: u128 = 1_000;
+const CLIENT_CLOSE_CONNECT_POLL: Duration = Duration::from_millis(10);
+const VLESS_CONNECT_THREAD_STACK: usize = 256 * 1024;
 
 #[cfg(test)]
 static VLESS_VISION_RAW_RELAY_SWITCHES: AtomicUsize = AtomicUsize::new(0);
@@ -354,7 +358,7 @@ impl VlessServer {
     ) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let (reader, writer, forwarded_ip) = accept_websocket_with_client_ip(client, path)?;
-        self.handle_split_client_with_ip(reader, writer, forwarded_ip.or(client_ip))
+        self.handle_websocket_split_client_with_ip(reader, writer, forwarded_ip.or(client_ip))
     }
 
     pub fn handle_split_client<R, W>(&self, reader: R, writer: W) -> io::Result<()>
@@ -418,6 +422,37 @@ impl VlessServer {
         };
         writer.write_all(&[VERSION, 0x00])?;
         self.relay_websocket(reader, writer, remote, request, bandwidth)
+    }
+
+    fn handle_websocket_split_client_with_ip(
+        &self,
+        mut reader: WebSocketReader,
+        mut writer: WebSocketWriter,
+        client_ip: Option<IpAddr>,
+    ) -> io::Result<()> {
+        let mut request = self.read_request(&mut reader)?;
+        request.client_ip = client_ip;
+        let user = self.request_user(&request);
+        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let bandwidth = if request.command == VlessCommand::Udp {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
+        if reader.peer_closed_nonblocking()? {
+            let _ = reader.shutdown();
+            let _ = writer.shutdown();
+            return Ok(());
+        }
+        if request.command == VlessCommand::Udp {
+            writer.write_all(&[VERSION, 0x00])?;
+            return self.relay_udp_split(reader, writer, request, bandwidth);
+        }
+        let Some(remote) = self.connect_tcp_for_websocket(&reader, &request)? else {
+            return Ok(());
+        };
+        writer.write_all(&[VERSION, 0x00])?;
+        self.relay_plain_websocket(reader, writer, remote, request, bandwidth)
     }
 
     pub fn handle_tls_client<S>(&self, client: TlsConnection<S>) -> io::Result<()>
@@ -517,29 +552,12 @@ impl VlessServer {
             websocket.write_all(&[VERSION, 0x00])?;
             return self.relay_udp_stream(websocket, request, bandwidth);
         }
-        let remote = match self
-            .router
-            .decide_tcp(&request.target.host, request.target.port, &[])
-        {
-            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
-            RouteDecision::Outbound(outbound) => connect_vless_route_tcp_outbound(
-                &self.config.node_tag,
-                &outbound,
-                &request.target,
-                self.config.connect_timeout,
-            )?,
-            RouteDecision::Block => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target blocked by route",
-                ));
-            }
-            RouteDecision::UnsupportedOutbound(tag) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("outbound route {tag} is not implemented"),
-                ));
-            }
+        if websocket.peer_closed_nonblocking()? {
+            let _ = websocket.shutdown();
+            return Ok(());
+        }
+        let Some(remote) = self.connect_tcp_for_tls_websocket(&websocket, &request)? else {
+            return Ok(());
         };
         websocket.write_all(&[VERSION, 0x00])?;
         self.relay_tls_websocket(websocket, remote, request, bandwidth)
@@ -803,20 +821,24 @@ impl VlessServer {
             relay_vision_split_streams(reader, writer, remote, request.user_id, bandwidth)?
         } else {
             let mut remote_write = remote.try_clone()?;
+            let remote_shutdown = remote.try_clone()?;
             let mut remote_read = remote;
             let _connection = self
                 .bandwidth
                 .register_tcp_connection(Some(&request.user_uuid), &[&remote_read])?;
             let upload_limiter = bandwidth.clone();
-            let upload_task =
-                spawn_native_blocking_relay(move || match upload_limiter.as_deref() {
+            let upload_task = spawn_native_blocking_relay(move || {
+                let result = match upload_limiter.as_deref() {
                     Some(limiter) => copy_count_best_effort_limited(
                         &mut reader,
                         &mut remote_write,
                         Some(limiter),
                     ),
                     None => copy_count_best_effort(&mut reader, &mut remote_write),
-                })?;
+                };
+                let _ = remote_shutdown.shutdown(Shutdown::Both);
+                result
+            })?;
             let download = match bandwidth.as_deref() {
                 Some(limiter) => {
                     copy_count_best_effort_limited(&mut remote_read, &mut writer, Some(limiter))
@@ -837,6 +859,221 @@ impl VlessServer {
         Ok(())
     }
 
+    fn relay_plain_websocket(
+        &self,
+        mut reader: WebSocketReader,
+        mut writer: WebSocketWriter,
+        mut remote: TcpStream,
+        request: VlessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()> {
+        let _connection = self
+            .bandwidth
+            .register_tcp_connection(Some(&request.user_uuid), &[&remote])?;
+        reader.set_nonblocking(true)?;
+        remote.set_nonblocking(true)?;
+        let mut download = 0u64;
+        let mut upload = 0u64;
+        let mut upload_done = false;
+        let mut download_done = false;
+        let mut client_buffer = [0u8; 16 * 1024];
+        let mut remote_buffer = [0u8; 16 * 1024];
+        let mut idle_rounds = 0u8;
+        while !upload_done || !download_done {
+            let mut progressed = false;
+
+            if !upload_done {
+                match reader.read(&mut client_buffer) {
+                    Ok(0) => {
+                        upload_done = true;
+                        download_done = true;
+                        let _ = reader.shutdown();
+                        let _ = writer.shutdown();
+                        let _ = remote.shutdown(Shutdown::Both);
+                        progressed = true;
+                    }
+                    Ok(read) => {
+                        if let Some(limiter) = bandwidth.as_deref() {
+                            if !limiter.wait_for(read) {
+                                upload_done = true;
+                                download_done = true;
+                                let _ = reader.shutdown();
+                                let _ = writer.shutdown();
+                                let _ = remote.shutdown(Shutdown::Both);
+                                continue;
+                            }
+                        }
+                        write_all_wait_tls_bridge(&mut remote, &client_buffer[..read])?;
+                        upload = upload.saturating_add(read as u64);
+                        progressed = true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        upload_done = true;
+                        download_done = true;
+                        let _ = reader.shutdown();
+                        let _ = writer.shutdown();
+                        let _ = remote.shutdown(Shutdown::Both);
+                        progressed = true;
+                    }
+                }
+            }
+
+            if !download_done {
+                match remote.read(&mut remote_buffer) {
+                    Ok(0) => {
+                        download_done = true;
+                        upload_done = true;
+                        let _ = reader.shutdown();
+                        let _ = writer.shutdown();
+                        let _ = remote.shutdown(Shutdown::Both);
+                        progressed = true;
+                    }
+                    Ok(read) => {
+                        write_all_wait_tls_bridge(&mut writer, &remote_buffer[..read])?;
+                        download = download.saturating_add(read as u64);
+                        progressed = true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        download_done = true;
+                        upload_done = true;
+                        let _ = reader.shutdown();
+                        let _ = writer.shutdown();
+                        let _ = remote.shutdown(Shutdown::Both);
+                        progressed = true;
+                    }
+                }
+            }
+
+            if !progressed {
+                thread::sleep(websocket_tls_relay_idle_timeout(&mut idle_rounds));
+            } else {
+                idle_rounds = 0;
+            }
+        }
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            request.user_uuid,
+            Some(request.user_numeric_id),
+            upload,
+            download,
+            request.client_ip,
+        );
+        Ok(())
+    }
+
+    fn connect_tcp_for_websocket(
+        &self,
+        client: &WebSocketReader,
+        request: &VlessRequest,
+    ) -> io::Result<Option<TcpStream>> {
+        let router = self.router.clone();
+        let node_tag = self.config.node_tag.clone();
+        let target = request.target.clone();
+        let timeout = self.config.connect_timeout;
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("keli-core-vless-connect".to_string())
+            .stack_size(VLESS_CONNECT_THREAD_STACK)
+            .spawn(move || {
+                let result = match router.decide_tcp(&target.host, target.port, &[]) {
+                    RouteDecision::Direct => connect_target(&target, timeout),
+                    RouteDecision::Outbound(outbound) => {
+                        connect_vless_route_tcp_outbound(&node_tag, &outbound, &target, timeout)
+                    }
+                    RouteDecision::Block => Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "target blocked by route",
+                    )),
+                    RouteDecision::UnsupportedOutbound(tag) => Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("outbound route {tag} is not implemented"),
+                    )),
+                };
+                let _ = sender.send(result);
+            })
+            .map_err(|source| {
+                io::Error::new(
+                    source.kind(),
+                    format!("spawn vless websocket connect worker: {source}"),
+                )
+            })?;
+
+        loop {
+            match receiver.try_recv() {
+                Ok(result) => return result.map(Some),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(io::Error::other(
+                        "vless websocket connect worker stopped before sending result",
+                    ));
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            if client.peer_closed_nonblocking()? {
+                let _ = client.shutdown();
+                return Ok(None);
+            }
+            thread::sleep(CLIENT_CLOSE_CONNECT_POLL);
+        }
+    }
+
+    fn connect_tcp_for_tls_websocket(
+        &self,
+        client: &crate::websocket::WebSocketTlsStream,
+        request: &VlessRequest,
+    ) -> io::Result<Option<TcpStream>> {
+        let router = self.router.clone();
+        let node_tag = self.config.node_tag.clone();
+        let target = request.target.clone();
+        let timeout = self.config.connect_timeout;
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("keli-core-vless-connect".to_string())
+            .stack_size(VLESS_CONNECT_THREAD_STACK)
+            .spawn(move || {
+                let result = match router.decide_tcp(&target.host, target.port, &[]) {
+                    RouteDecision::Direct => connect_target(&target, timeout),
+                    RouteDecision::Outbound(outbound) => {
+                        connect_vless_route_tcp_outbound(&node_tag, &outbound, &target, timeout)
+                    }
+                    RouteDecision::Block => Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "target blocked by route",
+                    )),
+                    RouteDecision::UnsupportedOutbound(tag) => Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("outbound route {tag} is not implemented"),
+                    )),
+                };
+                let _ = sender.send(result);
+            })
+            .map_err(|source| {
+                io::Error::new(
+                    source.kind(),
+                    format!("spawn vless tls-websocket connect worker: {source}"),
+                )
+            })?;
+
+        loop {
+            match receiver.recv_timeout(CLIENT_CLOSE_CONNECT_POLL) {
+                Ok(result) => return result.map(Some),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if client.peer_closed_nonblocking()? {
+                        let _ = client.shutdown();
+                        return Ok(None);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "vless tls-websocket connect worker exited without result",
+                    ));
+                }
+            }
+        }
+    }
+
     fn relay_tls<S>(
         &self,
         client: TlsConnection<S>,
@@ -848,7 +1085,28 @@ impl VlessServer {
         S: TlsSocket + RawTcpStreamAccess,
     {
         let (upload, download) = if request.flow == FLOW_XTLS_RPRX_VISION {
-            relay_tls_vision_stream(client, remote, request.user_id, bandwidth, true)?
+            let traffic = self.traffic.clone();
+            let node_tag = self.config.node_tag.clone();
+            let user_uuid = request.user_uuid.clone();
+            let user_id = request.user_numeric_id;
+            let client_ip = request.client_ip;
+            relay_tls_vision_stream_with_background(
+                client,
+                remote,
+                request.user_id,
+                bandwidth,
+                true,
+                move |upload, download| {
+                    traffic.add_with_user_id(
+                        node_tag,
+                        user_uuid,
+                        Some(user_id),
+                        upload,
+                        download,
+                        client_ip,
+                    );
+                },
+            )?
         } else {
             relay_tls_stream(client, remote, bandwidth)?
         };
@@ -2790,15 +3048,60 @@ where
     Ok((upload, download))
 }
 
+#[cfg(test)]
 fn relay_tls_vision_stream<S>(
-    mut client: TlsConnection<S>,
-    mut remote: TcpStream,
+    client: TlsConnection<S>,
+    remote: TcpStream,
     user_id: [u8; 16],
     limiter: Option<Arc<BandwidthLimiter>>,
     write_initial_padding: bool,
 ) -> io::Result<(u64, u64)>
 where
     S: TlsSocket + RawTcpStreamAccess,
+{
+    relay_tls_vision_stream_inner(
+        client,
+        remote,
+        user_id,
+        limiter,
+        write_initial_padding,
+        None::<fn(u64, u64)>,
+    )
+}
+
+fn relay_tls_vision_stream_with_background<S, F>(
+    client: TlsConnection<S>,
+    remote: TcpStream,
+    user_id: [u8; 16],
+    limiter: Option<Arc<BandwidthLimiter>>,
+    write_initial_padding: bool,
+    on_raw_relay_finish: F,
+) -> io::Result<(u64, u64)>
+where
+    S: TlsSocket + RawTcpStreamAccess,
+    F: FnOnce(u64, u64) + Send + 'static,
+{
+    relay_tls_vision_stream_inner(
+        client,
+        remote,
+        user_id,
+        limiter,
+        write_initial_padding,
+        Some(on_raw_relay_finish),
+    )
+}
+
+fn relay_tls_vision_stream_inner<S, F>(
+    mut client: TlsConnection<S>,
+    mut remote: TcpStream,
+    user_id: [u8; 16],
+    limiter: Option<Arc<BandwidthLimiter>>,
+    write_initial_padding: bool,
+    mut on_raw_relay_finish: Option<F>,
+) -> io::Result<(u64, u64)>
+where
+    S: TlsSocket + RawTcpStreamAccess,
+    F: FnOnce(u64, u64) + Send + 'static,
 {
     let drain_after_client_eof = vless_vision_drain_after_client_eof();
     client.set_nonblocking(true)?;
@@ -3032,6 +3335,16 @@ where
             client.set_nonblocking(false)?;
             remote.set_nonblocking(false)?;
             let raw_client = client.into_socket().into_raw_tcp_stream();
+            if let Some(on_finish) = on_raw_relay_finish.take() {
+                spawn_tcp_relay_background(raw_client, remote, limiter.clone(), true, on_finish)?;
+                if trace {
+                    eprintln!(
+                        "keli-core-rs vless trace: vision raw tcp relay moved to background upload={} download={}",
+                        upload, download
+                    );
+                }
+                return Ok((upload, download));
+            }
             let (raw_upload, raw_download) = match limiter.clone() {
                 Some(limiter) => relay_tcp_limited(raw_client, remote, limiter)?,
                 None => relay_tcp_fast_unlimited_close_on_eof(raw_client, remote)?,
@@ -3340,7 +3653,7 @@ mod tests {
         Arc,
     };
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use rustls::pki_types::{CertificateDer, ServerName};
     use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -3475,6 +3788,17 @@ mod tests {
             routes: Vec::new(),
             flow: flow.to_string(),
             connect_timeout: Duration::from_secs(3),
+        })
+    }
+
+    fn server_with_routes(routes: Vec<RouteRule>, connect_timeout: Duration) -> VlessServer {
+        VlessServer::new(VlessServerConfig {
+            node_tag: "panel|vless|1".to_string(),
+            listen: "127.0.0.1:0".parse().expect("listen addr"),
+            users: vec![user()],
+            routes,
+            flow: String::new(),
+            connect_timeout,
         })
     }
 
@@ -5418,6 +5742,144 @@ mod tests {
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn websocket_client_close_during_outbound_connect_does_not_wait_for_timeout() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let (proxy_accepted_tx, proxy_accepted_rx) = mpsc::channel();
+        let proxy_thread = thread::spawn(move || {
+            let (_stream, _) = proxy.accept().expect("proxy accept");
+            proxy_accepted_tx.send(()).expect("send proxy accepted");
+            thread::sleep(Duration::from_secs(3));
+        });
+
+        let target = "127.0.0.1:443"
+            .parse::<std::net::SocketAddr>()
+            .expect("target addr");
+        let server = server_with_routes(
+            vec![RouteRule {
+                targets: vec!["ip:127.0.0.1/32".to_string()],
+                action: RouteAction::Outbound("tw".to_string()),
+                outbound: Some(OutboundConfig {
+                    tag: "tw".to_string(),
+                    protocol: "socks".to_string(),
+                    method: None,
+                    alter_id: None,
+                    address: Some(proxy_addr.ip().to_string()),
+                    port: Some(proxy_addr.port()),
+                    username: None,
+                    password: None,
+                    tls: None,
+                    transport: None,
+                }),
+            }],
+            Duration::from_secs(2),
+        );
+        let listener = server.bind().expect("vless bind");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vless accept");
+            let result = server.handle_websocket_client(stream, Some("/vless"));
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = TcpStream::connect(vless_addr).expect("client connect");
+        client
+            .write_all(&websocket_request("/vless"))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame(&vless_request(target)))
+            .expect("vless request");
+        proxy_accepted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("proxy should receive outbound connection");
+
+        let started = Instant::now();
+        drop(client);
+
+        let handled = handled_rx
+            .recv_timeout(Duration::from_millis(700))
+            .expect("server should stop waiting once websocket client closes mid-connect");
+        handled.expect("client close during outbound connect is not a route error");
+        assert!(started.elapsed() < Duration::from_millis(700));
+        server_thread.join().expect("server thread");
+        proxy_thread.join().expect("proxy thread");
+    }
+
+    #[test]
+    fn tls_websocket_client_close_during_outbound_connect_does_not_wait_for_timeout() {
+        let cert = test_cert("vless-ws-connect-close");
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let (proxy_accepted_tx, proxy_accepted_rx) = mpsc::channel();
+        let proxy_thread = thread::spawn(move || {
+            let (_stream, _) = proxy.accept().expect("proxy accept");
+            proxy_accepted_tx.send(()).expect("send proxy accepted");
+            thread::sleep(Duration::from_secs(3));
+        });
+
+        let target = "127.0.0.1:443"
+            .parse::<std::net::SocketAddr>()
+            .expect("target addr");
+        let server = server_with_routes(
+            vec![RouteRule {
+                targets: vec!["ip:127.0.0.1/32".to_string()],
+                action: RouteAction::Outbound("tw".to_string()),
+                outbound: Some(OutboundConfig {
+                    tag: "tw".to_string(),
+                    protocol: "socks".to_string(),
+                    method: None,
+                    alter_id: None,
+                    address: Some(proxy_addr.ip().to_string()),
+                    port: Some(proxy_addr.port()),
+                    username: None,
+                    password: None,
+                    tls: None,
+                    transport: None,
+                }),
+            }],
+            Duration::from_secs(2),
+        );
+        let listener = server.bind().expect("vless bind");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vless accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            let result = server.handle_tls_websocket_client(client, Some("/vless"));
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = tls_client(vless_addr, cert.cert_der.clone());
+        client
+            .write_all(&websocket_request("/vless"))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame(&vless_request(target)))
+            .expect("vless request");
+        proxy_accepted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("proxy should receive outbound connection");
+
+        let started = Instant::now();
+        drop(client);
+
+        let handled = handled_rx
+            .recv_timeout(Duration::from_millis(700))
+            .expect("server should stop waiting once tls-websocket client closes mid-connect");
+        handled.expect("client close during outbound connect is not a route error");
+        assert!(started.elapsed() < Duration::from_millis(700));
+        server_thread.join().expect("server thread");
+        proxy_thread.join().expect("proxy thread");
     }
 
     #[test]
