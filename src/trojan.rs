@@ -411,7 +411,7 @@ impl TrojanServer {
                 }
                 None => copy_count_best_effort(&mut reader, &mut remote_write),
             };
-            let _ = remote_shutdown.shutdown(Shutdown::Both);
+            let _ = remote_shutdown.shutdown(Shutdown::Write);
             result
         })?;
         let download = match bandwidth.as_deref() {
@@ -465,18 +465,14 @@ impl TrojanServer {
                 match reader.read(&mut client_buffer) {
                     Ok(0) => {
                         upload_done = true;
-                        download_done = true;
-                        let _ = writer.shutdown();
-                        let _ = remote.shutdown(Shutdown::Both);
+                        let _ = remote.shutdown(Shutdown::Write);
                         progressed = true;
                     }
                     Ok(read) => {
                         if let Some(limiter) = bandwidth.as_deref() {
                             if !limiter.wait_for(read) {
                                 upload_done = true;
-                                download_done = true;
-                                let _ = writer.shutdown();
-                                let _ = remote.shutdown(Shutdown::Both);
+                                let _ = remote.shutdown(Shutdown::Write);
                                 continue;
                             }
                         }
@@ -497,9 +493,7 @@ impl TrojanServer {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                     Err(_) => {
                         upload_done = true;
-                        download_done = true;
-                        let _ = writer.shutdown();
-                        let _ = remote.shutdown(Shutdown::Both);
+                        let _ = remote.shutdown(Shutdown::Write);
                         progressed = true;
                     }
                 }
@@ -3874,6 +3868,78 @@ mod tests {
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
         assert_eq!(records[0].online_ips, vec!["198.51.100.44"]);
+    }
+
+    #[test]
+    fn tls_websocket_upload_eof_keeps_downlink_until_remote_response_like_go() {
+        let cert = test_cert("trojan-ws-upload-eof");
+        let remote = TcpListener::bind("127.0.0.1:0").expect("remote bind");
+        let remote_addr = remote.local_addr().expect("remote addr");
+        let remote_thread = thread::spawn(move || {
+            let (mut stream, _) = remote.accept().expect("remote accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("remote read");
+            assert_eq!(&bytes, b"ping");
+
+            let mut eof = [0u8; 1];
+            let read = stream.read(&mut eof).expect("remote upload eof");
+            assert_eq!(read, 0);
+
+            thread::sleep(Duration::from_millis(50));
+            stream
+                .write_all(b"pong")
+                .expect("remote response after upload eof");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            server_clone.handle_tls_websocket_client(client, Some("/trojan"))
+        });
+
+        let mut client = tls_client(trojan_addr, cert.cert_der.clone());
+        client
+            .sock
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("client read timeout");
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.46",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+
+        client
+            .write_all(&masked_frame(&trojan_request(remote_addr)))
+            .expect("trojan request frame");
+        client.write_all(&masked_frame(b"ping")).expect("payload");
+        client.flush().expect("flush payload");
+        client
+            .sock
+            .shutdown(Shutdown::Write)
+            .expect("client upload eof");
+
+        assert_eq!(read_binary_frame(&mut client), b"pong");
+        drop(client);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        remote_thread.join().expect("remote thread");
+
+        let records = drain_trojan_traffic_eventually(&server, 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].upload, 4);
+        assert_eq!(records[0].download, 4);
     }
 
     #[test]

@@ -196,16 +196,14 @@ pub(crate) fn relay_websocket_tls_stream_stats(
             match client.read(&mut client_buffer) {
                 Ok(0) => {
                     upload_done = true;
-                    download_done = true;
-                    shutdown_websocket_tls_pair(&mut client, &remote);
+                    let _ = remote.shutdown(Shutdown::Write);
                     progressed = true;
                 }
                 Ok(read) => {
                     if let Some(limiter) = limiter.as_deref() {
                         if !limiter.wait_for(read) {
                             upload_done = true;
-                            download_done = true;
-                            shutdown_websocket_tls_pair(&mut client, &remote);
+                            let _ = remote.shutdown(Shutdown::Write);
                             continue;
                         }
                     }
@@ -216,8 +214,7 @@ pub(crate) fn relay_websocket_tls_stream_stats(
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => {
                     upload_done = true;
-                    download_done = true;
-                    shutdown_websocket_tls_pair(&mut client, &remote);
+                    let _ = remote.shutdown(Shutdown::Write);
                     progressed = true;
                 }
             }
