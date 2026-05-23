@@ -38,8 +38,7 @@ use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::websocket::{
     accept_websocket_tls_with_client_ip, accept_websocket_with_client_ip, connect_websocket_client,
-    relay_websocket_tls_stream, websocket_tls_relay_idle_timeout, WebSocketClientStream,
-    WebSocketReader, WebSocketWriter,
+    relay_websocket_tls_stream, WebSocketClientStream, WebSocketReader, WebSocketWriter,
 };
 use crate::{connect_tcp_outbound, send_udp_outbound, RouteDecision, RouteDispatcher};
 
@@ -255,9 +254,8 @@ impl TrojanServer {
             return Ok(());
         }
         if request.command == TrojanCommand::UdpAssociate {
-            return self.spawn_plain_websocket_udp_relay(
-                reader, writer, request, bandwidth, session,
-            );
+            return self
+                .spawn_plain_websocket_udp_relay(reader, writer, request, bandwidth, session);
         }
         let Some(remote) = self.connect_tcp_for_websocket(&reader, &request)? else {
             return Ok(());
@@ -464,109 +462,13 @@ impl TrojanServer {
 
     fn relay_plain_websocket(
         &self,
-        mut reader: WebSocketReader,
-        mut writer: WebSocketWriter,
-        mut remote: TcpStream,
+        reader: WebSocketReader,
+        writer: WebSocketWriter,
+        remote: TcpStream,
         request: TrojanRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
-        let mut remote_write = remote.try_clone()?;
-        let remote_shutdown = remote.try_clone()?;
-        let _connection = self
-            .bandwidth
-            .register_tcp_connection(Some(&request.user_uuid), &[&remote])?;
-        reader.set_nonblocking(true)?;
-        remote.set_nonblocking(true)?;
-        let _ = remote_write.set_nonblocking(true);
-        let mut download = 0u64;
-        let mut upload = 0u64;
-        let mut upload_done = false;
-        let mut download_done = false;
-        let mut client_buffer = [0u8; 16 * 1024];
-        let mut buffer = [0u8; 16 * 1024];
-        let mut idle_rounds = 0u8;
-        while !upload_done || !download_done {
-            let mut progressed = false;
-
-            if !upload_done {
-                match reader.read(&mut client_buffer) {
-                    Ok(0) => {
-                        upload_done = true;
-                        download_done = true;
-                        let _ = reader.shutdown();
-                        let _ = writer.shutdown();
-                        let _ = remote_shutdown.shutdown(Shutdown::Both);
-                        progressed = true;
-                    }
-                    Ok(read) => {
-                        if let Some(limiter) = bandwidth.as_deref() {
-                            if !limiter.wait_for(read) {
-                                upload_done = true;
-                                download_done = true;
-                                let _ = reader.shutdown();
-                                let _ = writer.shutdown();
-                                let _ = remote_shutdown.shutdown(Shutdown::Both);
-                                continue;
-                            }
-                        }
-                        write_all_wait(&mut remote_write, &client_buffer[..read])?;
-                        upload = upload.saturating_add(read as u64);
-                        progressed = true;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => {
-                        upload_done = true;
-                        download_done = true;
-                        let _ = reader.shutdown();
-                        let _ = writer.shutdown();
-                        let _ = remote_shutdown.shutdown(Shutdown::Both);
-                        progressed = true;
-                    }
-                }
-            }
-
-            if !download_done {
-                match remote.read(&mut buffer) {
-                    Ok(0) => {
-                        download_done = true;
-                        upload_done = true;
-                        let _ = reader.shutdown();
-                        let _ = writer.shutdown();
-                        let _ = remote_shutdown.shutdown(Shutdown::Both);
-                        progressed = true;
-                    }
-                    Ok(read) => {
-                        writer.write_all(&buffer[..read])?;
-                        download = download.saturating_add(read as u64);
-                        progressed = true;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => {
-                        download_done = true;
-                        upload_done = true;
-                        let _ = reader.shutdown();
-                        let _ = writer.shutdown();
-                        let _ = remote_shutdown.shutdown(Shutdown::Both);
-                        progressed = true;
-                    }
-                }
-            }
-
-            if !progressed {
-                thread::sleep(websocket_tls_relay_idle_timeout(&mut idle_rounds));
-            } else {
-                idle_rounds = 0;
-            }
-        }
-        self.traffic.add_with_user_id(
-            self.config.node_tag.clone(),
-            request.user_uuid,
-            Some(request.user_id),
-            upload,
-            download,
-            request.client_ip,
-        );
-        Ok(())
+        self.relay_websocket(reader, writer, remote, request, bandwidth)
     }
 
     fn spawn_plain_websocket_relay(
@@ -917,10 +819,8 @@ impl TrojanServer {
             .lock()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "websocket writer poisoned"))
             .and_then(|writer| writer.shutdown());
-        let upload_result = join_native_blocking_relay(
-            upload_task,
-            "trojan websocket UDP upload relay panicked",
-        )?;
+        let upload_result =
+            join_native_blocking_relay(upload_task, "trojan websocket UDP upload relay panicked")?;
         if result.is_ok() {
             result = upload_result;
         }
@@ -4007,5 +3907,59 @@ mod tests {
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
         assert_eq!(records[0].online_ips, vec!["198.51.100.43"]);
+    }
+
+    #[test]
+    fn plain_websocket_relay_survives_tcp_fragmented_client_frame_like_gorilla() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("echo timeout");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            server_clone.handle_websocket_client(stream, Some("/trojan"))
+        });
+
+        let mut client = TcpStream::connect(trojan_addr).expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("client timeout");
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.44",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+
+        client
+            .write_all(&masked_frame(&trojan_request(echo_addr)))
+            .expect("trojan request frame");
+
+        let frame = masked_frame(b"ping");
+        client.write_all(&frame[..1]).expect("first tcp chunk");
+        thread::sleep(Duration::from_millis(80));
+        client.write_all(&frame[1..]).expect("remaining tcp chunk");
+        assert_eq!(read_binary_frame(&mut client), b"ping");
+        drop(client);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
     }
 }
