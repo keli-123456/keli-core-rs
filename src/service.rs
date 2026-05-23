@@ -171,6 +171,7 @@ impl CoreService {
             .map_err(CoreServiceError::InvalidConfig)?;
         crate::dns::configure(config.dns.clone());
         let connect_timeout = outbound_connect_timeout(&config.policy);
+        let connection_idle = connection_idle_timeout(&config.policy);
         let active_config = config_without_users(&config);
 
         let traffic = TrafficRegistry::shared();
@@ -244,6 +245,7 @@ impl CoreService {
                     &inbound,
                     routes.clone(),
                     connect_timeout,
+                    connection_idle,
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
@@ -462,6 +464,10 @@ fn outbound_connect_timeout(policy: &PolicyConfig) -> Duration {
         std::env::var("KELI_CORE_OUTBOUND_CONNECT_TIMEOUT_SECS").ok(),
         policy.connect_timeout_secs,
     )
+}
+
+fn connection_idle_timeout(policy: &PolicyConfig) -> Duration {
+    Duration::from_secs(policy.connection_idle_secs.max(1))
 }
 
 fn outbound_connect_timeout_from_env(value: Option<String>, default_secs: u64) -> Duration {
@@ -1193,6 +1199,7 @@ fn start_trojan_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
     connect_timeout: Duration,
+    connection_idle: Duration,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -1211,6 +1218,7 @@ fn start_trojan_listener(
             users: inbound.users.clone(),
             routes,
             connect_timeout,
+            connection_idle,
         },
         traffic,
         sessions,

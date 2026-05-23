@@ -7,7 +7,7 @@ use std::sync::{
     mpsc, Arc, Mutex,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -61,6 +61,7 @@ pub struct TrojanServerConfig {
     pub users: Vec<CoreUser>,
     pub routes: Vec<crate::RouteRule>,
     pub connect_timeout: Duration,
+    pub connection_idle: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -495,6 +496,7 @@ impl TrojanServer {
         let mut client_buffer = [0u8; 16 * 1024];
         let mut remote_buffer = [0u8; 16 * 1024];
         let mut idle_rounds = 0u8;
+        let mut idle_since = Instant::now();
 
         while !upload_done || !download_done {
             let mut progressed = false;
@@ -561,10 +563,25 @@ impl TrojanServer {
             }
 
             if !progressed {
+                let idle_elapsed = idle_since.elapsed();
+                if idle_elapsed >= self.config.connection_idle {
+                    upload_done = true;
+                    download_done = true;
+                    let _ = writer.shutdown();
+                    let _ = reader.shutdown();
+                    let _ = remote.shutdown(Shutdown::Both);
+                    continue;
+                }
                 let timeout = websocket_tls_relay_idle_timeout(&mut idle_rounds);
-                reader.wait_readable_with_remote(&remote, !upload_done, !download_done, timeout)?;
+                reader.wait_readable_with_remote(
+                    &remote,
+                    !upload_done,
+                    !download_done,
+                    timeout.min(self.config.connection_idle.saturating_sub(idle_elapsed)),
+                )?;
             } else {
                 idle_rounds = 0;
+                idle_since = Instant::now();
             }
         }
 
@@ -2302,6 +2319,7 @@ mod tests {
             users: vec![user()],
             routes: Vec::new(),
             connect_timeout: Duration::from_secs(3),
+            connection_idle: Duration::from_secs(120),
         })
     }
 
@@ -2312,6 +2330,18 @@ mod tests {
             users: vec![user()],
             routes,
             connect_timeout,
+            connection_idle: Duration::from_secs(120),
+        })
+    }
+
+    fn server_with_connection_idle(connection_idle: Duration) -> TrojanServer {
+        TrojanServer::new(TrojanServerConfig {
+            node_tag: "panel|trojan|1".to_string(),
+            listen: "127.0.0.1:0".parse().expect("listen addr"),
+            users: vec![user()],
+            routes: Vec::new(),
+            connect_timeout: Duration::from_secs(3),
+            connection_idle,
         })
     }
 
@@ -3781,6 +3811,70 @@ mod tests {
 
         let records = drain_trojan_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
+        server_thread.join().expect("server thread");
+    }
+
+    #[test]
+    fn websocket_idle_timeout_closes_plain_trojan_relay_like_xray_policy() {
+        let remote_listener = TcpListener::bind("127.0.0.1:0").expect("remote bind");
+        let remote_addr = remote_listener.local_addr().expect("remote addr");
+        let remote_thread = thread::spawn(move || {
+            let (mut stream, _) = remote_listener.accept().expect("remote accept");
+            let mut byte = [0u8; 1];
+            let _ = stream.read(&mut byte);
+        });
+
+        let server = server_with_connection_idle(Duration::from_millis(90));
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let server_clone = server.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let result = server_clone.handle_websocket_client(stream, Some("/trojan"));
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = TcpStream::connect(trojan_addr).expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("client read timeout");
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.55",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame(&trojan_request(remote_addr)))
+            .expect("trojan request frame");
+
+        let handled = handled_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("websocket relay should move off the connection worker after start");
+        handled.expect("spawn background websocket relay");
+
+        let mut header = [0u8; 2];
+        match client.read_exact(&mut header) {
+            Ok(()) => assert_eq!(
+                header[0] & 0x0f,
+                0x08,
+                "server should send websocket close after idle timeout"
+            ),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                ) => {}
+            Err(error) => panic!("server did not close idle websocket: {error}"),
+        }
+
+        remote_thread.join().expect("remote thread");
         server_thread.join().expect("server thread");
     }
 
