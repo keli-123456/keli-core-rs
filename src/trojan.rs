@@ -1,3 +1,4 @@
+use std::env;
 use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
@@ -53,6 +54,8 @@ const TROJAN_PASSWORD_HEX_LEN: usize = 56;
 const MAX_UDP_PACKET_SIZE: usize = 65_535;
 const CLIENT_CLOSE_CONNECT_POLL: Duration = Duration::from_millis(10);
 const TROJAN_CONNECT_THREAD_STACK: usize = 256 * 1024;
+const TROJAN_TRACE_ENV: &str = "KELI_CORE_TROJAN_TRACE";
+const TROJAN_ROUTE_SLOW_LOG_MS: u128 = 1_000;
 
 #[derive(Clone, Debug)]
 pub struct TrojanServerConfig {
@@ -155,27 +158,7 @@ impl TrojanServer {
         if request.command == TrojanCommand::UdpAssociate {
             return self.relay_udp_stream(client, request, bandwidth);
         }
-        let remote = match self
-            .router
-            .decide_tcp(&request.target.host, request.target.port, &[])
-        {
-            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
-            RouteDecision::Outbound(outbound) => {
-                connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
-            }
-            RouteDecision::Block => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target blocked by route",
-                ));
-            }
-            RouteDecision::UnsupportedOutbound(tag) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("outbound route {tag} is not implemented"),
-                ));
-            }
-        };
+        let remote = self.connect_tcp_for_request("tcp", &request)?;
         self.relay(client, remote, request, bandwidth)
     }
 
@@ -216,27 +199,7 @@ impl TrojanServer {
         if request.command == TrojanCommand::UdpAssociate {
             return self.relay_udp_split(reader, writer, request, bandwidth);
         }
-        let remote = match self
-            .router
-            .decide_tcp(&request.target.host, request.target.port, &[])
-        {
-            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
-            RouteDecision::Outbound(outbound) => {
-                connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
-            }
-            RouteDecision::Block => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target blocked by route",
-                ));
-            }
-            RouteDecision::UnsupportedOutbound(tag) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("outbound route {tag} is not implemented"),
-                ));
-            }
-        };
+        let remote = self.connect_tcp_for_request("split", &request)?;
         self.relay_websocket(reader, writer, remote, request, bandwidth)
     }
 
@@ -288,27 +251,7 @@ impl TrojanServer {
             let _session = session;
             return self.relay_udp_stream(client, request, bandwidth);
         }
-        let remote = match self
-            .router
-            .decide_tcp(&request.target.host, request.target.port, &[])
-        {
-            RouteDecision::Direct => connect_target(&request.target, self.config.connect_timeout)?,
-            RouteDecision::Outbound(outbound) => {
-                connect_tcp_outbound(&outbound, &request.target, self.config.connect_timeout)?
-            }
-            RouteDecision::Block => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target blocked by route",
-                ));
-            }
-            RouteDecision::UnsupportedOutbound(tag) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("outbound route {tag} is not implemented"),
-                ));
-            }
-        };
+        let remote = self.connect_tcp_for_request("tls", &request)?;
         self.spawn_tls_relay(client, remote, request, bandwidth, session)
     }
 
@@ -359,6 +302,20 @@ impl TrojanServer {
         sync_delta_bandwidth(&self.bandwidth, &self.sessions, delta);
         self.users
             .apply_keyed_delta(delta, |user| trojan_password_hash(user.credential()))
+    }
+
+    fn connect_tcp_for_request(
+        &self,
+        scope: &'static str,
+        request: &TrojanRequest,
+    ) -> io::Result<TcpStream> {
+        connect_trojan_routed_tcp(
+            &self.config.node_tag,
+            scope,
+            &self.router,
+            &request.target,
+            self.config.connect_timeout,
+        )
     }
 
     fn read_request<T>(&self, stream: &mut T) -> io::Result<TrojanRequest>
@@ -489,8 +446,11 @@ impl TrojanServer {
             .bandwidth
             .register_tcp_connection(Some(&request.user_uuid), &[&remote])?;
 
+        let relay_started = Instant::now();
         let mut upload = 0u64;
         let mut download = 0u64;
+        let mut first_byte_ms = None::<u128>;
+        let mut relay_error = None::<io::Error>;
         let mut upload_done = false;
         let mut download_done = false;
         let mut client_buffer = [0u8; 16 * 1024];
@@ -520,8 +480,18 @@ impl TrojanServer {
                                 continue;
                             }
                         }
-                        write_all_wait(&mut remote, &client_buffer[..read])?;
-                        upload = upload.saturating_add(read as u64);
+                        match write_all_wait(&mut remote, &client_buffer[..read]) {
+                            Ok(()) => {
+                                upload = upload.saturating_add(read as u64);
+                            }
+                            Err(error) => {
+                                relay_error = Some(error);
+                                upload_done = true;
+                                download_done = true;
+                                let _ = writer.shutdown();
+                                let _ = remote.shutdown(Shutdown::Both);
+                            }
+                        }
                         progressed = true;
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -546,8 +516,22 @@ impl TrojanServer {
                         progressed = true;
                     }
                     Ok(read) => {
-                        write_all_wait(&mut writer, &remote_buffer[..read])?;
-                        download = download.saturating_add(read as u64);
+                        if first_byte_ms.is_none() {
+                            first_byte_ms = Some(relay_started.elapsed().as_millis());
+                        }
+                        match write_all_wait(&mut writer, &remote_buffer[..read]) {
+                            Ok(()) => {
+                                download = download.saturating_add(read as u64);
+                            }
+                            Err(error) => {
+                                relay_error = Some(error);
+                                download_done = true;
+                                upload_done = true;
+                                let _ = writer.shutdown();
+                                let _ = reader.shutdown();
+                                let _ = remote.shutdown(Shutdown::Both);
+                            }
+                        }
                         progressed = true;
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -573,18 +557,36 @@ impl TrojanServer {
                     continue;
                 }
                 let timeout = websocket_tls_relay_idle_timeout(&mut idle_rounds);
-                reader.wait_readable_with_remote(
+                if let Err(error) = reader.wait_readable_with_remote(
                     &remote,
                     !upload_done,
                     !download_done,
                     timeout.min(self.config.connection_idle.saturating_sub(idle_elapsed)),
-                )?;
+                ) {
+                    relay_error = Some(error);
+                    upload_done = true;
+                    download_done = true;
+                    let _ = writer.shutdown();
+                    let _ = reader.shutdown();
+                    let _ = remote.shutdown(Shutdown::Both);
+                }
             } else {
                 idle_rounds = 0;
                 idle_since = Instant::now();
             }
         }
 
+        let relay_error = relay_error;
+        log_trojan_relay_finished(
+            &self.config.node_tag,
+            "websocket",
+            &request,
+            upload,
+            download,
+            first_byte_ms,
+            relay_started.elapsed(),
+            relay_error.as_ref(),
+        );
         self.traffic.add_with_user_id(
             self.config.node_tag.clone(),
             request.user_uuid,
@@ -593,6 +595,10 @@ impl TrojanServer {
             download,
             request.client_ip,
         );
+        if let Some(error) = relay_error {
+            record_trojan_connection_error(&self.config.node_tag, "websocket", &error);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -705,6 +711,7 @@ impl TrojanServer {
         request: &TrojanRequest,
     ) -> io::Result<Option<TcpStream>> {
         let router = self.router.clone();
+        let node_tag = self.config.node_tag.clone();
         let target = request.target.clone();
         let timeout = self.config.connect_timeout;
         let (sender, receiver) = mpsc::channel();
@@ -712,20 +719,8 @@ impl TrojanServer {
             .name("keli-core-trojan-connect".to_string())
             .stack_size(TROJAN_CONNECT_THREAD_STACK)
             .spawn(move || {
-                let result = match router.decide_tcp(&target.host, target.port, &[]) {
-                    RouteDecision::Direct => connect_target(&target, timeout),
-                    RouteDecision::Outbound(outbound) => {
-                        connect_tcp_outbound(&outbound, &target, timeout)
-                    }
-                    RouteDecision::Block => Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "target blocked by route",
-                    )),
-                    RouteDecision::UnsupportedOutbound(tag) => Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("outbound route {tag} is not implemented"),
-                    )),
-                };
+                let result =
+                    connect_trojan_routed_tcp(&node_tag, "websocket", &router, &target, timeout);
                 let _ = sender.send(result);
             })
             .map_err(|source| {
@@ -759,6 +754,7 @@ impl TrojanServer {
         request: &TrojanRequest,
     ) -> io::Result<Option<TcpStream>> {
         let router = self.router.clone();
+        let node_tag = self.config.node_tag.clone();
         let target = request.target.clone();
         let timeout = self.config.connect_timeout;
         let (sender, receiver) = mpsc::channel();
@@ -766,20 +762,13 @@ impl TrojanServer {
             .name("keli-core-trojan-connect".to_string())
             .stack_size(TROJAN_CONNECT_THREAD_STACK)
             .spawn(move || {
-                let result = match router.decide_tcp(&target.host, target.port, &[]) {
-                    RouteDecision::Direct => connect_target(&target, timeout),
-                    RouteDecision::Outbound(outbound) => {
-                        connect_tcp_outbound(&outbound, &target, timeout)
-                    }
-                    RouteDecision::Block => Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "target blocked by route",
-                    )),
-                    RouteDecision::UnsupportedOutbound(tag) => Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!("outbound route {tag} is not implemented"),
-                    )),
-                };
+                let result = connect_trojan_routed_tcp(
+                    &node_tag,
+                    "tls_websocket",
+                    &router,
+                    &target,
+                    timeout,
+                );
                 let _ = sender.send(result);
             })
             .map_err(|error| {
@@ -1274,6 +1263,330 @@ fn sync_delta_bandwidth(
     delta: &CoreUserDelta,
 ) {
     sync_user_limit_delta(bandwidth, sessions, delta);
+}
+
+fn connect_trojan_routed_tcp(
+    node_tag: &str,
+    scope: &'static str,
+    router: &RouteDispatcher,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    match router.decide_tcp(&target.host, target.port, &[]) {
+        RouteDecision::Direct => connect_trojan_direct_target(node_tag, scope, target, timeout),
+        RouteDecision::Outbound(outbound) => {
+            connect_trojan_route_tcp_outbound(node_tag, scope, &outbound, target, timeout)
+        }
+        RouteDecision::Block => {
+            let error = io::Error::new(io::ErrorKind::PermissionDenied, "target blocked by route");
+            record_trojan_connection_error(node_tag, scope, &error);
+            Err(error)
+        }
+        RouteDecision::UnsupportedOutbound(tag) => {
+            let error = io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("outbound route {tag} is not implemented"),
+            );
+            record_trojan_connection_error(node_tag, scope, &error);
+            Err(error)
+        }
+    }
+}
+
+fn connect_trojan_direct_target(
+    node_tag: &str,
+    scope: &'static str,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let started = Instant::now();
+    match connect_target(target, timeout) {
+        Ok(stream) => {
+            log_trojan_direct_connected(node_tag, scope, target, started.elapsed());
+            Ok(stream)
+        }
+        Err(error) => {
+            let error = annotate_trojan_direct_connect_error(
+                node_tag,
+                scope,
+                target,
+                started.elapsed(),
+                error,
+            );
+            record_trojan_connection_error(node_tag, scope, &error);
+            Err(error)
+        }
+    }
+}
+
+fn connect_trojan_route_tcp_outbound(
+    node_tag: &str,
+    scope: &'static str,
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let started = Instant::now();
+    match connect_tcp_outbound(outbound, target, timeout) {
+        Ok(stream) => {
+            log_trojan_route_outbound_connected(
+                node_tag,
+                scope,
+                outbound,
+                target,
+                started.elapsed(),
+            );
+            Ok(stream)
+        }
+        Err(error) => {
+            let error = annotate_trojan_route_outbound_error(
+                node_tag,
+                scope,
+                outbound,
+                target,
+                started.elapsed(),
+                error,
+            );
+            record_trojan_connection_error(node_tag, scope, &error);
+            Err(error)
+        }
+    }
+}
+
+fn annotate_trojan_direct_connect_error(
+    node_tag: &str,
+    scope: &'static str,
+    target: &SocksTarget,
+    elapsed: Duration,
+    error: io::Error,
+) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "direct connect failed node_tag={} scope={scope} target={}:{} elapsed_ms={} error={}",
+            trojan_log_field(node_tag),
+            trojan_log_field(&target.host),
+            target.port,
+            elapsed.as_millis(),
+            trojan_log_message(&error.to_string())
+        ),
+    )
+}
+
+fn annotate_trojan_route_outbound_error(
+    node_tag: &str,
+    scope: &'static str,
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    elapsed: Duration,
+    error: io::Error,
+) -> io::Error {
+    let endpoint = trojan_outbound_endpoint(outbound);
+    io::Error::new(
+        error.kind(),
+        format!(
+            "route outbound failed node_tag={} scope={scope} outbound={} protocol={} endpoint={} target={}:{} elapsed_ms={} error={}",
+            trojan_log_field(node_tag),
+            trojan_log_field(&outbound.tag),
+            trojan_log_field(&outbound.protocol),
+            trojan_log_field(&endpoint),
+            trojan_log_field(&target.host),
+            target.port,
+            elapsed.as_millis(),
+            trojan_log_message(&error.to_string())
+        ),
+    )
+}
+
+fn record_trojan_connection_error(node_tag: &str, scope: &'static str, error: &io::Error) {
+    let reason = classify_trojan_connection_error(error);
+    crate::metrics::record_connection_error("trojan", scope, reason);
+    log_trojan_connection_error(node_tag, scope, reason, error);
+}
+
+fn classify_trojan_connection_error(error: &io::Error) -> &'static str {
+    let text = error.to_string();
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        if text.contains("target blocked by route") {
+            return "route_blocked";
+        }
+        if text.contains("unknown trojan user")
+            || text.contains("device limit")
+            || text.contains("session limit")
+        {
+            return "auth_failed";
+        }
+        return "permission_denied";
+    }
+    if error.kind() == io::ErrorKind::TimedOut || text.contains("timed out") {
+        return "upstream_timeout";
+    }
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::AddrNotAvailable
+    ) || is_trojan_upstream_connect_failure_text(&text)
+    {
+        return "upstream_connect_failed";
+    }
+    if matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::UnexpectedEof
+    ) {
+        return "client_closed";
+    }
+    if error.kind() == io::ErrorKind::Unsupported {
+        return "unsupported";
+    }
+    if error.kind() == io::ErrorKind::InvalidData {
+        return "invalid_request";
+    }
+    "error"
+}
+
+fn is_trojan_upstream_connect_failure_text(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("tcp connect failed")
+        || text.contains("tcp outbound connect failed")
+        || text.contains("dns response indicates failure")
+        || text.contains("configured dns servers returned no target address")
+        || text.contains("target did not resolve to any socket address")
+        || text.contains("connection refused")
+        || text.contains("network is unreachable")
+        || text.contains("no route to host")
+}
+
+fn log_trojan_connection_error(
+    node_tag: &str,
+    scope: &'static str,
+    reason: &'static str,
+    error: &io::Error,
+) {
+    if reason == "client_closed" && !trojan_trace_enabled() {
+        return;
+    }
+    eprintln!(
+        "WARN  core   trojan connection failed node_tag={} scope={scope} reason={reason} error={}",
+        trojan_log_field(node_tag),
+        trojan_log_message(&error.to_string())
+    );
+}
+
+fn log_trojan_direct_connected(
+    node_tag: &str,
+    scope: &'static str,
+    target: &SocksTarget,
+    elapsed: Duration,
+) {
+    if elapsed.as_millis() < TROJAN_ROUTE_SLOW_LOG_MS && !trojan_trace_enabled() {
+        return;
+    }
+    eprintln!(
+        "INFO  core   trojan direct connected node_tag={} scope={scope} target={}:{} elapsed_ms={}",
+        trojan_log_field(node_tag),
+        trojan_log_field(&target.host),
+        target.port,
+        elapsed.as_millis()
+    );
+}
+
+fn log_trojan_route_outbound_connected(
+    node_tag: &str,
+    scope: &'static str,
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    elapsed: Duration,
+) {
+    if elapsed.as_millis() < TROJAN_ROUTE_SLOW_LOG_MS && !trojan_trace_enabled() {
+        return;
+    }
+    let endpoint = trojan_outbound_endpoint(outbound);
+    eprintln!(
+        "INFO  core   trojan route outbound connected node_tag={} scope={scope} outbound={} protocol={} endpoint={} target={}:{} elapsed_ms={}",
+        trojan_log_field(node_tag),
+        trojan_log_field(&outbound.tag),
+        trojan_log_field(&outbound.protocol),
+        trojan_log_field(&endpoint),
+        trojan_log_field(&target.host),
+        target.port,
+        elapsed.as_millis()
+    );
+}
+
+fn log_trojan_relay_finished(
+    node_tag: &str,
+    scope: &'static str,
+    request: &TrojanRequest,
+    upload: u64,
+    download: u64,
+    first_byte_ms: Option<u128>,
+    elapsed: Duration,
+    error: Option<&io::Error>,
+) {
+    if error.is_none() && elapsed.as_millis() < TROJAN_ROUTE_SLOW_LOG_MS && !trojan_trace_enabled()
+    {
+        return;
+    }
+    let status = match error {
+        Some(error) => classify_trojan_connection_error(error),
+        None => "ok",
+    };
+    let first_byte = first_byte_ms
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let error_text = error
+        .map(|error| trojan_log_message(&error.to_string()))
+        .unwrap_or_else(|| "-".to_string());
+    eprintln!(
+        "INFO  core   trojan relay finished node_tag={} scope={scope} target={}:{} status={status} first_byte_ms={} duration_ms={} upload_bytes={} download_bytes={} error={}",
+        trojan_log_field(node_tag),
+        trojan_log_field(&request.target.host),
+        request.target.port,
+        first_byte,
+        elapsed.as_millis(),
+        upload,
+        download,
+        error_text
+    );
+}
+
+fn trojan_outbound_endpoint(outbound: &OutboundConfig) -> String {
+    let host = outbound
+        .address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-");
+    match outbound.port {
+        Some(port) => format!("{host}:{port}"),
+        None => format!("{host}:-"),
+    }
+}
+
+fn trojan_log_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_control() || ch.is_whitespace() {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn trojan_log_message(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_ascii_control() { ' ' } else { ch })
+        .collect()
+}
+
+fn trojan_trace_enabled() -> bool {
+    env::var_os(TROJAN_TRACE_ENV).is_some()
 }
 
 impl TrojanUdpRelayState {
@@ -2343,6 +2656,45 @@ mod tests {
             connect_timeout: Duration::from_secs(3),
             connection_idle,
         })
+    }
+
+    #[test]
+    fn classifies_trojan_connection_errors_for_metrics() {
+        assert_eq!(
+            super::classify_trojan_connection_error(&io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "target blocked by route",
+            )),
+            "route_blocked"
+        );
+        assert_eq!(
+            super::classify_trojan_connection_error(&io::Error::new(
+                io::ErrorKind::TimedOut,
+                "operation timed out",
+            )),
+            "upstream_timeout"
+        );
+        assert_eq!(
+            super::classify_trojan_connection_error(&io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )),
+            "client_closed"
+        );
+        assert_eq!(
+            super::classify_trojan_connection_error(&io::Error::new(
+                io::ErrorKind::Unsupported,
+                "only trojan tcp and udp associate commands are supported",
+            )),
+            "unsupported"
+        );
+        assert_eq!(
+            super::classify_trojan_connection_error(&io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid trojan password hash",
+            )),
+            "invalid_request"
+        );
     }
 
     #[test]
