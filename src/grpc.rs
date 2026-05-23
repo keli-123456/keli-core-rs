@@ -325,7 +325,9 @@ where
         let path = expected_path.clone();
         let handler = handler.clone();
         tokio::spawn(async move {
-            let _ = handle_grpc_request(request, respond, path, handler).await;
+            if let Err(error) = handle_grpc_request(request, respond, path, handler).await {
+                eprintln!("grpc request failed: {error}");
+            }
         });
     }
     Ok(())

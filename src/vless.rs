@@ -32,8 +32,8 @@ use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
-    relay_tcp_fast_unlimited_close_on_eof, relay_tcp_limited, spawn_native_blocking_relay,
-    spawn_tcp_relay_background,
+    relay_tcp_fast_unlimited_close_on_eof, relay_tcp_limited, spawn_detached_blocking_relay,
+    spawn_native_blocking_relay, spawn_tcp_relay_background,
 };
 use crate::tls::{relay_tls_stream, RawTcpStreamAccess, TlsConnection, TlsSocket};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
@@ -364,7 +364,7 @@ impl VlessServer {
     pub fn handle_split_client<R, W>(&self, reader: R, writer: W) -> io::Result<()>
     where
         R: Read + Send + 'static,
-        W: Write,
+        W: Write + Send + 'static,
     {
         let result = self.handle_split_client_with_ip(reader, writer, None);
         if let Err(error) = &result {
@@ -381,18 +381,19 @@ impl VlessServer {
     ) -> io::Result<()>
     where
         R: Read + Send + 'static,
-        W: Write,
+        W: Write + Send + 'static,
     {
         let mut request = self.read_request(&mut reader)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let session = self.acquire_user_session(user.as_ref(), client_ip)?;
         let bandwidth = if request.command == VlessCommand::Udp {
             self.bandwidth.limiter_for(user.as_ref())
         } else {
             self.bandwidth.limiter_for_limited(user.as_ref())
         };
         if request.command == VlessCommand::Udp {
+            let _session = session;
             writer.write_all(&[VERSION, 0x00])?;
             return self.relay_udp_split(reader, writer, request, bandwidth);
         }
@@ -421,7 +422,7 @@ impl VlessServer {
             }
         };
         writer.write_all(&[VERSION, 0x00])?;
-        self.relay_websocket(reader, writer, remote, request, bandwidth)
+        self.spawn_split_relay(reader, writer, remote, request, bandwidth, session)
     }
 
     fn handle_websocket_split_client_with_ip(
@@ -433,7 +434,7 @@ impl VlessServer {
         let mut request = self.read_request(&mut reader)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let session = self.acquire_user_session(user.as_ref(), client_ip)?;
         let bandwidth = if request.command == VlessCommand::Udp {
             self.bandwidth.limiter_for(user.as_ref())
         } else {
@@ -445,6 +446,7 @@ impl VlessServer {
             return Ok(());
         }
         if request.command == VlessCommand::Udp {
+            let _session = session;
             writer.write_all(&[VERSION, 0x00])?;
             return self.relay_udp_split(reader, writer, request, bandwidth);
         }
@@ -452,7 +454,7 @@ impl VlessServer {
             return Ok(());
         };
         writer.write_all(&[VERSION, 0x00])?;
-        self.relay_plain_websocket(reader, writer, remote, request, bandwidth)
+        self.spawn_plain_websocket_relay(reader, writer, remote, request, bandwidth, session)
     }
 
     pub fn handle_tls_client<S>(&self, client: TlsConnection<S>) -> io::Result<()>
@@ -476,13 +478,14 @@ impl VlessServer {
         let _ = client.set_io_timeout(None);
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let session = self.acquire_user_session(user.as_ref(), client_ip)?;
         let bandwidth = if request.command == VlessCommand::Udp {
             self.bandwidth.limiter_for(user.as_ref())
         } else {
             self.bandwidth.limiter_for_limited(user.as_ref())
         };
         if request.command == VlessCommand::Udp {
+            let _session = session;
             client.write_all(&[VERSION, 0x00])?;
             return self.relay_udp_stream(client, request, bandwidth);
         }
@@ -517,7 +520,7 @@ impl VlessServer {
             )
         });
         client.write_all(&[VERSION, 0x00])?;
-        self.relay_tls(client, remote, request, bandwidth)
+        self.spawn_tls_relay(client, remote, request, bandwidth, session)
     }
 
     pub fn handle_tls_websocket_client(
@@ -542,13 +545,14 @@ impl VlessServer {
         let mut request = self.read_request(&mut websocket)?;
         request.client_ip = forwarded_ip.or(client_ip);
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user.as_ref(), request.client_ip)?;
+        let session = self.acquire_user_session(user.as_ref(), request.client_ip)?;
         let bandwidth = if request.command == VlessCommand::Udp {
             self.bandwidth.limiter_for(user.as_ref())
         } else {
             self.bandwidth.limiter_for_limited(user.as_ref())
         };
         if request.command == VlessCommand::Udp {
+            let _session = session;
             websocket.write_all(&[VERSION, 0x00])?;
             return self.relay_udp_stream(websocket, request, bandwidth);
         }
@@ -560,7 +564,7 @@ impl VlessServer {
             return Ok(());
         };
         websocket.write_all(&[VERSION, 0x00])?;
-        self.relay_tls_websocket(websocket, remote, request, bandwidth)
+        self.spawn_tls_websocket_relay(websocket, remote, request, bandwidth, session)
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
@@ -815,7 +819,7 @@ impl VlessServer {
     ) -> io::Result<()>
     where
         R: Read + Send + 'static,
-        W: Write,
+        W: Write + Send + 'static,
     {
         let (upload, download) = if request.flow == FLOW_XTLS_RPRX_VISION {
             relay_vision_split_streams(reader, writer, remote, request.user_id, bandwidth)?
@@ -859,6 +863,27 @@ impl VlessServer {
         Ok(())
     }
 
+    fn spawn_split_relay<R, W>(
+        &self,
+        reader: R,
+        writer: W,
+        remote: TcpStream,
+        request: VlessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+        session: Option<UserSessionGuard>,
+    ) -> io::Result<()>
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        let server = self.clone();
+        spawn_detached_blocking_relay("keli-core-vless-relay", move || {
+            let _session = session;
+            server.relay_websocket(reader, writer, remote, request, bandwidth)
+        })?;
+        Ok(())
+    }
+
     fn relay_plain_websocket(
         &self,
         mut reader: WebSocketReader,
@@ -879,7 +904,10 @@ impl VlessServer {
         let mut client_buffer = [0u8; 16 * 1024];
         let mut remote_buffer = [0u8; 16 * 1024];
         let mut idle_rounds = 0u8;
-        while !upload_done || !download_done {
+        let result = loop {
+            if upload_done && download_done {
+                break Ok(());
+            }
             let mut progressed = false;
 
             if !upload_done {
@@ -903,7 +931,14 @@ impl VlessServer {
                                 continue;
                             }
                         }
-                        write_all_wait_tls_bridge(&mut remote, &client_buffer[..read])?;
+                        if let Err(error) =
+                            write_all_wait_tls_bridge(&mut remote, &client_buffer[..read])
+                        {
+                            let _ = reader.shutdown();
+                            let _ = writer.shutdown();
+                            let _ = remote.shutdown(Shutdown::Both);
+                            break Err(error);
+                        }
                         upload = upload.saturating_add(read as u64);
                         progressed = true;
                     }
@@ -930,7 +965,14 @@ impl VlessServer {
                         progressed = true;
                     }
                     Ok(read) => {
-                        write_all_wait_tls_bridge(&mut writer, &remote_buffer[..read])?;
+                        if let Err(error) =
+                            write_all_wait_tls_bridge(&mut writer, &remote_buffer[..read])
+                        {
+                            let _ = reader.shutdown();
+                            let _ = writer.shutdown();
+                            let _ = remote.shutdown(Shutdown::Both);
+                            break Err(error);
+                        }
                         download = download.saturating_add(read as u64);
                         progressed = true;
                     }
@@ -951,7 +993,7 @@ impl VlessServer {
             } else {
                 idle_rounds = 0;
             }
-        }
+        };
         self.traffic.add_with_user_id(
             self.config.node_tag.clone(),
             request.user_uuid,
@@ -960,6 +1002,23 @@ impl VlessServer {
             download,
             request.client_ip,
         );
+        result
+    }
+
+    fn spawn_plain_websocket_relay(
+        &self,
+        reader: WebSocketReader,
+        writer: WebSocketWriter,
+        remote: TcpStream,
+        request: VlessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+        session: Option<UserSessionGuard>,
+    ) -> io::Result<()> {
+        let server = self.clone();
+        spawn_detached_blocking_relay("keli-core-vless-relay", move || {
+            let _session = session;
+            server.relay_plain_websocket(reader, writer, remote, request, bandwidth)
+        })?;
         Ok(())
     }
 
@@ -1121,6 +1180,25 @@ impl VlessServer {
         Ok(())
     }
 
+    fn spawn_tls_relay<S>(
+        &self,
+        client: TlsConnection<S>,
+        remote: TcpStream,
+        request: VlessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+        session: Option<UserSessionGuard>,
+    ) -> io::Result<()>
+    where
+        S: TlsSocket + RawTcpStreamAccess + Send + 'static,
+    {
+        let server = self.clone();
+        spawn_detached_blocking_relay("keli-core-vless-relay", move || {
+            let _session = session;
+            server.relay_tls(client, remote, request, bandwidth)
+        })?;
+        Ok(())
+    }
+
     fn relay_tls_websocket(
         &self,
         client: crate::websocket::WebSocketTlsStream,
@@ -1137,6 +1215,22 @@ impl VlessServer {
             download,
             request.client_ip,
         );
+        Ok(())
+    }
+
+    fn spawn_tls_websocket_relay(
+        &self,
+        client: crate::websocket::WebSocketTlsStream,
+        remote: TcpStream,
+        request: VlessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+        session: Option<UserSessionGuard>,
+    ) -> io::Result<()> {
+        let server = self.clone();
+        spawn_detached_blocking_relay("keli-core-vless-relay", move || {
+            let _session = session;
+            server.relay_tls_websocket(client, remote, request, bandwidth)
+        })?;
         Ok(())
     }
 
@@ -3802,6 +3896,20 @@ mod tests {
         })
     }
 
+    fn drain_vless_traffic_eventually(
+        server: &VlessServer,
+        minimum_bytes: u64,
+    ) -> Vec<crate::traffic::TrafficDelta> {
+        for _ in 0..250 {
+            let records = server.drain_traffic(minimum_bytes);
+            if !records.is_empty() {
+                return records;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        server.drain_traffic(minimum_bytes)
+    }
+
     #[test]
     fn server_clone_does_not_duplicate_full_user_list() {
         let server = VlessServer::new(VlessServerConfig {
@@ -4061,7 +4169,7 @@ mod tests {
             .expect("serve once");
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_vless_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|vless|1");
         assert_eq!(records[0].user_uuid, user().uuid);
@@ -4941,7 +5049,7 @@ mod tests {
             .expect("serve once");
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_vless_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|vless|1");
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
@@ -5010,7 +5118,7 @@ mod tests {
         server_task.await.expect("server task").expect("serve once");
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_vless_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|vless|1");
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
@@ -5098,7 +5206,7 @@ mod tests {
         }
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_vless_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].user_uuid, user().uuid);
         assert_eq!(records[0].user_id, Some(1));
@@ -5222,7 +5330,7 @@ mod tests {
             .expect("serve once");
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_vless_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|vless|1");
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
@@ -5282,7 +5390,7 @@ mod tests {
         server_task.await.expect("server task").expect("serve once");
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_vless_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|vless|1");
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
@@ -5334,12 +5442,63 @@ mod tests {
             .expect("serve once");
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_vless_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|vless|1");
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn tls_tcp_relay_does_not_hold_connection_worker_after_start() {
+        let cert = test_cert("vless-tls-worker");
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (release_remote_tx, release_remote_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+            let _ = release_remote_rx.recv_timeout(Duration::from_secs(3));
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vless bind");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vless accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            let result = server_clone.handle_tls_client(client);
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = tls_client(vless_addr, cert.cert_der.clone());
+        client
+            .write_all(&vless_request(echo_addr))
+            .expect("client request");
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).expect("client response");
+        assert_eq!(response, [0x00, 0x00]);
+        client.write_all(b"ping").expect("payload");
+        let mut echoed = [0u8; 4];
+        client.read_exact(&mut echoed).expect("echoed payload");
+        assert_eq!(&echoed, b"ping");
+
+        let handled = handled_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("tls relay should move off the connection worker after start");
+        handled.expect("spawn background tls relay");
+
+        drop(client);
+        release_remote_tx.send(()).expect("release remote");
+        server_thread.join().expect("server thread");
+        echo_thread.join().expect("echo thread");
     }
 
     #[test]
@@ -5395,7 +5554,7 @@ mod tests {
             .expect("serve once");
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_vless_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|vless|1");
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
@@ -5736,12 +5895,112 @@ mod tests {
             .expect("serve once");
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_vless_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|vless|1");
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn websocket_tcp_relay_does_not_hold_connection_worker_after_start() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (release_remote_tx, release_remote_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+            let _ = release_remote_rx.recv_timeout(Duration::from_secs(3));
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vless bind");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let server_clone = server.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vless accept");
+            let result = server_clone.handle_websocket_client(stream, Some("/vless"));
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = TcpStream::connect(vless_addr).expect("client connect");
+        client
+            .write_all(&websocket_request("/vless"))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame(&vless_request(echo_addr)))
+            .expect("vless request frame");
+        assert_eq!(read_binary_frame(&mut client), [0x00, 0x00]);
+        client.write_all(&masked_frame(b"ping")).expect("payload");
+        assert_eq!(read_binary_frame(&mut client), b"ping");
+
+        let handled = handled_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("websocket relay should move off the connection worker after start");
+        handled.expect("spawn background websocket relay");
+
+        drop(client);
+        release_remote_tx.send(()).expect("release remote");
+        server_thread.join().expect("server thread");
+        echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
+    fn tls_websocket_tcp_relay_does_not_hold_connection_worker_after_start() {
+        let cert = test_cert("vless-ws-worker");
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (release_remote_tx, release_remote_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+            let _ = release_remote_rx.recv_timeout(Duration::from_secs(3));
+        });
+
+        let server = server();
+        let listener = server.bind().expect("vless bind");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vless accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            let result = server_clone.handle_tls_websocket_client(client, Some("/vless"));
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = tls_client(vless_addr, cert.cert_der.clone());
+        client
+            .write_all(&websocket_request("/vless"))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame(&vless_request(echo_addr)))
+            .expect("vless request frame");
+        assert_eq!(read_binary_frame(&mut client), [0x00, 0x00]);
+        client.write_all(&masked_frame(b"ping")).expect("payload");
+        assert_eq!(read_binary_frame(&mut client), b"ping");
+
+        let handled = handled_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("tls websocket relay should move off the connection worker after start");
+        handled.expect("spawn background tls websocket relay");
+
+        drop(client);
+        release_remote_tx.send(()).expect("release remote");
+        server_thread.join().expect("server thread");
+        echo_thread.join().expect("echo thread");
     }
 
     #[test]
@@ -5924,7 +6183,7 @@ mod tests {
             .expect("serve once");
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_vless_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|vless|1");
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");

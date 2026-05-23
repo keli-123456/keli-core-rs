@@ -24,6 +24,10 @@ const NATIVE_RELAY_WORKERS_PER_CPU: usize = 16;
 const NATIVE_RELAY_WORKER_MEMORY_MIB: usize = 4;
 const NATIVE_RELAY_RESERVED_FDS: usize = 1024;
 const NATIVE_RELAY_FDS_PER_WORKER: usize = 4;
+#[cfg(windows)]
+const DETACHED_BLOCKING_RELAY_STACK_SIZE: usize = 2 * 1024 * 1024;
+#[cfg(not(windows))]
+const DETACHED_BLOCKING_RELAY_STACK_SIZE: usize = 1024 * 1024;
 
 pub type BlockingRelayHandle<T> = tokio::task::JoinHandle<T>;
 type NativeRelayJob = Box<dyn FnOnce() + Send + 'static>;
@@ -160,6 +164,20 @@ where
     T: Send + 'static,
 {
     Ok(tcp_relay_runtime()?.spawn_blocking(task))
+}
+
+pub fn spawn_detached_blocking_relay<F, T>(name: &'static str, task: F) -> io::Result<()>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(DETACHED_BLOCKING_RELAY_STACK_SIZE)
+        .spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+        })?;
+    Ok(())
 }
 
 pub fn spawn_background_io<F>(future: F) -> io::Result<tokio::task::JoinHandle<F::Output>>

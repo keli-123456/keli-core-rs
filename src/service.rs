@@ -3575,8 +3575,10 @@ mod tests {
                 false,
             )
             .expect("send vless request");
+            tokio::task::yield_now().await;
             send.send_data(Bytes::from(encode_grpc_hunk(b"ping")), true)
                 .expect("send vless payload");
+            tokio::task::yield_now().await;
 
             let response = response.await.expect("grpc response");
             assert_eq!(response.status(), http::StatusCode::OK);
@@ -3594,6 +3596,24 @@ mod tests {
                 let _ = body.flow_control().release_capacity(len);
                 while let Some(message) = take_grpc_message(&mut frames).expect("grpc frame") {
                     plain.extend_from_slice(&decode_hunk_message(&message).expect("grpc hunk"));
+                }
+            }
+            loop {
+                match tokio::time::timeout(Duration::from_millis(500), body.data()).await {
+                    Ok(Some(Ok(chunk))) => {
+                        let len = chunk.len();
+                        frames.extend_from_slice(&chunk);
+                        let _ = body.flow_control().release_capacity(len);
+                        while let Some(message) =
+                            take_grpc_message(&mut frames).expect("grpc frame")
+                        {
+                            plain.extend_from_slice(
+                                &decode_hunk_message(&message).expect("grpc hunk"),
+                            );
+                        }
+                    }
+                    Ok(Some(Err(error))) => panic!("grpc data chunk: {error}"),
+                    Ok(None) | Err(_) => break,
                 }
             }
             assert_eq!(&plain[..2], &[0x00, 0x00]);

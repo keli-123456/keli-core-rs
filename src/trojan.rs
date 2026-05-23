@@ -31,7 +31,8 @@ use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
-    relay_tcp_fast_unlimited, relay_tcp_limited, spawn_native_blocking_relay,
+    relay_tcp_fast_unlimited, relay_tcp_limited, spawn_detached_blocking_relay,
+    spawn_native_blocking_relay,
 };
 use crate::tls::{relay_tls_stream, TlsConnection};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
@@ -275,13 +276,14 @@ impl TrojanServer {
         client.set_io_timeout(None)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
+        let session = self.acquire_user_session(user.as_ref(), client_ip)?;
         let bandwidth = if request.command == TrojanCommand::UdpAssociate {
             self.bandwidth.limiter_for(user.as_ref())
         } else {
             self.bandwidth.limiter_for_limited(user.as_ref())
         };
         if request.command == TrojanCommand::UdpAssociate {
+            let _session = session;
             return self.relay_udp_stream(client, request, bandwidth);
         }
         let remote = match self
@@ -305,7 +307,7 @@ impl TrojanServer {
                 ));
             }
         };
-        self.relay_tls(client, remote, request, bandwidth)
+        self.spawn_tls_relay(client, remote, request, bandwidth, session)
     }
 
     pub fn handle_tls_websocket_client(
@@ -321,7 +323,7 @@ impl TrojanServer {
         websocket.set_io_timeout(None)?;
         request.client_ip = forwarded_ip.or(client_ip);
         let user = self.request_user(&request);
-        let _session = self.acquire_user_session(user.as_ref(), request.client_ip)?;
+        let session = self.acquire_user_session(user.as_ref(), request.client_ip)?;
         let bandwidth = if request.command == TrojanCommand::UdpAssociate {
             self.bandwidth.limiter_for(user.as_ref())
         } else {
@@ -332,12 +334,13 @@ impl TrojanServer {
             return Ok(());
         }
         if request.command == TrojanCommand::UdpAssociate {
+            let _session = session;
             return self.relay_udp_tls_websocket(websocket, request, bandwidth);
         }
         let Some(remote) = self.connect_tcp_for_tls_websocket(&websocket, &request)? else {
             return Ok(());
         };
-        self.relay_tls_websocket(websocket, remote, request, bandwidth)
+        self.spawn_tls_websocket_relay(websocket, remote, request, bandwidth, session)
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
@@ -491,7 +494,7 @@ impl TrojanServer {
         session: Option<UserSessionGuard>,
     ) -> io::Result<()> {
         let server = self.clone();
-        let _ = spawn_native_blocking_relay(move || {
+        spawn_detached_blocking_relay("keli-core-trojan-relay", move || {
             let _session = session;
             server.relay_plain_websocket(reader, writer, remote, request, bandwidth)
         })?;
@@ -507,7 +510,7 @@ impl TrojanServer {
         session: Option<UserSessionGuard>,
     ) -> io::Result<()> {
         let server = self.clone();
-        let _ = spawn_native_blocking_relay(move || {
+        spawn_detached_blocking_relay("keli-core-trojan-relay", move || {
             let _session = session;
             server.relay_udp_plain_websocket(reader, writer, request, bandwidth)
         })?;
@@ -549,6 +552,38 @@ impl TrojanServer {
             download,
             request.client_ip,
         );
+        Ok(())
+    }
+
+    fn spawn_tls_relay(
+        &self,
+        client: TlsConnection,
+        remote: TcpStream,
+        request: TrojanRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+        session: Option<UserSessionGuard>,
+    ) -> io::Result<()> {
+        let server = self.clone();
+        spawn_detached_blocking_relay("keli-core-trojan-relay", move || {
+            let _session = session;
+            server.relay_tls(client, remote, request, bandwidth)
+        })?;
+        Ok(())
+    }
+
+    fn spawn_tls_websocket_relay(
+        &self,
+        client: crate::websocket::WebSocketTlsStream,
+        remote: TcpStream,
+        request: TrojanRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+        session: Option<UserSessionGuard>,
+    ) -> io::Result<()> {
+        let server = self.clone();
+        spawn_detached_blocking_relay("keli-core-trojan-relay", move || {
+            let _session = session;
+            server.relay_tls_websocket(client, remote, request, bandwidth)
+        })?;
         Ok(())
     }
 
@@ -2388,7 +2423,7 @@ mod tests {
 
     fn tcp_connection_closed_eventually(stream: &TcpStream) -> bool {
         let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
-        for _ in 0..50 {
+        for _ in 0..250 {
             let mut probe = [0u8; 1];
             match stream.peek(&mut probe) {
                 Ok(0) => return true,
@@ -2424,7 +2459,7 @@ mod tests {
         server: &TrojanServer,
         minimum_bytes: u64,
     ) -> Vec<crate::traffic::TrafficDelta> {
-        for _ in 0..50 {
+        for _ in 0..250 {
             let records = server.drain_traffic(minimum_bytes);
             if !records.is_empty() {
                 return records;
@@ -3234,6 +3269,54 @@ mod tests {
     }
 
     #[test]
+    fn tls_tcp_relay_does_not_hold_connection_worker_after_start() {
+        let cert = test_cert("trojan-tls-worker");
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (release_remote_tx, release_remote_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+            let _ = release_remote_rx.recv_timeout(Duration::from_secs(3));
+        });
+
+        let server = server();
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            let result = server_clone.handle_tls_client(client);
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = tls_client(trojan_addr, cert.cert_der.clone());
+        client
+            .write_all(&trojan_request(echo_addr))
+            .expect("client request");
+        client.write_all(b"ping").expect("payload");
+        let mut echoed = [0u8; 4];
+        client.read_exact(&mut echoed).expect("echoed payload");
+        assert_eq!(&echoed, b"ping");
+
+        let handled = handled_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("tls relay should move off the connection worker after start");
+        handled.expect("spawn background tls relay");
+
+        drop(client);
+        release_remote_tx.send(()).expect("release remote");
+        server_thread.join().expect("server thread");
+        echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
     fn proxies_tls_websocket_and_records_user_traffic() {
         let cert = test_cert("trojan-ws");
         let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
@@ -3280,7 +3363,7 @@ mod tests {
             .expect("serve once");
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_trojan_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].node_tag, "panel|trojan|1");
         assert_eq!(records[0].user_uuid, "trojan-password");
@@ -3341,7 +3424,7 @@ mod tests {
             .expect("serve once");
         echo_thread.join().expect("echo thread");
 
-        let records = server.drain_traffic(1);
+        let records = drain_trojan_traffic_eventually(&server, 1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].upload, 96);
         assert_eq!(records[0].download, 96);
@@ -3610,6 +3693,60 @@ mod tests {
             .recv_timeout(Duration::from_millis(300))
             .expect("websocket relay should move off the connection worker after start");
         handled.expect("spawn background websocket relay");
+
+        drop(client);
+        release_remote_tx.send(()).expect("release remote");
+        server_thread.join().expect("server thread");
+        echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
+    fn tls_websocket_tcp_relay_does_not_hold_connection_worker_after_start() {
+        let cert = test_cert("trojan-ws-worker");
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (release_remote_tx, release_remote_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+            let _ = release_remote_rx.recv_timeout(Duration::from_secs(3));
+        });
+
+        let server = server();
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            let result = server_clone.handle_tls_websocket_client(client, Some("/trojan"));
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = tls_client(trojan_addr, cert.cert_der.clone());
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.53",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame(&trojan_request(echo_addr)))
+            .expect("trojan request frame");
+        client.write_all(&masked_frame(b"ping")).expect("payload");
+        assert_eq!(read_binary_frame(&mut client), b"ping");
+
+        let handled = handled_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("tls websocket relay should move off the connection worker after start");
+        handled.expect("spawn background tls websocket relay");
 
         drop(client);
         release_remote_tx.send(()).expect("release remote");
