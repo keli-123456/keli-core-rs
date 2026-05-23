@@ -138,7 +138,9 @@ impl TrojanServer {
 
     pub fn handle_tcp_client(&self, mut client: TcpStream) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        client.set_read_timeout(Some(self.config.connect_timeout))?;
         let mut request = self.read_request(&mut client)?;
+        client.set_read_timeout(None)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
@@ -175,6 +177,7 @@ impl TrojanServer {
     }
 
     pub fn handle_websocket_client(&self, client: TcpStream, path: Option<&str>) -> io::Result<()> {
+        client.set_read_timeout(Some(self.config.connect_timeout))?;
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let (reader, writer, forwarded_ip) = accept_websocket_with_client_ip(client, path)?;
         self.handle_websocket_split_client_with_ip(reader, writer, forwarded_ip.or(client_ip))
@@ -240,7 +243,9 @@ impl TrojanServer {
         writer: WebSocketWriter,
         client_ip: Option<IpAddr>,
     ) -> io::Result<()> {
+        reader.set_read_timeout(Some(self.config.connect_timeout))?;
         let mut request = self.read_request(&mut reader)?;
+        reader.set_read_timeout(None)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let session = self.acquire_user_session(user.as_ref(), client_ip)?;
@@ -265,7 +270,9 @@ impl TrojanServer {
 
     pub fn handle_tls_client(&self, mut client: TlsConnection) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        client.set_io_timeout(Some(self.config.connect_timeout))?;
         let mut request = self.read_request(&mut client)?;
+        client.set_io_timeout(None)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), client_ip)?;
@@ -306,9 +313,12 @@ impl TrojanServer {
         client: TlsConnection,
         path: Option<&str>,
     ) -> io::Result<()> {
+        client.set_io_timeout(Some(self.config.connect_timeout))?;
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let (mut websocket, forwarded_ip) = accept_websocket_tls_with_client_ip(client, path)?;
+        websocket.set_io_timeout(Some(self.config.connect_timeout))?;
         let mut request = self.read_request(&mut websocket)?;
+        websocket.set_io_timeout(None)?;
         request.client_ip = forwarded_ip.or(client_ip);
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), request.client_ip)?;
@@ -3524,6 +3534,37 @@ mod tests {
             .expect("remote done");
         server_thread.join().expect("server thread");
         echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
+    fn websocket_upgrade_without_trojan_header_times_out_like_go_handshake() {
+        let server = server_with_routes(Vec::new(), Duration::from_millis(120));
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let server_clone = server.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let result = server_clone.handle_websocket_client(stream, Some("/trojan"));
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = TcpStream::connect(trojan_addr).expect("client connect");
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.52",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+
+        let result = handled_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("websocket trojan handshake should time out");
+        assert!(result.is_err(), "missing trojan header should fail");
+        drop(client);
+        server_thread.join().expect("server thread");
     }
 
     #[test]

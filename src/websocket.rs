@@ -244,6 +244,10 @@ fn shutdown_websocket_tls_pair(client: &mut WebSocketTlsStream, remote: &TcpStre
 }
 
 impl WebSocketReader {
+    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.reader.set_read_timeout(timeout)
+    }
+
     pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         self.reader.set_nonblocking(nonblocking)
     }
@@ -319,6 +323,10 @@ impl Write for WebSocketWriter {
 }
 
 impl WebSocketTlsStream {
+    pub(crate) fn set_io_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.set_io_timeout(timeout)
+    }
+
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         self.stream.set_nonblocking(nonblocking)
     }
