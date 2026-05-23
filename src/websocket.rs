@@ -13,6 +13,7 @@ use crate::tls::TlsConnection;
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_HTTP_HEADER: usize = 16 * 1024;
 const OPCODE_CONTINUATION: u8 = 0x0;
+const OPCODE_TEXT: u8 = 0x1;
 const OPCODE_BINARY: u8 = 0x2;
 const OPCODE_CLOSE: u8 = 0x8;
 const OPCODE_PING: u8 = 0x9;
@@ -490,7 +491,7 @@ struct WebSocketMessageAssembler {
 impl WebSocketMessageAssembler {
     fn accept(&mut self, frame: RawWebSocketFrame) -> io::Result<Option<WebSocketFrame>> {
         match frame.opcode {
-            OPCODE_BINARY => {
+            OPCODE_TEXT | OPCODE_BINARY => {
                 if self.fragmented.is_some() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -1083,6 +1084,32 @@ mod tests {
         client
             .write_all(&masked_frame_with(true, 0x0, b"ng"))
             .expect("last fragment");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn accepts_text_message_payload_like_gorilla() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let (mut reader, _) = accept_websocket(stream, Some("/ws")).expect("upgrade");
+            let mut payload = [0u8; 4];
+            reader.read_exact(&mut payload).expect("text frame payload");
+            assert_eq!(&payload, b"ping");
+        });
+
+        let mut client = TcpStream::connect(addr).expect("client");
+        client
+            .write_all(
+                b"GET /ws HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            )
+            .expect("request");
+        let response = read_http_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame_with(true, 0x1, b"ping"))
+            .expect("text frame");
         server.join().expect("server");
     }
 
