@@ -27,7 +27,7 @@ const NATIVE_RELAY_FDS_PER_WORKER: usize = 4;
 #[cfg(windows)]
 const DETACHED_BLOCKING_RELAY_STACK_SIZE: usize = 2 * 1024 * 1024;
 #[cfg(not(windows))]
-const DETACHED_BLOCKING_RELAY_STACK_SIZE: usize = 1024 * 1024;
+const DETACHED_BLOCKING_RELAY_STACK_SIZE: usize = 256 * 1024;
 
 pub type BlockingRelayHandle<T> = tokio::task::JoinHandle<T>;
 type NativeRelayJob = Box<dyn FnOnce() + Send + 'static>;
@@ -544,7 +544,7 @@ fn native_relay_worker_threads_from_resources(
 }
 
 fn native_relay_stack_size() -> usize {
-    512 * 1024
+    256 * 1024
 }
 
 fn native_relay_idle_timeout() -> Duration {
