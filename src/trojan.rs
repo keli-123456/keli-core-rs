@@ -40,7 +40,7 @@ use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::websocket::{
     accept_websocket_tls_with_client_ip, accept_websocket_with_client_ip, connect_websocket_client,
-    relay_websocket_tls_stream, websocket_tls_relay_idle_timeout, WebSocketClientStream,
+    relay_websocket_tls_stream_stats, websocket_tls_relay_idle_timeout, WebSocketClientStream,
     WebSocketReader, WebSocketWriter,
 };
 use crate::{connect_tcp_outbound, send_udp_outbound, RouteDecision, RouteDispatcher};
@@ -661,13 +661,40 @@ impl TrojanServer {
         request: TrojanRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
-        let (upload, download) = relay_websocket_tls_stream(client, remote, bandwidth)?;
+        let relay_started = Instant::now();
+        let stats = match relay_websocket_tls_stream_stats(client, remote, bandwidth) {
+            Ok(stats) => stats,
+            Err(error) => {
+                log_trojan_relay_finished(
+                    &self.config.node_tag,
+                    "tls_websocket",
+                    &request,
+                    0,
+                    0,
+                    None,
+                    relay_started.elapsed(),
+                    Some(&error),
+                );
+                record_trojan_connection_error(&self.config.node_tag, "tls_websocket", &error);
+                return Err(error);
+            }
+        };
+        log_trojan_relay_finished(
+            &self.config.node_tag,
+            "tls_websocket",
+            &request,
+            stats.upload,
+            stats.download,
+            stats.first_byte_ms,
+            relay_started.elapsed(),
+            None,
+        );
         self.traffic.add_with_user_id(
             self.config.node_tag.clone(),
             request.user_uuid,
             Some(request.user_id),
-            upload,
-            download,
+            stats.upload,
+            stats.download,
             request.client_ip,
         );
         Ok(())

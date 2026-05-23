@@ -2,7 +2,7 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use sha1::{Digest, Sha1};
@@ -36,6 +36,13 @@ pub struct WebSocketTlsStream {
     input: Vec<u8>,
     buffer: Vec<u8>,
     assembler: WebSocketMessageAssembler,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WebSocketRelayStats {
+    pub upload: u64,
+    pub download: u64,
+    pub first_byte_ms: Option<u128>,
 }
 
 pub struct WebSocketClientStream<S> {
@@ -158,15 +165,24 @@ pub fn accept_websocket_tls_with_client_ip(
 }
 
 pub fn relay_websocket_tls_stream(
+    client: WebSocketTlsStream,
+    remote: TcpStream,
+    limiter: Option<Arc<BandwidthLimiter>>,
+) -> io::Result<(u64, u64)> {
+    let stats = relay_websocket_tls_stream_stats(client, remote, limiter)?;
+    Ok((stats.upload, stats.download))
+}
+
+pub(crate) fn relay_websocket_tls_stream_stats(
     mut client: WebSocketTlsStream,
     mut remote: TcpStream,
     limiter: Option<Arc<BandwidthLimiter>>,
-) -> io::Result<(u64, u64)> {
+) -> io::Result<WebSocketRelayStats> {
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
 
-    let mut upload = 0u64;
-    let mut download = 0u64;
+    let started = Instant::now();
+    let mut stats = WebSocketRelayStats::default();
     let mut upload_done = false;
     let mut download_done = false;
     let mut client_buffer = [0u8; 16 * 1024];
@@ -194,7 +210,7 @@ pub fn relay_websocket_tls_stream(
                         }
                     }
                     write_all_wait(&mut remote, &client_buffer[..read])?;
-                    upload = upload.saturating_add(read as u64);
+                    stats.upload = stats.upload.saturating_add(read as u64);
                     progressed = true;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -216,8 +232,11 @@ pub fn relay_websocket_tls_stream(
                     progressed = true;
                 }
                 Ok(read) => {
+                    if stats.first_byte_ms.is_none() {
+                        stats.first_byte_ms = Some(started.elapsed().as_millis());
+                    }
                     client.write_binary_wait(&remote_buffer[..read])?;
-                    download = download.saturating_add(read as u64);
+                    stats.download = stats.download.saturating_add(read as u64);
                     progressed = true;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -238,7 +257,7 @@ pub fn relay_websocket_tls_stream(
         }
     }
 
-    Ok((upload, download))
+    Ok(stats)
 }
 
 fn shutdown_websocket_tls_pair(client: &mut WebSocketTlsStream, remote: &TcpStream) {
