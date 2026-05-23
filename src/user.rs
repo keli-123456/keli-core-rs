@@ -65,7 +65,6 @@ pub struct UserStore {
 #[derive(Clone, Debug, Default)]
 struct UserStoreState {
     users: HashMap<String, Arc<CoreUser>>,
-    uuid_keys: HashMap<String, String>,
 }
 
 impl UserStore {
@@ -155,8 +154,7 @@ impl UserStore {
                 continue;
             }
             let key = key(user);
-            if let Some(old_key) = current.uuid_keys.insert(user.uuid.clone(), key.clone()) {
-                current.users.remove(&old_key);
+            if remove_arc_user_by_uuid(&mut current.users, &user.uuid).is_some() {
                 result.updated += 1;
             } else {
                 result.added += 1;
@@ -168,22 +166,16 @@ impl UserStore {
                 continue;
             }
             let key = key(user);
-            if let Some(old_key) = current.uuid_keys.insert(user.uuid.clone(), key.clone()) {
-                current.users.remove(&old_key);
+            if remove_arc_user_by_uuid(&mut current.users, &user.uuid).is_some() {
                 current.users.insert(key, Arc::new(user.clone()));
                 result.updated += 1;
             } else {
-                current.uuid_keys.remove(&user.uuid);
                 result.missing_updated += 1;
             }
         }
         for uuid in &delta.deleted {
-            if let Some(key) = current.uuid_keys.remove(uuid) {
-                if current.users.remove(&key).is_some() {
-                    result.deleted += 1;
-                } else {
-                    result.missing_deleted += 1;
-                }
+            if remove_arc_user_by_uuid(&mut current.users, uuid).is_some() {
+                result.deleted += 1;
             } else {
                 result.missing_deleted += 1;
             }
@@ -435,16 +427,24 @@ where
 {
     let mut state = UserStoreState {
         users: HashMap::with_capacity(users.len()),
-        uuid_keys: HashMap::with_capacity(users.len()),
     };
     for user in users {
         if !user.is_empty() {
             let key = key(user);
-            state.uuid_keys.insert(user.uuid.clone(), key.clone());
             state.users.insert(key, Arc::new(user.clone()));
         }
     }
     state
+}
+
+fn remove_arc_user_by_uuid(
+    users: &mut HashMap<String, Arc<CoreUser>>,
+    uuid: &str,
+) -> Option<Arc<CoreUser>> {
+    let key = users
+        .iter()
+        .find_map(|(key, user)| (user.uuid == uuid).then(|| key.clone()))?;
+    users.remove(&key)
 }
 
 #[cfg(test)]
