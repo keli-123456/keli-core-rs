@@ -8,7 +8,7 @@ use base64::Engine;
 use sha1::{Digest, Sha1};
 
 use crate::limits::BandwidthLimiter;
-use crate::tls::TlsConnection;
+use crate::tls::{RawTcpStreamAccess, TlsConnection};
 
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_HTTP_HEADER: usize = 16 * 1024;
@@ -257,6 +257,20 @@ impl WebSocketReader {
 
     pub(crate) fn shutdown(&self) -> io::Result<()> {
         self.reader.shutdown(Shutdown::Both)
+    }
+
+    pub(crate) fn wait_readable_with_remote(
+        &self,
+        remote: &TcpStream,
+        wait_client: bool,
+        wait_remote: bool,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        if wait_client && !self.buffer.is_empty() {
+            return Ok(());
+        }
+        self.reader
+            .wait_readable_with(remote, wait_client, wait_remote, timeout)
     }
 
     pub(crate) fn peer_closed_nonblocking(&self) -> io::Result<bool> {
@@ -978,7 +992,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::websocket::{
         accept_websocket, accept_websocket_with_client_ip, connect_websocket_client,
@@ -1144,6 +1158,51 @@ mod tests {
         client
             .write_all(&masked_frame(b"ping"))
             .expect("data frame");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn plain_reader_waits_for_client_or_remote_readiness_without_spin_polling() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let remote_listener = TcpListener::bind("127.0.0.1:0").expect("remote bind");
+        let remote_addr = remote_listener.local_addr().expect("remote addr");
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let (reader, _) = accept_websocket(stream, Some("/ws")).expect("upgrade");
+            let remote_client = TcpStream::connect(remote_addr).expect("remote client");
+            let (remote, _) = remote_listener.accept().expect("remote accept");
+            let delayed = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(120));
+                (&remote_client)
+                    .write_all(b"wake")
+                    .expect("wake remote readable");
+            });
+
+            reader.set_nonblocking(true).expect("reader nonblocking");
+            let started = Instant::now();
+            reader
+                .wait_readable_with_remote(&remote, true, true, Duration::from_secs(1))
+                .expect("wait readable");
+            let elapsed = started.elapsed();
+            if cfg!(unix) {
+                assert!(elapsed >= Duration::from_millis(80));
+                assert!(elapsed < Duration::from_millis(800));
+            } else {
+                assert!(elapsed < Duration::from_millis(200));
+            }
+            delayed.join().expect("delayed writer");
+        });
+
+        let mut client = TcpStream::connect(addr).expect("client");
+        client
+            .write_all(
+                b"GET /ws HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            )
+            .expect("request");
+        let response = read_http_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
         server.join().expect("server");
     }
 

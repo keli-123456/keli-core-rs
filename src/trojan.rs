@@ -39,7 +39,8 @@ use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::websocket::{
     accept_websocket_tls_with_client_ip, accept_websocket_with_client_ip, connect_websocket_client,
-    relay_websocket_tls_stream, WebSocketClientStream, WebSocketReader, WebSocketWriter,
+    relay_websocket_tls_stream, websocket_tls_relay_idle_timeout, WebSocketClientStream,
+    WebSocketReader, WebSocketWriter,
 };
 use crate::{connect_tcp_outbound, send_udp_outbound, RouteDecision, RouteDispatcher};
 
@@ -493,6 +494,7 @@ impl TrojanServer {
         let mut download_done = false;
         let mut client_buffer = [0u8; 16 * 1024];
         let mut remote_buffer = [0u8; 16 * 1024];
+        let mut idle_rounds = 0u8;
 
         while !upload_done || !download_done {
             let mut progressed = false;
@@ -559,7 +561,10 @@ impl TrojanServer {
             }
 
             if !progressed {
-                thread::sleep(Duration::from_millis(1));
+                let timeout = websocket_tls_relay_idle_timeout(&mut idle_rounds);
+                reader.wait_readable_with_remote(&remote, !upload_done, !download_done, timeout)?;
+            } else {
+                idle_rounds = 0;
             }
         }
 
