@@ -475,13 +475,103 @@ impl TrojanServer {
 
     fn relay_plain_websocket(
         &self,
-        reader: WebSocketReader,
-        writer: WebSocketWriter,
-        remote: TcpStream,
+        mut reader: WebSocketReader,
+        mut writer: WebSocketWriter,
+        mut remote: TcpStream,
         request: TrojanRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
-        self.relay_websocket(reader, writer, remote, request, bandwidth)
+        reader.set_nonblocking(true)?;
+        remote.set_nonblocking(true)?;
+        let _connection = self
+            .bandwidth
+            .register_tcp_connection(Some(&request.user_uuid), &[&remote])?;
+
+        let mut upload = 0u64;
+        let mut download = 0u64;
+        let mut upload_done = false;
+        let mut download_done = false;
+        let mut client_buffer = [0u8; 16 * 1024];
+        let mut remote_buffer = [0u8; 16 * 1024];
+
+        while !upload_done || !download_done {
+            let mut progressed = false;
+
+            if !upload_done {
+                match reader.read(&mut client_buffer) {
+                    Ok(0) => {
+                        upload_done = true;
+                        download_done = true;
+                        let _ = writer.shutdown();
+                        let _ = remote.shutdown(Shutdown::Both);
+                        progressed = true;
+                    }
+                    Ok(read) => {
+                        if let Some(limiter) = bandwidth.as_deref() {
+                            if !limiter.wait_for(read) {
+                                upload_done = true;
+                                download_done = true;
+                                let _ = writer.shutdown();
+                                let _ = remote.shutdown(Shutdown::Both);
+                                continue;
+                            }
+                        }
+                        write_all_wait(&mut remote, &client_buffer[..read])?;
+                        upload = upload.saturating_add(read as u64);
+                        progressed = true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        upload_done = true;
+                        download_done = true;
+                        let _ = writer.shutdown();
+                        let _ = remote.shutdown(Shutdown::Both);
+                        progressed = true;
+                    }
+                }
+            }
+
+            if !download_done {
+                match remote.read(&mut remote_buffer) {
+                    Ok(0) => {
+                        download_done = true;
+                        upload_done = true;
+                        let _ = writer.shutdown();
+                        let _ = reader.shutdown();
+                        let _ = remote.shutdown(Shutdown::Both);
+                        progressed = true;
+                    }
+                    Ok(read) => {
+                        write_all_wait(&mut writer, &remote_buffer[..read])?;
+                        download = download.saturating_add(read as u64);
+                        progressed = true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        download_done = true;
+                        upload_done = true;
+                        let _ = writer.shutdown();
+                        let _ = reader.shutdown();
+                        let _ = remote.shutdown(Shutdown::Both);
+                        progressed = true;
+                    }
+                }
+            }
+
+            if !progressed {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            request.user_uuid,
+            Some(request.user_id),
+            upload,
+            download,
+            request.client_ip,
+        );
+        Ok(())
     }
 
     fn spawn_plain_websocket_relay(
@@ -2134,7 +2224,7 @@ fn hex_digit(value: u8) -> char {
 mod tests {
     use std::fs;
     use std::io::{self, Cursor, Read, Write};
-    use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+    use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
     use std::path::PathBuf;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -3617,6 +3707,76 @@ mod tests {
             .expect("remote done");
         server_thread.join().expect("server thread");
         echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
+    fn websocket_remote_eof_closes_plain_trojan_relay_like_gorilla_conn() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+            let _ = stream.shutdown(Shutdown::Both);
+        });
+
+        let server = server();
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let server_clone = server.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let result = server_clone.handle_websocket_client(stream, Some("/trojan"));
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = TcpStream::connect(trojan_addr).expect("client connect");
+        client
+            .set_read_timeout(Some(Duration::from_millis(700)))
+            .expect("client read timeout");
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.54",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame(&trojan_request(echo_addr)))
+            .expect("trojan request frame");
+        client.write_all(&masked_frame(b"ping")).expect("payload");
+        assert_eq!(read_binary_frame(&mut client), b"ping");
+
+        let handled = handled_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("websocket relay should move off the connection worker after start");
+        handled.expect("spawn background websocket relay");
+        echo_thread.join().expect("echo thread");
+
+        let mut header = [0u8; 2];
+        match client.read_exact(&mut header) {
+            Ok(()) => assert_eq!(
+                header[0] & 0x0f,
+                0x08,
+                "server should send websocket close after remote EOF"
+            ),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                ) => {}
+            Err(error) => panic!("server did not close websocket after remote EOF: {error}"),
+        }
+
+        let records = drain_trojan_traffic_eventually(&server, 1);
+        assert_eq!(records.len(), 1);
+        server_thread.join().expect("server thread");
     }
 
     #[test]

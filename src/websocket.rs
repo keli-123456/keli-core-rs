@@ -22,6 +22,7 @@ const OPCODE_PONG: u8 = 0xA;
 pub struct WebSocketReader {
     reader: TcpStream,
     control_writer: Arc<Mutex<TcpStream>>,
+    input: Vec<u8>,
     buffer: Vec<u8>,
     assembler: WebSocketMessageAssembler,
 }
@@ -107,6 +108,7 @@ pub fn accept_websocket_with_client_ip(
         WebSocketReader {
             reader: stream,
             control_writer: control_writer.clone(),
+            input: Vec::new(),
             buffer: early_data,
             assembler: WebSocketMessageAssembler::default(),
         },
@@ -277,10 +279,12 @@ impl WebSocketReader {
 
 impl WebSocketWriter {
     pub(crate) fn shutdown(&self) -> io::Result<()> {
-        self.writer
-            .lock()
-            .expect("websocket writer lock poisoned")
-            .shutdown(Shutdown::Both)
+        let mut stream = self.writer.lock().expect("websocket writer lock poisoned");
+        let close_result = stream
+            .write_all(&frame_bytes(OPCODE_CLOSE, &[]))
+            .and_then(|_| stream.flush());
+        let shutdown_result = stream.shutdown(Shutdown::Both);
+        close_result.or(shutdown_result)
     }
 }
 
@@ -290,13 +294,23 @@ impl Read for WebSocketReader {
             return Ok(0);
         }
         while self.buffer.is_empty() {
-            match read_frame(&mut self.reader, &mut self.assembler)? {
-                WebSocketFrame::Data(data) => self.buffer = data,
-                WebSocketFrame::Ping(data) => {
-                    write_frame(&self.control_writer, OPCODE_PONG, &data)?;
+            if let Some(frame) = parse_buffered_frame(&mut self.input, &mut self.assembler)? {
+                match frame {
+                    WebSocketFrame::Data(data) => self.buffer = data,
+                    WebSocketFrame::Ping(data) => {
+                        write_frame(&self.control_writer, OPCODE_PONG, &data)?;
+                    }
+                    WebSocketFrame::Pong => {}
+                    WebSocketFrame::Close => return Ok(0),
                 }
-                WebSocketFrame::Pong => {}
-                WebSocketFrame::Close => return Ok(0),
+                continue;
+            }
+
+            let mut input = [0u8; 8 * 1024];
+            match self.reader.read(&mut input) {
+                Ok(0) => return Ok(0),
+                Ok(read) => self.input.extend_from_slice(&input[..read]),
+                Err(error) => return Err(error),
             }
         }
 
@@ -803,18 +817,6 @@ fn read_raw_frame<R: Read>(reader: &mut R, expect_masked: bool) -> io::Result<Ra
     })
 }
 
-fn read_frame(
-    reader: &mut TcpStream,
-    assembler: &mut WebSocketMessageAssembler,
-) -> io::Result<WebSocketFrame> {
-    loop {
-        let raw = read_raw_frame(reader, true)?;
-        if let Some(frame) = assembler.accept(raw)? {
-            return Ok(frame);
-        }
-    }
-}
-
 fn parse_buffered_frame(
     buffer: &mut Vec<u8>,
     assembler: &mut WebSocketMessageAssembler,
@@ -1139,7 +1141,9 @@ mod tests {
         client
             .write_all(&masked_frame_with(true, 0xA, b"keepalive"))
             .expect("pong frame");
-        client.write_all(&masked_frame(b"ping")).expect("data frame");
+        client
+            .write_all(&masked_frame(b"ping"))
+            .expect("data frame");
         server.join().expect("server");
     }
 
