@@ -1515,7 +1515,13 @@ fn connect_trojan_direct_target(
     let started = Instant::now();
     match connect_target(target, timeout) {
         Ok(stream) => {
-            log_trojan_direct_connected(node_tag, scope, target, started.elapsed());
+            log_trojan_direct_connected(
+                node_tag,
+                scope,
+                target,
+                started.elapsed(),
+                stream.peer_addr().ok(),
+            );
             Ok(stream)
         }
         Err(error) => {
@@ -1542,7 +1548,13 @@ async fn connect_trojan_direct_target_tokio(
     match crate::dns::connect_tcp_tokio(&target.host, target.port, timeout).await {
         Ok(stream) => match stream.into_std() {
             Ok(stream) => {
-                log_trojan_direct_connected(node_tag, scope, target, started.elapsed());
+                log_trojan_direct_connected(
+                    node_tag,
+                    scope,
+                    target,
+                    started.elapsed(),
+                    stream.peer_addr().ok(),
+                );
                 Ok(stream)
             }
             Err(error) => {
@@ -1779,15 +1791,20 @@ fn log_trojan_direct_connected(
     scope: &'static str,
     target: &SocksTarget,
     elapsed: Duration,
+    peer_addr: Option<SocketAddr>,
 ) {
     if elapsed.as_millis() < TROJAN_ROUTE_SLOW_LOG_MS && !trojan_trace_enabled() {
         return;
     }
+    let peer = peer_addr
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| "-".to_string());
     eprintln!(
-        "INFO  core   trojan direct connected node_tag={} scope={scope} target={}:{} elapsed_ms={}",
+        "INFO  core   trojan direct connected node_tag={} scope={scope} target={}:{} peer={} elapsed_ms={}",
         trojan_log_field(node_tag),
         trojan_log_field(&target.host),
         target.port,
+        trojan_log_field(&peer),
         elapsed.as_millis()
     );
 }
