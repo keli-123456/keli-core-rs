@@ -41,8 +41,8 @@ use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::vision::{VisionDecoder, VisionEncoder, VisionReader, VisionWriter};
 use crate::websocket::{
     accept_websocket_tls_with_client_ip, accept_websocket_with_client_ip, connect_websocket_client,
-    relay_websocket_tls_stream, websocket_tls_relay_idle_timeout, WebSocketClientStream,
-    WebSocketReader, WebSocketWriter,
+    relay_websocket_tls_stream, websocket_relay_idle_limit, websocket_tls_relay_idle_timeout,
+    WebSocketClientStream, WebSocketReader, WebSocketRelayTimeouts, WebSocketWriter,
 };
 use crate::{
     connect_tcp_outbound, connect_tcp_outbound_tokio, send_udp_outbound, send_udp_outbound_tokio,
@@ -904,6 +904,8 @@ impl VlessServer {
         let mut client_buffer = [0u8; 16 * 1024];
         let mut remote_buffer = [0u8; 16 * 1024];
         let mut idle_rounds = 0u8;
+        let mut idle_since = Instant::now();
+        let timeouts = WebSocketRelayTimeouts::default();
         let result = loop {
             if upload_done && download_done {
                 break Ok(());
@@ -914,10 +916,7 @@ impl VlessServer {
                 match reader.read(&mut client_buffer) {
                     Ok(0) => {
                         upload_done = true;
-                        download_done = true;
-                        let _ = reader.shutdown();
-                        let _ = writer.shutdown();
-                        let _ = remote.shutdown(Shutdown::Both);
+                        let _ = remote.shutdown(Shutdown::Write);
                         progressed = true;
                     }
                     Ok(read) => {
@@ -958,10 +957,6 @@ impl VlessServer {
                 match remote.read(&mut remote_buffer) {
                     Ok(0) => {
                         download_done = true;
-                        upload_done = true;
-                        let _ = reader.shutdown();
-                        let _ = writer.shutdown();
-                        let _ = remote.shutdown(Shutdown::Both);
                         progressed = true;
                     }
                     Ok(read) => {
@@ -989,9 +984,23 @@ impl VlessServer {
             }
 
             if !progressed {
-                thread::sleep(websocket_tls_relay_idle_timeout(&mut idle_rounds));
+                let idle_limit = websocket_relay_idle_limit(&timeouts, upload_done, download_done);
+                let idle_elapsed = idle_since.elapsed();
+                if idle_elapsed >= idle_limit {
+                    upload_done = true;
+                    download_done = true;
+                    let _ = reader.shutdown();
+                    let _ = writer.shutdown();
+                    let _ = remote.shutdown(Shutdown::Both);
+                    continue;
+                }
+                thread::sleep(
+                    websocket_tls_relay_idle_timeout(&mut idle_rounds)
+                        .min(idle_limit.saturating_sub(idle_elapsed)),
+                );
             } else {
                 idle_rounds = 0;
+                idle_since = Instant::now();
             }
         };
         self.traffic.add_with_user_id(

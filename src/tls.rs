@@ -4,7 +4,7 @@ use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -22,6 +22,23 @@ pub(crate) enum TlsHandshakeErrorClass {
     SniRejected,
     InvalidHandshake,
     Io,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TlsRelayTimeouts {
+    pub connection_idle: Duration,
+    pub uplink_only: Duration,
+    pub downlink_only: Duration,
+}
+
+impl Default for TlsRelayTimeouts {
+    fn default() -> Self {
+        Self {
+            connection_idle: Duration::from_secs(120),
+            uplink_only: Duration::from_secs(2),
+            downlink_only: Duration::from_secs(4),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -530,9 +547,21 @@ where
 }
 
 pub fn relay_tls_stream<S>(
+    client: TlsConnection<S>,
+    remote: TcpStream,
+    limiter: Option<Arc<BandwidthLimiter>>,
+) -> io::Result<(u64, u64)>
+where
+    S: TlsSocket + RawTcpStreamAccess,
+{
+    relay_tls_stream_with_timeouts(client, remote, limiter, TlsRelayTimeouts::default())
+}
+
+pub(crate) fn relay_tls_stream_with_timeouts<S>(
     mut client: TlsConnection<S>,
     mut remote: TcpStream,
     limiter: Option<Arc<BandwidthLimiter>>,
+    timeouts: TlsRelayTimeouts,
 ) -> io::Result<(u64, u64)>
 where
     S: TlsSocket + RawTcpStreamAccess,
@@ -547,6 +576,7 @@ where
     let mut client_buffer = [0u8; 16 * 1024];
     let mut remote_buffer = [0u8; 16 * 1024];
     let mut idle_rounds = 0u8;
+    let mut idle_since = Instant::now();
 
     while !upload_done || !download_done {
         if limiter
@@ -582,7 +612,9 @@ where
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => {
                     upload_done = true;
-                    let _ = remote.shutdown(Shutdown::Write);
+                    download_done = true;
+                    let _ = client.shutdown(Shutdown::Both);
+                    let _ = remote.shutdown(Shutdown::Both);
                     progressed = true;
                 }
             }
@@ -592,9 +624,6 @@ where
             match remote.read(&mut remote_buffer) {
                 Ok(0) => {
                     download_done = true;
-                    upload_done = true;
-                    let _ = client.shutdown(Shutdown::Both);
-                    let _ = remote.shutdown(Shutdown::Both);
                     progressed = true;
                 }
                 Ok(read) => {
@@ -623,10 +652,25 @@ where
         }
 
         if !progressed {
+            let idle_limit = tls_relay_idle_limit(&timeouts, upload_done, download_done);
+            let idle_elapsed = idle_since.elapsed();
+            if idle_elapsed >= idle_limit {
+                upload_done = true;
+                download_done = true;
+                let _ = client.shutdown(Shutdown::Both);
+                let _ = remote.shutdown(Shutdown::Both);
+                continue;
+            }
             let timeout = relay_idle_timeout(&mut idle_rounds);
-            client.wait_raw_readable_with(&remote, !upload_done, !download_done, timeout)?;
+            client.wait_raw_readable_with(
+                &remote,
+                !upload_done,
+                !download_done,
+                timeout.min(idle_limit.saturating_sub(idle_elapsed)),
+            )?;
         } else {
             idle_rounds = 0;
+            idle_since = Instant::now();
         }
     }
 
@@ -642,6 +686,20 @@ fn relay_idle_timeout(idle_rounds: &mut u8) -> Duration {
         .saturating_add(1)
         .min((BACKOFF_MS.len() - 1) as u8);
     Duration::from_millis(BACKOFF_MS[idx])
+}
+
+pub(crate) fn tls_relay_idle_limit(
+    timeouts: &TlsRelayTimeouts,
+    upload_done: bool,
+    download_done: bool,
+) -> Duration {
+    if upload_done && !download_done {
+        timeouts.downlink_only
+    } else if download_done && !upload_done {
+        timeouts.uplink_only
+    } else {
+        timeouts.connection_idle
+    }
 }
 
 fn reality_ed25519_certified_key(
@@ -950,6 +1008,28 @@ mod tests {
         assert_eq!(
             super::relay_idle_timeout(&mut idle_rounds),
             Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn tls_relay_idle_limit_matches_go_after_one_side_finishes() {
+        let timeouts = super::TlsRelayTimeouts {
+            connection_idle: Duration::from_secs(120),
+            uplink_only: Duration::from_secs(2),
+            downlink_only: Duration::from_secs(4),
+        };
+
+        assert_eq!(
+            super::tls_relay_idle_limit(&timeouts, false, false),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            super::tls_relay_idle_limit(&timeouts, true, false),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            super::tls_relay_idle_limit(&timeouts, false, true),
+            Duration::from_secs(2)
         );
     }
 
