@@ -3167,6 +3167,8 @@ fn start_trojan_server(
         routes: Vec::new(),
         connect_timeout: Duration::from_secs(3),
         connection_idle: Duration::from_secs(120),
+        uplink_only: Duration::from_secs(2),
+        downlink_only: Duration::from_secs(4),
     });
     let listener = server.bind()?;
     listener.set_nonblocking(true)?;

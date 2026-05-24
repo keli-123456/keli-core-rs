@@ -172,6 +172,8 @@ impl CoreService {
         crate::dns::configure(config.dns.clone());
         let connect_timeout = outbound_connect_timeout(&config.policy);
         let connection_idle = connection_idle_timeout(&config.policy);
+        let uplink_only = uplink_only_timeout(&config.policy);
+        let downlink_only = downlink_only_timeout(&config.policy);
         let active_config = config_without_users(&config);
 
         let traffic = TrafficRegistry::shared();
@@ -246,6 +248,8 @@ impl CoreService {
                     routes.clone(),
                     connect_timeout,
                     connection_idle,
+                    uplink_only,
+                    downlink_only,
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
@@ -468,6 +472,14 @@ fn outbound_connect_timeout(policy: &PolicyConfig) -> Duration {
 
 fn connection_idle_timeout(policy: &PolicyConfig) -> Duration {
     Duration::from_secs(policy.connection_idle_secs.max(1))
+}
+
+fn uplink_only_timeout(policy: &PolicyConfig) -> Duration {
+    Duration::from_secs(policy.uplink_only_secs.max(1))
+}
+
+fn downlink_only_timeout(policy: &PolicyConfig) -> Duration {
+    Duration::from_secs(policy.downlink_only_secs.max(1))
 }
 
 fn outbound_connect_timeout_from_env(value: Option<String>, default_secs: u64) -> Duration {
@@ -1200,6 +1212,8 @@ fn start_trojan_listener(
     routes: Vec<crate::RouteRule>,
     connect_timeout: Duration,
     connection_idle: Duration,
+    uplink_only: Duration,
+    downlink_only: Duration,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -1219,6 +1233,8 @@ fn start_trojan_listener(
             routes,
             connect_timeout,
             connection_idle,
+            uplink_only,
+            downlink_only,
         },
         traffic,
         sessions,

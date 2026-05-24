@@ -45,6 +45,23 @@ pub(crate) struct WebSocketRelayStats {
     pub first_byte_ms: Option<u128>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WebSocketRelayTimeouts {
+    pub connection_idle: Duration,
+    pub uplink_only: Duration,
+    pub downlink_only: Duration,
+}
+
+impl Default for WebSocketRelayTimeouts {
+    fn default() -> Self {
+        Self {
+            connection_idle: Duration::from_secs(120),
+            uplink_only: Duration::from_secs(2),
+            downlink_only: Duration::from_secs(4),
+        }
+    }
+}
+
 pub struct WebSocketClientStream<S> {
     stream: S,
     buffer: Vec<u8>,
@@ -169,7 +186,12 @@ pub fn relay_websocket_tls_stream(
     remote: TcpStream,
     limiter: Option<Arc<BandwidthLimiter>>,
 ) -> io::Result<(u64, u64)> {
-    let stats = relay_websocket_tls_stream_stats(client, remote, limiter)?;
+    let stats = relay_websocket_tls_stream_stats(
+        client,
+        remote,
+        limiter,
+        WebSocketRelayTimeouts::default(),
+    )?;
     Ok((stats.upload, stats.download))
 }
 
@@ -177,6 +199,7 @@ pub(crate) fn relay_websocket_tls_stream_stats(
     mut client: WebSocketTlsStream,
     mut remote: TcpStream,
     limiter: Option<Arc<BandwidthLimiter>>,
+    timeouts: WebSocketRelayTimeouts,
 ) -> io::Result<WebSocketRelayStats> {
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
@@ -188,6 +211,7 @@ pub(crate) fn relay_websocket_tls_stream_stats(
     let mut client_buffer = [0u8; 16 * 1024];
     let mut remote_buffer = [0u8; 16 * 1024];
     let mut idle_rounds = 0u8;
+    let mut idle_since = Instant::now();
 
     while !upload_done || !download_done {
         let mut progressed = false;
@@ -196,8 +220,7 @@ pub(crate) fn relay_websocket_tls_stream_stats(
             match client.read(&mut client_buffer) {
                 Ok(0) => {
                     upload_done = true;
-                    download_done = true;
-                    shutdown_websocket_tls_pair(&mut client, &remote);
+                    let _ = remote.shutdown(Shutdown::Write);
                     progressed = true;
                 }
                 Ok(read) => {
@@ -227,8 +250,6 @@ pub(crate) fn relay_websocket_tls_stream_stats(
             match remote.read(&mut remote_buffer) {
                 Ok(0) => {
                     download_done = true;
-                    upload_done = true;
-                    shutdown_websocket_tls_pair(&mut client, &remote);
                     progressed = true;
                 }
                 Ok(read) => {
@@ -250,10 +271,24 @@ pub(crate) fn relay_websocket_tls_stream_stats(
         }
 
         if !progressed {
+            let idle_limit = websocket_relay_idle_limit(&timeouts, upload_done, download_done);
+            let idle_elapsed = idle_since.elapsed();
+            if idle_elapsed >= idle_limit {
+                upload_done = true;
+                download_done = true;
+                shutdown_websocket_tls_pair(&mut client, &remote);
+                continue;
+            }
             let timeout = websocket_tls_relay_idle_timeout(&mut idle_rounds);
-            client.wait_readable_with_remote(&remote, !upload_done, !download_done, timeout)?;
+            client.wait_readable_with_remote(
+                &remote,
+                !upload_done,
+                !download_done,
+                timeout.min(idle_limit.saturating_sub(idle_elapsed)),
+            )?;
         } else {
             idle_rounds = 0;
+            idle_since = Instant::now();
         }
     }
 
@@ -422,6 +457,20 @@ pub(crate) fn websocket_tls_relay_idle_timeout(idle_rounds: &mut u8) -> Duration
         .saturating_add(1)
         .min((BACKOFF_MS.len() - 1) as u8);
     Duration::from_millis(BACKOFF_MS[idx])
+}
+
+pub(crate) fn websocket_relay_idle_limit(
+    timeouts: &WebSocketRelayTimeouts,
+    upload_done: bool,
+    download_done: bool,
+) -> Duration {
+    if upload_done && !download_done {
+        timeouts.downlink_only
+    } else if download_done && !upload_done {
+        timeouts.uplink_only
+    } else {
+        timeouts.connection_idle
+    }
 }
 
 impl Read for WebSocketTlsStream {
@@ -1328,6 +1377,28 @@ mod tests {
         assert_eq!(
             super::websocket_tls_relay_idle_timeout(&mut idle_rounds),
             Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn websocket_relay_idle_limit_matches_go_after_one_side_finishes() {
+        let timeouts = super::WebSocketRelayTimeouts {
+            connection_idle: Duration::from_secs(120),
+            uplink_only: Duration::from_secs(2),
+            downlink_only: Duration::from_secs(4),
+        };
+
+        assert_eq!(
+            super::websocket_relay_idle_limit(&timeouts, false, false),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            super::websocket_relay_idle_limit(&timeouts, true, false),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            super::websocket_relay_idle_limit(&timeouts, false, true),
+            Duration::from_secs(2)
         );
     }
 }

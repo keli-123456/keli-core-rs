@@ -40,8 +40,8 @@ use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::websocket::{
     accept_websocket_tls_with_client_ip, accept_websocket_with_client_ip, connect_websocket_client,
-    relay_websocket_tls_stream_stats, websocket_tls_relay_idle_timeout, WebSocketClientStream,
-    WebSocketReader, WebSocketWriter,
+    relay_websocket_tls_stream_stats, websocket_relay_idle_limit, websocket_tls_relay_idle_timeout,
+    WebSocketClientStream, WebSocketReader, WebSocketRelayTimeouts, WebSocketWriter,
 };
 use crate::{connect_tcp_outbound, send_udp_outbound, RouteDecision, RouteDispatcher};
 
@@ -65,6 +65,8 @@ pub struct TrojanServerConfig {
     pub routes: Vec<crate::RouteRule>,
     pub connect_timeout: Duration,
     pub connection_idle: Duration,
+    pub uplink_only: Duration,
+    pub downlink_only: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -465,9 +467,7 @@ impl TrojanServer {
                 match reader.read(&mut client_buffer) {
                     Ok(0) => {
                         upload_done = true;
-                        download_done = true;
-                        let _ = writer.shutdown();
-                        let _ = remote.shutdown(Shutdown::Both);
+                        let _ = remote.shutdown(Shutdown::Write);
                         progressed = true;
                     }
                     Ok(read) => {
@@ -509,10 +509,6 @@ impl TrojanServer {
                 match remote.read(&mut remote_buffer) {
                     Ok(0) => {
                         download_done = true;
-                        upload_done = true;
-                        let _ = writer.shutdown();
-                        let _ = reader.shutdown();
-                        let _ = remote.shutdown(Shutdown::Both);
                         progressed = true;
                     }
                     Ok(read) => {
@@ -547,8 +543,10 @@ impl TrojanServer {
             }
 
             if !progressed {
+                let timeouts = self.websocket_relay_timeouts();
+                let idle_limit = websocket_relay_idle_limit(&timeouts, upload_done, download_done);
                 let idle_elapsed = idle_since.elapsed();
-                if idle_elapsed >= self.config.connection_idle {
+                if idle_elapsed >= idle_limit {
                     upload_done = true;
                     download_done = true;
                     let _ = writer.shutdown();
@@ -561,7 +559,7 @@ impl TrojanServer {
                     &remote,
                     !upload_done,
                     !download_done,
-                    timeout.min(self.config.connection_idle.saturating_sub(idle_elapsed)),
+                    timeout.min(idle_limit.saturating_sub(idle_elapsed)),
                 ) {
                     relay_error = Some(error);
                     upload_done = true;
@@ -662,7 +660,12 @@ impl TrojanServer {
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
         let relay_started = Instant::now();
-        let stats = match relay_websocket_tls_stream_stats(client, remote, bandwidth) {
+        let stats = match relay_websocket_tls_stream_stats(
+            client,
+            remote,
+            bandwidth,
+            self.websocket_relay_timeouts(),
+        ) {
             Ok(stats) => stats,
             Err(error) => {
                 log_trojan_relay_finished(
@@ -698,6 +701,14 @@ impl TrojanServer {
             request.client_ip,
         );
         Ok(())
+    }
+
+    fn websocket_relay_timeouts(&self) -> WebSocketRelayTimeouts {
+        WebSocketRelayTimeouts {
+            connection_idle: self.config.connection_idle,
+            uplink_only: self.config.uplink_only,
+            downlink_only: self.config.downlink_only,
+        }
     }
 
     fn spawn_tls_relay(
@@ -2660,6 +2671,8 @@ mod tests {
             routes: Vec::new(),
             connect_timeout: Duration::from_secs(3),
             connection_idle: Duration::from_secs(120),
+            uplink_only: Duration::from_secs(2),
+            downlink_only: Duration::from_secs(4),
         })
     }
 
@@ -2671,6 +2684,8 @@ mod tests {
             routes,
             connect_timeout,
             connection_idle: Duration::from_secs(120),
+            uplink_only: Duration::from_secs(2),
+            downlink_only: Duration::from_secs(4),
         })
     }
 
@@ -2682,6 +2697,25 @@ mod tests {
             routes: Vec::new(),
             connect_timeout: Duration::from_secs(3),
             connection_idle,
+            uplink_only: Duration::from_secs(2),
+            downlink_only: Duration::from_secs(4),
+        })
+    }
+
+    fn server_with_relay_timeouts(
+        connection_idle: Duration,
+        uplink_only: Duration,
+        downlink_only: Duration,
+    ) -> TrojanServer {
+        TrojanServer::new(TrojanServerConfig {
+            node_tag: "panel|trojan|1".to_string(),
+            listen: "127.0.0.1:0".parse().expect("listen addr"),
+            users: vec![user()],
+            routes: Vec::new(),
+            connect_timeout: Duration::from_secs(3),
+            connection_idle,
+            uplink_only,
+            downlink_only,
         })
     }
 
@@ -3890,7 +3924,11 @@ mod tests {
             let _ = release_remote_rx.recv_timeout(Duration::from_secs(3));
         });
 
-        let server = server();
+        let server = server_with_relay_timeouts(
+            Duration::from_secs(120),
+            Duration::from_secs(2),
+            Duration::from_millis(80),
+        );
         let listener = server.bind().expect("trojan bind");
         let trojan_addr = listener.local_addr().expect("trojan addr");
         let acceptor =
@@ -4208,7 +4246,11 @@ mod tests {
             let _ = stream.shutdown(Shutdown::Both);
         });
 
-        let server = server();
+        let server = server_with_relay_timeouts(
+            Duration::from_secs(120),
+            Duration::from_millis(80),
+            Duration::from_secs(4),
+        );
         let listener = server.bind().expect("trojan bind");
         let trojan_addr = listener.local_addr().expect("trojan addr");
         let server_clone = server.clone();
