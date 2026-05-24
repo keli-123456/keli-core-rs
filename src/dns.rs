@@ -152,7 +152,7 @@ pub async fn connect_tcp_tokio(
 }
 
 fn connect_tcp_addrs(addrs: &[SocketAddr], timeout: Duration) -> io::Result<TcpStream> {
-    let addrs = happy_eyeballs_order(addrs, false, 1);
+    let addrs = happy_eyeballs_order(addrs, current_query_strategy_prefers_ipv6(), 1);
     if addrs.len() <= 1 {
         return connect_tcp_addrs_sequential(&addrs, timeout);
     }
@@ -182,7 +182,7 @@ async fn connect_tcp_addrs_tokio(
     addrs: &[SocketAddr],
     timeout: Duration,
 ) -> io::Result<tokio::net::TcpStream> {
-    let addrs = happy_eyeballs_order(addrs, false, 1);
+    let addrs = happy_eyeballs_order(addrs, current_query_strategy_prefers_ipv6(), 1);
     if addrs.len() <= 1 {
         return connect_tcp_addrs_tokio_sequential(&addrs, timeout).await;
     }
@@ -911,11 +911,32 @@ fn select_servers(config: &DnsConfig, host: &str) -> Vec<DnsServerConfig> {
 }
 
 fn query_types(strategy: &str) -> Vec<u16> {
-    match strategy.trim().to_ascii_lowercase().as_str() {
+    match query_strategy_key(strategy).as_str() {
         "useipv6" | "ipv6" => vec![28],
-        "asis" | "useip" | "useipv4v6" => vec![1, 28],
+        "useipv6v4" | "ipv6v4" => vec![28, 1],
+        "asis" | "useip" | "useipv4v6" | "ipv4v6" => vec![1, 28],
         _ => vec![1],
     }
+}
+
+fn current_query_strategy_prefers_ipv6() -> bool {
+    query_strategy_prefers_ipv6(&current_config().query_strategy)
+}
+
+fn query_strategy_prefers_ipv6(strategy: &str) -> bool {
+    matches!(
+        query_strategy_key(strategy).as_str(),
+        "useipv6" | "ipv6" | "useipv6v4" | "ipv6v4"
+    )
+}
+
+fn query_strategy_key(strategy: &str) -> String {
+    strategy
+        .trim()
+        .chars()
+        .filter(|ch| *ch != '_' && *ch != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn query_dns_server(
@@ -1439,9 +1460,7 @@ mod tests {
         (dns_addr, server)
     }
 
-    fn spawn_udp_googlevideo_dns_then_failure(
-        ip: [u8; 4],
-    ) -> (SocketAddr, thread::JoinHandle<()>) {
+    fn spawn_udp_googlevideo_dns_then_failure(ip: [u8; 4]) -> (SocketAddr, thread::JoinHandle<()>) {
         let dns = UdpSocket::bind("127.0.0.1:0").expect("dns bind");
         dns.set_read_timeout(Some(Duration::from_secs(2)))
             .expect("dns timeout");
@@ -1570,7 +1589,9 @@ mod tests {
         .expect_err("second googlevideo failure should query dns again");
         assert_eq!(second.kind(), io::ErrorKind::InvalidData);
 
-        server.join().expect("dns server should receive both queries");
+        server
+            .join()
+            .expect("dns server should receive both queries");
         configure(DnsConfig::default());
     }
 
@@ -1681,6 +1702,29 @@ mod tests {
         let ordered = happy_eyeballs_order(&[v6_a, v6_b, v4_a, v4_b, v4_c], false, 1);
 
         assert_eq!(ordered, vec![v4_a, v6_a, v4_b, v6_b, v4_c]);
+    }
+
+    #[test]
+    fn tcp_happy_eyeballs_order_can_prioritize_ipv6_like_go() {
+        let v6_a = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 443);
+        let v6_b = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8443);
+        let v4_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)), 443);
+        let v4_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)), 443);
+
+        let ordered = happy_eyeballs_order(&[v4_a, v4_b, v6_a, v6_b], true, 1);
+
+        assert_eq!(ordered, vec![v6_a, v4_a, v6_b, v4_b]);
+    }
+
+    #[test]
+    fn dns_query_strategy_order_matches_go_ip_strategy() {
+        assert_eq!(query_types("UseIPv4"), vec![1]);
+        assert_eq!(query_types("UseIPv6"), vec![28]);
+        assert_eq!(query_types("UseIPv4v6"), vec![1, 28]);
+        assert_eq!(query_types("UseIPv6v4"), vec![28, 1]);
+        assert_eq!(query_types("use-ipv6-v4"), vec![28, 1]);
+        assert!(query_strategy_prefers_ipv6("UseIPv6v4"));
+        assert!(!query_strategy_prefers_ipv6("UseIPv4v6"));
     }
 
     #[test]
