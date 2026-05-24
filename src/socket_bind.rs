@@ -52,6 +52,7 @@ fn dual_stack_wildcard_addr(listen: SocketAddr) -> SocketAddr {
 fn bind_ipv6_tcp_listener(listen: SocketAddr) -> io::Result<TcpListener> {
     let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
+    set_reuse_port_like_go(&socket);
     socket.set_only_v6(false)?;
     socket.bind(&listen.into())?;
     socket.listen(tcp_listen_backlog())?;
@@ -61,6 +62,7 @@ fn bind_ipv6_tcp_listener(listen: SocketAddr) -> io::Result<TcpListener> {
 fn bind_ipv6_udp_socket(listen: SocketAddr) -> io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
+    set_reuse_port_like_go(&socket);
     socket.set_only_v6(false)?;
     socket.bind(&listen.into())?;
     Ok(socket.into())
@@ -73,6 +75,7 @@ fn bind_tcp_listener(listen: SocketAddr) -> io::Result<TcpListener> {
         Some(Protocol::TCP),
     )?;
     socket.set_reuse_address(true)?;
+    set_reuse_port_like_go(&socket);
     socket.bind(&listen.into())?;
     socket.listen(tcp_listen_backlog())?;
     Ok(socket.into())
@@ -85,8 +88,21 @@ fn bind_udp_socket(listen: SocketAddr) -> io::Result<UdpSocket> {
         Some(Protocol::UDP),
     )?;
     socket.set_reuse_address(true)?;
+    set_reuse_port_like_go(&socket);
     socket.bind(&listen.into())?;
     Ok(socket.into())
+}
+
+fn set_reuse_port_like_go(socket: &Socket) {
+    #[cfg(unix)]
+    {
+        let _ = socket.set_reuse_port(true);
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = socket;
+    }
 }
 
 fn is_ipv6_unspecified(listen: SocketAddr) -> bool {
@@ -224,5 +240,19 @@ mod tests {
             bind_dual_stack_tcp_listener(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)))
                 .expect("rebind listener");
         assert_eq!(listener.local_addr().expect("listener addr").port(), port);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tcp_listener_allows_go_style_reuse_port() {
+        let _guard = crate::test_support::network_test_lock();
+        let first = bind_dual_stack_tcp_listener(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))
+            .expect("bind first listener");
+        let port = first.local_addr().expect("first addr").port();
+
+        let second = bind_dual_stack_tcp_listener(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)))
+            .expect("bind second listener on same port with SO_REUSEPORT");
+
+        assert_eq!(second.local_addr().expect("second addr").port(), port);
     }
 }

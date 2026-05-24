@@ -682,6 +682,7 @@ fn validate_path(path: &str, expected_path: Option<&str>) -> io::Result<()> {
     if let Some(expected) = expected_path
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .map(normalize_websocket_path)
     {
         let request_path = path.split('?').next().unwrap_or(path);
         if request_path != expected {
@@ -692,6 +693,14 @@ fn validate_path(path: &str, expected_path: Option<&str>) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn normalize_websocket_path(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
 }
 
 fn forwarded_client_ip(request: &str) -> Option<IpAddr> {
@@ -1140,6 +1149,26 @@ mod tests {
         let mut body = [0u8; 4];
         client.read_exact(&mut body).expect("frame body");
         assert_eq!(&body, b"pong");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn accepts_upgrade_path_without_leading_slash_like_go() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            accept_websocket(stream, Some("ws")).expect("upgrade");
+        });
+
+        let mut client = TcpStream::connect(addr).expect("client");
+        client
+            .write_all(
+                b"GET /ws HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            )
+            .expect("request");
+        let response = read_http_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
         server.join().expect("server");
     }
 
