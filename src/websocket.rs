@@ -582,14 +582,14 @@ struct RawWebSocketFrame {
 
 #[derive(Default)]
 struct WebSocketMessageAssembler {
-    fragmented: Option<Vec<u8>>,
+    fragmented: bool,
 }
 
 impl WebSocketMessageAssembler {
     fn accept(&mut self, frame: RawWebSocketFrame) -> io::Result<Option<WebSocketFrame>> {
         match frame.opcode {
             OPCODE_TEXT | OPCODE_BINARY => {
-                if self.fragmented.is_some() {
+                if self.fragmented {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "websocket data frame started before previous fragmented message ended",
@@ -598,31 +598,21 @@ impl WebSocketMessageAssembler {
                 if frame.fin {
                     Ok(Some(WebSocketFrame::Data(frame.payload)))
                 } else {
-                    self.fragmented = Some(frame.payload);
-                    Ok(None)
+                    self.fragmented = true;
+                    Ok(Some(WebSocketFrame::Data(frame.payload)))
                 }
             }
             OPCODE_CONTINUATION => {
-                let Some(fragmented) = self.fragmented.as_mut() else {
+                if !self.fragmented {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "websocket continuation frame without fragmented message",
                     ));
-                };
-                fragmented.extend_from_slice(&frame.payload);
-                if fragmented.len() > MAX_HTTP_HEADER * 64 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "websocket message too large",
-                    ));
                 }
                 if frame.fin {
-                    Ok(Some(WebSocketFrame::Data(
-                        self.fragmented.take().unwrap_or_default(),
-                    )))
-                } else {
-                    Ok(None)
+                    self.fragmented = false;
                 }
+                Ok(Some(WebSocketFrame::Data(frame.payload)))
             }
             OPCODE_PING => {
                 validate_control_frame(&frame)?;
@@ -634,7 +624,7 @@ impl WebSocketMessageAssembler {
             }
             OPCODE_CLOSE => {
                 validate_control_frame(&frame)?;
-                self.fragmented = None;
+                self.fragmented = false;
                 Ok(Some(WebSocketFrame::Close))
             }
             _ => Err(io::Error::new(
@@ -1198,6 +1188,39 @@ mod tests {
         client
             .write_all(&masked_frame_with(true, 0x0, b"ng"))
             .expect("last fragment");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn streams_fragmented_binary_before_final_fragment_like_gorilla() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let (mut reader, _) = accept_websocket(stream, Some("/ws")).expect("upgrade");
+            reader
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("read timeout");
+            let mut first = [0u8; 2];
+            reader
+                .read_exact(&mut first)
+                .expect("first fragment before final continuation");
+            assert_eq!(&first, b"pi");
+        });
+
+        let mut client = TcpStream::connect(addr).expect("client");
+        client
+            .write_all(
+                b"GET /ws HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            )
+            .expect("request");
+        let response = read_http_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame_with(false, 0x2, b"pi"))
+            .expect("first fragment");
+        thread::sleep(Duration::from_millis(350));
+        let _ = client.write_all(&masked_frame_with(true, 0x0, b"ng"));
         server.join().expect("server");
     }
 
