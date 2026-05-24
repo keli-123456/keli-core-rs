@@ -1482,19 +1482,19 @@ impl Default for PolicyConfig {
 }
 
 fn default_handshake_secs() -> u64 {
-    4
+    60
 }
 
 fn default_connection_idle_secs() -> u64 {
-    120
+    300
 }
 
 fn default_uplink_only_secs() -> u64 {
-    2
+    1
 }
 
 fn default_downlink_only_secs() -> u64 {
-    4
+    1
 }
 
 fn default_buffer_size_kib() -> usize {
@@ -1546,10 +1546,10 @@ mod tests {
     fn policy_defaults_match_go_xray_runtime_policy() {
         let policy = PolicyConfig::default();
 
-        assert_eq!(policy.handshake_secs, 4);
-        assert_eq!(policy.connection_idle_secs, 120);
-        assert_eq!(policy.uplink_only_secs, 2);
-        assert_eq!(policy.downlink_only_secs, 4);
+        assert_eq!(policy.handshake_secs, 60);
+        assert_eq!(policy.connection_idle_secs, 300);
+        assert_eq!(policy.uplink_only_secs, 1);
+        assert_eq!(policy.downlink_only_secs, 1);
         assert_eq!(policy.buffer_size_kib, 128);
         assert_eq!(policy.sniffing_cache_millis, 200);
         assert_eq!(policy.connect_timeout_secs, 15);
