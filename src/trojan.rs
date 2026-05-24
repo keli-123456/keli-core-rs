@@ -511,6 +511,7 @@ impl TrojanServer {
         let mut first_byte_ms = None::<u128>;
         let mut relay_error = None::<io::Error>;
         let mut finish_reason = "completed";
+        let mut finish_detail = None::<String>;
         let mut upload_done = false;
         let mut download_done = false;
         let mut client_buffer = [0u8; 16 * 1024];
@@ -545,6 +546,7 @@ impl TrojanServer {
                                 upload = upload.saturating_add(read as u64);
                             }
                             Err(error) => {
+                                finish_detail = Some(trojan_finish_detail("remote_write", &error));
                                 relay_error = Some(error);
                                 finish_reason = "remote_write_error";
                                 upload_done = true;
@@ -556,10 +558,11 @@ impl TrojanServer {
                         progressed = true;
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => {
+                    Err(error) => {
                         upload_done = true;
                         download_done = true;
                         remember_trojan_finish_reason(&mut finish_reason, "client_read_error");
+                        finish_detail = Some(trojan_finish_detail("client_read", &error));
                         let _ = writer.shutdown();
                         let _ = remote.shutdown(Shutdown::Both);
                         progressed = true;
@@ -583,6 +586,7 @@ impl TrojanServer {
                                 download = download.saturating_add(read as u64);
                             }
                             Err(error) => {
+                                finish_detail = Some(trojan_finish_detail("client_write", &error));
                                 relay_error = Some(error);
                                 finish_reason = "client_write_error";
                                 download_done = true;
@@ -595,10 +599,11 @@ impl TrojanServer {
                         progressed = true;
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => {
+                    Err(error) => {
                         download_done = true;
                         upload_done = true;
                         remember_trojan_finish_reason(&mut finish_reason, "remote_read_error");
+                        finish_detail = Some(trojan_finish_detail("remote_read", &error));
                         let _ = writer.shutdown();
                         let _ = reader.shutdown();
                         let _ = remote.shutdown(Shutdown::Both);
@@ -627,6 +632,7 @@ impl TrojanServer {
                     !download_done,
                     timeout.min(idle_limit.saturating_sub(idle_elapsed)),
                 ) {
+                    finish_detail = Some(trojan_finish_detail("wait", &error));
                     relay_error = Some(error);
                     finish_reason = "wait_error";
                     upload_done = true;
@@ -651,6 +657,7 @@ impl TrojanServer {
             first_byte_ms,
             relay_started.elapsed(),
             finish_reason,
+            finish_detail.as_deref(),
             relay_error.as_ref(),
         );
         self.traffic.add_with_user_id(
@@ -747,6 +754,7 @@ impl TrojanServer {
         ) {
             Ok(stats) => stats,
             Err(error) => {
+                let finish_detail = error.to_string();
                 log_trojan_relay_finished(
                     &self.config.node_tag,
                     "tls_websocket",
@@ -756,6 +764,7 @@ impl TrojanServer {
                     None,
                     relay_started.elapsed(),
                     "relay_error",
+                    Some(&finish_detail),
                     Some(&error),
                 );
                 record_trojan_connection_error(&self.config.node_tag, "tls_websocket", &error);
@@ -771,6 +780,7 @@ impl TrojanServer {
             stats.first_byte_ms,
             relay_started.elapsed(),
             stats.finish_reason,
+            stats.finish_detail.as_deref(),
             None,
         );
         self.traffic.add_with_user_id(
@@ -1810,6 +1820,7 @@ fn log_trojan_relay_finished(
     first_byte_ms: Option<u128>,
     elapsed: Duration,
     finish_reason: &'static str,
+    finish_detail: Option<&str>,
     error: Option<&io::Error>,
 ) {
     if error.is_none() && elapsed.as_millis() < TROJAN_ROUTE_SLOW_LOG_MS && !trojan_trace_enabled()
@@ -1827,6 +1838,7 @@ fn log_trojan_relay_finished(
             first_byte_ms,
             elapsed,
             finish_reason,
+            finish_detail,
             error,
         )
     );
@@ -1841,6 +1853,7 @@ fn format_trojan_relay_finished(
     first_byte_ms: Option<u128>,
     elapsed: Duration,
     finish_reason: &'static str,
+    finish_detail: Option<&str>,
     error: Option<&io::Error>,
 ) -> String {
     let status = match error {
@@ -1853,8 +1866,11 @@ fn format_trojan_relay_finished(
     let error_text = error
         .map(|error| trojan_log_message(&error.to_string()))
         .unwrap_or_else(|| "-".to_string());
+    let finish_detail = finish_detail
+        .map(trojan_log_field)
+        .unwrap_or_else(|| "-".to_string());
     format!(
-        "INFO  core   trojan relay finished node_tag={} scope={scope} target={}:{} status={status} first_byte_ms={} duration_ms={} upload_bytes={} download_bytes={} finish_reason={} error={}",
+        "INFO  core   trojan relay finished node_tag={} scope={scope} target={}:{} status={status} first_byte_ms={} duration_ms={} upload_bytes={} download_bytes={} finish_reason={} finish_detail={} error={}",
         trojan_log_field(node_tag),
         trojan_log_field(&request.target.host),
         request.target.port,
@@ -1863,8 +1879,13 @@ fn format_trojan_relay_finished(
         upload,
         download,
         finish_reason,
+        finish_detail,
         error_text
     )
+}
+
+fn trojan_finish_detail(context: &str, error: &io::Error) -> String {
+    format!("{context}:{:?}:{}", error.kind(), error)
 }
 
 fn remember_trojan_finish_reason(reason: &mut &'static str, value: &'static str) {
@@ -4631,12 +4652,13 @@ mod tests {
             Some(1),
             Duration::from_millis(106_316),
             "remote_eof",
+            Some("websocket read failed: connection reset"),
             None,
         );
 
         assert_eq!(
             line,
-            "INFO  core   trojan relay finished node_tag=node_tag scope=tls_websocket target=rr1---sn-n4v7snee.c.youtube.com:443 status=ok first_byte_ms=1 duration_ms=106316 upload_bytes=65052 download_bytes=2954116 finish_reason=remote_eof error=-"
+            "INFO  core   trojan relay finished node_tag=node_tag scope=tls_websocket target=rr1---sn-n4v7snee.c.youtube.com:443 status=ok first_byte_ms=1 duration_ms=106316 upload_bytes=65052 download_bytes=2954116 finish_reason=remote_eof finish_detail=websocket_read_failed:_connection_reset error=-"
         );
     }
 

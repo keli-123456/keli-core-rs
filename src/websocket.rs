@@ -38,12 +38,13 @@ pub struct WebSocketTlsStream {
     assembler: WebSocketMessageAssembler,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WebSocketRelayStats {
     pub upload: u64,
     pub download: u64,
     pub first_byte_ms: Option<u128>,
     pub finish_reason: &'static str,
+    pub finish_detail: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,10 +242,11 @@ pub(crate) fn relay_websocket_tls_stream_stats(
                     progressed = true;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(_) => {
+                Err(error) => {
                     upload_done = true;
                     download_done = true;
                     remember_websocket_finish_reason(&mut stats, "client_read_error");
+                    stats.finish_detail = Some(websocket_finish_detail("client_read", &error));
                     shutdown_websocket_tls_pair(&mut client, &remote);
                     progressed = true;
                 }
@@ -267,10 +269,11 @@ pub(crate) fn relay_websocket_tls_stream_stats(
                     progressed = true;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(_) => {
+                Err(error) => {
                     download_done = true;
                     upload_done = true;
                     remember_websocket_finish_reason(&mut stats, "remote_read_error");
+                    stats.finish_detail = Some(websocket_finish_detail("remote_read", &error));
                     shutdown_websocket_tls_pair(&mut client, &remote);
                     progressed = true;
                 }
@@ -307,6 +310,10 @@ fn remember_websocket_finish_reason(stats: &mut WebSocketRelayStats, reason: &'s
     if stats.finish_reason == "completed" {
         stats.finish_reason = reason;
     }
+}
+
+fn websocket_finish_detail(context: &str, error: &io::Error) -> String {
+    format!("{context}:{:?}:{}", error.kind(), error)
 }
 
 fn shutdown_websocket_tls_pair(client: &mut WebSocketTlsStream, remote: &TcpStream) {
