@@ -100,3 +100,21 @@ pub use vless::{VlessServer, VlessServerConfig};
 pub use vmess::{VmessServer, VmessServerConfig};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Applies Linux/glibc process defaults that keep relay memory behavior close to
+/// Go under many short-lived OS-threaded connection workers.
+pub fn apply_process_memory_defaults() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        let _ = libc::mallopt(libc::M_ARENA_MAX, 2);
+        let _ = libc::mallopt(libc::M_TRIM_THRESHOLD, 128 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod process_memory_tests {
+    #[test]
+    fn process_memory_defaults_are_safe_to_apply() {
+        crate::apply_process_memory_defaults();
+    }
+}
