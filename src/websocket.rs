@@ -416,8 +416,9 @@ impl WebSocketTlsStream {
     }
 
     fn write_binary_wait(&mut self, payload: &[u8]) -> io::Result<()> {
+        let (header, header_len) = server_frame_header(OPCODE_BINARY, payload.len());
         self.stream
-            .write_plain_all_wait(&frame_bytes(OPCODE_BINARY, payload))
+            .write_plain_chunks_all_wait(&[&header[..header_len], payload])
     }
 
     pub(crate) fn shutdown(&self) -> io::Result<()> {
@@ -997,8 +998,27 @@ fn parse_buffered_raw_frame(
 
 fn write_frame(writer: &Arc<Mutex<TcpStream>>, opcode: u8, payload: &[u8]) -> io::Result<()> {
     let mut stream = writer.lock().expect("websocket writer lock poisoned");
-    stream.write_all(&frame_bytes(opcode, payload))?;
+    let (header, header_len) = server_frame_header(opcode, payload.len());
+    stream.write_all(&header[..header_len])?;
+    stream.write_all(payload)?;
     stream.flush()
+}
+
+fn server_frame_header(opcode: u8, payload_len: usize) -> ([u8; 10], usize) {
+    let mut header = [0u8; 10];
+    header[0] = 0x80 | opcode;
+    if payload_len < 126 {
+        header[1] = payload_len as u8;
+        (header, 2)
+    } else if payload_len <= u16::MAX as usize {
+        header[1] = 126;
+        header[2..4].copy_from_slice(&(payload_len as u16).to_be_bytes());
+        (header, 4)
+    } else {
+        header[1] = 127;
+        header[2..10].copy_from_slice(&(payload_len as u64).to_be_bytes());
+        (header, 10)
+    }
 }
 
 fn frame_bytes(opcode: u8, payload: &[u8]) -> Vec<u8> {
@@ -1065,6 +1085,19 @@ mod tests {
         accept_websocket, accept_websocket_with_client_ip, connect_websocket_client,
         websocket_accept_key,
     };
+
+    #[test]
+    fn server_frame_header_matches_allocated_frame_encoding() {
+        for payload_len in [0usize, 1, 125, 126, u16::MAX as usize, u16::MAX as usize + 1] {
+            let payload = vec![0x5a; payload_len];
+            let frame = super::frame_bytes(super::OPCODE_BINARY, &payload);
+            let (header, header_len) =
+                super::server_frame_header(super::OPCODE_BINARY, payload.len());
+
+            assert_eq!(&frame[..header_len], &header[..header_len]);
+            assert_eq!(&frame[header_len..], payload);
+        }
+    }
 
     fn masked_frame_with(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
         let mask = [1u8, 2, 3, 4];

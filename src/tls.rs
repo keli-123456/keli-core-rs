@@ -304,6 +304,23 @@ where
         Ok(())
     }
 
+    pub(crate) fn write_plain_chunks_all_wait(&mut self, chunks: &[&[u8]]) -> io::Result<()> {
+        for chunk in chunks {
+            let mut input = *chunk;
+            while !input.is_empty() {
+                let written = self.connection.writer().write(input)?;
+                if written == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "tls plaintext writer returned zero",
+                    ));
+                }
+                input = &input[written..];
+            }
+        }
+        self.flush_tls_wait()
+    }
+
     pub(crate) fn raw_read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         self.socket.read(output)
     }
