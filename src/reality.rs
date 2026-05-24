@@ -537,6 +537,10 @@ impl TlsSocket for PrefixedTcpStream {
         PrefixedTcpStream::set_nonblocking(self, nonblocking)
     }
 
+    fn wait_writable(&self, timeout: Duration) -> io::Result<()> {
+        self.socket.wait_writable(timeout)
+    }
+
     fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         PrefixedTcpStream::shutdown(self, how)
     }

@@ -51,6 +51,7 @@ pub trait TlsSocket: Read + Write {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
     fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()>;
+    fn wait_writable(&self, timeout: Duration) -> io::Result<()>;
     fn shutdown(&self, how: Shutdown) -> io::Result<()>;
     fn peer_closed(&self) -> io::Result<bool>;
 }
@@ -82,6 +83,10 @@ impl TlsSocket for TcpStream {
 
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         TcpStream::set_nonblocking(self, nonblocking)
+    }
+
+    fn wait_writable(&self, timeout: Duration) -> io::Result<()> {
+        wait_tcp_stream_writable(self, timeout)
     }
 
     fn shutdown(&self, how: Shutdown) -> io::Result<()> {
@@ -282,7 +287,7 @@ where
                             "tls peer closed while waiting for tls flush",
                         ));
                     }
-                    thread::sleep(Duration::from_millis(1));
+                    self.socket.wait_writable(Duration::from_millis(250))?;
                 }
                 Err(error) => return Err(error),
             }
@@ -342,7 +347,7 @@ where
                             "tls peer closed while waiting for raw write",
                         ));
                     }
-                    thread::sleep(Duration::from_millis(1));
+                    self.socket.wait_writable(Duration::from_millis(250))?;
                 }
                 Err(error) => return Err(error),
             }
@@ -493,6 +498,25 @@ fn wait_tcp_streams_readable(
     }
 }
 
+#[cfg(unix)]
+fn wait_tcp_stream_writable(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
+    let mut fd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLOUT | libc::POLLHUP | libc::POLLERR,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut fd, 1, poll_timeout_ms(timeout)) };
+        if result >= 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 #[cfg(not(unix))]
 fn wait_tcp_streams_readable(
     _this: &TcpStream,
@@ -504,6 +528,12 @@ fn wait_tcp_streams_readable(
     if wait_self || wait_other {
         thread::sleep(timeout.min(Duration::from_millis(10)));
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn wait_tcp_stream_writable(_stream: &TcpStream, timeout: Duration) -> io::Result<()> {
+    thread::sleep(timeout.min(Duration::from_millis(10)));
     Ok(())
 }
 
@@ -763,7 +793,7 @@ fn write_all_wait(writer: &mut TcpStream, mut input: &[u8]) -> io::Result<()> {
             }
             Ok(written) => input = &input[written..],
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(1));
+                wait_tcp_stream_writable(writer, Duration::from_millis(250))?;
             }
             Err(error) => return Err(error),
         }
@@ -897,7 +927,7 @@ mod tests {
 
     use super::{
         classify_tls_handshake_error, reality_ed25519_certified_key, server_config_from_files,
-        sni_matches, RawTcpStreamAccess, TlsHandshakeErrorClass,
+        sni_matches, RawTcpStreamAccess, TlsHandshakeErrorClass, TlsSocket,
     };
 
     #[test]
@@ -997,6 +1027,18 @@ mod tests {
         client.read_exact(&mut byte).expect("read client byte");
         assert_eq!(byte, *b"x");
         writer.join().expect("writer thread");
+    }
+
+    #[test]
+    fn raw_tcp_stream_wait_writable_returns_for_connected_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let client = TcpStream::connect(addr).expect("connect client");
+        let (_server, _) = listener.accept().expect("accept server");
+
+        let start = Instant::now();
+        TlsSocket::wait_writable(&client, Duration::from_secs(2)).expect("wait writable");
+        assert!(start.elapsed() < Duration::from_millis(1500));
     }
 
     #[test]
