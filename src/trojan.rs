@@ -1735,12 +1735,7 @@ fn log_trojan_udp_relay_finished(
     elapsed: Duration,
     error: Option<&io::Error>,
 ) {
-    if error.is_none()
-        && upload_packets == 0
-        && download_packets == 0
-        && elapsed.as_millis() < TROJAN_ROUTE_SLOW_LOG_MS
-        && !trojan_trace_enabled()
-    {
+    if !should_log_trojan_udp_relay_finished(elapsed, error, trojan_trace_enabled()) {
         return;
     }
     eprintln!(
@@ -1758,6 +1753,14 @@ fn log_trojan_udp_relay_finished(
             error,
         )
     );
+}
+
+fn should_log_trojan_udp_relay_finished(
+    elapsed: Duration,
+    error: Option<&io::Error>,
+    trace_enabled: bool,
+) -> bool {
+    error.is_some() || elapsed.as_millis() >= TROJAN_ROUTE_SLOW_LOG_MS || trace_enabled
 }
 
 fn format_trojan_udp_relay_finished(
@@ -4398,6 +4401,30 @@ mod tests {
             line,
             "INFO  core   trojan udp relay finished node_tag=node_tag scope=tls_websocket_udp target=rr5---sn-test.gvt1.com:443 status=ok first_response_ms=1 duration_ms=2427 upload_bytes=1532 download_bytes=20856660 upload_packets=1 download_packets=1 error=-"
         );
+    }
+
+    #[test]
+    fn skips_fast_successful_trojan_udp_relay_summary_without_trace() {
+        assert!(!super::should_log_trojan_udp_relay_finished(
+            Duration::from_millis(250),
+            None,
+            false,
+        ));
+        assert!(super::should_log_trojan_udp_relay_finished(
+            Duration::from_millis(1001),
+            None,
+            false,
+        ));
+        assert!(super::should_log_trojan_udp_relay_finished(
+            Duration::from_millis(250),
+            Some(&io::Error::new(io::ErrorKind::TimedOut, "udp timeout")),
+            false,
+        ));
+        assert!(super::should_log_trojan_udp_relay_finished(
+            Duration::from_millis(250),
+            None,
+            true,
+        ));
     }
 
     #[test]
