@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock, RwLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -34,8 +36,7 @@ const TCP_CONNECT_FAILURE_THRESHOLD: u32 = 3;
 const TCP_CONNECT_FAILURE_WINDOW: Duration = Duration::from_secs(10);
 const TCP_CONNECT_FAILURE_BLOCK_DURATION: Duration = Duration::from_secs(5);
 const TCP_CONNECT_FAILURE_MAX_ENTRIES: usize = 8192;
-const DEFAULT_TCP_FAST_FALLBACK_MS: u64 = 750;
-static TCP_FAST_FALLBACK_TIMEOUT: OnceLock<Duration> = OnceLock::new();
+const TCP_RACE_MAX_CONCURRENT: usize = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsMetricsSnapshot {
@@ -141,7 +142,17 @@ pub async fn connect_tcp_tokio(
 }
 
 fn connect_tcp_addrs(addrs: &[SocketAddr], timeout: Duration) -> io::Result<TcpStream> {
-    let attempt_timeout = tcp_connect_attempt_timeout(timeout, addrs.len());
+    let addrs = happy_eyeballs_order(addrs, false, 1);
+    if addrs.len() <= 1 {
+        return connect_tcp_addrs_sequential(&addrs, timeout);
+    }
+    connect_tcp_addrs_race(&addrs, timeout)
+}
+
+fn connect_tcp_addrs_sequential(
+    addrs: &[SocketAddr],
+    attempt_timeout: Duration,
+) -> io::Result<TcpStream> {
     let mut last_error = None;
     for addr in addrs {
         match TcpStream::connect_timeout(addr, attempt_timeout) {
@@ -161,7 +172,17 @@ async fn connect_tcp_addrs_tokio(
     addrs: &[SocketAddr],
     timeout: Duration,
 ) -> io::Result<tokio::net::TcpStream> {
-    let attempt_timeout = tcp_connect_attempt_timeout(timeout, addrs.len());
+    let addrs = happy_eyeballs_order(addrs, false, 1);
+    if addrs.len() <= 1 {
+        return connect_tcp_addrs_tokio_sequential(&addrs, timeout).await;
+    }
+    connect_tcp_addrs_tokio_race(&addrs, timeout).await
+}
+
+async fn connect_tcp_addrs_tokio_sequential(
+    addrs: &[SocketAddr],
+    attempt_timeout: Duration,
+) -> io::Result<tokio::net::TcpStream> {
     let mut last_error = None;
     for addr in addrs {
         match tokio::time::timeout(attempt_timeout, tokio::net::TcpStream::connect(addr)).await {
@@ -183,18 +204,187 @@ async fn connect_tcp_addrs_tokio(
     }))
 }
 
-fn tcp_connect_attempt_timeout(timeout: Duration, address_count: usize) -> Duration {
-    if address_count <= 1 {
-        return timeout;
+fn connect_tcp_addrs_race(addrs: &[SocketAddr], timeout: Duration) -> io::Result<TcpStream> {
+    let deadline = Instant::now() + timeout;
+    let (tx, rx) = mpsc::channel();
+    let mut next = 0;
+    let mut active = 0;
+    let mut last_error = None;
+    spawn_tcp_race_attempts(addrs, timeout, &tx, &mut next, &mut active);
+
+    loop {
+        let Some(remaining) = remaining_until(deadline) else {
+            return Err(tcp_connect_timeout_error());
+        };
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) => {
+                active = active.saturating_sub(1);
+                last_error = Some(error);
+                spawn_tcp_race_attempts(addrs, timeout, &tx, &mut next, &mut active);
+                if active == 0 && next >= addrs.len() {
+                    return Err(last_error.unwrap_or_else(no_socket_addr_error));
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => return Err(tcp_connect_timeout_error()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(last_error.unwrap_or_else(no_socket_addr_error));
+            }
+        }
     }
-    timeout.min(*TCP_FAST_FALLBACK_TIMEOUT.get_or_init(|| {
-        std::env::var("KELI_CORE_TCP_FAST_FALLBACK_MS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .map(Duration::from_millis)
-            .unwrap_or_else(|| Duration::from_millis(DEFAULT_TCP_FAST_FALLBACK_MS))
-    }))
+}
+
+fn spawn_tcp_race_attempts(
+    addrs: &[SocketAddr],
+    timeout: Duration,
+    tx: &mpsc::Sender<io::Result<TcpStream>>,
+    next: &mut usize,
+    active: &mut usize,
+) {
+    while *next < addrs.len() && *active < tcp_race_max_concurrent() {
+        let addr = addrs[*next];
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(TcpStream::connect_timeout(&addr, timeout));
+        });
+        *next += 1;
+        *active += 1;
+        if tcp_race_try_delay() > Duration::ZERO {
+            break;
+        }
+    }
+}
+
+async fn connect_tcp_addrs_tokio_race(
+    addrs: &[SocketAddr],
+    timeout: Duration,
+) -> io::Result<tokio::net::TcpStream> {
+    let deadline = Instant::now() + timeout;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(addrs.len());
+    let mut next = 0;
+    let mut active = 0usize;
+    let mut last_error = None;
+    spawn_tcp_race_attempts_tokio(addrs, timeout, &tx, &mut next, &mut active);
+
+    loop {
+        let Some(remaining) = remaining_until(deadline) else {
+            return Err(tcp_connect_timeout_error());
+        };
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(Ok(stream))) => return Ok(stream),
+            Ok(Some(Err(error))) => {
+                active = active.saturating_sub(1);
+                last_error = Some(error);
+                spawn_tcp_race_attempts_tokio(addrs, timeout, &tx, &mut next, &mut active);
+                if active == 0 && next >= addrs.len() {
+                    return Err(last_error.unwrap_or_else(no_socket_addr_error));
+                }
+            }
+            Ok(None) => return Err(last_error.unwrap_or_else(no_socket_addr_error)),
+            Err(_) => return Err(tcp_connect_timeout_error()),
+        }
+    }
+}
+
+fn spawn_tcp_race_attempts_tokio(
+    addrs: &[SocketAddr],
+    timeout: Duration,
+    tx: &tokio::sync::mpsc::Sender<io::Result<tokio::net::TcpStream>>,
+    next: &mut usize,
+    active: &mut usize,
+) {
+    while *next < addrs.len() && *active < tcp_race_max_concurrent() {
+        let addr = addrs[*next];
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let result =
+                match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+                    Ok(Ok(stream)) => Ok(stream),
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(tcp_connect_timeout_error()),
+                };
+            let _ = tx.send(result).await;
+        });
+        *next += 1;
+        *active += 1;
+        if tcp_race_try_delay() > Duration::ZERO {
+            break;
+        }
+    }
+}
+
+fn remaining_until(deadline: Instant) -> Option<Duration> {
+    let now = Instant::now();
+    if now >= deadline {
+        None
+    } else {
+        Some(deadline.duration_since(now))
+    }
+}
+
+fn no_socket_addr_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AddrNotAvailable,
+        "target did not resolve to any socket address",
+    )
+}
+
+fn tcp_connect_timeout_error() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "target connect timed out")
+}
+
+fn tcp_race_try_delay() -> Duration {
+    Duration::ZERO
+}
+
+fn tcp_race_max_concurrent() -> usize {
+    TCP_RACE_MAX_CONCURRENT
+}
+
+fn happy_eyeballs_order(
+    addrs: &[SocketAddr],
+    prioritize_ipv6: bool,
+    interleave: usize,
+) -> Vec<SocketAddr> {
+    if addrs.len() <= 1 {
+        return addrs.to_vec();
+    }
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
+    for addr in addrs {
+        if addr.is_ipv4() {
+            ipv4.push(*addr);
+        } else {
+            ipv6.push(*addr);
+        }
+    }
+    if ipv4.is_empty() || ipv6.is_empty() {
+        return addrs.to_vec();
+    }
+
+    let interleave = interleave.max(1);
+    let mut ordered = Vec::with_capacity(addrs.len());
+    let mut ipv4_index = 0;
+    let mut ipv6_index = 0;
+    let mut turn_count = 0usize;
+    let mut ipv4_turn = !prioritize_ipv6;
+    while ipv4_index < ipv4.len() && ipv6_index < ipv6.len() {
+        if ipv4_turn {
+            ordered.push(ipv4[ipv4_index]);
+            ipv4_index += 1;
+        } else {
+            ordered.push(ipv6[ipv6_index]);
+            ipv6_index += 1;
+        }
+        turn_count += 1;
+        if turn_count == interleave {
+            ipv4_turn = !ipv4_turn;
+            turn_count = 0;
+        }
+    }
+    ordered.extend_from_slice(&ipv4[ipv4_index..]);
+    ordered.extend_from_slice(&ipv6[ipv6_index..]);
+    ordered
 }
 
 fn tune_tcp_stream(stream: &TcpStream) {
@@ -1263,18 +1453,22 @@ mod tests {
     }
 
     #[test]
-    fn tcp_connect_attempt_timeout_uses_fast_fallback_only_for_multiple_addresses() {
-        assert_eq!(
-            tcp_connect_attempt_timeout(Duration::from_secs(3), 1),
-            Duration::from_secs(3)
-        );
-        assert!(
-            tcp_connect_attempt_timeout(Duration::from_secs(3), 2) <= Duration::from_millis(750)
-        );
-        assert_eq!(
-            tcp_connect_attempt_timeout(Duration::from_millis(250), 2),
-            Duration::from_millis(250)
-        );
+    fn tcp_happy_eyeballs_defaults_match_go_xray() {
+        assert_eq!(tcp_race_try_delay(), Duration::ZERO);
+        assert_eq!(tcp_race_max_concurrent(), 4);
+    }
+
+    #[test]
+    fn tcp_happy_eyeballs_order_interleaves_ipv4_and_ipv6_like_go() {
+        let v6_a = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 443);
+        let v6_b = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8443);
+        let v4_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)), 443);
+        let v4_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)), 443);
+        let v4_c = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 3)), 443);
+
+        let ordered = happy_eyeballs_order(&[v6_a, v6_b, v4_a, v4_b, v4_c], false, 1);
+
+        assert_eq!(ordered, vec![v4_a, v6_a, v4_b, v6_b, v4_c]);
     }
 
     #[test]
