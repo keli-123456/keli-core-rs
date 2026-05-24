@@ -193,6 +193,7 @@ pub fn relay_websocket_tls_stream(
         remote,
         limiter,
         WebSocketRelayTimeouts::default(),
+        None,
     )?;
     Ok((stats.upload, stats.download))
 }
@@ -202,6 +203,7 @@ pub(crate) fn relay_websocket_tls_stream_stats(
     mut remote: TcpStream,
     limiter: Option<Arc<BandwidthLimiter>>,
     timeouts: WebSocketRelayTimeouts,
+    mut upload_observer: Option<&mut dyn FnMut(&[u8])>,
 ) -> io::Result<WebSocketRelayStats> {
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
@@ -228,6 +230,9 @@ pub(crate) fn relay_websocket_tls_stream_stats(
                     progressed = true;
                 }
                 Ok(read) => {
+                    if let Some(observer) = upload_observer.as_deref_mut() {
+                        observer(&client_buffer[..read]);
+                    }
                     if let Some(limiter) = limiter.as_deref() {
                         if !limiter.wait_for(read) {
                             upload_done = true;

@@ -750,11 +750,20 @@ impl TrojanServer {
             remote.write_all(&initial_payload)?;
             initial_upload = initial_payload.len() as u64;
         }
+        let mut first_upload_observed = !initial_payload.is_empty();
+        let mut upload_observer = |payload: &[u8]| {
+            if first_upload_observed {
+                return;
+            }
+            first_upload_observed = true;
+            log_trojan_tls_websocket_first_upload_payload(&self.config.node_tag, &request, payload);
+        };
         let stats = match relay_websocket_tls_stream_stats(
             client,
             remote,
             bandwidth,
             self.websocket_relay_timeouts(),
+            Some(&mut upload_observer),
         ) {
             Ok(stats) => stats,
             Err(error) => {
@@ -1887,6 +1896,20 @@ fn log_trojan_tls_websocket_initial_payload(
     );
 }
 
+fn log_trojan_tls_websocket_first_upload_payload(
+    node_tag: &str,
+    request: &TrojanRequest,
+    payload: &[u8],
+) {
+    if !trojan_trace_enabled() {
+        return;
+    }
+    eprintln!(
+        "{}",
+        format_trojan_tls_websocket_first_upload_payload(node_tag, request, payload)
+    );
+}
+
 fn format_trojan_relay_started(
     node_tag: &str,
     scope: &'static str,
@@ -1902,6 +1925,21 @@ fn format_trojan_relay_started(
         trojan_log_field(&request.target.host),
         request.target.port,
         trojan_log_field(&client_ip)
+    )
+}
+
+fn format_trojan_tls_websocket_first_upload_payload(
+    node_tag: &str,
+    request: &TrojanRequest,
+    payload: &[u8],
+) -> String {
+    format!(
+        "INFO  core   trojan tls websocket first upload payload node_tag={} target={}:{} first_upload_bytes={} {}",
+        trojan_log_field(node_tag),
+        trojan_log_field(&request.target.host),
+        request.target.port,
+        payload.len(),
+        describe_tls_client_hello(payload)
     )
 }
 
@@ -5076,6 +5114,32 @@ mod tests {
         assert_eq!(
             line,
             "INFO  core   trojan tls websocket initial payload node_tag=node_tag target=www.youtube.com:443 initial_bytes=107 client_hello=ok record_len=102 handshake_len=98 sni=www.youtube.com alpn=h2,http/1.1 versions=0x0304,0x0303 ech=true extensions=0,16,43,65037"
+        );
+        assert!(!line.contains("hash-that-must-not-be-logged"));
+        assert!(!line.contains("00000000-0000-0000-0000-000000000000"));
+    }
+
+    #[test]
+    fn formats_trojan_tls_websocket_first_upload_payload_client_hello_summary() {
+        let request = super::TrojanRequest {
+            command: super::TrojanCommand::Tcp,
+            password_hash: "hash-that-must-not-be-logged".to_string(),
+            user_uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            user_id: 7,
+            target: SocksTarget {
+                host: "www.youtube.com".to_string(),
+                port: 443,
+            },
+            client_ip: Some("198.51.100.54".parse().expect("client ip")),
+        };
+        let payload = tls_client_hello_payload_for_trace();
+
+        let line =
+            super::format_trojan_tls_websocket_first_upload_payload("node tag", &request, &payload);
+
+        assert_eq!(
+            line,
+            "INFO  core   trojan tls websocket first upload payload node_tag=node_tag target=www.youtube.com:443 first_upload_bytes=107 client_hello=ok record_len=102 handshake_len=98 sni=www.youtube.com alpn=h2,http/1.1 versions=0x0304,0x0303 ech=true extensions=0,16,43,65037"
         );
         assert!(!line.contains("hash-that-must-not-be-logged"));
         assert!(!line.contains("00000000-0000-0000-0000-000000000000"));
