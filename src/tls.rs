@@ -1,13 +1,14 @@
 use std::fs;
 use std::io::{self, BufReader, Cursor, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpStream, UdpSocket};
 use std::path::Path;
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(not(unix))]
+use std::thread;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, SubjectPublicKeyInfoDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -65,6 +66,13 @@ pub trait RawTcpStreamAccess: TlsSocket {
         wait_other: bool,
         timeout: Duration,
     ) -> io::Result<()>;
+    fn wait_readable_with_udp(
+        &self,
+        udp_v4: Option<&UdpSocket>,
+        udp_v6: Option<&UdpSocket>,
+        wait_self: bool,
+        timeout: Duration,
+    ) -> io::Result<()>;
     fn into_raw_tcp_stream(self) -> TcpStream;
 }
 
@@ -118,6 +126,16 @@ impl RawTcpStreamAccess for TcpStream {
         timeout: Duration,
     ) -> io::Result<()> {
         wait_tcp_streams_readable(self, other, wait_self, wait_other, timeout)
+    }
+
+    fn wait_readable_with_udp(
+        &self,
+        udp_v4: Option<&UdpSocket>,
+        udp_v6: Option<&UdpSocket>,
+        wait_self: bool,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        wait_tcp_and_udp_readable(self, udp_v4, udp_v6, wait_self, timeout)
     }
 
     fn into_raw_tcp_stream(self) -> TcpStream {
@@ -452,6 +470,20 @@ where
         self.socket
             .wait_readable_with(other, wait_self, wait_other, timeout)
     }
+
+    pub(crate) fn wait_raw_readable_with_udp(
+        &self,
+        udp_v4: Option<&UdpSocket>,
+        udp_v6: Option<&UdpSocket>,
+        wait_self: bool,
+        timeout: Duration,
+    ) -> io::Result<()>
+    where
+        S: RawTcpStreamAccess,
+    {
+        self.socket
+            .wait_readable_with_udp(udp_v4, udp_v6, wait_self, timeout)
+    }
 }
 
 #[cfg(unix)]
@@ -517,6 +549,57 @@ fn wait_tcp_stream_writable(stream: &TcpStream, timeout: Duration) -> io::Result
     }
 }
 
+#[cfg(unix)]
+fn wait_tcp_and_udp_readable(
+    stream: &TcpStream,
+    udp_v4: Option<&UdpSocket>,
+    udp_v6: Option<&UdpSocket>,
+    wait_stream: bool,
+    timeout: Duration,
+) -> io::Result<()> {
+    let mut fds = Vec::with_capacity(3);
+    if wait_stream {
+        fds.push(libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        });
+    }
+    if let Some(socket) = udp_v4 {
+        fds.push(libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        });
+    }
+    if let Some(socket) = udp_v6 {
+        fds.push(libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        });
+    }
+    if fds.is_empty() {
+        return Ok(());
+    }
+    loop {
+        let result = unsafe {
+            libc::poll(
+                fds.as_mut_ptr(),
+                fds.len() as libc::nfds_t,
+                poll_timeout_ms(timeout),
+            )
+        };
+        if result >= 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 #[cfg(not(unix))]
 fn wait_tcp_streams_readable(
     _this: &TcpStream,
@@ -534,6 +617,20 @@ fn wait_tcp_streams_readable(
 #[cfg(not(unix))]
 fn wait_tcp_stream_writable(_stream: &TcpStream, timeout: Duration) -> io::Result<()> {
     thread::sleep(timeout.min(Duration::from_millis(10)));
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn wait_tcp_and_udp_readable(
+    _stream: &TcpStream,
+    _udp_v4: Option<&UdpSocket>,
+    _udp_v6: Option<&UdpSocket>,
+    wait_stream: bool,
+    timeout: Duration,
+) -> io::Result<()> {
+    if wait_stream || _udp_v4.is_some() || _udp_v6.is_some() {
+        thread::sleep(timeout.min(Duration::from_millis(10)));
+    }
     Ok(())
 }
 
@@ -916,7 +1013,7 @@ pub(crate) fn classify_tls_handshake_error(error: &io::Error) -> TlsHandshakeErr
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{TcpListener, TcpStream, UdpSocket};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -1039,6 +1136,35 @@ mod tests {
         let start = Instant::now();
         TlsSocket::wait_writable(&client, Duration::from_secs(2)).expect("wait writable");
         assert!(start.elapsed() < Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn raw_tcp_stream_wait_readable_with_udp_returns_when_udp_receives() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let client = TcpStream::connect(addr).expect("connect client");
+        let (_server, _) = listener.accept().expect("accept server");
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("bind udp");
+        udp.set_nonblocking(true).expect("udp nonblocking");
+        let udp_addr = udp.local_addr().expect("udp addr");
+
+        let sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let socket = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+            socket.send_to(b"ok", udp_addr).expect("send udp");
+        });
+
+        let start = Instant::now();
+        RawTcpStreamAccess::wait_readable_with_udp(
+            &client,
+            Some(&udp),
+            None,
+            true,
+            Duration::from_secs(2),
+        )
+        .expect("wait readable with udp");
+        assert!(start.elapsed() < Duration::from_millis(1500));
+        sender.join().expect("sender thread");
     }
 
     #[test]

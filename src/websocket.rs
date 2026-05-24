@@ -1,5 +1,5 @@
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Shutdown, TcpStream};
+use std::net::{IpAddr, Shutdown, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -448,6 +448,19 @@ impl WebSocketTlsStream {
         }
         self.stream
             .wait_raw_readable_with(remote, wait_client, wait_remote, timeout)
+    }
+
+    pub(crate) fn wait_readable_with_udp(
+        &self,
+        udp_v4: Option<&UdpSocket>,
+        udp_v6: Option<&UdpSocket>,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        if !self.buffer.is_empty() {
+            return Ok(());
+        }
+        self.stream
+            .wait_raw_readable_with_udp(udp_v4, udp_v6, true, timeout)
     }
 }
 
@@ -1088,7 +1101,14 @@ mod tests {
 
     #[test]
     fn server_frame_header_matches_allocated_frame_encoding() {
-        for payload_len in [0usize, 1, 125, 126, u16::MAX as usize, u16::MAX as usize + 1] {
+        for payload_len in [
+            0usize,
+            1,
+            125,
+            126,
+            u16::MAX as usize,
+            u16::MAX as usize + 1,
+        ] {
             let payload = vec![0x5a; payload_len];
             let frame = super::frame_bytes(super::OPCODE_BINARY, &payload);
             let (header, header_len) =

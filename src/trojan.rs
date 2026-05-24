@@ -1094,7 +1094,7 @@ impl TrojanServer {
 
             if !progressed {
                 let timeout = websocket_udp_relay_idle_timeout(&mut idle_rounds);
-                thread::sleep(timeout);
+                client.wait_readable_with_udp(state.ipv4.as_ref(), state.ipv6.as_ref(), timeout)?;
             } else {
                 idle_rounds = 0;
             }

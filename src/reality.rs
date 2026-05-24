@@ -578,6 +578,19 @@ impl RawTcpStreamAccess for PrefixedTcpStream {
         RawTcpStreamAccess::wait_readable_with(&self.socket, other, wait_self, wait_other, timeout)
     }
 
+    fn wait_readable_with_udp(
+        &self,
+        udp_v4: Option<&std::net::UdpSocket>,
+        udp_v6: Option<&std::net::UdpSocket>,
+        wait_self: bool,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        if wait_self && !self.raw_tcp_stream_ready() {
+            return Ok(());
+        }
+        RawTcpStreamAccess::wait_readable_with_udp(&self.socket, udp_v4, udp_v6, wait_self, timeout)
+    }
+
     fn into_raw_tcp_stream(self) -> TcpStream {
         self.socket
     }
