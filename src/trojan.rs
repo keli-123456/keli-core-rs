@@ -1045,10 +1045,15 @@ impl TrojanServer {
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
         client.set_nonblocking(true)?;
+        let started = Instant::now();
         let mut state = TrojanUdpRelayState::new(self.config.connect_timeout);
         let mut pending = Vec::new();
         let mut upload = 0u64;
         let mut download = 0u64;
+        let mut upload_packets = 0u64;
+        let mut download_packets = 0u64;
+        let mut first_response_ms = None;
+        let mut last_target = None;
         let mut idle_rounds = 0u8;
         let result = 'relay: loop {
             let mut progressed = false;
@@ -1062,6 +1067,8 @@ impl TrojanServer {
                     while let Some((target, payload)) =
                         parse_trojan_udp_packet_from_buffer(&mut pending)?
                     {
+                        upload_packets = upload_packets.saturating_add(1);
+                        last_target = Some(target.clone());
                         match self.send_udp_packet(
                             &mut state,
                             &target,
@@ -1074,6 +1081,9 @@ impl TrojanServer {
                                     let packet = encode_trojan_udp_packet(source, &payload);
                                     client.write_all(&packet)?;
                                     download = download.saturating_add(payload.len() as u64);
+                                    download_packets = download_packets.saturating_add(1);
+                                    first_response_ms
+                                        .get_or_insert_with(|| started.elapsed().as_millis());
                                 }
                             }
                             Err(error) => break 'relay Err(error),
@@ -1089,6 +1099,8 @@ impl TrojanServer {
                 let packet = encode_trojan_udp_packet(source, &payload);
                 client.write_all(&packet)?;
                 download = download.saturating_add(payload.len() as u64);
+                download_packets = download_packets.saturating_add(1);
+                first_response_ms.get_or_insert_with(|| started.elapsed().as_millis());
                 progressed = true;
             }
 
@@ -1100,6 +1112,18 @@ impl TrojanServer {
             }
         };
         let _ = client.set_nonblocking(false);
+        log_trojan_udp_relay_finished(
+            &self.config.node_tag,
+            "tls_websocket_udp",
+            last_target.as_ref().or(Some(&request.target)),
+            upload,
+            download,
+            upload_packets,
+            download_packets,
+            first_response_ms,
+            started.elapsed(),
+            result.as_ref().err(),
+        );
         self.record_traffic(
             request.user_uuid,
             request.user_id,
@@ -1697,6 +1721,84 @@ fn log_trojan_relay_finished(
         download,
         error_text
     );
+}
+
+fn log_trojan_udp_relay_finished(
+    node_tag: &str,
+    scope: &'static str,
+    target: Option<&SocksTarget>,
+    upload: u64,
+    download: u64,
+    upload_packets: u64,
+    download_packets: u64,
+    first_response_ms: Option<u128>,
+    elapsed: Duration,
+    error: Option<&io::Error>,
+) {
+    if error.is_none()
+        && upload_packets == 0
+        && download_packets == 0
+        && elapsed.as_millis() < TROJAN_ROUTE_SLOW_LOG_MS
+        && !trojan_trace_enabled()
+    {
+        return;
+    }
+    eprintln!(
+        "{}",
+        format_trojan_udp_relay_finished(
+            node_tag,
+            scope,
+            target,
+            upload,
+            download,
+            upload_packets,
+            download_packets,
+            first_response_ms,
+            elapsed,
+            error,
+        )
+    );
+}
+
+fn format_trojan_udp_relay_finished(
+    node_tag: &str,
+    scope: &'static str,
+    target: Option<&SocksTarget>,
+    upload: u64,
+    download: u64,
+    upload_packets: u64,
+    download_packets: u64,
+    first_response_ms: Option<u128>,
+    elapsed: Duration,
+    error: Option<&io::Error>,
+) -> String {
+    let status = match error {
+        Some(error) => classify_trojan_connection_error(error),
+        None => "ok",
+    };
+    let first_response = first_response_ms
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let error_text = error
+        .map(|error| trojan_log_message(&error.to_string()))
+        .unwrap_or_else(|| "-".to_string());
+    let (target_host, target_port) = target
+        .map(|target| (trojan_log_field(&target.host), target.port.to_string()))
+        .unwrap_or_else(|| ("-".to_string(), "-".to_string()));
+
+    format!(
+        "INFO  core   trojan udp relay finished node_tag={} scope={scope} target={}:{} status={status} first_response_ms={} duration_ms={} upload_bytes={} download_bytes={} upload_packets={} download_packets={} error={}",
+        trojan_log_field(node_tag),
+        target_host,
+        target_port,
+        first_response,
+        elapsed.as_millis(),
+        upload,
+        download,
+        upload_packets,
+        download_packets,
+        error_text
+    )
 }
 
 fn trojan_outbound_endpoint(outbound: &OutboundConfig) -> String {
@@ -4270,6 +4372,32 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].upload, 8);
         assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn formats_trojan_udp_relay_summary_for_diagnostics() {
+        let target = SocksTarget {
+            host: "rr5---sn-test.gvt1.com".to_string(),
+            port: 443,
+        };
+
+        let line = super::format_trojan_udp_relay_finished(
+            "node tag",
+            "tls_websocket_udp",
+            Some(&target),
+            1532,
+            20_856_660,
+            1,
+            1,
+            Some(1),
+            Duration::from_millis(2427),
+            None,
+        );
+
+        assert_eq!(
+            line,
+            "INFO  core   trojan udp relay finished node_tag=node_tag scope=tls_websocket_udp target=rr5---sn-test.gvt1.com:443 status=ok first_response_ms=1 duration_ms=2427 upload_bytes=1532 download_bytes=20856660 upload_packets=1 download_packets=1 error=-"
+        );
     }
 
     #[test]
