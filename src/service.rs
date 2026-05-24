@@ -3601,28 +3601,19 @@ mod tests {
             )
             .await
             .expect("send vless request");
-            send_grpc_data(&mut send, Bytes::from(encode_grpc_hunk(b"ping")), true)
-                .await
-                .expect("send vless payload");
 
             let response = response.await.expect("grpc response");
             assert_eq!(response.status(), http::StatusCode::OK);
             let mut body = response.into_body();
             let mut frames = Vec::new();
             let mut plain = Vec::new();
-            while plain.len() < 6 {
-                let chunk = body
-                    .data()
-                    .await
-                    .expect("grpc data")
-                    .expect("grpc data chunk");
-                let len = chunk.len();
-                frames.extend_from_slice(&chunk);
-                let _ = body.flow_control().release_capacity(len);
-                while let Some(message) = take_grpc_message(&mut frames).expect("grpc frame") {
-                    plain.extend_from_slice(&decode_hunk_message(&message).expect("grpc hunk"));
-                }
-            }
+            read_grpc_plain_until(&mut body, &mut frames, &mut plain, 2).await;
+            assert_eq!(&plain[..2], &[0x00, 0x00]);
+
+            send_grpc_data(&mut send, Bytes::from(encode_grpc_hunk(b"ping")), true)
+                .await
+                .expect("send vless payload");
+            read_grpc_plain_until(&mut body, &mut frames, &mut plain, 6).await;
             loop {
                 match tokio::time::timeout(Duration::from_millis(500), body.data()).await {
                     Ok(Some(Ok(chunk))) => {
@@ -3641,9 +3632,29 @@ mod tests {
                     Ok(None) | Err(_) => break,
                 }
             }
-            assert_eq!(&plain[..2], &[0x00, 0x00]);
             assert_eq!(&plain[2..6], b"ping");
         });
+    }
+
+    async fn read_grpc_plain_until(
+        body: &mut h2::RecvStream,
+        frames: &mut Vec<u8>,
+        plain: &mut Vec<u8>,
+        len: usize,
+    ) {
+        while plain.len() < len {
+            let chunk = body
+                .data()
+                .await
+                .expect("grpc data")
+                .expect("grpc data chunk");
+            let chunk_len = chunk.len();
+            frames.extend_from_slice(&chunk);
+            let _ = body.flow_control().release_capacity(chunk_len);
+            while let Some(message) = take_grpc_message(frames).expect("grpc frame") {
+                plain.extend_from_slice(&decode_hunk_message(&message).expect("grpc hunk"));
+            }
+        }
     }
 
     struct TestCert {
