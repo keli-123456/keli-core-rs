@@ -18,6 +18,8 @@ static DNS_POSITIVE_CACHE: OnceLock<Mutex<HashMap<DnsCacheKey, DnsPositiveCacheE
     OnceLock::new();
 static DNS_NEGATIVE_CACHE: OnceLock<Mutex<HashMap<DnsCacheKey, DnsNegativeCacheEntry>>> =
     OnceLock::new();
+static GOOGLEVIDEO_FALLBACK_CACHE: OnceLock<Mutex<Option<GoogleVideoFallbackEntry>>> =
+    OnceLock::new();
 static TCP_CONNECT_FAILURE_BACKOFF: OnceLock<Mutex<HashMap<DnsCacheKey, TcpConnectFailureEntry>>> =
     OnceLock::new();
 static DNS_RESOLVE_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -30,6 +32,7 @@ static DNS_PRIVATE_IP_FILTER_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DNS_PRIVATE_IP_BLOCK_TOTAL: AtomicU64 = AtomicU64::new(0);
 const DNS_POSITIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const DNS_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(15);
+const GOOGLEVIDEO_FALLBACK_CACHE_TTL: Duration = Duration::from_secs(30);
 const DNS_POSITIVE_CACHE_MAX_ENTRIES: usize = 8192;
 const DNS_NEGATIVE_CACHE_MAX_ENTRIES: usize = 4096;
 const TCP_CONNECT_FAILURE_THRESHOLD: u32 = 3;
@@ -70,6 +73,12 @@ struct DnsNegativeCacheEntry {
 }
 
 #[derive(Clone, Debug)]
+struct GoogleVideoFallbackEntry {
+    expires_at: Instant,
+    ips: Vec<IpAddr>,
+}
+
+#[derive(Clone, Debug)]
 struct TcpConnectFailureEntry {
     failures: u32,
     window_started: Instant,
@@ -81,6 +90,7 @@ pub fn configure(config: DnsConfig) {
     *lock.write().expect("dns config lock poisoned") = config;
     clear_positive_cache();
     clear_negative_cache();
+    clear_googlevideo_fallback_cache();
     clear_tcp_connect_failure_backoff();
 }
 
@@ -524,6 +534,7 @@ pub fn resolve_socket_addrs(
             Ok(addrs) => {
                 remove_negative_cache_entry(&cache_key);
                 record_positive_cache(&cache_key, &addrs);
+                record_googlevideo_fallback(host, &addrs);
                 Ok(addrs)
             }
             Err(error) => {
@@ -535,7 +546,13 @@ pub fn resolve_socket_addrs(
             DNS_RESOLVE_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
             remove_negative_cache_entry(&cache_key);
             remove_positive_cache_entry(&cache_key);
-            record_negative_cache(&cache_key, &error);
+            if let Some(addrs) = googlevideo_fallback_addrs(host, port) {
+                record_positive_cache(&cache_key, &addrs);
+                return Ok(addrs);
+            }
+            if !is_googlevideo_host(host) {
+                record_negative_cache(&cache_key, &error);
+            }
             Err(error)
         }
     }
@@ -699,12 +716,22 @@ fn clear_negative_cache() {
     }
 }
 
+fn clear_googlevideo_fallback_cache() {
+    if let Some(cache) = GOOGLEVIDEO_FALLBACK_CACHE.get() {
+        *cache.lock().expect("googlevideo fallback cache poisoned") = None;
+    }
+}
+
 fn positive_cache() -> &'static Mutex<HashMap<DnsCacheKey, DnsPositiveCacheEntry>> {
     DNS_POSITIVE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn negative_cache() -> &'static Mutex<HashMap<DnsCacheKey, DnsNegativeCacheEntry>> {
     DNS_NEGATIVE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn googlevideo_fallback_cache() -> &'static Mutex<Option<GoogleVideoFallbackEntry>> {
+    GOOGLEVIDEO_FALLBACK_CACHE.get_or_init(|| Mutex::new(None))
 }
 
 fn cached_positive_addrs(key: &DnsCacheKey) -> Option<Vec<SocketAddr>> {
@@ -762,6 +789,56 @@ fn record_positive_cache(key: &DnsCacheKey, addrs: &[SocketAddr]) {
             addrs: addrs.to_vec(),
         },
     );
+}
+
+fn record_googlevideo_fallback(host: &str, addrs: &[SocketAddr]) {
+    if !is_googlevideo_host(host) || addrs.is_empty() {
+        return;
+    }
+    let ips = addrs.iter().map(|addr| addr.ip()).collect::<Vec<_>>();
+    *googlevideo_fallback_cache()
+        .lock()
+        .expect("googlevideo fallback cache poisoned") = Some(GoogleVideoFallbackEntry {
+        expires_at: Instant::now() + GOOGLEVIDEO_FALLBACK_CACHE_TTL,
+        ips,
+    });
+}
+
+fn googlevideo_fallback_addrs(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+    if !is_googlevideo_host(host) {
+        return None;
+    }
+    let now = Instant::now();
+    let mut cache = googlevideo_fallback_cache()
+        .lock()
+        .expect("googlevideo fallback cache poisoned");
+    let Some(entry) = cache.as_ref() else {
+        return None;
+    };
+    if now >= entry.expires_at {
+        *cache = None;
+        return None;
+    }
+    let addrs = entry
+        .ips
+        .iter()
+        .copied()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        None
+    } else {
+        Some(addrs)
+    }
+}
+
+fn is_googlevideo_host(host: &str) -> bool {
+    let host = host
+        .trim()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    host == "googlevideo.com" || host.ends_with(".googlevideo.com")
 }
 
 fn record_negative_cache(key: &DnsCacheKey, error: &io::Error) {
@@ -1360,6 +1437,141 @@ mod tests {
             dns.send_to(&response, peer).expect("dns response");
         });
         (dns_addr, server)
+    }
+
+    fn spawn_udp_googlevideo_dns_then_failure(
+        ip: [u8; 4],
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let dns = UdpSocket::bind("127.0.0.1:0").expect("dns bind");
+        dns.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("dns timeout");
+        let dns_addr = dns.local_addr().expect("dns addr");
+        let server = thread::spawn(move || {
+            for index in 0..2 {
+                let mut packet = [0u8; 512];
+                let (read, peer) = dns.recv_from(&mut packet).expect("dns recv");
+                assert!(read > 12);
+                let query_id = u16::from_be_bytes([packet[0], packet[1]]);
+                let mut response = Vec::new();
+                response.extend_from_slice(&query_id.to_be_bytes());
+                if index == 0 {
+                    response.extend_from_slice(&0x8180u16.to_be_bytes());
+                    response.extend_from_slice(&1u16.to_be_bytes());
+                    response.extend_from_slice(&1u16.to_be_bytes());
+                    response.extend_from_slice(&0u16.to_be_bytes());
+                    response.extend_from_slice(&0u16.to_be_bytes());
+                    response.extend_from_slice(&packet[12..read]);
+                    response.extend_from_slice(&[0xc0, 0x0c]);
+                    response.extend_from_slice(&1u16.to_be_bytes());
+                    response.extend_from_slice(&1u16.to_be_bytes());
+                    response.extend_from_slice(&30u32.to_be_bytes());
+                    response.extend_from_slice(&4u16.to_be_bytes());
+                    response.extend_from_slice(&ip);
+                } else {
+                    response.extend_from_slice(&0x8183u16.to_be_bytes());
+                    response.extend_from_slice(&1u16.to_be_bytes());
+                    response.extend_from_slice(&0u16.to_be_bytes());
+                    response.extend_from_slice(&0u16.to_be_bytes());
+                    response.extend_from_slice(&0u16.to_be_bytes());
+                    response.extend_from_slice(&packet[12..read]);
+                }
+                dns.send_to(&response, peer).expect("dns response");
+            }
+        });
+        (dns_addr, server)
+    }
+
+    fn spawn_udp_dns_failures(count: usize) -> (SocketAddr, thread::JoinHandle<()>) {
+        let dns = UdpSocket::bind("127.0.0.1:0").expect("dns bind");
+        dns.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("dns timeout");
+        let dns_addr = dns.local_addr().expect("dns addr");
+        let server = thread::spawn(move || {
+            for _ in 0..count {
+                let mut packet = [0u8; 512];
+                let (read, peer) = dns.recv_from(&mut packet).expect("dns recv");
+                assert!(read > 12);
+                let query_id = u16::from_be_bytes([packet[0], packet[1]]);
+                let mut response = Vec::new();
+                response.extend_from_slice(&query_id.to_be_bytes());
+                response.extend_from_slice(&0x8183u16.to_be_bytes());
+                response.extend_from_slice(&1u16.to_be_bytes());
+                response.extend_from_slice(&0u16.to_be_bytes());
+                response.extend_from_slice(&0u16.to_be_bytes());
+                response.extend_from_slice(&0u16.to_be_bytes());
+                response.extend_from_slice(&packet[12..read]);
+                dns.send_to(&response, peer).expect("dns response");
+            }
+        });
+        (dns_addr, server)
+    }
+
+    #[test]
+    fn googlevideo_dns_failure_reuses_recent_googlevideo_address() {
+        let _guard = crate::test_support::network_test_lock();
+        let (dns_addr, server) = spawn_udp_googlevideo_dns_then_failure([203, 0, 113, 9]);
+        configure(DnsConfig {
+            servers: vec![DnsServerConfig {
+                address: dns_addr.to_string(),
+                domains: Vec::new(),
+            }],
+            query_strategy: "UseIPv4".to_string(),
+            block_private_ips: false,
+            private_ip_allowlist: Vec::new(),
+        });
+
+        let first = resolve_socket_addrs(
+            "rr4---sn-o097znzd.googlevideo.com",
+            443,
+            Duration::from_secs(2),
+        )
+        .expect("first googlevideo resolve");
+        assert_eq!(first, vec!["203.0.113.9:443".parse().unwrap()]);
+
+        let second = resolve_socket_addrs(
+            "rr5---sn-5hneknek.googlevideo.com",
+            443,
+            Duration::from_secs(2),
+        )
+        .expect("failed googlevideo host should fall back to recent googlevideo address");
+        assert_eq!(second, vec!["203.0.113.9:443".parse().unwrap()]);
+
+        server.join().expect("dns server");
+        configure(DnsConfig::default());
+    }
+
+    #[test]
+    fn googlevideo_dns_failure_without_fallback_is_not_negative_cached() {
+        let _guard = crate::test_support::network_test_lock();
+        let (dns_addr, server) = spawn_udp_dns_failures(2);
+        configure(DnsConfig {
+            servers: vec![DnsServerConfig {
+                address: dns_addr.to_string(),
+                domains: Vec::new(),
+            }],
+            query_strategy: "UseIPv4".to_string(),
+            block_private_ips: false,
+            private_ip_allowlist: Vec::new(),
+        });
+
+        let first = resolve_socket_addrs(
+            "rr5---sn-5hneknek.googlevideo.com",
+            443,
+            Duration::from_secs(2),
+        )
+        .expect_err("first googlevideo failure");
+        assert_eq!(first.kind(), io::ErrorKind::InvalidData);
+
+        let second = resolve_socket_addrs(
+            "rr5---sn-5hneknek.googlevideo.com",
+            443,
+            Duration::from_secs(2),
+        )
+        .expect_err("second googlevideo failure should query dns again");
+        assert_eq!(second.kind(), io::ErrorKind::InvalidData);
+
+        server.join().expect("dns server should receive both queries");
+        configure(DnsConfig::default());
     }
 
     #[test]
