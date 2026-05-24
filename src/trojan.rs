@@ -351,7 +351,7 @@ impl TrojanServer {
         &self,
         websocket: &mut crate::websocket::WebSocketTlsStream,
     ) -> io::Result<Vec<u8>> {
-        websocket.set_io_timeout(Some(self.router.sniffing_cache_timeout()))?;
+        websocket.set_nonblocking(true)?;
         let mut buffer = vec![0u8; 16 * 1024];
         let result = match websocket.read(&mut buffer) {
             Ok(0) => Ok(Vec::new()),
@@ -371,7 +371,7 @@ impl TrojanServer {
             }
             Err(error) => Err(error),
         };
-        let restore = websocket.set_io_timeout(None);
+        let restore = websocket.set_nonblocking(false);
         match (result, restore) {
             (Ok(payload), Ok(())) => Ok(payload),
             (Err(error), _) => Err(error),
@@ -4566,6 +4566,64 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].upload, 96);
         assert_eq!(records[0].download, 96);
+    }
+
+    #[test]
+    fn tls_websocket_connects_without_waiting_for_late_first_payload_like_go() {
+        let cert = test_cert("trojan-ws-no-first-payload-wait");
+        let remote = TcpListener::bind("127.0.0.1:0").expect("remote bind");
+        let remote_addr = remote.local_addr().expect("remote addr");
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let started = Instant::now();
+        let remote_thread = thread::spawn(move || {
+            let (stream, _) = remote.accept().expect("remote accept");
+            accepted_tx
+                .send(started.elapsed())
+                .expect("accepted elapsed");
+            drop(stream);
+        });
+
+        let server = server();
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            server_clone.handle_tls_websocket_client(client, Some("/trojan"))
+        });
+
+        let mut client = tls_client(trojan_addr, cert.cert_der.clone());
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.48",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+
+        client
+            .write_all(&masked_frame(&trojan_request(remote_addr)))
+            .expect("trojan request frame");
+        client.flush().expect("flush request frame");
+
+        let elapsed = accepted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("remote should be connected");
+        drop(client);
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        remote_thread.join().expect("remote thread");
+
+        assert!(
+            elapsed < Duration::from_millis(120),
+            "trojan websocket should connect without waiting for sniff cache; elapsed={elapsed:?}"
+        );
     }
 
     #[test]
