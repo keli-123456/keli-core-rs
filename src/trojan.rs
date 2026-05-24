@@ -302,6 +302,7 @@ impl TrojanServer {
             let _ = websocket.shutdown();
             return Ok(());
         }
+        log_trojan_tls_websocket_initial_payload(&self.config.node_tag, &request, &initial_payload);
         let Some(remote) =
             self.connect_tcp_for_tls_websocket(&websocket, &request, &initial_payload)?
         else {
@@ -1872,6 +1873,20 @@ fn log_trojan_relay_started(node_tag: &str, scope: &'static str, request: &Troja
     eprintln!("{}", format_trojan_relay_started(node_tag, scope, request));
 }
 
+fn log_trojan_tls_websocket_initial_payload(
+    node_tag: &str,
+    request: &TrojanRequest,
+    initial_payload: &[u8],
+) {
+    if !trojan_trace_enabled() {
+        return;
+    }
+    eprintln!(
+        "{}",
+        format_trojan_tls_websocket_initial_payload(node_tag, request, initial_payload)
+    );
+}
+
 fn format_trojan_relay_started(
     node_tag: &str,
     scope: &'static str,
@@ -1888,6 +1903,256 @@ fn format_trojan_relay_started(
         request.target.port,
         trojan_log_field(&client_ip)
     )
+}
+
+fn format_trojan_tls_websocket_initial_payload(
+    node_tag: &str,
+    request: &TrojanRequest,
+    initial_payload: &[u8],
+) -> String {
+    format!(
+        "INFO  core   trojan tls websocket initial payload node_tag={} target={}:{} initial_bytes={} {}",
+        trojan_log_field(node_tag),
+        trojan_log_field(&request.target.host),
+        request.target.port,
+        initial_payload.len(),
+        describe_tls_client_hello(initial_payload)
+    )
+}
+
+fn describe_tls_client_hello(payload: &[u8]) -> String {
+    match parse_tls_client_hello_summary(payload) {
+        Ok(summary) => summary.to_log_fields(),
+        Err(message) => format!("client_hello={}", trojan_log_field(message)),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TlsClientHelloSummary {
+    record_len: usize,
+    handshake_len: usize,
+    sni: Option<String>,
+    alpn: Vec<String>,
+    supported_versions: Vec<u16>,
+    has_ech: bool,
+    extensions: Vec<u16>,
+}
+
+impl TlsClientHelloSummary {
+    fn to_log_fields(&self) -> String {
+        let sni = self.sni.as_deref().unwrap_or("-");
+        let alpn = if self.alpn.is_empty() {
+            "-".to_string()
+        } else {
+            self.alpn
+                .iter()
+                .map(|value| trojan_log_field(value))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let versions = if self.supported_versions.is_empty() {
+            "-".to_string()
+        } else {
+            self.supported_versions
+                .iter()
+                .map(|value| format!("0x{value:04x}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let extensions = if self.extensions.is_empty() {
+            "-".to_string()
+        } else {
+            self.extensions
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "client_hello=ok record_len={} handshake_len={} sni={} alpn={} versions={} ech={} extensions={}",
+            self.record_len,
+            self.handshake_len,
+            trojan_log_field(sni),
+            alpn,
+            versions,
+            self.has_ech,
+            extensions
+        )
+    }
+}
+
+fn parse_tls_client_hello_summary(payload: &[u8]) -> Result<TlsClientHelloSummary, &'static str> {
+    if payload.is_empty() {
+        return Err("empty");
+    }
+    if payload.len() < 5 {
+        return Err("partial_tls_record_header");
+    }
+    if payload[0] != 0x16 {
+        return Err("not_tls_handshake_record");
+    }
+    let record_len = u16::from_be_bytes([payload[3], payload[4]]) as usize;
+    let record_end = 5usize
+        .checked_add(record_len)
+        .ok_or("tls_record_len_overflow")?;
+    if payload.len() < record_end {
+        return Err("partial_tls_record");
+    }
+    if record_len < 4 {
+        return Err("partial_tls_handshake_header");
+    }
+    if payload[5] != 0x01 {
+        return Err("not_client_hello");
+    }
+    let handshake_len =
+        ((payload[6] as usize) << 16) | ((payload[7] as usize) << 8) | payload[8] as usize;
+    let hello_end = 9usize
+        .checked_add(handshake_len)
+        .ok_or("client_hello_len_overflow")?;
+    if payload.len() < hello_end || hello_end > record_end {
+        return Err("partial_client_hello");
+    }
+
+    let mut cursor = 9usize;
+    read_slice(payload, &mut cursor, 2).ok_or("missing_legacy_version")?;
+    read_slice(payload, &mut cursor, 32).ok_or("missing_random")?;
+    let session_id_len = read_u8_from(payload, &mut cursor).ok_or("missing_session_id_len")?;
+    read_slice(payload, &mut cursor, session_id_len as usize).ok_or("missing_session_id")?;
+    let cipher_suites_len =
+        read_u16_from(payload, &mut cursor).ok_or("missing_cipher_suites_len")? as usize;
+    read_slice(payload, &mut cursor, cipher_suites_len).ok_or("missing_cipher_suites")?;
+    let compression_len =
+        read_u8_from(payload, &mut cursor).ok_or("missing_compression_methods_len")?;
+    read_slice(payload, &mut cursor, compression_len as usize)
+        .ok_or("missing_compression_methods")?;
+    let extensions_len =
+        read_u16_from(payload, &mut cursor).ok_or("missing_extensions_len")? as usize;
+    let extensions_end = cursor
+        .checked_add(extensions_len)
+        .ok_or("extensions_len_overflow")?;
+    if extensions_end > hello_end {
+        return Err("extensions_out_of_bounds");
+    }
+
+    let mut sni = None;
+    let mut alpn = Vec::new();
+    let mut supported_versions = Vec::new();
+    let mut has_ech = false;
+    let mut extensions = Vec::new();
+
+    while cursor + 4 <= extensions_end {
+        let extension_type = read_u16_from(payload, &mut cursor).ok_or("missing_extension_type")?;
+        let extension_len =
+            read_u16_from(payload, &mut cursor).ok_or("missing_extension_len")? as usize;
+        let extension =
+            read_slice(payload, &mut cursor, extension_len).ok_or("missing_extension_payload")?;
+        extensions.push(extension_type);
+        match extension_type {
+            0 => sni = parse_tls_sni_extension(extension),
+            16 => alpn = parse_tls_alpn_extension(extension),
+            43 => supported_versions = parse_tls_supported_versions_extension(extension),
+            0xfe0d => has_ech = true,
+            _ => {}
+        }
+    }
+    if cursor != extensions_end {
+        return Err("trailing_extension_bytes");
+    }
+
+    Ok(TlsClientHelloSummary {
+        record_len,
+        handshake_len,
+        sni,
+        alpn,
+        supported_versions,
+        has_ech,
+        extensions,
+    })
+}
+
+fn parse_tls_sni_extension(extension: &[u8]) -> Option<String> {
+    let mut cursor = 0usize;
+    let list_len = read_u16_from(extension, &mut cursor)? as usize;
+    let list_end = cursor.checked_add(list_len)?;
+    if list_end > extension.len() {
+        return None;
+    }
+    while cursor + 3 <= list_end {
+        let name_type = read_u8_from(extension, &mut cursor)?;
+        let name_len = read_u16_from(extension, &mut cursor)? as usize;
+        let name = read_slice(extension, &mut cursor, name_len)?;
+        if name_type == 0 {
+            return std::str::from_utf8(name)
+                .ok()
+                .map(|value| value.to_string());
+        }
+    }
+    None
+}
+
+fn parse_tls_alpn_extension(extension: &[u8]) -> Vec<String> {
+    let mut cursor = 0usize;
+    let Some(list_len) = read_u16_from(extension, &mut cursor).map(|value| value as usize) else {
+        return Vec::new();
+    };
+    let Some(list_end) = cursor.checked_add(list_len) else {
+        return Vec::new();
+    };
+    if list_end > extension.len() {
+        return Vec::new();
+    }
+    let mut protocols = Vec::new();
+    while cursor < list_end {
+        let Some(protocol_len) = read_u8_from(extension, &mut cursor).map(|value| value as usize)
+        else {
+            return Vec::new();
+        };
+        let Some(protocol) = read_slice(extension, &mut cursor, protocol_len) else {
+            return Vec::new();
+        };
+        protocols.push(String::from_utf8_lossy(protocol).to_string());
+    }
+    protocols
+}
+
+fn parse_tls_supported_versions_extension(extension: &[u8]) -> Vec<u16> {
+    let mut cursor = 0usize;
+    let Some(list_len) = read_u8_from(extension, &mut cursor).map(|value| value as usize) else {
+        return Vec::new();
+    };
+    let Some(list_end) = cursor.checked_add(list_len) else {
+        return Vec::new();
+    };
+    if list_end > extension.len() {
+        return Vec::new();
+    }
+    let mut versions = Vec::new();
+    while cursor + 2 <= list_end {
+        if let Some(version) = read_u16_from(extension, &mut cursor) {
+            versions.push(version);
+        } else {
+            return Vec::new();
+        }
+    }
+    versions
+}
+
+fn read_u8_from(input: &[u8], cursor: &mut usize) -> Option<u8> {
+    let value = *input.get(*cursor)?;
+    *cursor += 1;
+    Some(value)
+}
+
+fn read_u16_from(input: &[u8], cursor: &mut usize) -> Option<u16> {
+    let bytes = read_slice(input, cursor, 2)?;
+    Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_slice<'a>(input: &'a [u8], cursor: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let end = cursor.checked_add(len)?;
+    let slice = input.get(*cursor..end)?;
+    *cursor = end;
+    Some(slice)
 }
 
 fn format_trojan_relay_finished(
@@ -4788,6 +5053,114 @@ mod tests {
         );
         assert!(!line.contains("hash-that-must-not-be-logged"));
         assert!(!line.contains("00000000-0000-0000-0000-000000000000"));
+    }
+
+    #[test]
+    fn formats_trojan_tls_websocket_initial_payload_client_hello_summary() {
+        let request = super::TrojanRequest {
+            command: super::TrojanCommand::Tcp,
+            password_hash: "hash-that-must-not-be-logged".to_string(),
+            user_uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            user_id: 7,
+            target: SocksTarget {
+                host: "www.youtube.com".to_string(),
+                port: 443,
+            },
+            client_ip: Some("198.51.100.54".parse().expect("client ip")),
+        };
+        let payload = tls_client_hello_payload_for_trace();
+
+        let line =
+            super::format_trojan_tls_websocket_initial_payload("node tag", &request, &payload);
+
+        assert_eq!(
+            line,
+            "INFO  core   trojan tls websocket initial payload node_tag=node_tag target=www.youtube.com:443 initial_bytes=107 client_hello=ok record_len=102 handshake_len=98 sni=www.youtube.com alpn=h2,http/1.1 versions=0x0304,0x0303 ech=true extensions=0,16,43,65037"
+        );
+        assert!(!line.contains("hash-that-must-not-be-logged"));
+        assert!(!line.contains("00000000-0000-0000-0000-000000000000"));
+    }
+
+    #[test]
+    fn describes_partial_trojan_tls_websocket_initial_payload() {
+        assert_eq!(
+            super::describe_tls_client_hello(&[0x16, 0x03]),
+            "client_hello=partial_tls_record_header"
+        );
+    }
+
+    fn tls_client_hello_payload_for_trace() -> Vec<u8> {
+        let mut extensions = Vec::new();
+        push_tls_extension(
+            &mut extensions,
+            0,
+            &tls_sni_extension_payload("www.youtube.com"),
+        );
+        push_tls_extension(
+            &mut extensions,
+            16,
+            &tls_alpn_extension_payload(&["h2", "http/1.1"]),
+        );
+        push_tls_extension(&mut extensions, 43, &[4, 0x03, 0x04, 0x03, 0x03]);
+        push_tls_extension(&mut extensions, 0xfe0d, &[]);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&(2u16).to_be_bytes());
+        body.extend_from_slice(&[0x13, 0x01]);
+        body.push(1);
+        body.push(0);
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let handshake_len = body.len();
+        let record_len = 4 + handshake_len;
+        let mut payload = vec![
+            0x16,
+            0x03,
+            0x01,
+            ((record_len >> 8) & 0xff) as u8,
+            (record_len & 0xff) as u8,
+            0x01,
+            ((handshake_len >> 16) & 0xff) as u8,
+            ((handshake_len >> 8) & 0xff) as u8,
+            (handshake_len & 0xff) as u8,
+        ];
+        payload.extend_from_slice(&body);
+        payload
+    }
+
+    fn push_tls_extension(output: &mut Vec<u8>, extension_type: u16, payload: &[u8]) {
+        output.extend_from_slice(&extension_type.to_be_bytes());
+        output.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        output.extend_from_slice(payload);
+    }
+
+    fn tls_sni_extension_payload(host: &str) -> Vec<u8> {
+        let mut name = Vec::new();
+        name.push(0);
+        name.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        name.extend_from_slice(host.as_bytes());
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&name);
+        payload
+    }
+
+    fn tls_alpn_extension_payload(protocols: &[&str]) -> Vec<u8> {
+        let mut list = Vec::new();
+        for protocol in protocols {
+            list.push(protocol.len() as u8);
+            list.extend_from_slice(protocol.as_bytes());
+        }
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(list.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&list);
+        payload
     }
 
     #[test]
