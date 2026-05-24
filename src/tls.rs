@@ -442,8 +442,22 @@ where
 
         self.tls_record_target_len = None;
         let record = std::mem::take(&mut self.tls_record_buf);
+        let record_len = record.len();
         let mut cursor = Cursor::new(record);
-        self.connection.read_tls(&mut cursor)
+        let mut consumed = 0usize;
+        while (cursor.position() as usize) < record_len {
+            match self.connection.read_tls(&mut cursor) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "rustls stopped before consuming buffered tls record",
+                    ));
+                }
+                Ok(read) => consumed += read,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(consumed)
     }
 
     pub(crate) fn into_socket(self) -> S {
@@ -1012,13 +1026,14 @@ pub(crate) fn classify_tls_handshake_error(error: &io::Error) -> TlsHandshakeErr
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
+    use std::io::{self, Read, Write};
     use std::net::{TcpListener, TcpStream, UdpSocket};
+    use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    use rustls::SignatureScheme;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use rustls::{ClientConfig, ClientConnection, RootCertStore, SignatureScheme, StreamOwned};
 
     use crate::reality::generate_reality_temporary_certificate;
 
@@ -1101,6 +1116,63 @@ mod tests {
             classify_tls_handshake_error(&invalid),
             TlsHandshakeErrorClass::InvalidHandshake
         );
+    }
+
+    #[test]
+    fn tls_connection_reads_plaintext_larger_than_rustls_internal_chunk() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("temporary certificate");
+        let cert_der = cert.cert.der().clone();
+        let acceptor = super::TlsAcceptor::from_der(
+            vec![cert_der.clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())),
+            &[],
+        )
+        .expect("tls acceptor");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let expected = vec![0x5au8; 12 * 1024];
+
+        let server_expected = expected.clone();
+        let (server_done_tx, server_done_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let result = (|| -> io::Result<()> {
+                let (stream, _) = listener.accept()?;
+                let mut tls = acceptor.accept(stream)?;
+                tls.set_io_timeout(Some(Duration::from_secs(30)))?;
+                let mut received = vec![0u8; server_expected.len()];
+                tls.read_exact(&mut received)?;
+                if received != server_expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "large tls plaintext mismatch",
+                    ));
+                }
+                Ok(())
+            })();
+            let _ = server_done_tx.send(result);
+        });
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).expect("root cert");
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name = ServerName::try_from("localhost")
+            .expect("server name")
+            .to_owned();
+        let connection = ClientConnection::new(Arc::new(config), server_name).expect("client tls");
+        let socket = TcpStream::connect(addr).expect("connect client");
+        let mut client = StreamOwned::new(connection, socket);
+        client.write_all(&expected).expect("write large plaintext");
+        client.flush().expect("flush client");
+        server_done_rx
+            .recv_timeout(Duration::from_secs(35))
+            .expect("server read completion")
+            .expect("large tls plaintext");
+        drop(client);
+
+        server.join().expect("server thread");
     }
 
     #[test]
