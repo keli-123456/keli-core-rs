@@ -244,11 +244,27 @@ impl TlsAcceptor {
             tls_record_target_len: None,
         };
         while connection.connection.is_handshaking() {
-            connection
-                .connection
-                .complete_io(&mut connection.socket)
-                .map_err(tls_error)?;
+            if connection.connection.wants_write() {
+                connection.flush_tls_wait()?;
+            }
+            if connection.connection.is_handshaking() {
+                match connection.read_tls_record_limited()? {
+                    0 => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "tls socket closed during handshake",
+                        ));
+                    }
+                    _ => {
+                        connection
+                            .connection
+                            .process_new_packets()
+                            .map_err(tls_error)?;
+                    }
+                }
+            }
         }
+        connection.flush_tls_wait()?;
         Ok(connection)
     }
 }

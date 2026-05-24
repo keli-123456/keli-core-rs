@@ -362,7 +362,9 @@ impl TrojanServer {
             Err(error)
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
                 ) =>
             {
                 Ok(Vec::new())
@@ -736,6 +738,7 @@ impl TrojanServer {
         initial_payload: Vec<u8>,
     ) -> io::Result<()> {
         let relay_started = Instant::now();
+        log_trojan_relay_started(&self.config.node_tag, "tls_websocket", &request);
         let mut initial_upload = 0u64;
         if !initial_payload.is_empty() {
             if let Some(limiter) = bandwidth.as_deref() {
@@ -1147,6 +1150,7 @@ impl TrojanServer {
         request: TrojanRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
+        log_trojan_relay_started(&self.config.node_tag, "tls_websocket_udp", &request);
         client.set_nonblocking(true)?;
         let started = Instant::now();
         let mut state = TrojanUdpRelayState::new(self.config.connect_timeout);
@@ -1842,6 +1846,31 @@ fn log_trojan_relay_finished(
             error,
         )
     );
+}
+
+fn log_trojan_relay_started(node_tag: &str, scope: &'static str, request: &TrojanRequest) {
+    if !trojan_trace_enabled() {
+        return;
+    }
+    eprintln!("{}", format_trojan_relay_started(node_tag, scope, request));
+}
+
+fn format_trojan_relay_started(
+    node_tag: &str,
+    scope: &'static str,
+    request: &TrojanRequest,
+) -> String {
+    let client_ip = request
+        .client_ip
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "INFO  core   trojan relay started node_tag={} scope={scope} target={}:{} client_ip={}",
+        trojan_log_field(node_tag),
+        trojan_log_field(&request.target.host),
+        request.target.port,
+        trojan_log_field(&client_ip)
+    )
 }
 
 fn format_trojan_relay_finished(
@@ -4660,6 +4689,30 @@ mod tests {
             line,
             "INFO  core   trojan relay finished node_tag=node_tag scope=tls_websocket target=rr1---sn-n4v7snee.c.youtube.com:443 status=ok first_byte_ms=1 duration_ms=106316 upload_bytes=65052 download_bytes=2954116 finish_reason=remote_eof finish_detail=websocket_read_failed:_connection_reset error=-"
         );
+    }
+
+    #[test]
+    fn formats_trojan_relay_start_without_sensitive_user_fields() {
+        let request = super::TrojanRequest {
+            command: super::TrojanCommand::Tcp,
+            password_hash: "hash-that-must-not-be-logged".to_string(),
+            user_uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            user_id: 7,
+            target: SocksTarget {
+                host: "www.youtube.com".to_string(),
+                port: 443,
+            },
+            client_ip: Some("198.51.100.54".parse().expect("client ip")),
+        };
+
+        let line = super::format_trojan_relay_started("node tag", "tls_websocket", &request);
+
+        assert_eq!(
+            line,
+            "INFO  core   trojan relay started node_tag=node_tag scope=tls_websocket target=www.youtube.com:443 client_ip=198.51.100.54"
+        );
+        assert!(!line.contains("hash-that-must-not-be-logged"));
+        assert!(!line.contains("00000000-0000-0000-0000-000000000000"));
     }
 
     #[test]
