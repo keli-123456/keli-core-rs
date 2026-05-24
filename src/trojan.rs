@@ -18,7 +18,9 @@ use rustls::{
 };
 use sha2::{Digest, Sha224};
 
-use crate::config::{outbound_transport_network, OutboundConfig, OutboundTlsConfig};
+use crate::config::{
+    outbound_transport_network, OutboundConfig, OutboundTlsConfig, PolicyConfig, SniffingConfig,
+};
 use crate::grpc::{connect_grpc_client, GrpcClientStream};
 use crate::http2::{connect_http2_client, local_bridge_for_http2};
 use crate::httpupgrade::connect_httpupgrade_client;
@@ -69,6 +71,8 @@ pub struct TrojanServerConfig {
     pub connection_idle: Duration,
     pub uplink_only: Duration,
     pub downlink_only: Duration,
+    pub sniffing: SniffingConfig,
+    pub sniffing_cache: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -128,8 +132,14 @@ impl TrojanServer {
         let users = UserStore::from_keyed_users(&config.users, |user| {
             trojan_password_hash(user.credential())
         });
-        let router =
-            RouteDispatcher::with_connect_timeout(config.routes.clone(), config.connect_timeout);
+        let mut policy = PolicyConfig::default();
+        policy.connect_timeout_secs = config.connect_timeout.as_secs().clamp(1, 60);
+        policy.sniffing_cache_millis = config.sniffing_cache.as_millis().clamp(1, 60_000) as u64;
+        let router = RouteDispatcher::with_policy_and_sniffing(
+            config.routes.clone(),
+            policy,
+            config.sniffing.clone(),
+        );
         config.users.clear();
         config.routes.clear();
         Self {
@@ -286,10 +296,24 @@ impl TrojanServer {
             let _session = session;
             return self.relay_udp_tls_websocket(websocket, request, bandwidth);
         }
-        let Some(remote) = self.connect_tcp_for_tls_websocket(&websocket, &request)? else {
+        let initial_payload = self.read_initial_tls_websocket_payload(&mut websocket)?;
+        if initial_payload.is_empty() && websocket.peer_closed_nonblocking()? {
+            let _ = websocket.shutdown();
+            return Ok(());
+        }
+        let Some(remote) =
+            self.connect_tcp_for_tls_websocket(&websocket, &request, &initial_payload)?
+        else {
             return Ok(());
         };
-        self.spawn_tls_websocket_relay(websocket, remote, request, bandwidth, session)
+        self.spawn_tls_websocket_relay(
+            websocket,
+            remote,
+            request,
+            bandwidth,
+            session,
+            initial_payload,
+        )
     }
 
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
@@ -320,6 +344,36 @@ impl TrojanServer {
             &request.target,
             self.config.connect_timeout,
         )
+    }
+
+    fn read_initial_tls_websocket_payload(
+        &self,
+        websocket: &mut crate::websocket::WebSocketTlsStream,
+    ) -> io::Result<Vec<u8>> {
+        websocket.set_io_timeout(Some(self.router.sniffing_cache_timeout()))?;
+        let mut buffer = vec![0u8; 16 * 1024];
+        let result = match websocket.read(&mut buffer) {
+            Ok(0) => Ok(Vec::new()),
+            Ok(read) => {
+                buffer.truncate(read);
+                Ok(buffer)
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(Vec::new())
+            }
+            Err(error) => Err(error),
+        };
+        let restore = websocket.set_io_timeout(None);
+        match (result, restore) {
+            (Ok(payload), Ok(())) => Ok(payload),
+            (Err(error), _) => Err(error),
+            (_, Err(error)) => Err(error),
+        }
     }
 
     fn read_request<T>(&self, stream: &mut T) -> io::Result<TrojanRequest>
@@ -657,11 +711,22 @@ impl TrojanServer {
     fn relay_tls_websocket(
         &self,
         client: crate::websocket::WebSocketTlsStream,
-        remote: TcpStream,
+        mut remote: TcpStream,
         request: TrojanRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
+        initial_payload: Vec<u8>,
     ) -> io::Result<()> {
         let relay_started = Instant::now();
+        let mut initial_upload = 0u64;
+        if !initial_payload.is_empty() {
+            if let Some(limiter) = bandwidth.as_deref() {
+                if !limiter.wait_for(initial_payload.len()) {
+                    return Ok(());
+                }
+            }
+            remote.write_all(&initial_payload)?;
+            initial_upload = initial_payload.len() as u64;
+        }
         let stats = match relay_websocket_tls_stream_stats(
             client,
             remote,
@@ -688,7 +753,7 @@ impl TrojanServer {
             &self.config.node_tag,
             "tls_websocket",
             &request,
-            stats.upload,
+            stats.upload.saturating_add(initial_upload),
             stats.download,
             stats.first_byte_ms,
             relay_started.elapsed(),
@@ -698,7 +763,7 @@ impl TrojanServer {
             self.config.node_tag.clone(),
             request.user_uuid,
             Some(request.user_id),
-            stats.upload,
+            stats.upload.saturating_add(initial_upload),
             stats.download,
             request.client_ip,
         );
@@ -736,11 +801,12 @@ impl TrojanServer {
         request: TrojanRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
         session: Option<UserSessionGuard>,
+        initial_payload: Vec<u8>,
     ) -> io::Result<()> {
         let server = self.clone();
         spawn_detached_blocking_relay("keli-core-trojan-relay", move || {
             let _session = session;
-            server.relay_tls_websocket(client, remote, request, bandwidth)
+            server.relay_tls_websocket(client, remote, request, bandwidth, initial_payload)
         })?;
         Ok(())
     }
@@ -754,8 +820,14 @@ impl TrojanServer {
         let node_tag = self.config.node_tag.clone();
         let target = request.target.clone();
         let timeout = self.config.connect_timeout;
-        let (receiver, connector) =
-            spawn_trojan_routed_tcp_connector(node_tag, "websocket", router, target, timeout)?;
+        let (receiver, connector) = spawn_trojan_routed_tcp_connector(
+            node_tag,
+            "websocket",
+            router,
+            target,
+            timeout,
+            Vec::new(),
+        )?;
 
         loop {
             match receiver.recv_timeout(CLIENT_CLOSE_CONNECT_POLL) {
@@ -779,13 +851,20 @@ impl TrojanServer {
         &self,
         client: &crate::websocket::WebSocketTlsStream,
         request: &TrojanRequest,
+        initial_payload: &[u8],
     ) -> io::Result<Option<TcpStream>> {
         let router = self.router.clone();
         let node_tag = self.config.node_tag.clone();
         let target = request.target.clone();
         let timeout = self.config.connect_timeout;
-        let (receiver, connector) =
-            spawn_trojan_routed_tcp_connector(node_tag, "tls_websocket", router, target, timeout)?;
+        let (receiver, connector) = spawn_trojan_routed_tcp_connector(
+            node_tag,
+            "tls_websocket",
+            router,
+            target,
+            timeout,
+            initial_payload.to_vec(),
+        )?;
 
         loop {
             match receiver.recv_timeout(CLIENT_CLOSE_CONNECT_POLL) {
@@ -1306,10 +1385,22 @@ fn connect_trojan_routed_tcp(
     target: &SocksTarget,
     timeout: Duration,
 ) -> io::Result<TcpStream> {
-    match router.decide_tcp(&target.host, target.port, &[]) {
-        RouteDecision::Direct => connect_trojan_direct_target(node_tag, scope, target, timeout),
+    connect_trojan_routed_tcp_with_payload(node_tag, scope, router, target, timeout, &[])
+}
+
+fn connect_trojan_routed_tcp_with_payload(
+    node_tag: &str,
+    scope: &'static str,
+    router: &RouteDispatcher,
+    target: &SocksTarget,
+    timeout: Duration,
+    initial_payload: &[u8],
+) -> io::Result<TcpStream> {
+    let target = router.sniffed_tcp_target(target, initial_payload);
+    match router.decide_tcp(&target.host, target.port, initial_payload) {
+        RouteDecision::Direct => connect_trojan_direct_target(node_tag, scope, &target, timeout),
         RouteDecision::Outbound(outbound) => {
-            connect_trojan_route_tcp_outbound(node_tag, scope, &outbound, target, timeout)
+            connect_trojan_route_tcp_outbound(node_tag, scope, &outbound, &target, timeout)
         }
         RouteDecision::Block => {
             let error = io::Error::new(io::ErrorKind::PermissionDenied, "target blocked by route");
@@ -1333,14 +1424,22 @@ fn spawn_trojan_routed_tcp_connector(
     router: RouteDispatcher,
     target: SocksTarget,
     timeout: Duration,
+    initial_payload: Vec<u8>,
 ) -> io::Result<(
     mpsc::Receiver<io::Result<TcpStream>>,
     tokio::task::JoinHandle<()>,
 )> {
     let (sender, receiver) = mpsc::channel();
     let handle = spawn_background_io(async move {
-        let result =
-            connect_trojan_routed_tcp_tokio(&node_tag, scope, &router, &target, timeout).await;
+        let result = connect_trojan_routed_tcp_tokio(
+            &node_tag,
+            scope,
+            &router,
+            &target,
+            timeout,
+            &initial_payload,
+        )
+        .await;
         let _ = sender.send(result);
     })?;
     Ok((receiver, handle))
@@ -1352,13 +1451,15 @@ async fn connect_trojan_routed_tcp_tokio(
     router: &RouteDispatcher,
     target: &SocksTarget,
     timeout: Duration,
+    initial_payload: &[u8],
 ) -> io::Result<TcpStream> {
-    match router.decide_tcp(&target.host, target.port, &[]) {
+    let target = router.sniffed_tcp_target(target, initial_payload);
+    match router.decide_tcp(&target.host, target.port, initial_payload) {
         RouteDecision::Direct => {
-            connect_trojan_direct_target_tokio(node_tag, scope, target, timeout).await
+            connect_trojan_direct_target_tokio(node_tag, scope, &target, timeout).await
         }
         RouteDecision::Outbound(outbound) => {
-            connect_trojan_route_tcp_outbound_tokio(node_tag, scope, &outbound, target, timeout)
+            connect_trojan_route_tcp_outbound_tokio(node_tag, scope, &outbound, &target, timeout)
                 .await
         }
         RouteDecision::Block => {
@@ -2888,6 +2989,8 @@ mod tests {
             connection_idle: Duration::from_secs(120),
             uplink_only: Duration::from_secs(2),
             downlink_only: Duration::from_secs(4),
+            sniffing: Default::default(),
+            sniffing_cache: Duration::from_millis(200),
         })
     }
 
@@ -2901,6 +3004,8 @@ mod tests {
             connection_idle: Duration::from_secs(120),
             uplink_only: Duration::from_secs(2),
             downlink_only: Duration::from_secs(4),
+            sniffing: Default::default(),
+            sniffing_cache: Duration::from_millis(200),
         })
     }
 
@@ -2914,6 +3019,8 @@ mod tests {
             connection_idle,
             uplink_only: Duration::from_secs(2),
             downlink_only: Duration::from_secs(4),
+            sniffing: Default::default(),
+            sniffing_cache: Duration::from_millis(200),
         })
     }
 
@@ -2931,6 +3038,8 @@ mod tests {
             connection_idle,
             uplink_only,
             downlink_only,
+            sniffing: Default::default(),
+            sniffing_cache: Duration::from_millis(200),
         })
     }
 
@@ -3000,6 +3109,7 @@ mod tests {
                 &router,
                 &target,
                 Duration::from_secs(2),
+                &[],
             ))
             .expect("async routed connect");
         stream.set_nonblocking(false).expect("blocking stream");
@@ -3329,6 +3439,52 @@ mod tests {
         input.extend_from_slice(&target.port().to_be_bytes());
         input.extend_from_slice(b"\r\n");
         input
+    }
+
+    fn tls_client_hello_with_sni(server_name: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        body.extend_from_slice(&[0x11; 32]);
+        body.push(0);
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&0x1301u16.to_be_bytes());
+        body.push(1);
+        body.push(0);
+
+        let mut name = Vec::new();
+        name.push(0);
+        name.extend_from_slice(&(server_name.len() as u16).to_be_bytes());
+        name.extend_from_slice(server_name.as_bytes());
+
+        let mut sni_payload = Vec::new();
+        sni_payload.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        sni_payload.extend_from_slice(&name);
+
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&0u16.to_be_bytes());
+        extensions.extend_from_slice(&(sni_payload.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&sni_payload);
+
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let mut handshake = Vec::new();
+        handshake.push(1);
+        push_u24(&mut handshake, body.len() as u32);
+        handshake.extend_from_slice(&body);
+
+        let mut record = Vec::new();
+        record.push(0x16);
+        record.extend_from_slice(&0x0303u16.to_be_bytes());
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    fn push_u24(output: &mut Vec<u8>, value: u32) {
+        output.push(((value >> 16) & 0xff) as u8);
+        output.push(((value >> 8) & 0xff) as u8);
+        output.push((value & 0xff) as u8);
     }
 
     fn trojan_udp_packet(target: SocketAddr, payload: &[u8]) -> Vec<u8> {
@@ -4425,6 +4581,60 @@ mod tests {
             None,
             true,
         ));
+    }
+
+    #[test]
+    fn tls_websocket_tcp_relay_uses_tls_sni_before_connecting_fake_ip_target() {
+        let cert = test_cert("trojan-ws-sniff");
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let fake_target = SocketAddr::new("127.0.0.2".parse().expect("fake ip"), echo_addr.port());
+        let client_hello = tls_client_hello_with_sni("localhost");
+        let expected = client_hello.clone();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut received = vec![0u8; expected.len()];
+            stream
+                .read_exact(&mut received)
+                .expect("sniffed payload forwarded");
+            assert_eq!(received, expected);
+            stream.write_all(b"pong").expect("echo write");
+        });
+
+        let server = server();
+        let listener = server.bind().expect("trojan bind");
+        let trojan_addr = listener.local_addr().expect("trojan addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("trojan accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            server.handle_tls_websocket_client(client, Some("/trojan"))
+        });
+
+        let mut client = tls_client(trojan_addr, cert.cert_der.clone());
+        client
+            .write_all(&websocket_request_with_forwarded_for(
+                "/trojan",
+                "198.51.100.54",
+            ))
+            .expect("websocket request");
+        let response = read_websocket_response(&mut client);
+        assert!(response.contains("101 Switching Protocols"));
+        client
+            .write_all(&masked_frame(&trojan_request(fake_target)))
+            .expect("trojan request frame");
+        client
+            .write_all(&masked_frame(&client_hello))
+            .expect("client hello frame");
+        assert_eq!(read_binary_frame(&mut client), b"pong");
+        drop(client);
+
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve once");
+        echo_thread.join().expect("echo thread");
     }
 
     #[test]

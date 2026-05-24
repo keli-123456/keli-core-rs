@@ -174,6 +174,7 @@ impl CoreService {
         let connection_idle = connection_idle_timeout(&config.policy);
         let uplink_only = uplink_only_timeout(&config.policy);
         let downlink_only = downlink_only_timeout(&config.policy);
+        let sniffing_cache = sniffing_cache_timeout(&config.policy);
         let active_config = config_without_users(&config);
 
         let traffic = TrafficRegistry::shared();
@@ -250,6 +251,7 @@ impl CoreService {
                     connection_idle,
                     uplink_only,
                     downlink_only,
+                    sniffing_cache,
                     traffic.clone(),
                     sessions.clone(),
                     bandwidth.clone(),
@@ -480,6 +482,10 @@ fn uplink_only_timeout(policy: &PolicyConfig) -> Duration {
 
 fn downlink_only_timeout(policy: &PolicyConfig) -> Duration {
     Duration::from_secs(policy.downlink_only_secs.max(1))
+}
+
+fn sniffing_cache_timeout(policy: &PolicyConfig) -> Duration {
+    Duration::from_millis(policy.sniffing_cache_millis.max(1))
 }
 
 fn outbound_connect_timeout_from_env(value: Option<String>, default_secs: u64) -> Duration {
@@ -1214,6 +1220,7 @@ fn start_trojan_listener(
     connection_idle: Duration,
     uplink_only: Duration,
     downlink_only: Duration,
+    sniffing_cache: Duration,
     traffic: SharedTrafficRegistry,
     sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
@@ -1235,6 +1242,8 @@ fn start_trojan_listener(
             connection_idle,
             uplink_only,
             downlink_only,
+            sniffing: inbound.sniffing.clone(),
+            sniffing_cache,
         },
         traffic,
         sessions,

@@ -3169,6 +3169,8 @@ fn start_trojan_server(
         connection_idle: Duration::from_secs(120),
         uplink_only: Duration::from_secs(2),
         downlink_only: Duration::from_secs(4),
+        sniffing: Default::default(),
+        sniffing_cache: Duration::from_millis(200),
     });
     let listener = server.bind()?;
     listener.set_nonblocking(true)?;

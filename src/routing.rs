@@ -522,6 +522,7 @@ mod tests {
     use crate::config::{OutboundConfig, RouteAction, RouteRule, SniffingConfig};
     use crate::dispatcher::RouteDispatcher;
     use crate::routing::{route_protocol_labels, RouteDecision, RouteMatcher};
+    use crate::socks5::SocksTarget;
 
     use super::{matches_geoip_rule, matches_geosite_domain, matches_geosite_rule};
 
@@ -774,6 +775,29 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_overrides_ip_target_with_tls_sni_when_sniffing_is_enabled() {
+        let dispatcher = RouteDispatcher::with_sniffing(
+            Vec::new(),
+            SniffingConfig {
+                enabled: true,
+                dest_override: vec!["tls".to_string()],
+            },
+        );
+        let target = SocksTarget {
+            host: "198.18.0.42".to_string(),
+            port: 443,
+        };
+
+        let sniffed = dispatcher.sniffed_tcp_target(
+            &target,
+            &tls_client_hello_with_sni("rr5---sn-test.googlevideo.com"),
+        );
+
+        assert_eq!(sniffed.host, "rr5---sn-test.googlevideo.com");
+        assert_eq!(sniffed.port, 443);
+    }
+
+    #[test]
     fn dispatcher_ignores_payload_when_sniffing_is_disabled() {
         let dispatcher = RouteDispatcher::with_sniffing(
             vec![RouteRule {
@@ -855,5 +879,51 @@ mod tests {
 
         assert_eq!(target.host, "127.0.0.1");
         assert_eq!(target.port, 8443);
+    }
+
+    fn tls_client_hello_with_sni(server_name: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        body.extend_from_slice(&[0x11; 32]);
+        body.push(0);
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&0x1301u16.to_be_bytes());
+        body.push(1);
+        body.push(0);
+
+        let mut name = Vec::new();
+        name.push(0);
+        name.extend_from_slice(&(server_name.len() as u16).to_be_bytes());
+        name.extend_from_slice(server_name.as_bytes());
+
+        let mut sni_payload = Vec::new();
+        sni_payload.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        sni_payload.extend_from_slice(&name);
+
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&0u16.to_be_bytes());
+        extensions.extend_from_slice(&(sni_payload.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&sni_payload);
+
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let mut handshake = Vec::new();
+        handshake.push(1);
+        push_u24(&mut handshake, body.len() as u32);
+        handshake.extend_from_slice(&body);
+
+        let mut record = Vec::new();
+        record.push(0x16);
+        record.extend_from_slice(&0x0303u16.to_be_bytes());
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    fn push_u24(output: &mut Vec<u8>, value: u32) {
+        output.push(((value >> 16) & 0xff) as u8);
+        output.push(((value >> 8) & 0xff) as u8);
+        output.push((value & 0xff) as u8);
     }
 }
