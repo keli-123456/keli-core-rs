@@ -32,8 +32,8 @@ use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
-    relay_tcp_fast_unlimited, relay_tcp_limited, spawn_detached_blocking_relay,
-    spawn_native_blocking_relay,
+    relay_tcp_fast_unlimited, relay_tcp_limited, spawn_background_io,
+    spawn_detached_blocking_relay, spawn_native_blocking_relay,
 };
 use crate::tls::{relay_tls_stream, TlsConnection};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
@@ -43,7 +43,10 @@ use crate::websocket::{
     relay_websocket_tls_stream_stats, websocket_relay_idle_limit, websocket_tls_relay_idle_timeout,
     WebSocketClientStream, WebSocketReader, WebSocketRelayTimeouts, WebSocketWriter,
 };
-use crate::{connect_tcp_outbound, send_udp_outbound, RouteDecision, RouteDispatcher};
+use crate::{
+    connect_tcp_outbound, connect_tcp_outbound_tokio, send_udp_outbound, RouteDecision,
+    RouteDispatcher,
+};
 
 const COMMAND_TCP: u8 = 0x01;
 const COMMAND_UDP_ASSOCIATE: u8 = 0x03;
@@ -53,7 +56,6 @@ const ATYP_IPV6: u8 = 0x04;
 const TROJAN_PASSWORD_HEX_LEN: usize = 56;
 const MAX_UDP_PACKET_SIZE: usize = 65_535;
 const CLIENT_CLOSE_CONNECT_POLL: Duration = Duration::from_millis(10);
-const TROJAN_CONNECT_THREAD_STACK: usize = 256 * 1024;
 const TROJAN_TRACE_ENV: &str = "KELI_CORE_TROJAN_TRACE";
 const TROJAN_ROUTE_SLOW_LOG_MS: u128 = 1_000;
 
@@ -752,37 +754,24 @@ impl TrojanServer {
         let node_tag = self.config.node_tag.clone();
         let target = request.target.clone();
         let timeout = self.config.connect_timeout;
-        let (sender, receiver) = mpsc::channel();
-        thread::Builder::new()
-            .name("keli-core-trojan-connect".to_string())
-            .stack_size(TROJAN_CONNECT_THREAD_STACK)
-            .spawn(move || {
-                let result =
-                    connect_trojan_routed_tcp(&node_tag, "websocket", &router, &target, timeout);
-                let _ = sender.send(result);
-            })
-            .map_err(|source| {
-                io::Error::new(
-                    source.kind(),
-                    format!("spawn trojan websocket connect worker: {source}"),
-                )
-            })?;
+        let (receiver, connector) =
+            spawn_trojan_routed_tcp_connector(node_tag, "websocket", router, target, timeout)?;
 
         loop {
-            match receiver.try_recv() {
+            match receiver.recv_timeout(CLIENT_CLOSE_CONNECT_POLL) {
                 Ok(result) => return result.map(Some),
-                Err(mpsc::TryRecvError::Disconnected) => {
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(io::Error::other(
                         "trojan websocket connect worker stopped before sending result",
                     ));
                 }
-                Err(mpsc::TryRecvError::Empty) => {}
             }
             if client.peer_closed_nonblocking()? {
+                connector.abort();
                 let _ = client.shutdown();
                 return Ok(None);
             }
-            thread::sleep(CLIENT_CLOSE_CONNECT_POLL);
         }
     }
 
@@ -795,32 +784,15 @@ impl TrojanServer {
         let node_tag = self.config.node_tag.clone();
         let target = request.target.clone();
         let timeout = self.config.connect_timeout;
-        let (sender, receiver) = mpsc::channel();
-        thread::Builder::new()
-            .name("keli-core-trojan-connect".to_string())
-            .stack_size(TROJAN_CONNECT_THREAD_STACK)
-            .spawn(move || {
-                let result = connect_trojan_routed_tcp(
-                    &node_tag,
-                    "tls_websocket",
-                    &router,
-                    &target,
-                    timeout,
-                );
-                let _ = sender.send(result);
-            })
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("failed to spawn trojan outbound connector: {error}"),
-                )
-            })?;
+        let (receiver, connector) =
+            spawn_trojan_routed_tcp_connector(node_tag, "tls_websocket", router, target, timeout)?;
 
         loop {
             match receiver.recv_timeout(CLIENT_CLOSE_CONNECT_POLL) {
                 Ok(result) => return result.map(Some),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if client.peer_closed_nonblocking()? {
+                        connector.abort();
                         let _ = client.shutdown();
                         return Ok(None);
                     }
@@ -1331,6 +1303,56 @@ fn connect_trojan_routed_tcp(
     }
 }
 
+fn spawn_trojan_routed_tcp_connector(
+    node_tag: String,
+    scope: &'static str,
+    router: RouteDispatcher,
+    target: SocksTarget,
+    timeout: Duration,
+) -> io::Result<(
+    mpsc::Receiver<io::Result<TcpStream>>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let (sender, receiver) = mpsc::channel();
+    let handle = spawn_background_io(async move {
+        let result =
+            connect_trojan_routed_tcp_tokio(&node_tag, scope, &router, &target, timeout).await;
+        let _ = sender.send(result);
+    })?;
+    Ok((receiver, handle))
+}
+
+async fn connect_trojan_routed_tcp_tokio(
+    node_tag: &str,
+    scope: &'static str,
+    router: &RouteDispatcher,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    match router.decide_tcp(&target.host, target.port, &[]) {
+        RouteDecision::Direct => {
+            connect_trojan_direct_target_tokio(node_tag, scope, target, timeout).await
+        }
+        RouteDecision::Outbound(outbound) => {
+            connect_trojan_route_tcp_outbound_tokio(node_tag, scope, &outbound, target, timeout)
+                .await
+        }
+        RouteDecision::Block => {
+            let error = io::Error::new(io::ErrorKind::PermissionDenied, "target blocked by route");
+            record_trojan_connection_error(node_tag, scope, &error);
+            Err(error)
+        }
+        RouteDecision::UnsupportedOutbound(tag) => {
+            let error = io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("outbound route {tag} is not implemented"),
+            );
+            record_trojan_connection_error(node_tag, scope, &error);
+            Err(error)
+        }
+    }
+}
+
 fn connect_trojan_direct_target(
     node_tag: &str,
     scope: &'static str,
@@ -1343,6 +1365,45 @@ fn connect_trojan_direct_target(
             log_trojan_direct_connected(node_tag, scope, target, started.elapsed());
             Ok(stream)
         }
+        Err(error) => {
+            let error = annotate_trojan_direct_connect_error(
+                node_tag,
+                scope,
+                target,
+                started.elapsed(),
+                error,
+            );
+            record_trojan_connection_error(node_tag, scope, &error);
+            Err(error)
+        }
+    }
+}
+
+async fn connect_trojan_direct_target_tokio(
+    node_tag: &str,
+    scope: &'static str,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let started = Instant::now();
+    match crate::dns::connect_tcp_tokio(&target.host, target.port, timeout).await {
+        Ok(stream) => match stream.into_std() {
+            Ok(stream) => {
+                log_trojan_direct_connected(node_tag, scope, target, started.elapsed());
+                Ok(stream)
+            }
+            Err(error) => {
+                let error = annotate_trojan_direct_connect_error(
+                    node_tag,
+                    scope,
+                    target,
+                    started.elapsed(),
+                    error,
+                );
+                record_trojan_connection_error(node_tag, scope, &error);
+                Err(error)
+            }
+        },
         Err(error) => {
             let error = annotate_trojan_direct_connect_error(
                 node_tag,
@@ -1376,6 +1437,54 @@ fn connect_trojan_route_tcp_outbound(
             );
             Ok(stream)
         }
+        Err(error) => {
+            let error = annotate_trojan_route_outbound_error(
+                node_tag,
+                scope,
+                outbound,
+                target,
+                started.elapsed(),
+                error,
+            );
+            record_trojan_connection_error(node_tag, scope, &error);
+            Err(error)
+        }
+    }
+}
+
+async fn connect_trojan_route_tcp_outbound_tokio(
+    node_tag: &str,
+    scope: &'static str,
+    outbound: &OutboundConfig,
+    target: &SocksTarget,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let started = Instant::now();
+    match connect_tcp_outbound_tokio(outbound, target, timeout).await {
+        Ok(stream) => match stream.into_std() {
+            Ok(stream) => {
+                log_trojan_route_outbound_connected(
+                    node_tag,
+                    scope,
+                    outbound,
+                    target,
+                    started.elapsed(),
+                );
+                Ok(stream)
+            }
+            Err(error) => {
+                let error = annotate_trojan_route_outbound_error(
+                    node_tag,
+                    scope,
+                    outbound,
+                    target,
+                    started.elapsed(),
+                    error,
+                );
+                record_trojan_connection_error(node_tag, scope, &error);
+                Err(error)
+            }
+        },
         Err(error) => {
             let error = annotate_trojan_route_outbound_error(
                 node_tag,
@@ -2622,6 +2731,7 @@ mod tests {
     };
     use crate::user::{CoreUser, CoreUserDelta};
     use crate::websocket::accept_websocket;
+    use crate::RouteDispatcher;
 
     struct MemoryStream {
         input: Cursor<Vec<u8>>,
@@ -2756,6 +2866,42 @@ mod tests {
             )),
             "invalid_request"
         );
+    }
+
+    #[test]
+    fn async_routed_connector_connects_direct_target() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("target bind");
+        let target_addr = listener.local_addr().expect("target addr");
+        let target_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("target accept");
+            stream.write_all(b"ok").expect("target response");
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let router = RouteDispatcher::with_connect_timeout(Vec::new(), Duration::from_secs(2));
+        let target = SocksTarget {
+            host: target_addr.ip().to_string(),
+            port: target_addr.port(),
+        };
+
+        let mut stream = runtime
+            .block_on(super::connect_trojan_routed_tcp_tokio(
+                "panel|trojan|1",
+                "tls_websocket",
+                &router,
+                &target,
+                Duration::from_secs(2),
+            ))
+            .expect("async routed connect");
+        stream.set_nonblocking(false).expect("blocking stream");
+        let mut response = [0u8; 2];
+        stream.read_exact(&mut response).expect("read response");
+        assert_eq!(&response, b"ok");
+        target_thread.join().expect("target thread");
     }
 
     #[test]
