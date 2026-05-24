@@ -141,6 +141,7 @@ CERT_DIR="${ROOT_DIR}/runtime/interop-certs"
 CA_PATH="${CERT_DIR}/naive-${SERVER_NAME}-ca.crt"
 CA_KEY_PATH="${CERT_DIR}/naive-${SERVER_NAME}-ca.key"
 CERT_PATH="${CERT_DIR}/naive-${SERVER_NAME}.crt"
+CHAIN_CERT_PATH="${CERT_DIR}/naive-${SERVER_NAME}-chain.crt"
 KEY_PATH="${CERT_DIR}/naive-${SERVER_NAME}.key"
 CSR_PATH="${CERT_DIR}/naive-${SERVER_NAME}.csr"
 CA_OPENSSL_CNF="${CERT_DIR}/naive-${SERVER_NAME}.ca.openssl.cnf"
@@ -241,6 +242,8 @@ openssl x509 -req \
   -extensions v3_req \
   -extfile "${OPENSSL_CNF}" >/dev/null 2>&1
 
+cat "${CERT_PATH}" "${CA_PATH}" > "${CHAIN_CERT_PATH}"
+
 sudo cp "${CA_PATH}" "${SYSTEM_CERT}"
 sudo update-ca-certificates >/dev/null
 CERT_INSTALLED=1
@@ -271,7 +274,7 @@ args=(
   --client naive
   --naive "${NAIVE_BIN}"
   --only "${CASE}"
-  --tls-cert "${CERT_PATH}"
+  --tls-cert "${CHAIN_CERT_PATH}"
   --tls-key "${KEY_PATH}"
   --naive-server-name "${SERVER_NAME}"
   --probe-rounds "${ROUNDS}"
@@ -294,4 +297,4 @@ if [[ -n "${MAX_P99_MS}" ]]; then
   args+=(--max-p99-ms "${MAX_P99_MS}")
 fi
 
-cargo run --locked --release --example interop_matrix -- "${args[@]}"
+SSL_CERT_FILE="${CA_PATH}" cargo run --locked --release --example interop_matrix -- "${args[@]}"

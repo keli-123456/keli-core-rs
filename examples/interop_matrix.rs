@@ -2106,7 +2106,15 @@ fn start_naive_proxy_process(
     args: &Args,
     socks_port: u16,
 ) -> Result<ProcessGuard> {
-    let naive_args = naive_proxy_process_args(config_path, args.naive_ignore_spki_list.as_deref());
+    let ssl_cert_file = env::var("SSL_CERT_FILE").ok();
+    let naive_args = naive_proxy_process_args(
+        config_path,
+        args.naive_ignore_spki_list.as_deref(),
+        ssl_cert_file.as_deref(),
+        case.naive_proxy
+            .as_deref()
+            .is_some_and(|proxy| proxy.starts_with("quic://")),
+    );
     let mut naive = start_process(
         &format!("naive-{}", case.name),
         naive_path,
@@ -2118,7 +2126,12 @@ fn start_naive_proxy_process(
     Ok(naive)
 }
 
-fn naive_proxy_process_args(config_path: &Path, ignore_spki_list: Option<&str>) -> Vec<String> {
+fn naive_proxy_process_args(
+    config_path: &Path,
+    ignore_spki_list: Option<&str>,
+    ssl_cert_file: Option<&str>,
+    disable_post_quantum: bool,
+) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(spki_list) = ignore_spki_list.filter(|value| !value.is_empty()) {
         args.push(format!(
@@ -2126,6 +2139,13 @@ fn naive_proxy_process_args(config_path: &Path, ignore_spki_list: Option<&str>) 
             config_path.with_extension("profile").display()
         ));
         args.push(format!("--ignore-certificate-errors-spki-list={spki_list}"));
+        args.push("--allow_unknown_root_cert".to_string());
+    }
+    if let Some(path) = ssl_cert_file.filter(|value| !value.is_empty()) {
+        args.push(format!("--env=SSL_CERT_FILE={path}"));
+    }
+    if disable_post_quantum {
+        args.push("--no-post-quantum".to_string());
     }
     args.push(config_path.display().to_string());
     args
@@ -2672,16 +2692,46 @@ mod tests {
 
     #[test]
     fn passes_naiveproxy_spki_allowlist_as_process_switch() {
-        let args = naive_proxy_process_args(Path::new("config.json"), Some("abc123"));
+        let args = naive_proxy_process_args(Path::new("config.json"), Some("abc123"), None, false);
 
         assert_eq!(
             args,
             vec![
                 "--user-data-dir=config.profile".to_string(),
                 "--ignore-certificate-errors-spki-list=abc123".to_string(),
+                "--allow_unknown_root_cert".to_string(),
                 "config.json".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn passes_naiveproxy_ssl_cert_file_as_process_env_switch() {
+        let args = naive_proxy_process_args(
+            Path::new("config.json"),
+            Some("abc123"),
+            Some("/tmp/keli-naive-ca.crt"),
+            false,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "--user-data-dir=config.profile".to_string(),
+                "--ignore-certificate-errors-spki-list=abc123".to_string(),
+                "--allow_unknown_root_cert".to_string(),
+                "--env=SSL_CERT_FILE=/tmp/keli-naive-ca.crt".to_string(),
+                "config.json".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn passes_naiveproxy_no_post_quantum_for_quic_proxy() {
+        let args = naive_proxy_process_args(Path::new("config.json"), Some("abc123"), None, true);
+
+        assert!(args.contains(&"--no-post-quantum".to_string()));
+        assert_eq!(args.last().map(String::as_str), Some("config.json"));
     }
 
     #[test]
