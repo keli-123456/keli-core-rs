@@ -571,13 +571,7 @@ impl RawTcpStreamAccess for PrefixedTcpStream {
         if wait_self && !self.raw_tcp_stream_ready() {
             return Ok(());
         }
-        RawTcpStreamAccess::wait_readable_with(
-            &self.socket,
-            other,
-            wait_self,
-            wait_other,
-            timeout,
-        )
+        RawTcpStreamAccess::wait_readable_with(&self.socket, other, wait_self, wait_other, timeout)
     }
 
     fn into_raw_tcp_stream(self) -> TcpStream {
