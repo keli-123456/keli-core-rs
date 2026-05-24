@@ -465,14 +465,18 @@ impl TrojanServer {
                 match reader.read(&mut client_buffer) {
                     Ok(0) => {
                         upload_done = true;
-                        let _ = remote.shutdown(Shutdown::Write);
+                        download_done = true;
+                        let _ = writer.shutdown();
+                        let _ = remote.shutdown(Shutdown::Both);
                         progressed = true;
                     }
                     Ok(read) => {
                         if let Some(limiter) = bandwidth.as_deref() {
                             if !limiter.wait_for(read) {
                                 upload_done = true;
-                                let _ = remote.shutdown(Shutdown::Write);
+                                download_done = true;
+                                let _ = writer.shutdown();
+                                let _ = remote.shutdown(Shutdown::Both);
                                 continue;
                             }
                         }
@@ -493,7 +497,9 @@ impl TrojanServer {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                     Err(_) => {
                         upload_done = true;
-                        let _ = remote.shutdown(Shutdown::Write);
+                        download_done = true;
+                        let _ = writer.shutdown();
+                        let _ = remote.shutdown(Shutdown::Both);
                         progressed = true;
                     }
                 }
@@ -3871,24 +3877,17 @@ mod tests {
     }
 
     #[test]
-    fn tls_websocket_upload_eof_keeps_downlink_until_remote_response_like_go() {
-        let cert = test_cert("trojan-ws-upload-eof");
+    fn tls_websocket_client_disconnect_before_remote_response_releases_relay_like_go() {
+        let cert = test_cert("trojan-ws-client-disconnect");
         let remote = TcpListener::bind("127.0.0.1:0").expect("remote bind");
         let remote_addr = remote.local_addr().expect("remote addr");
+        let (release_remote_tx, release_remote_rx) = mpsc::channel();
         let remote_thread = thread::spawn(move || {
             let (mut stream, _) = remote.accept().expect("remote accept");
             let mut bytes = [0u8; 4];
             stream.read_exact(&mut bytes).expect("remote read");
             assert_eq!(&bytes, b"ping");
-
-            let mut eof = [0u8; 1];
-            let read = stream.read(&mut eof).expect("remote upload eof");
-            assert_eq!(read, 0);
-
-            thread::sleep(Duration::from_millis(50));
-            stream
-                .write_all(b"pong")
-                .expect("remote response after upload eof");
+            let _ = release_remote_rx.recv_timeout(Duration::from_secs(3));
         });
 
         let server = server();
@@ -3922,24 +3921,32 @@ mod tests {
             .expect("trojan request frame");
         client.write_all(&masked_frame(b"ping")).expect("payload");
         client.flush().expect("flush payload");
-        client
-            .sock
-            .shutdown(Shutdown::Write)
-            .expect("client upload eof");
-
-        assert_eq!(read_binary_frame(&mut client), b"pong");
         drop(client);
 
         server_thread
             .join()
             .expect("server thread")
             .expect("serve once");
+
+        let mut records = Vec::new();
+        for _ in 0..25 {
+            records = server.drain_traffic(0);
+            if !records.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        release_remote_tx.send(()).expect("release remote");
         remote_thread.join().expect("remote thread");
 
-        let records = drain_trojan_traffic_eventually(&server, 1);
-        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records.len(),
+            1,
+            "websocket client disconnect should release relay without waiting for remote EOF"
+        );
         assert_eq!(records[0].upload, 4);
-        assert_eq!(records[0].download, 4);
+        assert_eq!(records[0].download, 0);
     }
 
     #[test]
