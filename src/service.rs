@@ -2532,7 +2532,7 @@ mod tests {
         CoreConfig, DnsConfig, InboundConfig, OutboundConfig, PolicyConfig, RealityConfig,
         SniffingConfig, StatsConfig, TlsConfig, TransportConfig,
     };
-    use crate::grpc::{decode_hunk_message, encode_grpc_hunk, take_grpc_message};
+    use crate::grpc::{decode_hunk_message, encode_grpc_hunk, send_grpc_data, take_grpc_message};
     use crate::protocol::Protocol;
     use crate::service::CoreService;
     use crate::tls::TlsAcceptor;
@@ -3594,15 +3594,16 @@ mod tests {
                 .body(())
                 .expect("grpc request");
             let (response, mut send) = client.send_request(request, false).expect("send request");
-            send.send_data(
+            send_grpc_data(
+                &mut send,
                 Bytes::from(encode_grpc_hunk(&vless_tcp_request(echo_addr))),
                 false,
             )
+            .await
             .expect("send vless request");
-            tokio::task::yield_now().await;
-            send.send_data(Bytes::from(encode_grpc_hunk(b"ping")), true)
+            send_grpc_data(&mut send, Bytes::from(encode_grpc_hunk(b"ping")), true)
+                .await
                 .expect("send vless payload");
-            tokio::task::yield_now().await;
 
             let response = response.await.expect("grpc response");
             assert_eq!(response.status(), http::StatusCode::OK);

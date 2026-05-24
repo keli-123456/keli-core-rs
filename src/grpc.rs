@@ -1,3 +1,4 @@
+use std::future::poll_fn;
 use std::io::{self, Read, Write};
 use std::net::Ipv6Addr;
 use std::sync::{mpsc, Arc};
@@ -233,10 +234,9 @@ async fn write_grpc_client_hunks(
     mut rx: UnboundedReceiver<Vec<u8>>,
 ) -> io::Result<()> {
     while let Some(payload) = rx.recv().await {
-        send.send_data(Bytes::from(encode_grpc_hunk(&payload)), false)
-            .map_err(io_other)?;
+        send_grpc_data(send, Bytes::from(encode_grpc_hunk(&payload)), false).await?;
     }
-    send.send_data(Bytes::new(), true).map_err(io_other)
+    send_grpc_data(send, Bytes::new(), true).await
 }
 
 fn grpc_tls_client_config(tls: &OutboundTlsConfig) -> Arc<ClientConfig> {
@@ -390,12 +390,44 @@ async fn write_grpc_hunks(
     mut rx: UnboundedReceiver<Vec<u8>>,
 ) -> io::Result<()> {
     while let Some(payload) = rx.recv().await {
-        send.send_data(Bytes::from(encode_grpc_hunk(&payload)), false)
-            .map_err(io_other)?;
+        send_grpc_data(send, Bytes::from(encode_grpc_hunk(&payload)), false).await?;
     }
     let mut trailers = HeaderMap::new();
     trailers.insert("grpc-status", "0".parse().map_err(io_other)?);
     send.send_trailers(trailers).map_err(io_other)
+}
+
+pub(crate) async fn send_grpc_data(
+    send: &mut h2::SendStream<Bytes>,
+    mut data: Bytes,
+    end_stream: bool,
+) -> io::Result<()> {
+    if data.is_empty() {
+        return send.send_data(data, end_stream).map_err(io_other);
+    }
+
+    while !data.is_empty() {
+        send.reserve_capacity(data.len());
+        let capacity = loop {
+            match poll_fn(|cx| send.poll_capacity(cx)).await {
+                Some(Ok(capacity)) if capacity > 0 => break capacity,
+                Some(Ok(_)) => continue,
+                Some(Err(error)) => return Err(io_other(error)),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "grpc stream closed before data capacity was assigned",
+                    ));
+                }
+            }
+        };
+        let chunk_len = capacity.min(data.len());
+        let chunk = data.split_to(chunk_len);
+        let chunk_ends_stream = end_stream && data.is_empty();
+        send.send_data(chunk, chunk_ends_stream).map_err(io_other)?;
+    }
+
+    Ok(())
 }
 
 pub(crate) fn take_grpc_message(buffer: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {
