@@ -43,6 +43,7 @@ pub(crate) struct WebSocketRelayStats {
     pub upload: u64,
     pub download: u64,
     pub first_byte_ms: Option<u128>,
+    pub finish_reason: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,6 +207,7 @@ pub(crate) fn relay_websocket_tls_stream_stats(
 
     let started = Instant::now();
     let mut stats = WebSocketRelayStats::default();
+    stats.finish_reason = "completed";
     let mut upload_done = false;
     let mut download_done = false;
     let mut client_buffer = [0u8; 16 * 1024];
@@ -220,6 +222,7 @@ pub(crate) fn relay_websocket_tls_stream_stats(
             match client.read(&mut client_buffer) {
                 Ok(0) => {
                     upload_done = true;
+                    remember_websocket_finish_reason(&mut stats, "client_eof");
                     let _ = remote.shutdown(Shutdown::Write);
                     progressed = true;
                 }
@@ -228,6 +231,7 @@ pub(crate) fn relay_websocket_tls_stream_stats(
                         if !limiter.wait_for(read) {
                             upload_done = true;
                             download_done = true;
+                            stats.finish_reason = "bandwidth_limiter_closed";
                             shutdown_websocket_tls_pair(&mut client, &remote);
                             continue;
                         }
@@ -240,6 +244,7 @@ pub(crate) fn relay_websocket_tls_stream_stats(
                 Err(_) => {
                     upload_done = true;
                     download_done = true;
+                    remember_websocket_finish_reason(&mut stats, "client_read_error");
                     shutdown_websocket_tls_pair(&mut client, &remote);
                     progressed = true;
                 }
@@ -250,6 +255,7 @@ pub(crate) fn relay_websocket_tls_stream_stats(
             match remote.read(&mut remote_buffer) {
                 Ok(0) => {
                     download_done = true;
+                    remember_websocket_finish_reason(&mut stats, "remote_eof");
                     progressed = true;
                 }
                 Ok(read) => {
@@ -264,6 +270,7 @@ pub(crate) fn relay_websocket_tls_stream_stats(
                 Err(_) => {
                     download_done = true;
                     upload_done = true;
+                    remember_websocket_finish_reason(&mut stats, "remote_read_error");
                     shutdown_websocket_tls_pair(&mut client, &remote);
                     progressed = true;
                 }
@@ -274,6 +281,7 @@ pub(crate) fn relay_websocket_tls_stream_stats(
             let idle_limit = websocket_relay_idle_limit(&timeouts, upload_done, download_done);
             let idle_elapsed = idle_since.elapsed();
             if idle_elapsed >= idle_limit {
+                stats.finish_reason = websocket_relay_timeout_reason(upload_done, download_done);
                 upload_done = true;
                 download_done = true;
                 shutdown_websocket_tls_pair(&mut client, &remote);
@@ -293,6 +301,12 @@ pub(crate) fn relay_websocket_tls_stream_stats(
     }
 
     Ok(stats)
+}
+
+fn remember_websocket_finish_reason(stats: &mut WebSocketRelayStats, reason: &'static str) {
+    if stats.finish_reason == "completed" {
+        stats.finish_reason = reason;
+    }
 }
 
 fn shutdown_websocket_tls_pair(client: &mut WebSocketTlsStream, remote: &TcpStream) {
@@ -484,6 +498,19 @@ pub(crate) fn websocket_relay_idle_limit(
         timeouts.uplink_only
     } else {
         timeouts.connection_idle
+    }
+}
+
+pub(crate) fn websocket_relay_timeout_reason(
+    upload_done: bool,
+    download_done: bool,
+) -> &'static str {
+    if upload_done && !download_done {
+        "downlink_only_timeout"
+    } else if !upload_done && download_done {
+        "uplink_only_timeout"
+    } else {
+        "connection_idle_timeout"
     }
 }
 

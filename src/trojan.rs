@@ -42,8 +42,9 @@ use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::websocket::{
     accept_websocket_tls_with_client_ip, accept_websocket_with_client_ip, connect_websocket_client,
-    relay_websocket_tls_stream_stats, websocket_relay_idle_limit, websocket_tls_relay_idle_timeout,
-    WebSocketClientStream, WebSocketReader, WebSocketRelayTimeouts, WebSocketWriter,
+    relay_websocket_tls_stream_stats, websocket_relay_idle_limit, websocket_relay_timeout_reason,
+    websocket_tls_relay_idle_timeout, WebSocketClientStream, WebSocketReader,
+    WebSocketRelayTimeouts, WebSocketWriter,
 };
 use crate::{
     connect_tcp_outbound, connect_tcp_outbound_tokio, send_udp_outbound, RouteDecision,
@@ -509,6 +510,7 @@ impl TrojanServer {
         let mut download = 0u64;
         let mut first_byte_ms = None::<u128>;
         let mut relay_error = None::<io::Error>;
+        let mut finish_reason = "completed";
         let mut upload_done = false;
         let mut download_done = false;
         let mut client_buffer = [0u8; 16 * 1024];
@@ -523,6 +525,7 @@ impl TrojanServer {
                 match reader.read(&mut client_buffer) {
                     Ok(0) => {
                         upload_done = true;
+                        remember_trojan_finish_reason(&mut finish_reason, "client_eof");
                         let _ = remote.shutdown(Shutdown::Write);
                         progressed = true;
                     }
@@ -531,6 +534,7 @@ impl TrojanServer {
                             if !limiter.wait_for(read) {
                                 upload_done = true;
                                 download_done = true;
+                                finish_reason = "bandwidth_limiter_closed";
                                 let _ = writer.shutdown();
                                 let _ = remote.shutdown(Shutdown::Both);
                                 continue;
@@ -542,6 +546,7 @@ impl TrojanServer {
                             }
                             Err(error) => {
                                 relay_error = Some(error);
+                                finish_reason = "remote_write_error";
                                 upload_done = true;
                                 download_done = true;
                                 let _ = writer.shutdown();
@@ -554,6 +559,7 @@ impl TrojanServer {
                     Err(_) => {
                         upload_done = true;
                         download_done = true;
+                        remember_trojan_finish_reason(&mut finish_reason, "client_read_error");
                         let _ = writer.shutdown();
                         let _ = remote.shutdown(Shutdown::Both);
                         progressed = true;
@@ -565,6 +571,7 @@ impl TrojanServer {
                 match remote.read(&mut remote_buffer) {
                     Ok(0) => {
                         download_done = true;
+                        remember_trojan_finish_reason(&mut finish_reason, "remote_eof");
                         progressed = true;
                     }
                     Ok(read) => {
@@ -577,6 +584,7 @@ impl TrojanServer {
                             }
                             Err(error) => {
                                 relay_error = Some(error);
+                                finish_reason = "client_write_error";
                                 download_done = true;
                                 upload_done = true;
                                 let _ = writer.shutdown();
@@ -590,6 +598,7 @@ impl TrojanServer {
                     Err(_) => {
                         download_done = true;
                         upload_done = true;
+                        remember_trojan_finish_reason(&mut finish_reason, "remote_read_error");
                         let _ = writer.shutdown();
                         let _ = reader.shutdown();
                         let _ = remote.shutdown(Shutdown::Both);
@@ -603,6 +612,7 @@ impl TrojanServer {
                 let idle_limit = websocket_relay_idle_limit(&timeouts, upload_done, download_done);
                 let idle_elapsed = idle_since.elapsed();
                 if idle_elapsed >= idle_limit {
+                    finish_reason = websocket_relay_timeout_reason(upload_done, download_done);
                     upload_done = true;
                     download_done = true;
                     let _ = writer.shutdown();
@@ -618,6 +628,7 @@ impl TrojanServer {
                     timeout.min(idle_limit.saturating_sub(idle_elapsed)),
                 ) {
                     relay_error = Some(error);
+                    finish_reason = "wait_error";
                     upload_done = true;
                     download_done = true;
                     let _ = writer.shutdown();
@@ -639,6 +650,7 @@ impl TrojanServer {
             download,
             first_byte_ms,
             relay_started.elapsed(),
+            finish_reason,
             relay_error.as_ref(),
         );
         self.traffic.add_with_user_id(
@@ -743,6 +755,7 @@ impl TrojanServer {
                     0,
                     None,
                     relay_started.elapsed(),
+                    "relay_error",
                     Some(&error),
                 );
                 record_trojan_connection_error(&self.config.node_tag, "tls_websocket", &error);
@@ -757,6 +770,7 @@ impl TrojanServer {
             stats.download,
             stats.first_byte_ms,
             relay_started.elapsed(),
+            stats.finish_reason,
             None,
         );
         self.traffic.add_with_user_id(
@@ -1795,12 +1809,40 @@ fn log_trojan_relay_finished(
     download: u64,
     first_byte_ms: Option<u128>,
     elapsed: Duration,
+    finish_reason: &'static str,
     error: Option<&io::Error>,
 ) {
     if error.is_none() && elapsed.as_millis() < TROJAN_ROUTE_SLOW_LOG_MS && !trojan_trace_enabled()
     {
         return;
     }
+    eprintln!(
+        "{}",
+        format_trojan_relay_finished(
+            node_tag,
+            scope,
+            request,
+            upload,
+            download,
+            first_byte_ms,
+            elapsed,
+            finish_reason,
+            error,
+        )
+    );
+}
+
+fn format_trojan_relay_finished(
+    node_tag: &str,
+    scope: &'static str,
+    request: &TrojanRequest,
+    upload: u64,
+    download: u64,
+    first_byte_ms: Option<u128>,
+    elapsed: Duration,
+    finish_reason: &'static str,
+    error: Option<&io::Error>,
+) -> String {
     let status = match error {
         Some(error) => classify_trojan_connection_error(error),
         None => "ok",
@@ -1811,8 +1853,8 @@ fn log_trojan_relay_finished(
     let error_text = error
         .map(|error| trojan_log_message(&error.to_string()))
         .unwrap_or_else(|| "-".to_string());
-    eprintln!(
-        "INFO  core   trojan relay finished node_tag={} scope={scope} target={}:{} status={status} first_byte_ms={} duration_ms={} upload_bytes={} download_bytes={} error={}",
+    format!(
+        "INFO  core   trojan relay finished node_tag={} scope={scope} target={}:{} status={status} first_byte_ms={} duration_ms={} upload_bytes={} download_bytes={} finish_reason={} error={}",
         trojan_log_field(node_tag),
         trojan_log_field(&request.target.host),
         request.target.port,
@@ -1820,8 +1862,15 @@ fn log_trojan_relay_finished(
         elapsed.as_millis(),
         upload,
         download,
+        finish_reason,
         error_text
-    );
+    )
+}
+
+fn remember_trojan_finish_reason(reason: &mut &'static str, value: &'static str) {
+    if *reason == "completed" {
+        *reason = value;
+    }
 }
 
 fn log_trojan_udp_relay_finished(
@@ -4556,6 +4605,38 @@ mod tests {
         assert_eq!(
             line,
             "INFO  core   trojan udp relay finished node_tag=node_tag scope=tls_websocket_udp target=rr5---sn-test.gvt1.com:443 status=ok first_response_ms=1 duration_ms=2427 upload_bytes=1532 download_bytes=20856660 upload_packets=1 download_packets=1 error=-"
+        );
+    }
+
+    #[test]
+    fn formats_trojan_tcp_relay_summary_with_finish_reason() {
+        let request = super::TrojanRequest {
+            command: super::TrojanCommand::Tcp,
+            password_hash: "hash".to_string(),
+            user_uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            user_id: 7,
+            target: SocksTarget {
+                host: "rr1---sn-n4v7snee.c.youtube.com".to_string(),
+                port: 443,
+            },
+            client_ip: None,
+        };
+
+        let line = super::format_trojan_relay_finished(
+            "node tag",
+            "tls_websocket",
+            &request,
+            65052,
+            2_954_116,
+            Some(1),
+            Duration::from_millis(106_316),
+            "remote_eof",
+            None,
+        );
+
+        assert_eq!(
+            line,
+            "INFO  core   trojan relay finished node_tag=node_tag scope=tls_websocket target=rr1---sn-n4v7snee.c.youtube.com:443 status=ok first_byte_ms=1 duration_ms=106316 upload_bytes=65052 download_bytes=2954116 finish_reason=remote_eof error=-"
         );
     }
 
