@@ -6111,6 +6111,7 @@ mod tests {
                 .expect("sniffed payload forwarded");
             assert_eq!(received, expected);
             stream.write_all(b"pong").expect("echo write");
+            stream.flush().expect("echo flush");
         });
 
         let server = server();
@@ -6133,12 +6134,11 @@ mod tests {
             .expect("websocket request");
         let response = read_websocket_response(&mut client);
         assert!(response.contains("101 Switching Protocols"));
+        let mut first_frame_payload = trojan_request(fake_target);
+        first_frame_payload.extend_from_slice(&client_hello);
         client
-            .write_all(&masked_frame(&trojan_request(fake_target)))
-            .expect("trojan request frame");
-        client
-            .write_all(&masked_frame(&client_hello))
-            .expect("client hello frame");
+            .write_all(&masked_frame(&first_frame_payload))
+            .expect("trojan request and client hello frame");
         assert_eq!(read_binary_frame(&mut client), b"pong");
         drop(client);
 
