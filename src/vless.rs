@@ -1365,10 +1365,17 @@ impl VlessServer {
         S: TlsSocket + RawTcpStreamAccess + Send + 'static,
     {
         let server = self.clone();
-        spawn_detached_blocking_relay("keli-core-vless-relay", move || {
-            let _session = session;
-            server.relay_tls(client, remote, request, bandwidth)
-        })?;
+        if request.flow == FLOW_XTLS_RPRX_VISION {
+            let _handle = spawn_native_blocking_relay(move || {
+                let _session = session;
+                server.relay_tls(client, remote, request, bandwidth)
+            })?;
+        } else {
+            spawn_detached_blocking_relay("keli-core-vless-relay", move || {
+                let _session = session;
+                server.relay_tls(client, remote, request, bandwidth)
+            })?;
+        }
         Ok(())
     }
 
@@ -5997,6 +6004,73 @@ mod tests {
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn tls_vision_relay_does_not_spawn_detached_relay_thread() {
+        let cert = test_cert("vless-vision-native-relay");
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (release_remote_tx, release_remote_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (_stream, _) = echo.accept().expect("echo accept");
+            let _ = release_remote_rx.recv_timeout(Duration::from_secs(3));
+        });
+
+        let server = server_with_flow("xtls-rprx-vision");
+        let listener = server.bind().expect("vless bind");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let server_clone = server.clone();
+        let (handled_tx, handled_rx) = mpsc::channel();
+        let detached_before = crate::stream::detached_blocking_relay_metrics_snapshot()
+            .get("keli-core-vless-relay")
+            .copied()
+            .unwrap_or(0);
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("vless accept");
+            let client = acceptor.accept(stream).expect("tls accept");
+            let result = server_clone.handle_tls_client(client);
+            handled_tx.send(result).expect("send handled");
+        });
+
+        let mut client = tls_client(vless_addr, cert.cert_der.clone());
+        client
+            .write_all(&vless_request_with_flow(echo_addr, "xtls-rprx-vision"))
+            .expect("vless request");
+        let mut response = [0u8; 2];
+        client
+            .read_exact(&mut response)
+            .expect("vless response header");
+        assert_eq!(response, [0x00, 0x00]);
+        handled_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("tls vision relay should move off the connection worker after start")
+            .expect("spawn background tls vision relay");
+
+        let mut detached_during = 0usize;
+        for _ in 0..50 {
+            detached_during = detached_during.max(
+                crate::stream::detached_blocking_relay_metrics_snapshot()
+                    .get("keli-core-vless-relay")
+                    .copied()
+                    .unwrap_or(0),
+            );
+            if detached_during > detached_before {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            detached_during <= detached_before,
+            "vless vision relay must not add detached OS relay threads: before={detached_before} during={detached_during}"
+        );
+
+        drop(client);
+        release_remote_tx.send(()).expect("release remote");
+        server_thread.join().expect("server thread");
+        echo_thread.join().expect("echo thread");
     }
 
     #[test]
