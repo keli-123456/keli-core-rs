@@ -49,7 +49,7 @@ const MAX_CONNECTION_WORKERS_PER_LISTENER: usize = 256;
 #[cfg(windows)]
 const DEFAULT_CONNECTION_WORKER_STACK_KIB: usize = 2048;
 #[cfg(not(windows))]
-const DEFAULT_CONNECTION_WORKER_STACK_KIB: usize = 1024;
+const DEFAULT_CONNECTION_WORKER_STACK_KIB: usize = 2048;
 const MIN_CONNECTION_WORKER_STACK_KIB: usize = 256;
 const MAX_CONNECTION_WORKER_STACK_KIB: usize = 8192;
 const QUIC_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -2791,7 +2791,7 @@ mod tests {
         #[cfg(windows)]
         let expected_default = 2048 * 1024;
         #[cfg(not(windows))]
-        let expected_default = 1024 * 1024;
+        let expected_default = 2048 * 1024;
         assert_eq!(
             super::connection_worker_stack_size_from_env(None),
             expected_default
@@ -4190,7 +4190,7 @@ mod tests {
         run_grpc_vless_client(grpc_addr, echo_addr, None);
         echo_thread.join().expect("echo thread");
 
-        for _ in 0..50 {
+        for _ in 0..100 {
             let records = service.drain_traffic(1);
             if !records.is_empty() {
                 assert_eq!(records[0].upload, 4);
@@ -4198,7 +4198,7 @@ mod tests {
                 service.stop();
                 return;
             }
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(20));
         }
         service.stop();
         panic!("traffic was not recorded");
@@ -4236,7 +4236,7 @@ mod tests {
         run_grpc_vless_client(grpc_addr, echo_addr, Some(cert.cert_der.clone()));
         echo_thread.join().expect("echo thread");
 
-        for _ in 0..50 {
+        for _ in 0..100 {
             let records = service.drain_traffic(1);
             if !records.is_empty() {
                 assert_eq!(records[0].upload, 4);
@@ -4244,7 +4244,7 @@ mod tests {
                 service.stop();
                 return;
             }
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(20));
         }
         service.stop();
         panic!("traffic was not recorded");
