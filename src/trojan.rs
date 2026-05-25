@@ -1854,8 +1854,16 @@ fn log_trojan_relay_finished(
     finish_detail: Option<&str>,
     error: Option<&io::Error>,
 ) {
-    if error.is_none() && elapsed.as_millis() < TROJAN_ROUTE_SLOW_LOG_MS && !trojan_trace_enabled()
-    {
+    if !should_log_trojan_relay_finished(
+        upload,
+        download,
+        first_byte_ms,
+        elapsed,
+        finish_reason,
+        finish_detail,
+        error,
+        trojan_trace_enabled(),
+    ) {
         return;
     }
     eprintln!(
@@ -1873,6 +1881,34 @@ fn log_trojan_relay_finished(
             error,
         )
     );
+}
+
+fn should_log_trojan_relay_finished(
+    _upload: u64,
+    download: u64,
+    first_byte_ms: Option<u128>,
+    elapsed: Duration,
+    finish_reason: &'static str,
+    finish_detail: Option<&str>,
+    error: Option<&io::Error>,
+    trace_enabled: bool,
+) -> bool {
+    if trace_enabled || error.is_some() {
+        return true;
+    }
+    if first_byte_ms.is_some_and(|value| value >= TROJAN_ROUTE_SLOW_LOG_MS) {
+        return true;
+    }
+    if download == 0 && elapsed.as_millis() >= TROJAN_ROUTE_SLOW_LOG_MS {
+        return true;
+    }
+    if finish_detail.is_some() {
+        return true;
+    }
+    !matches!(
+        finish_reason,
+        "completed" | "client_eof" | "remote_eof" | "uplink_only_timeout" | "downlink_only_timeout"
+    )
 }
 
 fn log_trojan_relay_started(node_tag: &str, scope: &'static str, request: &TrojanRequest) {
@@ -5067,6 +5103,70 @@ mod tests {
             line,
             "INFO  core   trojan relay finished node_tag=node_tag scope=tls_websocket target=rr1---sn-n4v7snee.c.youtube.com:443 status=ok first_byte_ms=1 duration_ms=106316 upload_bytes=65052 download_bytes=2954116 finish_reason=remote_eof finish_detail=websocket_read_failed:_connection_reset error=-"
         );
+    }
+
+    #[test]
+    fn skips_healthy_long_trojan_tcp_relay_summary_without_trace() {
+        assert!(!super::should_log_trojan_relay_finished(
+            64 * 1024,
+            4 * 1024 * 1024,
+            Some(18),
+            Duration::from_secs(120),
+            "remote_eof",
+            None,
+            None,
+            false,
+        ));
+        assert!(super::should_log_trojan_relay_finished(
+            64 * 1024,
+            4 * 1024 * 1024,
+            Some(18),
+            Duration::from_secs(120),
+            "remote_eof",
+            None,
+            None,
+            true,
+        ));
+        assert!(super::should_log_trojan_relay_finished(
+            64 * 1024,
+            4 * 1024 * 1024,
+            Some(1500),
+            Duration::from_secs(120),
+            "remote_eof",
+            None,
+            None,
+            false,
+        ));
+        assert!(super::should_log_trojan_relay_finished(
+            1024,
+            0,
+            None,
+            Duration::from_secs(15),
+            "client_eof",
+            None,
+            None,
+            false,
+        ));
+        assert!(super::should_log_trojan_relay_finished(
+            64 * 1024,
+            4 * 1024 * 1024,
+            Some(18),
+            Duration::from_secs(120),
+            "remote_read_error",
+            Some("remote_read:ConnectionReset:reset"),
+            None,
+            false,
+        ));
+        assert!(super::should_log_trojan_relay_finished(
+            0,
+            0,
+            None,
+            Duration::from_millis(10),
+            "completed",
+            None,
+            Some(&io::Error::new(io::ErrorKind::TimedOut, "relay timeout")),
+            false,
+        ));
     }
 
     #[test]

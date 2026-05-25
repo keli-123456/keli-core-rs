@@ -25,9 +25,12 @@ const NATIVE_RELAY_WORKER_MEMORY_MIB: usize = 4;
 const NATIVE_RELAY_RESERVED_FDS: usize = 1024;
 const NATIVE_RELAY_FDS_PER_WORKER: usize = 4;
 #[cfg(windows)]
-const DETACHED_BLOCKING_RELAY_STACK_SIZE: usize = 2 * 1024 * 1024;
+const DEFAULT_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 2048;
 #[cfg(not(windows))]
-const DETACHED_BLOCKING_RELAY_STACK_SIZE: usize = 256 * 1024;
+const DEFAULT_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 128;
+const MIN_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 64;
+const MAX_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 8192;
+const DETACHED_BLOCKING_RELAY_STACK_ENV: &str = "KELI_CORE_DETACHED_RELAY_STACK_KIB";
 
 pub type BlockingRelayHandle<T> = tokio::task::JoinHandle<T>;
 type NativeRelayJob = Box<dyn FnOnce() + Send + 'static>;
@@ -173,7 +176,7 @@ where
 {
     thread::Builder::new()
         .name(name.to_string())
-        .stack_size(DETACHED_BLOCKING_RELAY_STACK_SIZE)
+        .stack_size(detached_blocking_relay_stack_size())
         .spawn(move || {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
         })?;
@@ -371,6 +374,24 @@ fn tcp_relay_worker_threads() -> usize {
 
 fn tcp_relay_blocking_threads() -> usize {
     tcp_relay_blocking_threads_from_resources(available_parallelism_count(), memory_limit_mib())
+}
+
+fn detached_blocking_relay_stack_size() -> usize {
+    detached_blocking_relay_stack_size_from_env(
+        std::env::var(DETACHED_BLOCKING_RELAY_STACK_ENV).ok(),
+        DEFAULT_DETACHED_BLOCKING_RELAY_STACK_KIB,
+    )
+}
+
+fn detached_blocking_relay_stack_size_from_env(value: Option<String>, default_kib: usize) -> usize {
+    let stack_kib = value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default_kib)
+        .clamp(
+            MIN_DETACHED_BLOCKING_RELAY_STACK_KIB,
+            MAX_DETACHED_BLOCKING_RELAY_STACK_KIB,
+        );
+    stack_kib * 1024
 }
 
 impl NativeRelayPool {
@@ -686,6 +707,26 @@ mod tests {
         assert_eq!(
             super::native_relay_worker_threads_from_resources(4, Some(64), Some(100_000)),
             16
+        );
+    }
+
+    #[test]
+    fn detached_blocking_relay_stack_size_is_small_and_configurable() {
+        assert_eq!(
+            super::detached_blocking_relay_stack_size_from_env(None, 128),
+            128 * 1024
+        );
+        assert_eq!(
+            super::detached_blocking_relay_stack_size_from_env(Some("32".to_string()), 128),
+            64 * 1024
+        );
+        assert_eq!(
+            super::detached_blocking_relay_stack_size_from_env(Some("512".to_string()), 128),
+            512 * 1024
+        );
+        assert_eq!(
+            super::detached_blocking_relay_stack_size_from_env(Some("99999".to_string()), 128),
+            8192 * 1024
         );
     }
 
