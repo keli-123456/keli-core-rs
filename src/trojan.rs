@@ -18,6 +18,7 @@ use rustls::{
     StreamOwned,
 };
 use sha2::{Digest, Sha224};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::config::{
     outbound_transport_network, OutboundConfig, OutboundTlsConfig, PolicyConfig, SniffingConfig,
@@ -42,14 +43,15 @@ use crate::tls::{relay_tls_stream, TlsConnection};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::websocket::{
-    accept_websocket_tls_with_client_ip, accept_websocket_with_client_ip, connect_websocket_client,
+    accept_websocket_async_with_client_ip, accept_websocket_tls_with_client_ip,
+    accept_websocket_with_client_ip, connect_websocket_client, relay_websocket_async_stream_stats,
     relay_websocket_tls_stream_stats, websocket_relay_idle_limit, websocket_relay_timeout_reason,
-    websocket_tls_relay_idle_timeout, WebSocketClientStream, WebSocketReader,
+    websocket_tls_relay_idle_timeout, AsyncWebSocketStream, WebSocketClientStream, WebSocketReader,
     WebSocketRelayTimeouts, WebSocketWriter,
 };
 use crate::{
-    connect_tcp_outbound, connect_tcp_outbound_tokio, send_udp_outbound, RouteDecision,
-    RouteDispatcher,
+    connect_tcp_outbound, connect_tcp_outbound_tokio, send_udp_outbound, send_udp_outbound_tokio,
+    RouteDecision, RouteDispatcher,
 };
 
 const COMMAND_TCP: u8 = 0x01;
@@ -107,6 +109,14 @@ enum TrojanCommand {
 struct TrojanUdpRelayState {
     ipv4: Option<UdpSocket>,
     ipv6: Option<UdpSocket>,
+    target: Option<SocksTarget>,
+    target_addr: Option<SocketAddr>,
+    timeout: Duration,
+}
+
+struct AsyncTrojanUdpRelayState {
+    ipv4: Option<tokio::net::UdpSocket>,
+    ipv6: Option<tokio::net::UdpSocket>,
     target: Option<SocksTarget>,
     target_addr: Option<SocketAddr>,
     timeout: Duration,
@@ -320,6 +330,56 @@ impl TrojanServer {
         )
     }
 
+    pub async fn handle_tls_websocket_client_async<S>(
+        &self,
+        client: S,
+        client_ip: Option<IpAddr>,
+        path: Option<&str>,
+    ) -> io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let (mut websocket, forwarded_ip) =
+            accept_websocket_async_with_client_ip(client, path).await?;
+        let mut request = tokio::time::timeout(
+            self.config.connect_timeout,
+            self.read_request_from_async_websocket(&mut websocket),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, "trojan websocket auth timed out")
+        })??;
+        request.client_ip = forwarded_ip.or(client_ip);
+        let user = self.request_user(&request);
+        let _session = self.acquire_user_session(user.as_ref(), request.client_ip)?;
+        let bandwidth = if request.command == TrojanCommand::UdpAssociate {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
+        if request.command == TrojanCommand::UdpAssociate {
+            return self
+                .relay_udp_tls_websocket_async(websocket, request, bandwidth)
+                .await;
+        }
+        let initial_payload = self
+            .read_initial_tls_websocket_payload_async(&mut websocket)
+            .await?;
+        log_trojan_tls_websocket_initial_payload(&self.config.node_tag, &request, &initial_payload);
+        let remote = connect_trojan_routed_tcp_tokio(
+            &self.config.node_tag,
+            "tls_websocket",
+            &self.router,
+            &request.target,
+            self.config.connect_timeout,
+            &initial_payload,
+        )
+        .await?;
+        let remote = tokio::net::TcpStream::from_std(remote)?;
+        self.relay_tls_websocket_async(websocket, remote, request, bandwidth, initial_payload)
+            .await
+    }
+
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
         self.traffic.drain_minimum(minimum_bytes)
     }
@@ -382,6 +442,35 @@ impl TrojanServer {
         }
     }
 
+    async fn read_initial_tls_websocket_payload_async<S>(
+        &self,
+        websocket: &mut AsyncWebSocketStream<S>,
+    ) -> io::Result<Vec<u8>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut buffer = vec![0u8; 16 * 1024];
+        match tokio::time::timeout(Duration::from_millis(1), websocket.read_data(&mut buffer)).await
+        {
+            Ok(Ok(0)) | Err(_) => Ok(Vec::new()),
+            Ok(Ok(read)) => {
+                buffer.truncate(read);
+                Ok(buffer)
+            }
+            Ok(Err(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(Vec::new())
+            }
+            Ok(Err(error)) => Err(error),
+        }
+    }
+
     fn read_request<T>(&self, stream: &mut T) -> io::Result<TrojanRequest>
     where
         T: Read,
@@ -413,6 +502,51 @@ impl TrojanServer {
         };
         let target = read_trojan_target(stream)?;
         read_crlf(stream)?;
+
+        Ok(TrojanRequest {
+            command,
+            password_hash,
+            user_uuid: user.uuid.clone(),
+            user_id: user.id,
+            target,
+            client_ip: None,
+        })
+    }
+
+    async fn read_request_from_async_websocket<S>(
+        &self,
+        stream: &mut AsyncWebSocketStream<S>,
+    ) -> io::Result<TrojanRequest>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut hash = [0u8; TROJAN_PASSWORD_HEX_LEN];
+        read_exact_from_async_websocket(stream, &mut hash).await?;
+        let password_hash = String::from_utf8(hash.to_vec()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid trojan password hash")
+        })?;
+        read_crlf_from_async_websocket(stream).await?;
+
+        let Some(user) = self.users.get(&password_hash) else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unknown trojan user",
+            ));
+        };
+
+        let command = read_u8_from_async_websocket(stream).await?;
+        let command = match command {
+            COMMAND_TCP => TrojanCommand::Tcp,
+            COMMAND_UDP_ASSOCIATE => TrojanCommand::UdpAssociate,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "only trojan tcp and udp associate commands are supported",
+                ));
+            }
+        };
+        let target = read_trojan_target_from_async_websocket(stream).await?;
+        read_crlf_from_async_websocket(stream).await?;
 
         Ok(TrojanRequest {
             command,
@@ -767,6 +901,79 @@ impl TrojanServer {
             self.websocket_relay_timeouts(),
             Some(&mut upload_observer),
         ) {
+            Ok(stats) => stats,
+            Err(error) => {
+                let finish_detail = error.to_string();
+                log_trojan_relay_finished(
+                    &self.config.node_tag,
+                    "tls_websocket",
+                    &request,
+                    0,
+                    0,
+                    None,
+                    relay_started.elapsed(),
+                    "relay_error",
+                    Some(&finish_detail),
+                    Some(&error),
+                );
+                record_trojan_connection_error(&self.config.node_tag, "tls_websocket", &error);
+                return Err(error);
+            }
+        };
+        log_trojan_relay_finished(
+            &self.config.node_tag,
+            "tls_websocket",
+            &request,
+            stats.upload.saturating_add(initial_upload),
+            stats.download,
+            stats.first_byte_ms,
+            relay_started.elapsed(),
+            stats.finish_reason,
+            stats.finish_detail.as_deref(),
+            None,
+        );
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            request.user_uuid,
+            Some(request.user_id),
+            stats.upload.saturating_add(initial_upload),
+            stats.download,
+            request.client_ip,
+        );
+        Ok(())
+    }
+
+    async fn relay_tls_websocket_async<S>(
+        &self,
+        client: AsyncWebSocketStream<S>,
+        mut remote: tokio::net::TcpStream,
+        request: TrojanRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+        initial_payload: Vec<u8>,
+    ) -> io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let relay_started = Instant::now();
+        log_trojan_relay_started(&self.config.node_tag, "tls_websocket", &request);
+        let mut initial_upload = 0u64;
+        if !initial_payload.is_empty() {
+            if let Some(limiter) = bandwidth.as_deref() {
+                if !limiter.wait_for_async(initial_payload.len()).await {
+                    return Ok(());
+                }
+            }
+            remote.write_all(&initial_payload).await?;
+            initial_upload = initial_payload.len() as u64;
+        }
+        let stats = match relay_websocket_async_stream_stats(
+            client,
+            remote,
+            bandwidth,
+            self.websocket_relay_timeouts(),
+        )
+        .await
+        {
             Ok(stats) => stats,
             Err(error) => {
                 let finish_detail = error.to_string();
@@ -1253,6 +1460,110 @@ impl TrojanServer {
         result
     }
 
+    async fn relay_udp_tls_websocket_async<S>(
+        &self,
+        mut client: AsyncWebSocketStream<S>,
+        request: TrojanRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        log_trojan_relay_started(&self.config.node_tag, "tls_websocket_udp", &request);
+        let started = Instant::now();
+        let mut state = AsyncTrojanUdpRelayState::new(self.config.connect_timeout);
+        let mut pending = Vec::new();
+        let mut upload = 0u64;
+        let mut download = 0u64;
+        let mut upload_packets = 0u64;
+        let mut download_packets = 0u64;
+        let mut first_response_ms = None;
+        let mut last_target = None;
+        let mut idle_rounds = 0u8;
+        let result = 'relay: loop {
+            let mut progressed = false;
+            let mut input = [0u8; 16 * 1024];
+
+            match tokio::time::timeout(
+                websocket_udp_relay_idle_timeout(&mut idle_rounds),
+                client.read_data(&mut input),
+            )
+            .await
+            {
+                Ok(Ok(0)) => break 'relay Ok(()),
+                Ok(Ok(read)) => {
+                    pending.extend_from_slice(&input[..read]);
+                    progressed = true;
+                    while let Some((target, payload)) =
+                        parse_trojan_udp_packet_from_buffer(&mut pending)?
+                    {
+                        upload_packets = upload_packets.saturating_add(1);
+                        last_target = Some(target.clone());
+                        match self
+                            .send_udp_packet_async(
+                                &mut state,
+                                &target,
+                                &payload,
+                                bandwidth.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok((sent, response)) => {
+                                upload = upload.saturating_add(sent);
+                                if let Some((source, payload)) = response {
+                                    let packet = encode_trojan_udp_packet(source, &payload);
+                                    client.write_binary_all(&packet).await?;
+                                    download = download.saturating_add(payload.len() as u64);
+                                    download_packets = download_packets.saturating_add(1);
+                                    first_response_ms
+                                        .get_or_insert_with(|| started.elapsed().as_millis());
+                                }
+                            }
+                            Err(error) => break 'relay Err(error),
+                        }
+                    }
+                }
+                Ok(Err(error)) if is_stream_closed(&error) => break 'relay Ok(()),
+                Ok(Err(error)) => break 'relay Err(error),
+                Err(_) => {}
+            }
+
+            while let Some((source, payload)) = state.recv_available()? {
+                let packet = encode_trojan_udp_packet(source, &payload);
+                client.write_binary_all(&packet).await?;
+                download = download.saturating_add(payload.len() as u64);
+                download_packets = download_packets.saturating_add(1);
+                first_response_ms.get_or_insert_with(|| started.elapsed().as_millis());
+                progressed = true;
+            }
+
+            if progressed {
+                idle_rounds = 0;
+            }
+        };
+        let _ = client.shutdown().await;
+        log_trojan_udp_relay_finished(
+            &self.config.node_tag,
+            "tls_websocket_udp",
+            last_target.as_ref().or(Some(&request.target)),
+            upload,
+            download,
+            upload_packets,
+            download_packets,
+            first_response_ms,
+            started.elapsed(),
+            result.as_ref().err(),
+        );
+        self.record_traffic(
+            request.user_uuid,
+            request.user_id,
+            upload,
+            download,
+            request.client_ip,
+        );
+        result
+    }
+
     fn forward_udp_packet<W>(
         &self,
         state: &mut TrojanUdpRelayState,
@@ -1370,6 +1681,60 @@ impl TrojanServer {
         let remote_addr = state.remote_addr_for(target)?;
         let udp = state.socket_for_nonblocking(remote_addr)?;
         udp.send_to(payload, remote_addr)?;
+        Ok((payload.len() as u64, None))
+    }
+
+    async fn send_udp_packet_async(
+        &self,
+        state: &mut AsyncTrojanUdpRelayState,
+        target: &SocksTarget,
+        payload: &[u8],
+        bandwidth: Option<&BandwidthLimiter>,
+    ) -> io::Result<(u64, Option<(SocketAddr, Vec<u8>)>)> {
+        let decision = self.router.decide_udp(&target.host, target.port, payload);
+        let outbound = match &decision {
+            RouteDecision::Direct => None,
+            RouteDecision::Outbound(outbound) => Some(outbound),
+            RouteDecision::Block => return Ok((0, None)),
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
+
+        if let Some(limiter) = bandwidth {
+            if !limiter.wait_for_async(payload.len()).await {
+                return Ok((0, None));
+            }
+        }
+
+        if let Some(outbound) = outbound {
+            return match send_udp_outbound_tokio(
+                outbound,
+                target,
+                payload,
+                self.config.connect_timeout,
+            )
+            .await
+            {
+                Ok((source, response)) => Ok((payload.len() as u64, Some((source, response)))),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    Ok((payload.len() as u64, None))
+                }
+                Err(error) => Err(error),
+            };
+        }
+
+        let remote_addr = state.remote_addr_for(target).await?;
+        let udp = state.socket_for(remote_addr)?;
+        udp.send_to(payload, remote_addr).await?;
         Ok((payload.len() as u64, None))
     }
 
@@ -2557,6 +2922,59 @@ impl TrojanUdpRelayState {
     }
 }
 
+impl AsyncTrojanUdpRelayState {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            ipv4: None,
+            ipv6: None,
+            target: None,
+            target_addr: None,
+            timeout,
+        }
+    }
+
+    async fn remote_addr_for(&mut self, target: &SocksTarget) -> io::Result<SocketAddr> {
+        if self.target.as_ref() == Some(target) {
+            if let Some(target_addr) = self.target_addr {
+                return Ok(target_addr);
+            }
+        }
+        let target_addr =
+            crate::dns::resolve_socket_addr_tokio(&target.host, target.port, self.timeout).await?;
+        self.target = Some(target.clone());
+        self.target_addr = Some(target_addr);
+        Ok(target_addr)
+    }
+
+    fn socket_for(&mut self, remote: SocketAddr) -> io::Result<&tokio::net::UdpSocket> {
+        let slot = if remote.is_ipv4() {
+            &mut self.ipv4
+        } else {
+            &mut self.ipv6
+        };
+        if slot.is_none() {
+            let socket = UdpSocket::bind(udp_bind_addr_for_remote(remote))?;
+            socket.set_nonblocking(true)?;
+            *slot = Some(tokio::net::UdpSocket::from_std(socket)?);
+        }
+        Ok(slot.as_ref().expect("udp socket initialized"))
+    }
+
+    fn recv_available(&self) -> io::Result<Option<(SocketAddr, Vec<u8>)>> {
+        if let Some(socket) = self.ipv4.as_ref() {
+            if let Some(packet) = try_recv_available_from_tokio_socket(socket)? {
+                return Ok(Some(packet));
+            }
+        }
+        if let Some(socket) = self.ipv6.as_ref() {
+            if let Some(packet) = try_recv_available_from_tokio_socket(socket)? {
+                return Ok(Some(packet));
+            }
+        }
+        Ok(None)
+    }
+}
+
 pub fn trojan_password_hash(password: &str) -> String {
     let digest = Sha224::digest(password.as_bytes());
     hex_lower(&digest)
@@ -3247,6 +3665,43 @@ fn read_trojan_target<R: Read>(reader: &mut R) -> io::Result<SocksTarget> {
     })
 }
 
+async fn read_trojan_target_from_async_websocket<S>(
+    reader: &mut AsyncWebSocketStream<S>,
+) -> io::Result<SocksTarget>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let host = match read_u8_from_async_websocket(reader).await? {
+        ATYP_IPV4 => {
+            let mut bytes = [0u8; 4];
+            read_exact_from_async_websocket(reader, &mut bytes).await?;
+            Ipv4Addr::from(bytes).to_string()
+        }
+        ATYP_DOMAIN => {
+            let len = read_u8_from_async_websocket(reader).await?;
+            read_string_from_async_websocket(reader, usize::from(len)).await?
+        }
+        ATYP_IPV6 => {
+            let mut bytes = [0u8; 16];
+            read_exact_from_async_websocket(reader, &mut bytes).await?;
+            Ipv6Addr::from(bytes).to_string()
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported trojan address type",
+            ));
+        }
+    };
+
+    let mut port = [0u8; 2];
+    read_exact_from_async_websocket(reader, &mut port).await?;
+    Ok(SocksTarget {
+        host,
+        port: u16::from_be_bytes(port),
+    })
+}
+
 fn connect_target(target: &SocksTarget, timeout: Duration) -> io::Result<TcpStream> {
     crate::dns::connect_tcp(&target.host, target.port, timeout)
 }
@@ -3405,6 +3860,29 @@ fn recv_available_from_socket(
     }
 }
 
+fn try_recv_available_from_tokio_socket(
+    socket: &tokio::net::UdpSocket,
+) -> io::Result<Option<(SocketAddr, Vec<u8>)>> {
+    let mut buffer = vec![0u8; MAX_UDP_PACKET_SIZE];
+    match socket.try_recv_from(&mut buffer) {
+        Ok((read, source)) => {
+            buffer.truncate(read);
+            Ok(Some((source, buffer)))
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn websocket_udp_relay_idle_timeout(idle_rounds: &mut u8) -> Duration {
     const BACKOFF_MS: [u64; 4] = [1, 2, 5, 10];
     let idx = usize::from((*idle_rounds).min((BACKOFF_MS.len() - 1) as u8));
@@ -3430,9 +3908,31 @@ fn read_u8<R: Read>(reader: &mut R) -> io::Result<u8> {
     Ok(byte[0])
 }
 
+async fn read_u8_from_async_websocket<S>(reader: &mut AsyncWebSocketStream<S>) -> io::Result<u8>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut byte = [0u8; 1];
+    read_exact_from_async_websocket(reader, &mut byte).await?;
+    Ok(byte[0])
+}
+
 fn read_string<R: Read>(reader: &mut R, len: usize) -> io::Result<String> {
     let mut bytes = vec![0u8; len];
     reader.read_exact(&mut bytes)?;
+    String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8"))
+}
+
+async fn read_string_from_async_websocket<S>(
+    reader: &mut AsyncWebSocketStream<S>,
+    len: usize,
+) -> io::Result<String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut bytes = vec![0u8; len];
+    read_exact_from_async_websocket(reader, &mut bytes).await?;
     String::from_utf8(bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8"))
 }
@@ -3445,6 +3945,40 @@ fn read_crlf<R: Read>(reader: &mut R) -> io::Result<()> {
     } else {
         Err(io::Error::new(io::ErrorKind::InvalidData, "missing crlf"))
     }
+}
+
+async fn read_crlf_from_async_websocket<S>(reader: &mut AsyncWebSocketStream<S>) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut crlf = [0u8; 2];
+    read_exact_from_async_websocket(reader, &mut crlf).await?;
+    if crlf == [b'\r', b'\n'] {
+        Ok(())
+    } else {
+        Err(io::Error::new(io::ErrorKind::InvalidData, "missing crlf"))
+    }
+}
+
+async fn read_exact_from_async_websocket<S>(
+    reader: &mut AsyncWebSocketStream<S>,
+    output: &mut [u8],
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut offset = 0usize;
+    while offset < output.len() {
+        let read = reader.read_data(&mut output[offset..]).await?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "websocket closed before enough data was read",
+            ));
+        }
+        offset += read;
+    }
+    Ok(())
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -5993,6 +6527,79 @@ mod tests {
         release_remote_tx.send(()).expect("release remote");
         server_thread.join().expect("server thread");
         echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
+    fn tls_websocket_async_tcp_relay_does_not_spawn_detached_relay_thread() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let cert = test_cert("trojan-ws-async-relay");
+            let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+            let echo_addr = echo.local_addr().expect("echo addr");
+            let (release_remote_tx, release_remote_rx) = mpsc::channel();
+            let echo_thread = thread::spawn(move || {
+                let (mut stream, _) = echo.accept().expect("echo accept");
+                let mut bytes = [0u8; 4];
+                stream.read_exact(&mut bytes).expect("echo read");
+                stream.write_all(&bytes).expect("echo write");
+                let _ = release_remote_rx.recv_timeout(Duration::from_secs(3));
+            });
+
+            let server = server();
+            let detached_before = crate::stream::detached_blocking_relay_metrics_snapshot()
+                .get("keli-core-trojan-relay")
+                .copied()
+                .unwrap_or(0);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("trojan bind");
+            let trojan_addr = listener.local_addr().expect("trojan addr");
+            let acceptor =
+                TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+            let acceptor = tokio_rustls::TlsAcceptor::from(acceptor.server_config());
+            let server_task = tokio::spawn(async move {
+                let (stream, peer) = listener.accept().await.expect("trojan accept");
+                let client = acceptor.accept(stream).await.expect("tls accept");
+                server
+                    .handle_tls_websocket_client_async(client, Some(peer.ip()), Some("/trojan"))
+                    .await
+            });
+
+            let client_task = tokio::task::spawn_blocking(move || {
+                let mut client = tls_client(trojan_addr, cert.cert_der.clone());
+                client
+                    .write_all(&websocket_request_with_forwarded_for(
+                        "/trojan",
+                        "198.51.100.55",
+                    ))
+                    .expect("websocket request");
+                let response = read_websocket_response(&mut client);
+                assert!(response.contains("101 Switching Protocols"));
+                client
+                    .write_all(&masked_frame(&trojan_request(echo_addr)))
+                    .expect("trojan request frame");
+                client.write_all(&masked_frame(b"ping")).expect("payload");
+                assert_eq!(read_binary_frame(&mut client), b"ping");
+                client
+            });
+
+            let client = client_task.await.expect("client task");
+            let detached_during = crate::stream::detached_blocking_relay_metrics_snapshot()
+                    .get("keli-core-trojan-relay")
+                    .copied()
+                    .unwrap_or(0);
+            assert!(
+                detached_during <= detached_before,
+                "async trojan websocket relay must not add detached OS relay threads: before={detached_before} during={detached_during}"
+            );
+            drop(client);
+            release_remote_tx.send(()).expect("release remote");
+            server_task
+                .await
+                .expect("server task")
+                .expect("async tls websocket relay");
+            echo_thread.join().expect("echo thread");
+        });
     }
 
     #[test]

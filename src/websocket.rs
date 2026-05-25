@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use sha1::{Digest, Sha1};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::limits::BandwidthLimiter;
 use crate::tls::{RawTcpStreamAccess, TlsConnection};
@@ -33,6 +34,13 @@ pub struct WebSocketWriter {
 
 pub struct WebSocketTlsStream {
     stream: TlsConnection,
+    input: Vec<u8>,
+    buffer: Vec<u8>,
+    assembler: WebSocketMessageAssembler,
+}
+
+pub(crate) struct AsyncWebSocketStream<S> {
+    stream: S,
     input: Vec<u8>,
     buffer: Vec<u8>,
     assembler: WebSocketMessageAssembler,
@@ -183,6 +191,40 @@ pub fn accept_websocket_tls_with_client_ip(
     ))
 }
 
+pub(crate) async fn accept_websocket_async_with_client_ip<S>(
+    mut stream: S,
+    expected_path: Option<&str>,
+) -> io::Result<(AsyncWebSocketStream<S>, Option<IpAddr>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request = read_http_upgrade_async(&mut stream).await?;
+    let (path, key) = parse_upgrade_request(&request)?;
+    validate_path(path, expected_path)?;
+    let forwarded_ip = forwarded_client_ip(&request);
+    let (early_protocol, early_data) = websocket_early_data(&request);
+
+    let accept = websocket_accept_key(key);
+    let protocol_header = early_protocol
+        .map(|protocol| format!("Sec-WebSocket-Protocol: {protocol}\r\n"))
+        .unwrap_or_default();
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n{protocol_header}\r\n"
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+
+    Ok((
+        AsyncWebSocketStream {
+            stream,
+            input: Vec::new(),
+            buffer: early_data,
+            assembler: WebSocketMessageAssembler::default(),
+        },
+        forwarded_ip,
+    ))
+}
+
 pub fn relay_websocket_tls_stream(
     client: WebSocketTlsStream,
     remote: TcpStream,
@@ -305,6 +347,117 @@ pub(crate) fn relay_websocket_tls_stream_stats(
         } else {
             idle_rounds = 0;
             idle_since = Instant::now();
+        }
+    }
+
+    Ok(stats)
+}
+
+pub(crate) async fn relay_websocket_async_stream_stats<S>(
+    mut client: AsyncWebSocketStream<S>,
+    mut remote: tokio::net::TcpStream,
+    limiter: Option<Arc<BandwidthLimiter>>,
+    timeouts: WebSocketRelayTimeouts,
+) -> io::Result<WebSocketRelayStats>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let started = Instant::now();
+    let mut stats = WebSocketRelayStats {
+        finish_reason: "completed",
+        ..WebSocketRelayStats::default()
+    };
+    let mut upload_done = false;
+    let mut download_done = false;
+    let mut client_buffer = [0u8; 16 * 1024];
+    let mut remote_buffer = [0u8; 16 * 1024];
+    let mut idle_since = Instant::now();
+
+    while !upload_done || !download_done {
+        if limiter
+            .as_deref()
+            .map(BandwidthLimiter::is_revoked)
+            .unwrap_or(false)
+        {
+            stats.finish_reason = "bandwidth_limiter_closed";
+            let _ = client.shutdown().await;
+            let _ = remote.shutdown().await;
+            break;
+        }
+
+        let idle_limit = websocket_relay_idle_limit(&timeouts, upload_done, download_done);
+        let idle_elapsed = idle_since.elapsed();
+        if idle_elapsed >= idle_limit {
+            stats.finish_reason = websocket_relay_timeout_reason(upload_done, download_done);
+            let _ = client.shutdown().await;
+            let _ = remote.shutdown().await;
+            break;
+        }
+        let idle_left = idle_limit.saturating_sub(idle_elapsed);
+
+        tokio::select! {
+            result = client.read_data(&mut client_buffer), if !upload_done => {
+                match result {
+                    Ok(0) => {
+                        upload_done = true;
+                        remember_websocket_finish_reason(&mut stats, "client_eof");
+                        let _ = remote.shutdown().await;
+                    }
+                    Ok(read) => {
+                        if let Some(limiter) = limiter.as_deref() {
+                            if !limiter.wait_for_async(read).await {
+                                upload_done = true;
+                                download_done = true;
+                                stats.finish_reason = "bandwidth_limiter_closed";
+                                let _ = client.shutdown().await;
+                                let _ = remote.shutdown().await;
+                                continue;
+                            }
+                        }
+                        remote.write_all(&client_buffer[..read]).await?;
+                        stats.upload = stats.upload.saturating_add(read as u64);
+                    }
+                    Err(error) => {
+                        upload_done = true;
+                        download_done = true;
+                        remember_websocket_finish_reason(&mut stats, "client_read_error");
+                        stats.finish_detail = Some(websocket_finish_detail("client_read", &error));
+                        let _ = client.shutdown().await;
+                        let _ = remote.shutdown().await;
+                    }
+                }
+                idle_since = Instant::now();
+            }
+            result = remote.read(&mut remote_buffer), if !download_done => {
+                match result {
+                    Ok(0) => {
+                        download_done = true;
+                        remember_websocket_finish_reason(&mut stats, "remote_eof");
+                    }
+                    Ok(read) => {
+                        if stats.first_byte_ms.is_none() {
+                            stats.first_byte_ms = Some(started.elapsed().as_millis());
+                        }
+                        client.write_binary_all(&remote_buffer[..read]).await?;
+                        stats.download = stats.download.saturating_add(read as u64);
+                    }
+                    Err(error) => {
+                        download_done = true;
+                        upload_done = true;
+                        remember_websocket_finish_reason(&mut stats, "remote_read_error");
+                        stats.finish_detail = Some(websocket_finish_detail("remote_read", &error));
+                        let _ = client.shutdown().await;
+                        let _ = remote.shutdown().await;
+                    }
+                }
+                idle_since = Instant::now();
+            }
+            _ = tokio::time::sleep(idle_left) => {
+                stats.finish_reason = websocket_relay_timeout_reason(upload_done, download_done);
+                let _ = client.shutdown().await;
+                let _ = remote.shutdown().await;
+                break;
+            }
         }
     }
 
@@ -580,6 +733,64 @@ impl<S> WebSocketClientStream<S> {
     }
 }
 
+impl<S> AsyncWebSocketStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    pub(crate) async fn read_data(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        while self.buffer.is_empty() {
+            if let Some(frame) = parse_buffered_frame(&mut self.input, &mut self.assembler)? {
+                match frame {
+                    WebSocketFrame::Data(data) => self.buffer = data,
+                    WebSocketFrame::Ping(data) => {
+                        self.stream
+                            .write_all(&frame_bytes(OPCODE_PONG, &data))
+                            .await?;
+                        self.stream.flush().await?;
+                    }
+                    WebSocketFrame::Pong => {}
+                    WebSocketFrame::Close => return Ok(0),
+                }
+                continue;
+            }
+
+            let mut input = [0u8; 8 * 1024];
+            match self.stream.read(&mut input).await {
+                Ok(0) => return Ok(0),
+                Ok(read) => self.input.extend_from_slice(&input[..read]),
+                Err(error) => return Err(error),
+            }
+        }
+
+        let len = output.len().min(self.buffer.len());
+        output[..len].copy_from_slice(&self.buffer[..len]);
+        self.buffer.drain(..len);
+        Ok(len)
+    }
+
+    pub(crate) async fn write_binary_all(&mut self, payload: &[u8]) -> io::Result<()> {
+        let (header, header_len) = server_frame_header(OPCODE_BINARY, payload.len());
+        self.stream.write_all(&header[..header_len]).await?;
+        self.stream.write_all(payload).await?;
+        self.stream.flush().await
+    }
+
+    pub(crate) async fn shutdown(&mut self) -> io::Result<()> {
+        let close_result = async {
+            self.stream
+                .write_all(&frame_bytes(OPCODE_CLOSE, &[]))
+                .await?;
+            self.stream.flush().await
+        }
+        .await;
+        let shutdown_result = self.stream.shutdown().await;
+        close_result.or(shutdown_result)
+    }
+}
+
 impl<S: Read + Write> Read for WebSocketClientStream<S> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         if output.is_empty() {
@@ -709,6 +920,26 @@ fn read_http_upgrade<R: Read>(stream: &mut R) -> io::Result<String> {
     let mut byte = [0u8; 1];
     while bytes.len() < MAX_HTTP_HEADER {
         stream.read_exact(&mut byte)?;
+        bytes.push(byte[0]);
+        if bytes.ends_with(b"\r\n\r\n") {
+            return String::from_utf8(bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid http header"));
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "websocket upgrade header too large",
+    ))
+}
+
+async fn read_http_upgrade_async<S>(stream: &mut S) -> io::Result<String>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    while bytes.len() < MAX_HTTP_HEADER {
+        stream.read_exact(&mut byte).await?;
         bytes.push(byte[0]);
         if bytes.ends_with(b"\r\n\r\n") {
             return String::from_utf8(bytes)

@@ -1038,6 +1038,60 @@ fn accept_tls_connection(
     }
 }
 
+async fn accept_tls_connection_async(
+    acceptor: &TlsAcceptor,
+    stream: tokio::net::TcpStream,
+    protocol: Protocol,
+    tag: &str,
+    failures: &ClientFailureBackoff,
+    connect_timeout: Duration,
+) -> io::Result<(
+    tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    Option<std::net::IpAddr>,
+)> {
+    let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
+    if let Some(ip) = peer_ip {
+        if failures.is_blocked(ip) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tls handshake backoff active",
+            ));
+        }
+    }
+    let tls_acceptor = tokio_rustls::TlsAcceptor::from(acceptor.server_config());
+    match tokio::time::timeout(connect_timeout, tls_acceptor.accept(stream)).await {
+        Ok(Ok(client)) => {
+            if let Some(ip) = peer_ip {
+                failures.record_success(ip);
+            }
+            Ok((client, peer_ip))
+        }
+        Ok(Err(error)) => {
+            let class = classify_tls_handshake_error(&error);
+            if !matches!(class, TlsHandshakeErrorClass::ClientClosed) {
+                if let Some(ip) = peer_ip {
+                    failures.record_failure(ip);
+                }
+                eprintln!(
+                    "WARN  tls    handshake failed protocol={protocol:?} tag={tag} class={class:?} error={error}"
+                );
+            }
+            Err(error)
+        }
+        Err(_) => {
+            let error = io::Error::new(io::ErrorKind::TimedOut, "tls handshake timed out");
+            if let Some(ip) = peer_ip {
+                failures.record_failure(ip);
+            }
+            eprintln!(
+                "WARN  tls    handshake failed protocol={protocol:?} tag={tag} class={:?} error={error}",
+                TlsHandshakeErrorClass::Io
+            );
+            Err(error)
+        }
+    }
+}
+
 fn handle_tcp_connection_with_failure_backoff<F>(stream: TcpStream, handler: F) -> io::Result<()>
 where
     F: FnOnce(TcpStream) -> io::Result<()>,
@@ -1054,6 +1108,43 @@ where
         }
     }
     let result = handler(stream);
+    match result {
+        Ok(()) => {
+            if let Some(ip) = peer_ip {
+                failures.record_success(ip);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(ip) = peer_ip {
+                if should_record_tcp_auth_failure(&error) {
+                    failures.record_failure(ip);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn handle_tcp_connection_with_failure_backoff_async<F, Fut>(
+    stream: tokio::net::TcpStream,
+    handler: F,
+) -> io::Result<()>
+where
+    F: FnOnce(tokio::net::TcpStream) -> Fut,
+    Fut: Future<Output = io::Result<()>>,
+{
+    let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
+    let failures = tcp_auth_failure_backoff();
+    if let Some(ip) = peer_ip {
+        if failures.is_blocked(ip) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tcp auth backoff active",
+            ));
+        }
+    }
+    let result = handler(stream).await;
     match result {
         Ok(()) => {
             if let Some(ip) = peer_ip {
@@ -1290,6 +1381,56 @@ fn start_trojan_listener(
     let tls_acceptor = tls_acceptor_for(inbound)?;
     let tag = inbound.tag.clone();
     let runtime_server = server.clone();
+    if let Some(tls_acceptor_async) = tls_acceptor.clone().filter(|_| network == "ws") {
+        let join = spawn_async_tcp_accept_loop(
+            listener,
+            stop_for_thread,
+            workers_for_thread,
+            move |stream| {
+                let server = server.clone();
+                let websocket_path = websocket_path.clone();
+                let tls_acceptor = tls_acceptor_async.clone();
+                let tls_failures = tls_failures.clone();
+                let tag = tag.clone();
+                async move {
+                    let _ = handle_tcp_connection_with_failure_backoff_async(
+                        stream,
+                        move |stream| async move {
+                            let (client, peer_ip) = accept_tls_connection_async(
+                                &tls_acceptor,
+                                stream,
+                                Protocol::Trojan,
+                                &tag,
+                                &tls_failures,
+                                connect_timeout,
+                            )
+                            .await?;
+                            server
+                                .handle_tls_websocket_client_async(
+                                    client,
+                                    peer_ip,
+                                    websocket_path.as_deref(),
+                                )
+                                .await
+                        },
+                    )
+                    .await;
+                }
+            },
+        );
+
+        return Ok(ListenerHandle {
+            status: ListenerStatus {
+                tag: inbound.tag.clone(),
+                protocol: Protocol::Trojan,
+                local_addr,
+            },
+            runtime: ListenerRuntime::Trojan(runtime_server),
+            stop,
+            workers,
+            join: Some(join),
+        });
+    }
     let join = spawn_tcp_accept_loop(
         listener,
         stop_for_thread,

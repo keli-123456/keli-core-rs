@@ -151,6 +151,10 @@ pub struct TlsConnection<S = TcpStream> {
 }
 
 impl TlsAcceptor {
+    pub(crate) fn server_config(&self) -> Arc<ServerConfig> {
+        self.config.clone()
+    }
+
     pub fn from_files(
         cert_file: impl AsRef<Path>,
         key_file: impl AsRef<Path>,
