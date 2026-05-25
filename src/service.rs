@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,6 +104,7 @@ pub struct CoreService {
     quic_connections: Option<SharedQuicConnectionLimiter>,
     tls_failures: ClientFailureBackoff,
     user_revisions: HashMap<String, String>,
+    user_fingerprints: HashMap<String, UserFingerprintState>,
     stopped: bool,
 }
 
@@ -192,6 +194,7 @@ impl CoreService {
         let downlink_only = downlink_only_timeout(&config.policy);
         let sniffing_cache = sniffing_cache_timeout(&config.policy);
         let active_config = config_without_users(&config);
+        let user_fingerprints = user_fingerprints_for_inbounds(&config.inbounds);
 
         let traffic = TrafficRegistry::shared();
         let sessions = UserSessionTracker::default();
@@ -353,6 +356,7 @@ impl CoreService {
             quic_connections,
             tls_failures,
             user_revisions: HashMap::new(),
+            user_fingerprints,
             stopped: false,
         })
     }
@@ -387,12 +391,11 @@ impl CoreService {
     }
 
     pub fn can_update_users(&self, config: &CoreConfig) -> bool {
-        config_without_users(&self.config) == config_without_users(config)
+        config_eq_without_users(&self.config, config)
     }
 
     pub fn can_update_routes(&self, config: &CoreConfig) -> bool {
-        config_without_users_routes_and_outbounds(&self.config)
-            == config_without_users_routes_and_outbounds(config)
+        config_eq_without_users_routes_and_outbounds(&self.config, config)
     }
 
     pub fn update_users(&mut self, config: CoreConfig) {
@@ -402,10 +405,15 @@ impl CoreService {
                 .iter()
                 .find(|handle| handle.status.tag == inbound.tag)
             {
-                handle.runtime.replace_users(inbound.users.clone());
+                let fingerprint = UserFingerprintState::from_users(&inbound.users);
+                if self.user_fingerprints.get(&inbound.tag) != Some(&fingerprint) {
+                    handle.runtime.replace_users(inbound.users.clone());
+                    self.user_revisions.remove(&inbound.tag);
+                    self.user_fingerprints
+                        .insert(inbound.tag.clone(), fingerprint);
+                }
             }
         }
-        self.user_revisions.clear();
         self.config = config_without_users(&config);
     }
 
@@ -417,13 +425,18 @@ impl CoreService {
                 .iter()
                 .find(|handle| handle.status.tag == inbound.tag)
             {
-                handle.runtime.replace_users(inbound.users.clone());
+                let fingerprint = UserFingerprintState::from_users(&inbound.users);
+                if self.user_fingerprints.get(&inbound.tag) != Some(&fingerprint) {
+                    handle.runtime.replace_users(inbound.users.clone());
+                    self.user_revisions.remove(&inbound.tag);
+                    self.user_fingerprints
+                        .insert(inbound.tag.clone(), fingerprint);
+                }
                 handle
                     .runtime
                     .replace_routes(active_config.resolved_inbound_routes(inbound));
             }
         }
-        self.user_revisions.clear();
         self.config = active_config;
     }
 
@@ -453,6 +466,10 @@ impl CoreService {
             }
         }
         let result = handle.runtime.apply_user_delta(delta);
+        self.user_fingerprints
+            .entry(node_tag.to_string())
+            .or_default()
+            .apply_delta(delta);
         if let Some(revision) = delta.revision.as_ref() {
             self.user_revisions
                 .insert(node_tag.to_string(), revision.clone());
@@ -497,21 +514,144 @@ impl Drop for CoreService {
 }
 
 fn config_without_users(config: &CoreConfig) -> CoreConfig {
-    let mut config = config.clone();
-    for inbound in &mut config.inbounds {
-        inbound.users.clear();
+    CoreConfig {
+        instance_id: config.instance_id.clone(),
+        log_level: config.log_level.clone(),
+        dns: config.dns.clone(),
+        policy: config.policy.clone(),
+        inbounds: config.inbounds.iter().map(inbound_without_users).collect(),
+        outbounds: config.outbounds.clone(),
+        routes: config.routes.clone(),
+        stats: config.stats.clone(),
     }
-    config
 }
 
-fn config_without_users_routes_and_outbounds(config: &CoreConfig) -> CoreConfig {
-    let mut config = config_without_users(config);
-    config.outbounds.clear();
-    config.routes.clear();
-    for inbound in &mut config.inbounds {
-        inbound.routes.clear();
+fn inbound_without_users(inbound: &InboundConfig) -> InboundConfig {
+    InboundConfig {
+        tag: inbound.tag.clone(),
+        protocol: inbound.protocol.clone(),
+        listen: inbound.listen.clone(),
+        port: inbound.port,
+        users: Vec::new(),
+        cipher: inbound.cipher.clone(),
+        flow: inbound.flow.clone(),
+        padding_scheme: inbound.padding_scheme.clone(),
+        transport: inbound.transport.clone(),
+        tls: inbound.tls.clone(),
+        sniffing: inbound.sniffing.clone(),
+        routes: inbound.routes.clone(),
     }
-    config
+}
+
+fn config_eq_without_users(left: &CoreConfig, right: &CoreConfig) -> bool {
+    left.instance_id == right.instance_id
+        && left.log_level == right.log_level
+        && left.dns == right.dns
+        && left.policy == right.policy
+        && left.outbounds == right.outbounds
+        && left.routes == right.routes
+        && left.stats == right.stats
+        && inbounds_eq_without_users(&left.inbounds, &right.inbounds)
+}
+
+fn config_eq_without_users_routes_and_outbounds(left: &CoreConfig, right: &CoreConfig) -> bool {
+    left.instance_id == right.instance_id
+        && left.log_level == right.log_level
+        && left.dns == right.dns
+        && left.policy == right.policy
+        && left.stats == right.stats
+        && inbounds_eq_without_users_routes(&left.inbounds, &right.inbounds)
+}
+
+fn inbounds_eq_without_users(left: &[InboundConfig], right: &[InboundConfig]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| inbound_eq_without_users(left, right))
+}
+
+fn inbounds_eq_without_users_routes(left: &[InboundConfig], right: &[InboundConfig]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| inbound_eq_without_users_routes(left, right))
+}
+
+fn inbound_eq_without_users(left: &InboundConfig, right: &InboundConfig) -> bool {
+    inbound_eq_without_users_routes(left, right) && left.routes == right.routes
+}
+
+fn inbound_eq_without_users_routes(left: &InboundConfig, right: &InboundConfig) -> bool {
+    left.tag == right.tag
+        && left.protocol == right.protocol
+        && left.listen == right.listen
+        && left.port == right.port
+        && left.cipher == right.cipher
+        && left.flow == right.flow
+        && left.padding_scheme == right.padding_scheme
+        && left.transport == right.transport
+        && left.tls == right.tls
+        && left.sniffing == right.sniffing
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct UserFingerprintState {
+    users: HashMap<String, u64>,
+}
+
+impl UserFingerprintState {
+    fn from_users(users: &[CoreUser]) -> Self {
+        Self {
+            users: users
+                .iter()
+                .filter(|user| !user.is_empty())
+                .map(|user| (user.uuid.clone(), user_fingerprint(user)))
+                .collect(),
+        }
+    }
+
+    fn apply_delta(&mut self, delta: &CoreUserDelta) {
+        if let Some(full) = delta.full.as_ref() {
+            *self = Self::from_users(full);
+            return;
+        }
+        for user in delta.added.iter().chain(delta.updated.iter()) {
+            if user.is_empty() {
+                continue;
+            }
+            self.users.insert(user.uuid.clone(), user_fingerprint(user));
+        }
+        for uuid in &delta.deleted {
+            self.users.remove(uuid);
+        }
+    }
+}
+
+fn user_fingerprints_for_inbounds(
+    inbounds: &[InboundConfig],
+) -> HashMap<String, UserFingerprintState> {
+    inbounds
+        .iter()
+        .map(|inbound| {
+            (
+                inbound.tag.clone(),
+                UserFingerprintState::from_users(&inbound.users),
+            )
+        })
+        .collect()
+}
+
+fn user_fingerprint(user: &CoreUser) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    user.id.hash(&mut hasher);
+    user.uuid.hash(&mut hasher);
+    user.password.hash(&mut hasher);
+    user.email.hash(&mut hasher);
+    user.speed_limit.hash(&mut hasher);
+    user.device_limit.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn outbound_connect_timeout(policy: &PolicyConfig) -> Duration {

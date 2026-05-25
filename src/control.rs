@@ -449,6 +449,125 @@ mod tests {
     }
 
     #[test]
+    fn route_only_hot_update_preserves_user_delta_revision() {
+        let config = config(Protocol::Socks);
+        let node_tag = config.inbounds[0].tag.clone();
+        let mut updated = config.clone();
+        updated.routes.push(RouteRule {
+            targets: vec!["blocked.example.com".to_string()],
+            action: RouteAction::Block,
+            outbound: None,
+        });
+        let mut controller = CoreController::new();
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyConfig {
+                config: config.clone()
+            }),
+            CoreResponse::Applied { .. }
+        ));
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyUserDelta {
+                node_tag: node_tag.clone(),
+                delta: CoreUserDelta {
+                    revision: Some("1".to_string()),
+                    ..CoreUserDelta::default()
+                },
+            }),
+            CoreResponse::UserDeltaApplied { .. }
+        ));
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyConfig { config: updated }),
+            CoreResponse::Applied { decision, .. } if decision == "updated"
+        ));
+
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyUserDelta {
+                node_tag,
+                delta: CoreUserDelta {
+                    base_revision: Some("1".to_string()),
+                    revision: Some("2".to_string()),
+                    ..CoreUserDelta::default()
+                },
+            }),
+            CoreResponse::UserDeltaApplied { .. }
+        ));
+        assert!(matches!(
+            controller.handle(CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+    }
+
+    #[test]
+    fn route_hot_update_after_user_delta_preserves_revision() {
+        let config = config(Protocol::Socks);
+        let node_tag = config.inbounds[0].tag.clone();
+        let user_b = CoreUser {
+            id: 2,
+            uuid: "user-b".to_string(),
+            password: None,
+            email: None,
+            speed_limit: 0,
+            device_limit: 0,
+        };
+        let mut updated = config.clone();
+        updated.inbounds[0].users.push(user_b.clone());
+        updated.routes.push(RouteRule {
+            targets: vec!["blocked.example.com".to_string()],
+            action: RouteAction::Block,
+            outbound: None,
+        });
+        let mut controller = CoreController::new();
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyConfig {
+                config: config.clone()
+            }),
+            CoreResponse::Applied { .. }
+        ));
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyUserDelta {
+                node_tag: node_tag.clone(),
+                delta: CoreUserDelta {
+                    revision: Some("1".to_string()),
+                    ..CoreUserDelta::default()
+                },
+            }),
+            CoreResponse::UserDeltaApplied { .. }
+        ));
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyUserDelta {
+                node_tag: node_tag.clone(),
+                delta: CoreUserDelta {
+                    added: vec![user_b],
+                    base_revision: Some("1".to_string()),
+                    revision: Some("2".to_string()),
+                    ..CoreUserDelta::default()
+                },
+            }),
+            CoreResponse::UserDeltaApplied { .. }
+        ));
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyConfig { config: updated }),
+            CoreResponse::Applied { decision, .. } if decision == "updated"
+        ));
+
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyUserDelta {
+                node_tag,
+                delta: CoreUserDelta {
+                    base_revision: Some("2".to_string()),
+                    revision: Some("3".to_string()),
+                    ..CoreUserDelta::default()
+                },
+            }),
+            CoreResponse::UserDeltaApplied { .. }
+        ));
+        assert!(matches!(
+            controller.handle(CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+    }
+
+    #[test]
     fn apply_user_delta_updates_users_without_rebinding_listener() {
         let config = config(Protocol::Socks);
         let node_tag = config.inbounds[0].tag.clone();
