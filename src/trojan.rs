@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::io::{self, Read, Write};
 use std::net::{
@@ -5,10 +6,10 @@ use std::net::{
 };
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc, Arc, Mutex, OnceLock,
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -61,6 +62,7 @@ const MAX_UDP_PACKET_SIZE: usize = 65_535;
 const CLIENT_CLOSE_CONNECT_POLL: Duration = Duration::from_millis(10);
 const TROJAN_TRACE_ENV: &str = "KELI_CORE_TROJAN_TRACE";
 const TROJAN_ROUTE_SLOW_LOG_MS: u128 = 1_000;
+const TROJAN_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
 
 #[derive(Clone, Debug)]
 pub struct TrojanServerConfig {
@@ -1786,14 +1788,82 @@ fn log_trojan_connection_error(
     reason: &'static str,
     error: &io::Error,
 ) {
-    if reason == "client_closed" && !trojan_trace_enabled() {
+    let trace_enabled = trojan_trace_enabled();
+    if reason == "client_closed" && !trace_enabled {
         return;
+    }
+    if !trace_enabled {
+        let Some(suppressed) = should_log_trojan_connection_error(node_tag, scope, reason) else {
+            return;
+        };
+        if suppressed != 0 {
+            eprintln!(
+                "WARN  core   trojan connection failed suppressed node_tag={} scope={scope} reason={reason} suppressed={suppressed}",
+                trojan_log_field(node_tag),
+            );
+        }
     }
     eprintln!(
         "WARN  core   trojan connection failed node_tag={} scope={scope} reason={reason} error={}",
         trojan_log_field(node_tag),
         trojan_log_message(&error.to_string())
     );
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TrojanConnectionErrorLogKey {
+    node_tag: String,
+    scope: &'static str,
+    reason: &'static str,
+}
+
+#[derive(Default)]
+struct TrojanConnectionErrorLogState {
+    has_logged: bool,
+    last_ms: u64,
+    suppressed: u64,
+}
+
+fn should_log_trojan_connection_error(
+    node_tag: &str,
+    scope: &'static str,
+    reason: &'static str,
+) -> Option<u64> {
+    static STATE: OnceLock<
+        Mutex<HashMap<TrojanConnectionErrorLogKey, TrojanConnectionErrorLogState>>,
+    > = OnceLock::new();
+    let mut states = STATE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("trojan connection error log state poisoned");
+    trojan_connection_error_log_decision_at(&mut states, node_tag, scope, reason, now_millis())
+}
+
+fn trojan_connection_error_log_decision_at(
+    states: &mut HashMap<TrojanConnectionErrorLogKey, TrojanConnectionErrorLogState>,
+    node_tag: &str,
+    scope: &'static str,
+    reason: &'static str,
+    now_ms: u64,
+) -> Option<u64> {
+    let key = TrojanConnectionErrorLogKey {
+        node_tag: node_tag.to_string(),
+        scope,
+        reason,
+    };
+    let state = states.entry(key).or_default();
+    if !state.has_logged {
+        state.has_logged = true;
+        state.last_ms = now_ms;
+        return Some(0);
+    }
+    if now_ms.saturating_sub(state.last_ms) < TROJAN_ERROR_LOG_INTERVAL_MS {
+        state.suppressed = state.suppressed.saturating_add(1);
+        return None;
+    }
+    let suppressed = std::mem::take(&mut state.suppressed);
+    state.last_ms = now_ms;
+    Some(suppressed)
 }
 
 fn log_trojan_direct_connected(
@@ -2410,6 +2480,13 @@ fn trojan_log_message(value: &str) -> String {
         .chars()
         .map(|ch| if ch.is_ascii_control() { ' ' } else { ch })
         .collect()
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 fn trojan_trace_enabled() -> bool {
@@ -3553,6 +3630,62 @@ mod tests {
                 "invalid trojan password hash",
             )),
             "invalid_request"
+        );
+    }
+
+    #[test]
+    fn rate_limits_repeated_trojan_connection_errors_by_scope_and_reason() {
+        let mut states = std::collections::HashMap::new();
+
+        assert_eq!(
+            super::trojan_connection_error_log_decision_at(
+                &mut states,
+                "node",
+                "tls_websocket",
+                "upstream_timeout",
+                1_000,
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            super::trojan_connection_error_log_decision_at(
+                &mut states,
+                "node",
+                "tls_websocket",
+                "upstream_timeout",
+                1_001,
+            ),
+            None
+        );
+        assert_eq!(
+            super::trojan_connection_error_log_decision_at(
+                &mut states,
+                "node",
+                "tls_websocket",
+                "upstream_timeout",
+                30_999,
+            ),
+            None
+        );
+        assert_eq!(
+            super::trojan_connection_error_log_decision_at(
+                &mut states,
+                "node",
+                "tls_websocket",
+                "upstream_timeout",
+                31_000,
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            super::trojan_connection_error_log_decision_at(
+                &mut states,
+                "node",
+                "tls_websocket",
+                "permission_denied",
+                31_001,
+            ),
+            Some(0)
         );
     }
 
