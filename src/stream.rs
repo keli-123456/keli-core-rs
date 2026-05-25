@@ -24,10 +24,8 @@ const NATIVE_RELAY_WORKERS_PER_CPU: usize = 16;
 const NATIVE_RELAY_WORKER_MEMORY_MIB: usize = 4;
 const NATIVE_RELAY_RESERVED_FDS: usize = 1024;
 const NATIVE_RELAY_FDS_PER_WORKER: usize = 4;
-#[cfg(windows)]
-const DEFAULT_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 2048;
-#[cfg(not(windows))]
-const DEFAULT_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 256;
+const WINDOWS_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 2048;
+const UNIX_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 128;
 const MIN_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 64;
 const MAX_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 8192;
 const DETACHED_BLOCKING_RELAY_STACK_ENV: &str = "KELI_CORE_DETACHED_RELAY_STACK_KIB";
@@ -379,8 +377,16 @@ fn tcp_relay_blocking_threads() -> usize {
 fn detached_blocking_relay_stack_size() -> usize {
     detached_blocking_relay_stack_size_from_env(
         std::env::var(DETACHED_BLOCKING_RELAY_STACK_ENV).ok(),
-        DEFAULT_DETACHED_BLOCKING_RELAY_STACK_KIB,
+        detached_blocking_relay_default_stack_kib(cfg!(windows)),
     )
+}
+
+fn detached_blocking_relay_default_stack_kib(is_windows: bool) -> usize {
+    if is_windows {
+        WINDOWS_DETACHED_BLOCKING_RELAY_STACK_KIB
+    } else {
+        UNIX_DETACHED_BLOCKING_RELAY_STACK_KIB
+    }
 }
 
 fn detached_blocking_relay_stack_size_from_env(value: Option<String>, default_kib: usize) -> usize {
@@ -712,9 +718,11 @@ mod tests {
 
     #[test]
     fn detached_blocking_relay_stack_size_is_small_and_configurable() {
+        assert_eq!(super::detached_blocking_relay_default_stack_kib(false), 128);
+        assert_eq!(super::detached_blocking_relay_default_stack_kib(true), 2048);
         assert_eq!(
-            super::detached_blocking_relay_stack_size_from_env(None, 256),
-            256 * 1024
+            super::detached_blocking_relay_stack_size_from_env(None, 128),
+            128 * 1024
         );
         assert_eq!(
             super::detached_blocking_relay_stack_size_from_env(Some("32".to_string()), 256),
