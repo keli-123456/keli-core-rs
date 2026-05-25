@@ -31,6 +31,8 @@ pub struct CoreMetricsSnapshot {
     pub keli_core_hy2_udp_session_limit: usize,
     #[serde(default)]
     pub keli_core_connection_error_total: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub keli_core_detached_blocking_relay_active: BTreeMap<String, usize>,
     pub keli_core_dns: DnsMetricsSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keli_core_quic_resource: Option<QuicResourceSnapshot>,
@@ -88,6 +90,8 @@ impl CoreMetrics {
         snapshot.keli_core_hy2_udp_session_limit =
             crate::hysteria2::hy2_udp_session_limit_for_metrics();
         snapshot.keli_core_connection_error_total = connection_error_metrics_snapshot();
+        snapshot.keli_core_detached_blocking_relay_active =
+            crate::stream::detached_blocking_relay_metrics_snapshot();
         snapshot
     }
 
@@ -354,5 +358,18 @@ mod tests {
         assert!(!snapshot
             .keli_core_connection_error_total
             .contains_key("user-a"));
+    }
+
+    #[test]
+    fn snapshots_include_detached_blocking_relay_active_counts() {
+        let metrics = CoreMetrics::default();
+        let _guard = crate::stream::DetachedBlockingRelayMetricsGuard::new("keli-core-test-relay");
+
+        let snapshot = metrics.snapshot_with_runtime_metrics(None, None, None);
+
+        assert_eq!(
+            snapshot.keli_core_detached_blocking_relay_active["keli-core-test-relay"],
+            1
+        );
     }
 }

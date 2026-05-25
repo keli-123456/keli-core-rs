@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,6 +13,8 @@ use crate::quic_resources::{available_parallelism_count, memory_limit_mib, open_
 
 static TCP_RELAY_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static NATIVE_RELAY_POOL: OnceLock<NativeRelayPool> = OnceLock::new();
+static DETACHED_BLOCKING_RELAY_ACTIVE: OnceLock<Mutex<BTreeMap<&'static str, usize>>> =
+    OnceLock::new();
 const RELAY_COPY_BUFFER_SIZE: usize = 64 * 1024;
 const TCP_RELAY_BLOCKING_THREADS_MIN: usize = 16;
 const TCP_RELAY_BLOCKING_THREADS_MAX: usize = 128;
@@ -179,9 +181,55 @@ where
         .name(name.to_string())
         .stack_size(detached_blocking_relay_stack_size())
         .spawn(move || {
+            let _metrics = DetachedBlockingRelayMetricsGuard::new(name);
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
         })?;
     Ok(())
+}
+
+pub(crate) struct DetachedBlockingRelayMetricsGuard {
+    name: &'static str,
+}
+
+impl DetachedBlockingRelayMetricsGuard {
+    pub(crate) fn new(name: &'static str) -> Self {
+        {
+            let mut active = detached_blocking_relay_metrics()
+                .lock()
+                .expect("detached blocking relay metrics poisoned");
+            let count = active.entry(name).or_default();
+            *count = count.saturating_add(1);
+        }
+        Self { name }
+    }
+}
+
+impl Drop for DetachedBlockingRelayMetricsGuard {
+    fn drop(&mut self) {
+        let mut active = detached_blocking_relay_metrics()
+            .lock()
+            .expect("detached blocking relay metrics poisoned");
+        let Some(count) = active.get_mut(self.name) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            active.remove(self.name);
+        }
+    }
+}
+
+pub(crate) fn detached_blocking_relay_metrics_snapshot() -> BTreeMap<String, usize> {
+    detached_blocking_relay_metrics()
+        .lock()
+        .expect("detached blocking relay metrics poisoned")
+        .iter()
+        .map(|(name, count)| ((*name).to_string(), *count))
+        .collect()
+}
+
+fn detached_blocking_relay_metrics() -> &'static Mutex<BTreeMap<&'static str, usize>> {
+    DETACHED_BLOCKING_RELAY_ACTIVE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 pub fn spawn_background_io<F>(future: F) -> io::Result<tokio::task::JoinHandle<F::Output>>
@@ -738,6 +786,26 @@ mod tests {
         assert_eq!(
             super::detached_blocking_relay_stack_size_from_env(Some("99999".to_string()), 256),
             8192 * 1024
+        );
+    }
+
+    #[test]
+    fn detached_blocking_relay_metrics_track_active_tasks_by_name() {
+        let _guard = super::DetachedBlockingRelayMetricsGuard::new("keli-core-test-relay");
+        assert_eq!(
+            super::detached_blocking_relay_metrics_snapshot().get("keli-core-test-relay"),
+            Some(&1)
+        );
+        {
+            let _second = super::DetachedBlockingRelayMetricsGuard::new("keli-core-test-relay");
+            assert_eq!(
+                super::detached_blocking_relay_metrics_snapshot().get("keli-core-test-relay"),
+                Some(&2)
+            );
+        }
+        assert_eq!(
+            super::detached_blocking_relay_metrics_snapshot().get("keli-core-test-relay"),
+            Some(&1)
         );
     }
 
