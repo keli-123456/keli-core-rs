@@ -1,6 +1,9 @@
 use std::io;
 use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::time::Duration;
+
+use arc_swap::ArcSwap;
 
 use crate::config::{PolicyConfig, RouteRule, SniffingConfig};
 use crate::outbound::{
@@ -11,7 +14,7 @@ use crate::socks5::SocksTarget;
 
 #[derive(Clone, Debug)]
 pub struct RouteDispatcher {
-    router: RouteMatcher,
+    router: Arc<ArcSwap<RouteMatcher>>,
     sniffing: SniffingConfig,
     policy: PolicyConfig,
 }
@@ -37,18 +40,22 @@ impl RouteDispatcher {
         sniffing: SniffingConfig,
     ) -> Self {
         Self {
-            router: RouteMatcher::new(routes),
+            router: Arc::new(ArcSwap::from_pointee(RouteMatcher::new(routes))),
             policy,
             sniffing,
         }
     }
 
+    pub fn replace_routes(&self, routes: Vec<RouteRule>) {
+        self.router.store(Arc::new(RouteMatcher::new(routes)));
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.router.is_empty()
+        self.router.load().is_empty()
     }
 
     pub fn decide(&self, host: &str) -> RouteDecision {
-        self.router.decide(host)
+        self.router.load().decide(host)
     }
 
     pub fn policy(&self) -> &PolicyConfig {
@@ -97,7 +104,9 @@ impl RouteDispatcher {
         port: u16,
         protocol_labels: &str,
     ) -> RouteDecision {
-        self.router.decide_target(host, port, protocol_labels)
+        self.router
+            .load()
+            .decide_target(host, port, protocol_labels)
     }
 
     pub fn decide_target(&self, host: &str, port: u16, protocol_labels: &str) -> RouteDecision {
@@ -190,7 +199,7 @@ impl RouteDispatcher {
         payload: &[u8],
     ) -> RouteDecision {
         let labels = self.protocol_labels(network, payload);
-        self.router.decide_target(host, port, &labels)
+        self.router.load().decide_target(host, port, &labels)
     }
 
     fn protocol_labels(&self, network: &str, payload: &[u8]) -> String {

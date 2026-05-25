@@ -207,6 +207,10 @@ impl TuicServer {
         self.users.store(Arc::new(tuic_user_map(&users)));
     }
 
+    pub fn replace_routes(&self, routes: Vec<crate::RouteRule>) {
+        self.router.replace_routes(routes);
+    }
+
     pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
         sync_delta_bandwidth(&self.bandwidth, &self.sessions, delta);
         let _guard = self

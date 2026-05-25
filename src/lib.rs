@@ -111,10 +111,23 @@ pub fn apply_process_memory_defaults() {
     }
 }
 
+/// Returns free heap pages to the OS after large connection batches are closed.
+pub fn trim_process_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        let _ = libc::malloc_trim(0);
+    }
+}
+
 #[cfg(test)]
 mod process_memory_tests {
     #[test]
     fn process_memory_defaults_are_safe_to_apply() {
         crate::apply_process_memory_defaults();
+    }
+
+    #[test]
+    fn process_memory_trim_is_safe_to_apply() {
+        crate::trim_process_memory();
     }
 }

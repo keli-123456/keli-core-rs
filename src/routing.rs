@@ -825,6 +825,21 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_replaces_routes_for_existing_clones() {
+        let dispatcher = RouteDispatcher::new(Vec::new());
+        let cloned = dispatcher.clone();
+
+        assert_eq!(cloned.decide("blocked.example.com"), RouteDecision::Direct);
+        dispatcher.replace_routes(vec![RouteRule {
+            targets: vec!["blocked.example.com".to_string()],
+            action: RouteAction::Block,
+            outbound: None,
+        }]);
+
+        assert_eq!(cloned.decide("blocked.example.com"), RouteDecision::Block);
+    }
+
+    #[test]
     fn freedom_outbound_routes_are_direct_decisions() {
         let matcher = RouteMatcher::new(vec![RouteRule {
             targets: vec!["domain:example.com".to_string()],

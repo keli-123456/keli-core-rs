@@ -111,6 +111,7 @@ impl CoreController {
                     service.stop();
                 }
                 self.service = None;
+                crate::trim_process_memory();
                 self.runtime.stop();
                 CoreResponse::Stopped
             }
@@ -183,12 +184,22 @@ impl CoreController {
                     listeners: self.listeners(),
                 };
             }
+            if service.can_update_routes(&config) {
+                service.update_routes_and_users(config);
+                let decision = self.runtime.apply_update(plan);
+                return CoreResponse::Applied {
+                    decision: decision_name(decision).to_string(),
+                    status: self.runtime.status().clone(),
+                    listeners: self.listeners(),
+                };
+            }
         }
 
         if let Some(service) = &mut self.service {
             service.stop();
         }
         self.service = None;
+        crate::trim_process_memory();
 
         let service = match CoreService::start(config) {
             Ok(service) => service,
@@ -249,8 +260,8 @@ mod tests {
     use std::net::{SocketAddr, TcpListener, TcpStream};
 
     use crate::config::{
-        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, PolicyConfig, SniffingConfig,
-        StatsConfig, TransportConfig,
+        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, PolicyConfig, RouteAction, RouteRule,
+        SniffingConfig, StatsConfig, TransportConfig,
     };
     use crate::control::{CoreCommand, CoreController, CoreResponse};
     use crate::protocol::Protocol;
@@ -356,6 +367,51 @@ mod tests {
         let mut updated = config.clone();
         updated.inbounds[0].users[0].uuid = "user-b".to_string();
         updated.inbounds[0].users[0].password = Some("secret-b".to_string());
+        let mut controller = CoreController::new();
+
+        let first = controller.handle(CoreCommand::ApplyConfig {
+            config: config.clone(),
+        });
+        let first_addr = match first {
+            CoreResponse::Applied {
+                decision,
+                listeners,
+                ..
+            } => {
+                assert_eq!(decision, "reloaded");
+                listeners[0].local_addr
+            }
+            response => panic!("unexpected response: {response:?}"),
+        };
+        let second = controller.handle(CoreCommand::ApplyConfig { config: updated });
+
+        match second {
+            CoreResponse::Applied {
+                decision,
+                status,
+                listeners,
+            } => {
+                assert_eq!(decision, "updated");
+                assert_eq!(status, CoreStatus::Running);
+                assert_eq!(listeners[0].local_addr, first_addr);
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
+        assert!(matches!(
+            controller.handle(CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+    }
+
+    #[test]
+    fn apply_config_hot_updates_routes_without_rebinding_listener() {
+        let config = config(Protocol::Socks);
+        let mut updated = config.clone();
+        updated.routes.push(RouteRule {
+            targets: vec!["blocked.example.com".to_string()],
+            action: RouteAction::Block,
+            outbound: None,
+        });
         let mut controller = CoreController::new();
 
         let first = controller.handle(CoreCommand::ApplyConfig {

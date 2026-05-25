@@ -299,6 +299,10 @@ impl Hysteria2Server {
             .replace_keyed_users(users, |user| user.credential().to_string());
     }
 
+    pub fn replace_routes(&self, routes: Vec<crate::RouteRule>) {
+        self.router.replace_routes(routes);
+    }
+
     pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
         sync_delta_bandwidth(&self.bandwidth, &self.sessions, delta);
         self.users

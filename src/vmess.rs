@@ -334,6 +334,10 @@ impl VmessServer {
         self.auth_users.store(Arc::new(vmess_auth_users(&users)));
     }
 
+    pub fn replace_routes(&self, routes: Vec<crate::RouteRule>) {
+        self.router.replace_routes(routes);
+    }
+
     pub fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
         let delta = CoreUserDelta {
             added: valid_vmess_users(&delta.added),

@@ -147,6 +147,22 @@ impl ListenerRuntime {
         }
     }
 
+    fn replace_routes(&self, routes: Vec<crate::RouteRule>) {
+        match self {
+            ListenerRuntime::Socks(server) => server.replace_routes(routes),
+            ListenerRuntime::Http(server) => server.replace_routes(routes),
+            ListenerRuntime::Vless(server) => server.replace_routes(routes),
+            ListenerRuntime::Vmess(server) => server.replace_routes(routes),
+            ListenerRuntime::Trojan(server) => server.replace_routes(routes),
+            ListenerRuntime::Shadowsocks(server) => server.replace_routes(routes),
+            ListenerRuntime::AnyTls(server) => server.replace_routes(routes),
+            ListenerRuntime::Tuic(server) => server.replace_routes(routes),
+            ListenerRuntime::Hysteria2(server) => server.replace_routes(routes),
+            ListenerRuntime::Mieru(server) => server.replace_routes(routes),
+            ListenerRuntime::Naive(server) => server.replace_routes(routes),
+        }
+    }
+
     fn apply_user_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
         match self {
             ListenerRuntime::Socks(server) => server.apply_user_delta(delta),
@@ -374,6 +390,11 @@ impl CoreService {
         config_without_users(&self.config) == config_without_users(config)
     }
 
+    pub fn can_update_routes(&self, config: &CoreConfig) -> bool {
+        config_without_users_routes_and_outbounds(&self.config)
+            == config_without_users_routes_and_outbounds(config)
+    }
+
     pub fn update_users(&mut self, config: CoreConfig) {
         for inbound in &config.inbounds {
             if let Some(handle) = self
@@ -386,6 +407,24 @@ impl CoreService {
         }
         self.user_revisions.clear();
         self.config = config_without_users(&config);
+    }
+
+    pub fn update_routes_and_users(&mut self, config: CoreConfig) {
+        let active_config = config_without_users(&config);
+        for inbound in &config.inbounds {
+            if let Some(handle) = self
+                .listeners
+                .iter()
+                .find(|handle| handle.status.tag == inbound.tag)
+            {
+                handle.runtime.replace_users(inbound.users.clone());
+                handle
+                    .runtime
+                    .replace_routes(active_config.resolved_inbound_routes(inbound));
+            }
+        }
+        self.user_revisions.clear();
+        self.config = active_config;
     }
 
     pub fn apply_user_delta(
@@ -461,6 +500,16 @@ fn config_without_users(config: &CoreConfig) -> CoreConfig {
     let mut config = config.clone();
     for inbound in &mut config.inbounds {
         inbound.users.clear();
+    }
+    config
+}
+
+fn config_without_users_routes_and_outbounds(config: &CoreConfig) -> CoreConfig {
+    let mut config = config_without_users(config);
+    config.outbounds.clear();
+    config.routes.clear();
+    for inbound in &mut config.inbounds {
+        inbound.routes.clear();
     }
     config
 }
