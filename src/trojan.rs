@@ -1963,8 +1963,11 @@ fn should_log_trojan_relay_finished(
     error: Option<&io::Error>,
     trace_enabled: bool,
 ) -> bool {
-    if trace_enabled || error.is_some() {
+    if trace_enabled {
         return true;
+    }
+    if let Some(error) = error {
+        return classify_trojan_connection_error(error) != "client_closed";
     }
     if first_byte_ms.is_some_and(|value| value >= TROJAN_ROUTE_SLOW_LOG_MS) {
         return true;
@@ -5317,6 +5320,16 @@ mod tests {
             "completed",
             None,
             Some(&io::Error::new(io::ErrorKind::TimedOut, "relay timeout")),
+            false,
+        ));
+        assert!(!super::should_log_trojan_relay_finished(
+            0,
+            0,
+            None,
+            Duration::from_millis(1200),
+            "relay_error",
+            Some("Broken_pipe_(os_error_32)"),
+            Some(&io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe")),
             false,
         ));
     }
