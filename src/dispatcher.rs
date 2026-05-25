@@ -307,7 +307,11 @@ fn parse_host_header_target(value: &str, default_port: u16) -> Option<SocksTarge
             .unwrap_or(default_port);
         return sanitized_target(host, port);
     }
-    let colon_count = value.as_bytes().iter().filter(|byte| **byte == b':').count();
+    let colon_count = value
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b':')
+        .count();
     if colon_count == 1 {
         let (host, port) = value.rsplit_once(':')?;
         let port = port.parse::<u16>().ok().unwrap_or(default_port);
