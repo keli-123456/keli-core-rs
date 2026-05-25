@@ -74,6 +74,7 @@ impl Default for WebSocketRelayTimeouts {
 
 pub struct WebSocketClientStream<S> {
     stream: S,
+    input: Vec<u8>,
     buffer: Vec<u8>,
     assembler: WebSocketMessageAssembler,
 }
@@ -105,6 +106,7 @@ pub fn connect_websocket_client<S: Read + Write>(
     validate_client_upgrade_response(&response, key)?;
     Ok(WebSocketClientStream {
         stream,
+        input: Vec::new(),
         buffer: Vec::new(),
         assembler: WebSocketMessageAssembler::default(),
     })
@@ -797,15 +799,28 @@ impl<S: Read + Write> Read for WebSocketClientStream<S> {
             return Ok(0);
         }
         while self.buffer.is_empty() {
-            match read_server_frame(&mut self.stream, &mut self.assembler)? {
-                WebSocketFrame::Data(data) => self.buffer = data,
-                WebSocketFrame::Ping(data) => {
-                    self.stream
-                        .write_all(&client_frame_bytes(OPCODE_PONG, &data))?;
-                    self.stream.flush()?;
+            if let Some(frame) =
+                parse_buffered_frame_with_mask(&mut self.input, &mut self.assembler, false)?
+            {
+                match frame {
+                    WebSocketFrame::Data(data) => self.buffer = data,
+                    WebSocketFrame::Ping(data) => {
+                        self.stream
+                            .write_all(&client_frame_bytes(OPCODE_PONG, &data))?;
+                        self.stream.flush()?;
+                    }
+                    WebSocketFrame::Pong => {}
+                    WebSocketFrame::Close => return Ok(0),
                 }
-                WebSocketFrame::Pong => {}
-                WebSocketFrame::Close => return Ok(0),
+                continue;
+            }
+
+            let mut input = [0u8; 8 * 1024];
+            match self.stream.read(&mut input) {
+                Ok(0) => return Ok(0),
+                Ok(read) => self.input.extend_from_slice(&input[..read]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(error),
+                Err(error) => return Err(error),
             }
         }
 
@@ -1115,78 +1130,19 @@ fn websocket_accept_key(key: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
 }
 
-fn read_server_frame<R: Read>(
-    reader: &mut R,
-    assembler: &mut WebSocketMessageAssembler,
-) -> io::Result<WebSocketFrame> {
-    loop {
-        let raw = read_raw_frame(reader, false)?;
-        if let Some(frame) = assembler.accept(raw)? {
-            return Ok(frame);
-        }
-    }
-}
-
-fn read_raw_frame<R: Read>(reader: &mut R, expect_masked: bool) -> io::Result<RawWebSocketFrame> {
-    let mut header = [0u8; 2];
-    reader.read_exact(&mut header)?;
-    let fin = header[0] & 0x80 != 0;
-    let opcode = header[0] & 0x0f;
-    let masked = header[1] & 0x80 != 0;
-    if expect_masked && !masked {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "client websocket frame must be masked",
-        ));
-    }
-    if !expect_masked && masked {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "server websocket frame must not be masked",
-        ));
-    }
-
-    let mut len = u64::from(header[1] & 0x7f);
-    if len == 126 {
-        let mut extended = [0u8; 2];
-        reader.read_exact(&mut extended)?;
-        len = u64::from(u16::from_be_bytes(extended));
-    } else if len == 127 {
-        let mut extended = [0u8; 8];
-        reader.read_exact(&mut extended)?;
-        len = u64::from_be_bytes(extended);
-    }
-    if len > MAX_HTTP_HEADER as u64 * 64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "websocket frame too large",
-        ));
-    }
-
-    let mut mask = [0u8; 4];
-    if masked {
-        reader.read_exact(&mut mask)?;
-    }
-    let mut payload = vec![0u8; len as usize];
-    reader.read_exact(&mut payload)?;
-    if masked {
-        for (index, byte) in payload.iter_mut().enumerate() {
-            *byte ^= mask[index % 4];
-        }
-    }
-
-    Ok(RawWebSocketFrame {
-        fin,
-        opcode,
-        payload,
-    })
-}
-
 fn parse_buffered_frame(
     buffer: &mut Vec<u8>,
     assembler: &mut WebSocketMessageAssembler,
 ) -> io::Result<Option<WebSocketFrame>> {
-    while let Some(raw) = parse_buffered_raw_frame(buffer, true)? {
+    parse_buffered_frame_with_mask(buffer, assembler, true)
+}
+
+fn parse_buffered_frame_with_mask(
+    buffer: &mut Vec<u8>,
+    assembler: &mut WebSocketMessageAssembler,
+    expect_masked: bool,
+) -> io::Result<Option<WebSocketFrame>> {
+    while let Some(raw) = parse_buffered_raw_frame(buffer, expect_masked)? {
         if let Some(frame) = assembler.accept(raw)? {
             return Ok(Some(frame));
         }
@@ -1675,6 +1631,50 @@ mod tests {
             connect_websocket_client(client, Some("/ws"), "example.test").expect("upgrade");
         let mut payload = [0u8; 4];
         ws.read_exact(&mut payload).expect("fragmented payload");
+        assert_eq!(&payload, b"pong");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn client_nonblocking_read_preserves_partial_server_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let request = read_http_response(&mut stream);
+            assert!(request.contains("GET /ws HTTP/1.1"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                )
+                .expect("response");
+            let frame = server_frame_with(true, 0x2, b"pong");
+            stream.write_all(&frame[..2]).expect("frame header");
+            stream.flush().expect("flush header");
+            thread::sleep(Duration::from_millis(100));
+            stream.write_all(&frame[2..]).expect("frame body");
+            stream.flush().expect("flush body");
+        });
+
+        let client = TcpStream::connect(addr).expect("client");
+        let mut ws =
+            connect_websocket_client(client, Some("/ws"), "example.test").expect("upgrade");
+        ws.get_mut().set_nonblocking(true).expect("nonblocking");
+        let mut payload = [0u8; 4];
+        let mut read = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while read < payload.len() && Instant::now() < deadline {
+            match ws.read(&mut payload[read..]) {
+                Ok(0) => break,
+                Ok(n) => read += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("read websocket frame: {error}"),
+            }
+        }
+
+        assert_eq!(read, payload.len());
         assert_eq!(&payload, b"pong");
         server.join().expect("server");
     }

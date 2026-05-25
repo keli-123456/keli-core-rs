@@ -611,7 +611,9 @@ fn start_vmess_listener(
         let grpc_server = server.clone();
         let handler: GrpcStreamHandler =
             Arc::new(move |reader: GrpcHunkReader, writer: GrpcHunkWriter| {
-                let _ = grpc_server.handle_split_client(reader, writer);
+                if let Err(error) = grpc_server.handle_split_client(reader, writer) {
+                    eprintln!("vmess grpc stream failed: {error}");
+                }
             });
         return start_grpc_transport_listener(
             inbound,
@@ -1344,7 +1346,9 @@ fn start_trojan_listener(
         let grpc_server = server.clone();
         let handler: GrpcStreamHandler =
             Arc::new(move |reader: GrpcHunkReader, writer: GrpcHunkWriter| {
-                let _ = grpc_server.handle_split_client(reader, writer);
+                if let Err(error) = grpc_server.handle_split_client(reader, writer) {
+                    eprintln!("trojan grpc stream failed: {error}");
+                }
             });
         return start_grpc_transport_listener(
             inbound,
@@ -1526,7 +1530,9 @@ fn start_vless_listener(
         let grpc_server = server.clone();
         let handler: GrpcStreamHandler =
             Arc::new(move |reader: GrpcHunkReader, writer: GrpcHunkWriter| {
-                let _ = grpc_server.handle_split_client(reader, writer);
+                if let Err(error) = grpc_server.handle_split_client(reader, writer) {
+                    eprintln!("vless grpc stream failed: {error}");
+                }
             });
         return start_grpc_transport_listener(
             inbound,
@@ -2715,15 +2721,15 @@ fn resolve_listen_addr(listen: &str, port: u16) -> io::Result<SocketAddr> {
 mod tests {
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use base64::Engine;
-    use bytes::{Buf, Bytes};
+    use bytes::Buf;
     use quinn::crypto::rustls::QuicClientConfig;
-    use rustls::pki_types::{CertificateDer, ServerName};
+    use rustls::pki_types::CertificateDer;
     use rustls::{ClientConfig, RootCertStore};
     use sha2::{Digest, Sha224};
     use std::fs;
     use std::future::poll_fn;
     use std::io::{self, Read, Write};
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+    use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};
@@ -2731,14 +2737,16 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use crate::config::{
-        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, PolicyConfig, RealityConfig,
-        SniffingConfig, StatsConfig, TlsConfig, TransportConfig,
+        CoreConfig, DnsConfig, InboundConfig, OutboundConfig, OutboundTlsConfig,
+        OutboundTransportConfig, PolicyConfig, RealityConfig, SniffingConfig, StatsConfig,
+        TlsConfig, TransportConfig,
     };
-    use crate::grpc::{decode_hunk_message, encode_grpc_hunk, send_grpc_data, take_grpc_message};
     use crate::protocol::Protocol;
     use crate::service::CoreService;
+    use crate::socks5::SocksTarget;
     use crate::tls::TlsAcceptor;
     use crate::user::{CoreUser, CoreUserDelta};
+    use crate::vless::connect_vless_tcp_outbound;
 
     use super::reality_tls_acceptor;
 
@@ -3057,10 +3065,6 @@ mod tests {
         assert!(group.join_timeout(Duration::from_secs(5)));
     }
 
-    trait AsyncIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
-
-    impl<T> AsyncIo for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
-
     fn user() -> CoreUser {
         CoreUser {
             id: 1,
@@ -3077,6 +3081,14 @@ mod tests {
             .expect("bind free port")
             .local_addr()
             .expect("free port addr")
+            .port()
+    }
+
+    fn free_udp_port() -> u16 {
+        UdpSocket::bind("127.0.0.1:0")
+            .expect("bind free udp port")
+            .local_addr()
+            .expect("free udp port addr")
             .port()
     }
 
@@ -3250,10 +3262,6 @@ mod tests {
             *byte = u8::from_str_radix(&compact[index * 2..index * 2 + 2], 16).expect("uuid byte");
         }
         bytes
-    }
-
-    fn vless_tcp_request(target: std::net::SocketAddr) -> Vec<u8> {
-        vless_tcp_request_for_user("11111111-1111-1111-1111-111111111111", target)
     }
 
     fn vless_tcp_request_for_user(uuid: &str, target: std::net::SocketAddr) -> Vec<u8> {
@@ -3757,106 +3765,40 @@ mod tests {
         echo_addr: std::net::SocketAddr,
         cert_der: Option<CertificateDer<'static>>,
     ) {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        runtime.block_on(async move {
-            let stream = tokio::net::TcpStream::connect(proxy_addr)
-                .await
-                .expect("grpc connect");
-            let stream: Box<dyn AsyncIo> = if let Some(cert_der) = cert_der {
-                let mut roots = RootCertStore::empty();
-                roots.add(cert_der).expect("root cert");
-                let config = ClientConfig::builder()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth();
-                let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-                let server_name = ServerName::try_from("localhost")
-                    .expect("server name")
-                    .to_owned();
-                let tls = connector
-                    .connect(server_name, stream)
-                    .await
-                    .expect("tls connect");
-                Box::new(tls)
-            } else {
-                Box::new(stream)
-            };
-            let (mut client, connection) =
-                h2::client::handshake(stream).await.expect("h2 handshake");
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-
-            let request = http::Request::builder()
-                .method("POST")
-                .uri("/GunService/Tun")
-                .header("content-type", "application/grpc")
-                .body(())
-                .expect("grpc request");
-            let (response, mut send) = client.send_request(request, false).expect("send request");
-            send_grpc_data(
-                &mut send,
-                Bytes::from(encode_grpc_hunk(&vless_tcp_request(echo_addr))),
-                false,
-            )
-            .await
-            .expect("send vless request");
-
-            let response = response.await.expect("grpc response");
-            assert_eq!(response.status(), http::StatusCode::OK);
-            let mut body = response.into_body();
-            let mut frames = Vec::new();
-            let mut plain = Vec::new();
-            read_grpc_plain_until(&mut body, &mut frames, &mut plain, 2).await;
-            assert_eq!(&plain[..2], &[0x00, 0x00]);
-
-            send_grpc_data(&mut send, Bytes::from(encode_grpc_hunk(b"ping")), true)
-                .await
-                .expect("send vless payload");
-            read_grpc_plain_until(&mut body, &mut frames, &mut plain, 6).await;
-            loop {
-                match tokio::time::timeout(Duration::from_millis(500), body.data()).await {
-                    Ok(Some(Ok(chunk))) => {
-                        let len = chunk.len();
-                        frames.extend_from_slice(&chunk);
-                        let _ = body.flow_control().release_capacity(len);
-                        while let Some(message) =
-                            take_grpc_message(&mut frames).expect("grpc frame")
-                        {
-                            plain.extend_from_slice(
-                                &decode_hunk_message(&message).expect("grpc hunk"),
-                            );
-                        }
-                    }
-                    Ok(Some(Err(error))) => panic!("grpc data chunk: {error}"),
-                    Ok(None) | Err(_) => break,
-                }
-            }
-            assert_eq!(&plain[2..6], b"ping");
-        });
-    }
-
-    async fn read_grpc_plain_until(
-        body: &mut h2::RecvStream,
-        frames: &mut Vec<u8>,
-        plain: &mut Vec<u8>,
-        len: usize,
-    ) {
-        while plain.len() < len {
-            let chunk = body
-                .data()
-                .await
-                .expect("grpc data")
-                .expect("grpc data chunk");
-            let chunk_len = chunk.len();
-            frames.extend_from_slice(&chunk);
-            let _ = body.flow_control().release_capacity(chunk_len);
-            while let Some(message) = take_grpc_message(frames).expect("grpc frame") {
-                plain.extend_from_slice(&decode_hunk_message(&message).expect("grpc hunk"));
-            }
-        }
+        let outbound = OutboundConfig {
+            tag: "vless-grpc-out".to_string(),
+            protocol: "vless".to_string(),
+            method: None,
+            alter_id: None,
+            address: Some(proxy_addr.ip().to_string()),
+            port: Some(proxy_addr.port()),
+            username: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            password: None,
+            tls: cert_der.map(|_| OutboundTlsConfig {
+                server_name: "localhost".to_string(),
+                allow_insecure: true,
+                alpn: vec!["h2".to_string()],
+            }),
+            transport: Some(OutboundTransportConfig {
+                network: "grpc".to_string(),
+                service_name: Some("GunService".to_string()),
+                host: Some("localhost".to_string()),
+                ..OutboundTransportConfig::default()
+            }),
+        };
+        let target = SocksTarget {
+            host: echo_addr.ip().to_string(),
+            port: echo_addr.port(),
+        };
+        let mut stream = connect_vless_tcp_outbound(&outbound, &target, Duration::from_secs(2))
+            .expect("connect vless grpc outbound");
+        stream.write_all(b"ping").expect("write grpc payload");
+        let mut response = [0u8; 4];
+        stream
+            .read_exact(&mut response)
+            .expect("read grpc response");
+        assert_eq!(&response, b"ping");
+        stream.shutdown(Shutdown::Both).expect("close grpc bridge");
     }
 
     struct TestCert {
@@ -4186,6 +4128,7 @@ mod tests {
         config.inbounds[0].transport.service_name = Some("GunService".to_string());
         let mut service = CoreService::start(config).expect("service start");
         let grpc_addr = service.listeners()[0].local_addr;
+        thread::sleep(Duration::from_millis(50));
 
         run_grpc_vless_client(grpc_addr, echo_addr, None);
         echo_thread.join().expect("echo thread");
@@ -4232,6 +4175,7 @@ mod tests {
         });
         let mut service = CoreService::start(config).expect("service start");
         let grpc_addr = service.listeners()[0].local_addr;
+        thread::sleep(Duration::from_millis(50));
 
         run_grpc_vless_client(grpc_addr, echo_addr, Some(cert.cert_der.clone()));
         echo_thread.join().expect("echo thread");
@@ -4621,7 +4565,7 @@ mod tests {
     #[test]
     fn starts_naive_h3_listener_from_core_config() {
         let cert = test_cert("naive-h3");
-        let mut config = config(free_port());
+        let mut config = config(free_udp_port());
         config.inbounds[0].tag = "panel|naive-h3|1".to_string();
         config.inbounds[0].protocol = Protocol::Naive;
         config.inbounds[0].transport = TransportConfig {
@@ -4649,7 +4593,7 @@ mod tests {
     fn naive_h3_listener_proxies_tcp_and_records_traffic() {
         let cert = test_cert("naive-h3-proxy");
         let greeting = GreetingServer::start(b"x");
-        let mut config = config(free_port());
+        let mut config = config(free_udp_port());
         config.inbounds[0].tag = "panel|naive-h3|1".to_string();
         config.inbounds[0].protocol = Protocol::Naive;
         config.inbounds[0].transport = TransportConfig {
@@ -4699,7 +4643,7 @@ mod tests {
     fn naive_h3_listener_handles_repeated_client_reconnects() {
         let cert = test_cert("naive-h3-reconnect");
         let greeting = GreetingServer::start(b"r");
-        let mut config = config(free_port());
+        let mut config = config(free_udp_port());
         config.inbounds[0].tag = "panel|naive-h3|1".to_string();
         config.inbounds[0].protocol = Protocol::Naive;
         config.inbounds[0].transport = TransportConfig {

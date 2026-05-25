@@ -27,7 +27,7 @@ const NATIVE_RELAY_WORKER_MEMORY_MIB: usize = 4;
 const NATIVE_RELAY_RESERVED_FDS: usize = 1024;
 const NATIVE_RELAY_FDS_PER_WORKER: usize = 4;
 const WINDOWS_NATIVE_RELAY_STACK_KIB: usize = 2048;
-const UNIX_NATIVE_RELAY_STACK_KIB: usize = 256;
+const UNIX_NATIVE_RELAY_STACK_KIB: usize = 2048;
 const WINDOWS_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 2048;
 // VLESS/Trojan WS+TLS relay frames can nest TLS/WebSocket buffers deeply enough to
 // overflow 128 KiB stacks under real Linux traffic. Keep Linux at 256 KiB until

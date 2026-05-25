@@ -46,7 +46,7 @@ pub struct GrpcHunkWriter {
 
 pub(crate) struct GrpcClientStream {
     rx: mpsc::Receiver<Vec<u8>>,
-    tx: UnboundedSender<Vec<u8>>,
+    tx: Option<UnboundedSender<Vec<u8>>>,
     buffer: Vec<u8>,
     nonblocking: bool,
 }
@@ -363,7 +363,9 @@ async fn handle_grpc_request(
     let request_task = read_grpc_hunks(request.into_body(), input_tx);
     let response_task = write_grpc_hunks(&mut send, output_rx);
     let (request_result, response_result) = tokio::join!(request_task, response_task);
-    let _ = handler_task.await;
+    handler_task
+        .await
+        .map_err(|error| io::Error::other(format!("grpc stream handler failed: {error}")))?;
     request_result?;
     response_result
 }
@@ -610,7 +612,7 @@ impl GrpcClientStream {
     fn new(rx: mpsc::Receiver<Vec<u8>>, tx: UnboundedSender<Vec<u8>>) -> Self {
         Self {
             rx,
-            tx,
+            tx: Some(tx),
             buffer: Vec::new(),
             nonblocking: false,
         }
@@ -618,6 +620,10 @@ impl GrpcClientStream {
 
     pub(crate) fn set_nonblocking(&mut self, nonblocking: bool) {
         self.nonblocking = nonblocking;
+    }
+
+    pub(crate) fn close_upload(&mut self) {
+        self.tx.take();
     }
 }
 
@@ -658,6 +664,8 @@ impl Write for GrpcClientStream {
             return Ok(0);
         }
         self.tx
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "grpc upload closed"))?
             .send(input.to_vec())
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "grpc stream closed"))?;
         Ok(input.len())

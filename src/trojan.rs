@@ -3517,7 +3517,7 @@ fn relay_plain_to_grpc(mut plain: TcpStream, mut grpc: GrpcClientStream) -> io::
             match plain.read(&mut upload_buffer) {
                 Ok(0) => {
                     upload_done = true;
-                    let _ = grpc.flush();
+                    grpc.close_upload();
                     progressed = true;
                 }
                 Ok(read) => {
@@ -3527,7 +3527,7 @@ fn relay_plain_to_grpc(mut plain: TcpStream, mut grpc: GrpcClientStream) -> io::
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => {
                     upload_done = true;
-                    let _ = grpc.flush();
+                    grpc.close_upload();
                     progressed = true;
                 }
             }
@@ -4964,6 +4964,7 @@ mod tests {
             reader.read_exact(&mut payload).expect("payload");
             assert_eq!(&payload, b"ping");
             writer.write_all(b"pong").expect("response");
+            writer.flush().expect("flush response");
         });
 
         let outbound = OutboundConfig {
