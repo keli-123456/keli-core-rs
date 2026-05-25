@@ -40,9 +40,11 @@ use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::vision::{VisionDecoder, VisionEncoder, VisionReader, VisionWriter};
 use crate::websocket::{
-    accept_websocket_tls_with_client_ip, accept_websocket_with_client_ip, connect_websocket_client,
+    accept_websocket_async_with_client_ip, accept_websocket_tls_with_client_ip,
+    accept_websocket_with_client_ip, connect_websocket_client, relay_websocket_async_stream_stats,
     relay_websocket_tls_stream, websocket_relay_idle_limit, websocket_tls_relay_idle_timeout,
-    WebSocketClientStream, WebSocketReader, WebSocketRelayTimeouts, WebSocketWriter,
+    AsyncWebSocketStream, WebSocketClientStream, WebSocketReader, WebSocketRelayTimeouts,
+    WebSocketWriter,
 };
 use crate::{
     connect_tcp_outbound, connect_tcp_outbound_tokio, send_udp_outbound, send_udp_outbound_tokio,
@@ -567,6 +569,61 @@ impl VlessServer {
         self.spawn_tls_websocket_relay(websocket, remote, request, bandwidth, session)
     }
 
+    pub async fn handle_tls_websocket_client_async<S>(
+        &self,
+        client: S,
+        client_ip: Option<IpAddr>,
+        path: Option<&str>,
+    ) -> io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let result = self
+            .handle_tls_websocket_client_async_inner(client, client_ip, path)
+            .await;
+        if let Err(error) = &result {
+            record_vless_connection_error(&self.config.node_tag, "tls_websocket", error);
+        }
+        result
+    }
+
+    async fn handle_tls_websocket_client_async_inner<S>(
+        &self,
+        client: S,
+        client_ip: Option<IpAddr>,
+        path: Option<&str>,
+    ) -> io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let (mut websocket, forwarded_ip) =
+            accept_websocket_async_with_client_ip(client, path).await?;
+        let mut request = tokio::time::timeout(
+            self.config.connect_timeout,
+            self.read_request_from_async_websocket(&mut websocket),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "vless websocket auth timed out"))??;
+        request.client_ip = forwarded_ip.or(client_ip);
+        let user = self.request_user(&request);
+        let _session = self.acquire_user_session(user.as_ref(), request.client_ip)?;
+        let bandwidth = if request.command == VlessCommand::Udp {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
+        if request.command == VlessCommand::Udp {
+            websocket.write_binary_all(&[VERSION, 0x00]).await?;
+            return self
+                .relay_udp_tls_websocket_async(websocket, request, bandwidth)
+                .await;
+        }
+        let remote = self.connect_tcp_for_request_async(&request).await?;
+        websocket.write_binary_all(&[VERSION, 0x00]).await?;
+        self.relay_tls_websocket_async(websocket, remote, request, bandwidth)
+            .await
+    }
+
     pub fn drain_traffic(&self, minimum_bytes: u64) -> Vec<crate::traffic::TrafficDelta> {
         self.traffic.drain_minimum(minimum_bytes)
     }
@@ -697,6 +754,66 @@ impl VlessServer {
         })
     }
 
+    async fn read_request_from_async_websocket<S>(
+        &self,
+        stream: &mut AsyncWebSocketStream<S>,
+    ) -> io::Result<VlessRequest>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let version = read_u8_from_async_websocket(stream).await?;
+        if version != VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported vless version",
+            ));
+        }
+
+        let mut uuid = [0u8; 16];
+        read_exact_from_async_websocket(stream, &mut uuid).await?;
+        let user_key = format_uuid_compact(&uuid);
+        let Some(user) = self.users.get(&user_key) else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unknown vless user",
+            ));
+        };
+
+        let flow = self.read_addon_flow_from_async_websocket(stream).await?;
+        self.validate_request_flow(&flow)?;
+
+        let command = read_u8_from_async_websocket(stream).await?;
+        let command = match command {
+            COMMAND_TCP => VlessCommand::Tcp,
+            COMMAND_UDP => VlessCommand::Udp,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "only vless tcp and udp commands are supported",
+                ));
+            }
+        };
+        if command == VlessCommand::Udp && !flow.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "vless udp command does not support flow",
+            ));
+        }
+
+        let target = read_vless_target_from_async_websocket(stream).await?;
+
+        Ok(VlessRequest {
+            command,
+            user_key,
+            user_uuid: user.uuid.clone(),
+            user_numeric_id: user.id,
+            user_id: uuid,
+            flow,
+            target,
+            client_ip: None,
+        })
+    }
+
     fn read_addon_flow<T>(&self, stream: &mut T) -> io::Result<String>
     where
         T: Read,
@@ -720,6 +837,22 @@ impl VlessServer {
         }
         let mut addon = vec![0u8; usize::from(addon_len)];
         stream.read_exact(&mut addon).await?;
+        parse_addon_flow(&addon)
+    }
+
+    async fn read_addon_flow_from_async_websocket<S>(
+        &self,
+        stream: &mut AsyncWebSocketStream<S>,
+    ) -> io::Result<String>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let addon_len = read_u8_from_async_websocket(stream).await?;
+        if addon_len == 0 {
+            return Ok(String::new());
+        }
+        let mut addon = vec![0u8; usize::from(addon_len)];
+        read_exact_from_async_websocket(stream, &mut addon).await?;
         parse_addon_flow(&addon)
     }
 
@@ -1142,6 +1275,37 @@ impl VlessServer {
         }
     }
 
+    async fn connect_tcp_for_request_async(
+        &self,
+        request: &VlessRequest,
+    ) -> io::Result<tokio::net::TcpStream> {
+        match self
+            .router
+            .decide_tcp(&request.target.host, request.target.port, &[])
+        {
+            RouteDecision::Direct => {
+                connect_target_async(&request.target, self.config.connect_timeout).await
+            }
+            RouteDecision::Outbound(outbound) => {
+                connect_vless_route_tcp_outbound_tokio(
+                    &self.config.node_tag,
+                    &outbound,
+                    &request.target,
+                    self.config.connect_timeout,
+                )
+                .await
+            }
+            RouteDecision::Block => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "target blocked by route",
+            )),
+            RouteDecision::UnsupportedOutbound(tag) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("outbound route {tag} is not implemented"),
+            )),
+        }
+    }
+
     fn relay_tls<S>(
         &self,
         client: TlsConnection<S>,
@@ -1227,6 +1391,34 @@ impl VlessServer {
         Ok(())
     }
 
+    async fn relay_tls_websocket_async<S>(
+        &self,
+        client: AsyncWebSocketStream<S>,
+        remote: tokio::net::TcpStream,
+        request: VlessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let stats = relay_websocket_async_stream_stats(
+            client,
+            remote,
+            bandwidth,
+            WebSocketRelayTimeouts::default(),
+        )
+        .await?;
+        self.traffic.add_with_user_id(
+            self.config.node_tag.clone(),
+            request.user_uuid,
+            Some(request.user_numeric_id),
+            stats.upload,
+            stats.download,
+            request.client_ip,
+        );
+        Ok(())
+    }
+
     fn spawn_tls_websocket_relay(
         &self,
         client: crate::websocket::WebSocketTlsStream,
@@ -1302,6 +1494,52 @@ impl VlessServer {
                         .forward_udp_payload_async(
                             &mut state,
                             &mut stream,
+                            &request.target,
+                            &payload,
+                            bandwidth.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok((sent, received)) => {
+                            upload = upload.saturating_add(sent);
+                            download = download.saturating_add(received);
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+                Err(error) if is_stream_closed(&error) => break Ok(()),
+                Err(error) => break Err(error),
+            }
+        };
+        self.record_traffic(
+            request.user_uuid,
+            request.user_numeric_id,
+            upload,
+            download,
+            request.client_ip,
+        );
+        result
+    }
+
+    async fn relay_udp_tls_websocket_async<S>(
+        &self,
+        mut websocket: AsyncWebSocketStream<S>,
+        request: VlessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+    ) -> io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut state = AsyncVlessUdpRelayState::new(self.config.connect_timeout);
+        let mut upload = 0u64;
+        let mut download = 0u64;
+        let result = loop {
+            match read_vless_udp_payload_from_async_websocket(&mut websocket).await {
+                Ok(payload) => {
+                    match self
+                        .forward_udp_payload_async_websocket(
+                            &mut state,
+                            &mut websocket,
                             &request.target,
                             &payload,
                             bandwidth.as_deref(),
@@ -1515,6 +1753,86 @@ impl VlessServer {
         let download = match recv_udp_response_async(udp, &mut response, timeout).await {
             Ok((read, _)) => {
                 write_vless_udp_payload_async(writer, &response[..read]).await?;
+                read as u64
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                0
+            }
+            Err(error) => return Err(error),
+        };
+
+        Ok((payload.len() as u64, download))
+    }
+
+    async fn forward_udp_payload_async_websocket<S>(
+        &self,
+        state: &mut AsyncVlessUdpRelayState,
+        writer: &mut AsyncWebSocketStream<S>,
+        target: &SocksTarget,
+        payload: &[u8],
+        bandwidth: Option<&BandwidthLimiter>,
+    ) -> io::Result<(u64, u64)>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let decision = self.router.decide_udp(&target.host, target.port, payload);
+        let outbound = match &decision {
+            RouteDecision::Direct => None,
+            RouteDecision::Outbound(outbound) => Some(outbound),
+            RouteDecision::Block => return Ok((0, 0)),
+            RouteDecision::UnsupportedOutbound(tag) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("outbound route {tag} is not implemented"),
+                ));
+            }
+        };
+
+        if let Some(limiter) = bandwidth {
+            if !limiter.wait_for_async(payload.len()).await {
+                return Ok((0, 0));
+            }
+        }
+
+        if let Some(outbound) = outbound {
+            return match send_vless_route_udp_outbound_tokio(
+                &self.config.node_tag,
+                outbound,
+                target,
+                payload,
+                self.config.connect_timeout,
+            )
+            .await
+            {
+                Ok((_, response)) => {
+                    write_vless_udp_payload_to_async_websocket(writer, &response).await?;
+                    Ok((payload.len() as u64, response.len() as u64))
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    Ok((payload.len() as u64, 0))
+                }
+                Err(error) => Err(error),
+            };
+        }
+
+        let remote_addr = state.remote_addr_for(target).await?;
+        let timeout = state.timeout;
+        let udp = state.socket_for(remote_addr).await?;
+        udp.send_to(payload, remote_addr).await?;
+        let mut response = vec![0u8; MAX_UDP_PACKET_SIZE];
+        let download = match recv_udp_response_async(udp, &mut response, timeout).await {
+            Ok((read, _)) => {
+                write_vless_udp_payload_to_async_websocket(writer, &response[..read]).await?;
                 read as u64
             }
             Err(error)
@@ -1820,6 +2138,40 @@ where
         ATYP_IPV6 => {
             let mut bytes = [0u8; 16];
             reader.read_exact(&mut bytes).await?;
+            Ipv6Addr::from(bytes).to_string()
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported vless address type",
+            ));
+        }
+    };
+    Ok(SocksTarget { host, port })
+}
+
+async fn read_vless_target_from_async_websocket<S>(
+    reader: &mut AsyncWebSocketStream<S>,
+) -> io::Result<SocksTarget>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut port = [0u8; 2];
+    read_exact_from_async_websocket(reader, &mut port).await?;
+    let port = u16::from_be_bytes(port);
+    let host = match read_u8_from_async_websocket(reader).await? {
+        ATYP_IPV4 => {
+            let mut bytes = [0u8; 4];
+            read_exact_from_async_websocket(reader, &mut bytes).await?;
+            Ipv4Addr::from(bytes).to_string()
+        }
+        ATYP_DOMAIN => {
+            let len = read_u8_from_async_websocket(reader).await?;
+            read_string_from_async_websocket(reader, usize::from(len)).await?
+        }
+        ATYP_IPV6 => {
+            let mut bytes = [0u8; 16];
+            read_exact_from_async_websocket(reader, &mut bytes).await?;
             Ipv6Addr::from(bytes).to_string()
         }
         _ => {
@@ -2452,6 +2804,20 @@ where
     Ok(payload)
 }
 
+async fn read_vless_udp_payload_from_async_websocket<S>(
+    reader: &mut AsyncWebSocketStream<S>,
+) -> io::Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut len = [0u8; 2];
+    read_exact_from_async_websocket(reader, &mut len).await?;
+    let len = u16::from_be_bytes(len) as usize;
+    let mut payload = vec![0u8; len];
+    read_exact_from_async_websocket(reader, &mut payload).await?;
+    Ok(payload)
+}
+
 fn write_vless_udp_payload<W: Write>(writer: &mut W, payload: &[u8]) -> io::Result<()> {
     if payload.len() > u16::MAX as usize {
         return Err(io::Error::new(
@@ -2477,6 +2843,25 @@ where
         .write_all(&(payload.len() as u16).to_be_bytes())
         .await?;
     writer.write_all(payload).await
+}
+
+async fn write_vless_udp_payload_to_async_websocket<S>(
+    writer: &mut AsyncWebSocketStream<S>,
+    payload: &[u8],
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if payload.len() > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "vless udp payload is too large",
+        ));
+    }
+    let mut framed = Vec::with_capacity(payload.len() + 2);
+    framed.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    framed.extend_from_slice(payload);
+    writer.write_binary_all(&framed).await
 }
 
 async fn recv_udp_response_async(
@@ -3630,6 +4015,49 @@ where
     reader.read_exact(&mut bytes).await?;
     String::from_utf8(bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8"))
+}
+
+async fn read_u8_from_async_websocket<S>(reader: &mut AsyncWebSocketStream<S>) -> io::Result<u8>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut byte = [0u8; 1];
+    read_exact_from_async_websocket(reader, &mut byte).await?;
+    Ok(byte[0])
+}
+
+async fn read_string_from_async_websocket<S>(
+    reader: &mut AsyncWebSocketStream<S>,
+    len: usize,
+) -> io::Result<String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut bytes = vec![0u8; len];
+    read_exact_from_async_websocket(reader, &mut bytes).await?;
+    String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8"))
+}
+
+async fn read_exact_from_async_websocket<S>(
+    reader: &mut AsyncWebSocketStream<S>,
+    output: &mut [u8],
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut offset = 0usize;
+    while offset < output.len() {
+        let read = reader.read_data(&mut output[offset..]).await?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "websocket closed before enough data was read",
+            ));
+        }
+        offset += read;
+    }
+    Ok(())
 }
 
 fn parse_addon_flow(addon: &[u8]) -> io::Result<String> {
@@ -6010,6 +6438,77 @@ mod tests {
         release_remote_tx.send(()).expect("release remote");
         server_thread.join().expect("server thread");
         echo_thread.join().expect("echo thread");
+    }
+
+    #[test]
+    fn tls_websocket_async_tcp_relay_does_not_spawn_detached_relay_thread() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let cert = test_cert("vless-ws-async-relay");
+            let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+            let echo_addr = echo.local_addr().expect("echo addr");
+            let (release_remote_tx, release_remote_rx) = mpsc::channel();
+            let echo_thread = thread::spawn(move || {
+                let (mut stream, _) = echo.accept().expect("echo accept");
+                let mut bytes = [0u8; 4];
+                stream.read_exact(&mut bytes).expect("echo read");
+                stream.write_all(&bytes).expect("echo write");
+                let _ = release_remote_rx.recv_timeout(Duration::from_secs(3));
+            });
+
+            let server = server();
+            let detached_before = crate::stream::detached_blocking_relay_metrics_snapshot()
+                .get("keli-core-vless-relay")
+                .copied()
+                .unwrap_or(0);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("vless bind");
+            let vless_addr = listener.local_addr().expect("vless addr");
+            let acceptor =
+                TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+            let acceptor = tokio_rustls::TlsAcceptor::from(acceptor.server_config());
+            let server_task = tokio::spawn(async move {
+                let (stream, peer) = listener.accept().await.expect("vless accept");
+                let client = acceptor.accept(stream).await.expect("tls accept");
+                server
+                    .handle_tls_websocket_client_async(client, Some(peer.ip()), Some("/vless"))
+                    .await
+            });
+
+            let client_task = tokio::task::spawn_blocking(move || {
+                let mut client = tls_client(vless_addr, cert.cert_der.clone());
+                client
+                    .write_all(&websocket_request("/vless"))
+                    .expect("websocket request");
+                let response = read_websocket_response(&mut client);
+                assert!(response.contains("101 Switching Protocols"));
+                client
+                    .write_all(&masked_frame(&vless_request(echo_addr)))
+                    .expect("vless request frame");
+                assert_eq!(read_binary_frame(&mut client), [0x00, 0x00]);
+                client.write_all(&masked_frame(b"ping")).expect("payload");
+                assert_eq!(read_binary_frame(&mut client), b"ping");
+                client
+            });
+
+            let client = client_task.await.expect("client task");
+            let detached_during = crate::stream::detached_blocking_relay_metrics_snapshot()
+                .get("keli-core-vless-relay")
+                .copied()
+                .unwrap_or(0);
+            assert!(
+                detached_during <= detached_before,
+                "async vless websocket relay must not add detached OS relay threads: before={detached_before} during={detached_during}"
+            );
+            drop(client);
+            release_remote_tx.send(()).expect("release remote");
+            server_task
+                .await
+                .expect("server task")
+                .expect("async tls websocket relay");
+            echo_thread.join().expect("echo thread");
+        });
     }
 
     #[test]
