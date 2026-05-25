@@ -71,8 +71,11 @@ pub struct DeviceLimitOnlineRecord {
 #[derive(Debug)]
 pub struct UserSessionGuard {
     user_uuid: String,
+    node_tag: String,
+    user_id: u64,
     key: UserSessionKey,
     active: UserSessionShards,
+    devices: Arc<Mutex<DeviceLimitRuntimeState>>,
 }
 
 #[derive(Debug)]
@@ -211,9 +214,20 @@ impl UserSessionTracker {
                 *count += 1;
                 return Ok(Some(UserSessionGuard {
                     user_uuid: user.uuid.clone(),
+                    node_tag: node_tag.to_string(),
+                    user_id: user.id,
                     key: UserSessionKey::Ip(ip),
                     active: Arc::clone(&self.active),
+                    devices: Arc::clone(&self.devices),
                 }));
+            }
+            if !policy.udp_rebind_tolerant && state.device_count() >= limit {
+                drop(active);
+                self.remove_pending_ip(node_tag, user, ip);
+                return Err(DeviceLimitExceeded {
+                    user_uuid: user.uuid.clone(),
+                    limit: user.device_limit,
+                });
             }
             state.ips.insert(ip, 1);
             UserSessionKey::Ip(ip)
@@ -229,8 +243,11 @@ impl UserSessionTracker {
         };
         Ok(Some(UserSessionGuard {
             user_uuid: user.uuid.clone(),
+            node_tag: node_tag.to_string(),
+            user_id: user.id,
             key,
             active: Arc::clone(&self.active),
+            devices: Arc::clone(&self.devices),
         }))
     }
 
@@ -377,6 +394,30 @@ impl UserSessionTracker {
         devices.pending.entry(key).or_default().insert(ip, user.id);
         Ok(())
     }
+
+    fn remove_pending_ip(&self, node_tag: &str, user: &CoreUser, ip: IpAddr) {
+        remove_pending_ip_for_user(&self.devices, node_tag, &user.uuid, user.id, ip);
+    }
+}
+
+fn remove_pending_ip_for_user(
+    devices: &Arc<Mutex<DeviceLimitRuntimeState>>,
+    node_tag: &str,
+    user_uuid: &str,
+    user_id: u64,
+    ip: IpAddr,
+) {
+    let mut devices = devices.lock().expect("device limit lock poisoned");
+    let key = device_limit_user_key(node_tag, user_uuid);
+    let Some(pending) = devices.pending.get_mut(&key) else {
+        return;
+    };
+    if pending.get(&ip) == Some(&user_id) {
+        pending.remove(&ip);
+    }
+    if pending.is_empty() {
+        devices.pending.remove(&key);
+    }
 }
 
 impl DeviceLimitRuntimeState {
@@ -478,17 +519,22 @@ impl UserSessionState {
         self.ips.len() + self.anonymous
     }
 
-    fn release(&mut self, key: UserSessionKey) {
+    fn release(&mut self, key: UserSessionKey) -> Option<IpAddr> {
         match key {
             UserSessionKey::Ip(ip) => match self.ips.get_mut(&ip) {
-                Some(count) if *count > 1 => *count -= 1,
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    None
+                }
                 Some(_) => {
                     self.ips.remove(&ip);
+                    Some(ip)
                 }
-                None => {}
+                None => None,
             },
             UserSessionKey::Anonymous => {
                 self.anonymous = self.anonymous.saturating_sub(1);
+                None
             }
         }
     }
@@ -953,14 +999,27 @@ impl UserConnectionHandle {
 
 impl Drop for UserSessionGuard {
     fn drop(&mut self) {
-        let Ok(mut active) = user_session_shard(&self.active, &self.user_uuid).lock() else {
-            return;
-        };
-        if let Some(state) = active.get_mut(&self.user_uuid) {
-            state.release(self.key);
-            if state.device_count() == 0 {
-                active.remove(&self.user_uuid);
+        let mut released_ip = None;
+        {
+            let Ok(mut active) = user_session_shard(&self.active, &self.user_uuid).lock() else {
+                return;
+            };
+            if let Some(state) = active.get_mut(&self.user_uuid) {
+                released_ip = state.release(self.key);
+                if state.device_count() == 0 {
+                    active.remove(&self.user_uuid);
+                }
             }
+        };
+
+        if let Some(ip) = released_ip {
+            remove_pending_ip_for_user(
+                &self.devices,
+                &self.node_tag,
+                &self.user_uuid,
+                self.user_id,
+                ip,
+            );
         }
     }
 }
@@ -1251,6 +1310,83 @@ mod tests {
         assert!(tracker
             .try_acquire_for_node_ip(node_tag, Some(&user_b), Some(ip))
             .is_ok());
+    }
+
+    #[test]
+    fn rejects_different_ip_for_same_user_across_node_tags_before_alive_sync() {
+        let tracker = UserSessionTracker::default();
+        let user = user(1);
+        let first = tracker
+            .try_acquire_for_node_ip(
+                "panel|vless|1",
+                Some(&user),
+                Some("198.51.100.11".parse().unwrap()),
+            )
+            .expect("first protocol should be accepted")
+            .expect("first guard");
+
+        let error = tracker
+            .try_acquire_for_node_ip(
+                "panel|trojan|2",
+                Some(&user),
+                Some("198.51.100.12".parse().unwrap()),
+            )
+            .expect_err("same user should share device limit across protocols");
+
+        assert_eq!(error.user_uuid(), "user-a");
+        assert_eq!(tracker.active_count("user-a"), 1);
+        drop(first);
+        assert_eq!(tracker.active_count("user-a"), 0);
+    }
+
+    #[test]
+    fn allows_same_ip_for_same_user_across_node_tags() {
+        let tracker = UserSessionTracker::default();
+        let user = user(1);
+        let ip = "198.51.100.13".parse().unwrap();
+        let first = tracker
+            .try_acquire_for_node_ip("panel|vless|1", Some(&user), Some(ip))
+            .expect("first protocol should be accepted")
+            .expect("first guard");
+        let second = tracker
+            .try_acquire_for_node_ip("panel|trojan|2", Some(&user), Some(ip))
+            .expect("same ip should be accepted across protocols")
+            .expect("second guard");
+
+        assert_eq!(tracker.active_count("user-a"), 1);
+        drop(first);
+        assert_eq!(tracker.active_count("user-a"), 1);
+        drop(second);
+        assert_eq!(tracker.active_count("user-a"), 0);
+    }
+
+    #[test]
+    fn dropping_unreported_ip_releases_pending_device_slot() {
+        let tracker = UserSessionTracker::default();
+        let user = user(1);
+        let node_tag = "panel|trojan|1";
+        let first = tracker
+            .try_acquire_for_node_ip(
+                node_tag,
+                Some(&user),
+                Some("198.51.100.14".parse().unwrap()),
+            )
+            .expect("first ip should be accepted")
+            .expect("first guard");
+        drop(first);
+        assert_eq!(tracker.active_count("user-a"), 0);
+
+        let second = tracker
+            .try_acquire_for_node_ip(
+                node_tag,
+                Some(&user),
+                Some("198.51.100.15".parse().unwrap()),
+            )
+            .expect("closed unreported ip should not reserve the slot")
+            .expect("second guard");
+
+        assert_eq!(tracker.active_count("user-a"), 1);
+        drop(second);
     }
 
     #[test]
