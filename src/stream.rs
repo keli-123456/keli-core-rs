@@ -27,7 +27,7 @@ const NATIVE_RELAY_FDS_PER_WORKER: usize = 4;
 #[cfg(windows)]
 const DEFAULT_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 2048;
 #[cfg(not(windows))]
-const DEFAULT_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 128;
+const DEFAULT_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 256;
 const MIN_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 64;
 const MAX_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 8192;
 const DETACHED_BLOCKING_RELAY_STACK_ENV: &str = "KELI_CORE_DETACHED_RELAY_STACK_KIB";
@@ -713,19 +713,19 @@ mod tests {
     #[test]
     fn detached_blocking_relay_stack_size_is_small_and_configurable() {
         assert_eq!(
-            super::detached_blocking_relay_stack_size_from_env(None, 128),
-            128 * 1024
+            super::detached_blocking_relay_stack_size_from_env(None, 256),
+            256 * 1024
         );
         assert_eq!(
-            super::detached_blocking_relay_stack_size_from_env(Some("32".to_string()), 128),
+            super::detached_blocking_relay_stack_size_from_env(Some("32".to_string()), 256),
             64 * 1024
         );
         assert_eq!(
-            super::detached_blocking_relay_stack_size_from_env(Some("512".to_string()), 128),
+            super::detached_blocking_relay_stack_size_from_env(Some("512".to_string()), 256),
             512 * 1024
         );
         assert_eq!(
-            super::detached_blocking_relay_stack_size_from_env(Some("99999".to_string()), 128),
+            super::detached_blocking_relay_stack_size_from_env(Some("99999".to_string()), 256),
             8192 * 1024
         );
     }
