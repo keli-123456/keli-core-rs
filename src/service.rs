@@ -440,6 +440,22 @@ impl CoreService {
         self.config = active_config;
     }
 
+    pub fn update_routes(&mut self, config: CoreConfig) {
+        let active_config = config_without_users(&config);
+        for inbound in &active_config.inbounds {
+            if let Some(handle) = self
+                .listeners
+                .iter()
+                .find(|handle| handle.status.tag == inbound.tag)
+            {
+                handle
+                    .runtime
+                    .replace_routes(active_config.resolved_inbound_routes(inbound));
+            }
+        }
+        self.config = active_config;
+    }
+
     pub fn apply_user_delta(
         &mut self,
         node_tag: &str,

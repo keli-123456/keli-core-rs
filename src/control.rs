@@ -14,6 +14,9 @@ pub enum CoreCommand {
     ApplyConfig {
         config: CoreConfig,
     },
+    ApplyRoutes {
+        config: CoreConfig,
+    },
     ApplyUserDelta {
         node_tag: String,
         delta: CoreUserDelta,
@@ -81,6 +84,7 @@ impl CoreController {
     pub fn handle(&mut self, command: CoreCommand) -> CoreResponse {
         match command {
             CoreCommand::ApplyConfig { config } => self.apply_config(config),
+            CoreCommand::ApplyRoutes { config } => self.apply_routes(config),
             CoreCommand::ApplyUserDelta { node_tag, delta } => {
                 self.apply_user_delta(node_tag, delta)
             }
@@ -115,6 +119,27 @@ impl CoreController {
                 self.runtime.stop();
                 CoreResponse::Stopped
             }
+        }
+    }
+
+    fn apply_routes(&mut self, config: CoreConfig) -> CoreResponse {
+        let Some(service) = &mut self.service else {
+            return CoreResponse::Error {
+                message: "cannot apply routes before config is applied".to_string(),
+            };
+        };
+        if !service.can_update_routes(&config) {
+            return CoreResponse::Error {
+                message: "route hot config requires reload".to_string(),
+            };
+        }
+
+        service.update_routes(config);
+        let decision = self.runtime.apply_runtime_update();
+        CoreResponse::Applied {
+            decision: decision_name(decision).to_string(),
+            status: self.runtime.status().clone(),
+            listeners: self.listeners(),
         }
     }
 
@@ -561,6 +586,80 @@ mod tests {
             }),
             CoreResponse::UserDeltaApplied { .. }
         ));
+        assert!(matches!(
+            controller.handle(CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+    }
+
+    #[test]
+    fn apply_routes_accepts_config_without_users_and_preserves_revision() {
+        let config = config(Protocol::Socks);
+        let node_tag = config.inbounds[0].tag.clone();
+        let mut route_config = config.clone();
+        route_config.inbounds[0].users.clear();
+        route_config.routes.push(RouteRule {
+            targets: vec!["blocked.example.com".to_string()],
+            action: RouteAction::Block,
+            outbound: None,
+        });
+        let mut controller = CoreController::new();
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyConfig { config }),
+            CoreResponse::Applied { .. }
+        ));
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyUserDelta {
+                node_tag: node_tag.clone(),
+                delta: CoreUserDelta {
+                    revision: Some("1".to_string()),
+                    ..CoreUserDelta::default()
+                },
+            }),
+            CoreResponse::UserDeltaApplied { .. }
+        ));
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyRoutes {
+                config: route_config
+            }),
+            CoreResponse::Applied { decision, .. } if decision == "updated"
+        ));
+
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyUserDelta {
+                node_tag,
+                delta: CoreUserDelta {
+                    base_revision: Some("1".to_string()),
+                    revision: Some("2".to_string()),
+                    ..CoreUserDelta::default()
+                },
+            }),
+            CoreResponse::UserDeltaApplied { .. }
+        ));
+        assert!(matches!(
+            controller.handle(CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+    }
+
+    #[test]
+    fn apply_routes_rejects_structural_changes() {
+        let config = config(Protocol::Socks);
+        let mut route_config = config.clone();
+        route_config.inbounds[0].users.clear();
+        route_config.inbounds[0].port = free_port();
+        let mut controller = CoreController::new();
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyConfig { config }),
+            CoreResponse::Applied { .. }
+        ));
+
+        match controller.handle(CoreCommand::ApplyRoutes {
+            config: route_config,
+        }) {
+            CoreResponse::Error { message } => assert!(message.contains("requires reload")),
+            response => panic!("unexpected response: {response:?}"),
+        }
         assert!(matches!(
             controller.handle(CoreCommand::Stop),
             CoreResponse::Stopped
