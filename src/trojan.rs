@@ -1969,7 +1969,9 @@ fn should_log_trojan_relay_finished(
     if let Some(error) = error {
         return classify_trojan_connection_error(error) != "client_closed";
     }
-    if first_byte_ms.is_some_and(|value| value >= TROJAN_ROUTE_SLOW_LOG_MS) {
+    if first_byte_ms.is_some_and(|value| value >= TROJAN_ROUTE_SLOW_LOG_MS)
+        && finish_reason != "client_eof"
+    {
         return true;
     }
     if download == 0 && elapsed.as_millis() >= TROJAN_ROUTE_SLOW_LOG_MS {
@@ -5288,6 +5290,16 @@ mod tests {
             Some(1500),
             Duration::from_secs(120),
             "remote_eof",
+            None,
+            None,
+            false,
+        ));
+        assert!(!super::should_log_trojan_relay_finished(
+            1024,
+            2048,
+            Some(1500),
+            Duration::from_secs(5),
+            "client_eof",
             None,
             None,
             false,
