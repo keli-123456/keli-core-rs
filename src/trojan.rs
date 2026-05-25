@@ -2291,7 +2291,14 @@ fn log_trojan_udp_relay_finished(
     elapsed: Duration,
     error: Option<&io::Error>,
 ) {
-    if !should_log_trojan_udp_relay_finished(elapsed, error, trojan_trace_enabled()) {
+    if !should_log_trojan_udp_relay_finished(
+        download,
+        download_packets,
+        first_response_ms,
+        elapsed,
+        error,
+        trojan_trace_enabled(),
+    ) {
         return;
     }
     eprintln!(
@@ -2312,11 +2319,23 @@ fn log_trojan_udp_relay_finished(
 }
 
 fn should_log_trojan_udp_relay_finished(
+    download: u64,
+    download_packets: u64,
+    first_response_ms: Option<u128>,
     elapsed: Duration,
     error: Option<&io::Error>,
     trace_enabled: bool,
 ) -> bool {
-    error.is_some() || elapsed.as_millis() >= TROJAN_ROUTE_SLOW_LOG_MS || trace_enabled
+    if error.is_some() || trace_enabled {
+        return true;
+    }
+    if first_response_ms.is_some_and(|value| value >= TROJAN_ROUTE_SLOW_LOG_MS) {
+        return true;
+    }
+    first_response_ms.is_none()
+        && download == 0
+        && download_packets == 0
+        && elapsed.as_millis() >= TROJAN_ROUTE_SLOW_LOG_MS
 }
 
 fn format_trojan_udp_relay_finished(
@@ -5330,24 +5349,56 @@ mod tests {
     #[test]
     fn skips_fast_successful_trojan_udp_relay_summary_without_trace() {
         assert!(!super::should_log_trojan_udp_relay_finished(
+            48,
+            1,
+            Some(56),
             Duration::from_millis(250),
             None,
             false,
         ));
         assert!(super::should_log_trojan_udp_relay_finished(
+            0,
+            0,
+            None,
             Duration::from_millis(1001),
             None,
             false,
         ));
         assert!(super::should_log_trojan_udp_relay_finished(
+            0,
+            0,
+            None,
             Duration::from_millis(250),
             Some(&io::Error::new(io::ErrorKind::TimedOut, "udp timeout")),
             false,
         ));
         assert!(super::should_log_trojan_udp_relay_finished(
+            48,
+            1,
+            Some(56),
             Duration::from_millis(250),
             None,
             true,
+        ));
+        assert!(super::should_log_trojan_udp_relay_finished(
+            48,
+            1,
+            Some(1001),
+            Duration::from_millis(1200),
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn skips_healthy_long_successful_trojan_udp_relay_summary_without_trace() {
+        assert!(!super::should_log_trojan_udp_relay_finished(
+            48,
+            1,
+            Some(56),
+            Duration::from_secs(60),
+            None,
+            false,
         ));
     }
 
