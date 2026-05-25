@@ -25,7 +25,10 @@ const NATIVE_RELAY_WORKER_MEMORY_MIB: usize = 4;
 const NATIVE_RELAY_RESERVED_FDS: usize = 1024;
 const NATIVE_RELAY_FDS_PER_WORKER: usize = 4;
 const WINDOWS_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 2048;
-const UNIX_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 128;
+// VLESS/Trojan WS+TLS relay frames can nest TLS/WebSocket buffers deeply enough to
+// overflow 128 KiB stacks under real Linux traffic. Keep Linux at 256 KiB until
+// these relays move to the async runtime instead of detached OS threads.
+const UNIX_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 256;
 const MIN_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 64;
 const MAX_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 8192;
 const DETACHED_BLOCKING_RELAY_STACK_ENV: &str = "KELI_CORE_DETACHED_RELAY_STACK_KIB";
@@ -718,11 +721,11 @@ mod tests {
 
     #[test]
     fn detached_blocking_relay_stack_size_is_small_and_configurable() {
-        assert_eq!(super::detached_blocking_relay_default_stack_kib(false), 128);
+        assert_eq!(super::detached_blocking_relay_default_stack_kib(false), 256);
         assert_eq!(super::detached_blocking_relay_default_stack_kib(true), 2048);
         assert_eq!(
-            super::detached_blocking_relay_stack_size_from_env(None, 128),
-            128 * 1024
+            super::detached_blocking_relay_stack_size_from_env(None, 256),
+            256 * 1024
         );
         assert_eq!(
             super::detached_blocking_relay_stack_size_from_env(Some("32".to_string()), 256),
