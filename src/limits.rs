@@ -1,5 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -9,12 +9,14 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use socket2::SockRef;
 use tokio::sync::Notify;
 
 use crate::user::{CoreUser, CoreUserDelta};
 
 const USER_LIMIT_SHARDS: usize = 64;
+const REPORTED_ALIVE_BRIDGE_TTL: Duration = Duration::from_secs(120);
 
 type UserSessionShards = Arc<Vec<Mutex<HashMap<String, UserSessionState>>>>;
 type BandwidthLimiterShards = Arc<Vec<Mutex<HashMap<String, Arc<BandwidthLimiter>>>>>;
@@ -23,6 +25,7 @@ type UserConnectionShards = Arc<Vec<Mutex<HashMap<String, Vec<Weak<UserConnectio
 #[derive(Clone, Debug)]
 pub struct UserSessionTracker {
     active: UserSessionShards,
+    devices: Arc<Mutex<DeviceLimitRuntimeState>>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +43,29 @@ pub struct ActiveConnectionRegistry {
 pub struct DeviceLimitExceeded {
     user_uuid: String,
     limit: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceLimitPolicy {
+    pub udp_rebind_tolerant: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceLimitSnapshot {
+    pub node_tag: String,
+    #[serde(default)]
+    pub alive: BTreeMap<u64, usize>,
+    #[serde(default)]
+    pub alive_ips: BTreeMap<u64, Vec<IpAddr>>,
+    #[serde(default)]
+    pub mode: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceLimitOnlineRecord {
+    pub node_tag: String,
+    pub user_id: u64,
+    pub ip: IpAddr,
 }
 
 #[derive(Debug)]
@@ -81,6 +107,21 @@ struct UserSessionState {
     anonymous: usize,
 }
 
+#[derive(Debug, Default)]
+struct DeviceLimitRuntimeState {
+    snapshots: HashMap<String, DeviceLimitNodeState>,
+    pending: HashMap<String, HashMap<IpAddr, u64>>,
+    reported: HashMap<String, HashMap<u64, HashMap<IpAddr, Instant>>>,
+}
+
+#[derive(Debug)]
+struct DeviceLimitNodeState {
+    alive: HashMap<u64, usize>,
+    alive_ips: HashMap<u64, HashSet<IpAddr>>,
+    mode: i32,
+    last_alive_pull: Instant,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UserSessionKey {
     Ip(IpAddr),
@@ -91,6 +132,7 @@ impl Default for UserSessionTracker {
     fn default() -> Self {
         Self {
             active: sharded_hash_maps(),
+            devices: Arc::new(Mutex::new(DeviceLimitRuntimeState::default())),
         }
     }
 }
@@ -125,11 +167,38 @@ impl UserSessionTracker {
         user: Option<&CoreUser>,
         client_ip: Option<IpAddr>,
     ) -> Result<Option<UserSessionGuard>, DeviceLimitExceeded> {
+        self.try_acquire_for_node_ip("", user, client_ip)
+    }
+
+    pub fn try_acquire_for_node_ip(
+        &self,
+        node_tag: &str,
+        user: Option<&CoreUser>,
+        client_ip: Option<IpAddr>,
+    ) -> Result<Option<UserSessionGuard>, DeviceLimitExceeded> {
+        self.try_acquire_for_node_ip_with_policy(
+            node_tag,
+            user,
+            client_ip,
+            DeviceLimitPolicy::default(),
+        )
+    }
+
+    pub fn try_acquire_for_node_ip_with_policy(
+        &self,
+        node_tag: &str,
+        user: Option<&CoreUser>,
+        client_ip: Option<IpAddr>,
+        policy: DeviceLimitPolicy,
+    ) -> Result<Option<UserSessionGuard>, DeviceLimitExceeded> {
         let Some(user) = user else {
             return Ok(None);
         };
         if user.device_limit == 0 {
             return Ok(None);
+        }
+        if let Some(client_ip) = client_ip {
+            self.check_device_limit_ip(node_tag, user, client_ip, policy)?;
         }
 
         let limit = user.device_limit as usize;
@@ -145,12 +214,6 @@ impl UserSessionTracker {
                     key: UserSessionKey::Ip(ip),
                     active: Arc::clone(&self.active),
                 }));
-            }
-            if state.device_count() >= limit {
-                return Err(DeviceLimitExceeded {
-                    user_uuid: user.uuid.clone(),
-                    limit: user.device_limit,
-                });
             }
             state.ips.insert(ip, 1);
             UserSessionKey::Ip(ip)
@@ -171,6 +234,59 @@ impl UserSessionTracker {
         }))
     }
 
+    pub fn apply_device_limit_snapshot(&self, snapshot: DeviceLimitSnapshot) {
+        let mut devices = self.devices.lock().expect("device limit lock poisoned");
+        let now = Instant::now();
+        devices.prune_reported(now);
+        devices.snapshots.insert(
+            snapshot.node_tag,
+            DeviceLimitNodeState {
+                alive: snapshot.alive.into_iter().collect(),
+                alive_ips: snapshot
+                    .alive_ips
+                    .into_iter()
+                    .map(|(user_id, ips)| (user_id, ips.into_iter().collect()))
+                    .collect(),
+                mode: snapshot.mode,
+                last_alive_pull: now,
+            },
+        );
+    }
+
+    pub fn commit_device_limit_report(&self, records: &[DeviceLimitOnlineRecord]) {
+        let mut devices = self.devices.lock().expect("device limit lock poisoned");
+        let now = Instant::now();
+        devices.prune_reported(now);
+        for record in records {
+            if record.node_tag.trim().is_empty() || record.user_id == 0 {
+                continue;
+            }
+            devices
+                .reported
+                .entry(record.node_tag.clone())
+                .or_default()
+                .entry(record.user_id)
+                .or_default()
+                .insert(record.ip, now);
+            let prefix = format!("{}|", record.node_tag);
+            let mut empty_keys = Vec::new();
+            for (key, pending) in &mut devices.pending {
+                if !key.starts_with(&prefix) {
+                    continue;
+                }
+                if pending.get(&record.ip) == Some(&record.user_id) {
+                    pending.remove(&record.ip);
+                }
+                if pending.is_empty() {
+                    empty_keys.push(key.clone());
+                }
+            }
+            for key in empty_keys {
+                devices.pending.remove(&key);
+            }
+        }
+    }
+
     pub fn active_count(&self, user_uuid: &str) -> usize {
         user_session_shard(&self.active, user_uuid)
             .lock()
@@ -187,6 +303,14 @@ impl UserSessionTracker {
                 .expect("user session lock poisoned")
                 .remove(user_uuid);
         }
+        if !user_uuids.is_empty() {
+            let mut devices = self.devices.lock().expect("device limit lock poisoned");
+            devices.pending.retain(|key, _| {
+                !user_uuids
+                    .iter()
+                    .any(|user_uuid| key == user_uuid || key.ends_with(&format!("|{user_uuid}")))
+            });
+        }
     }
 
     pub fn sync_users(&self, users: &[CoreUser]) {
@@ -200,6 +324,152 @@ impl UserSessionTracker {
                 .expect("user session lock poisoned")
                 .retain(|uuid, _| active_uuids.contains(uuid.as_str()));
         }
+        let mut devices = self.devices.lock().expect("device limit lock poisoned");
+        devices.pending.retain(|key, _| {
+            key.rsplit_once('|')
+                .map(|(_, uuid)| active_uuids.contains(uuid))
+                .unwrap_or_else(|| active_uuids.contains(key.as_str()))
+        });
+    }
+
+    fn check_device_limit_ip(
+        &self,
+        node_tag: &str,
+        user: &CoreUser,
+        ip: IpAddr,
+        policy: DeviceLimitPolicy,
+    ) -> Result<(), DeviceLimitExceeded> {
+        let mut devices = self.devices.lock().expect("device limit lock poisoned");
+        devices.prune_reported(Instant::now());
+        let key = device_limit_user_key(node_tag, &user.uuid);
+        if devices
+            .pending
+            .get(&key)
+            .and_then(|pending| pending.get(&ip))
+            == Some(&user.id)
+        {
+            return Ok(());
+        }
+        let known = devices.is_known_alive_ip(node_tag, user.id, ip);
+        if !known {
+            let known_device_count = devices.known_device_count(node_tag, user.id);
+            let mut pending_new = devices.pending_new_ip_count(&key, node_tag, user.id);
+            if user.device_limit as usize <= known_device_count.saturating_add(pending_new)
+                && policy.udp_rebind_tolerant
+                && known_device_count > 0
+            {
+                if devices.drop_one_pending_unknown_ip(&key, node_tag, user.id) && pending_new > 0 {
+                    pending_new -= 1;
+                }
+            }
+            if user.device_limit as usize <= known_device_count.saturating_add(pending_new) {
+                if !(policy.udp_rebind_tolerant
+                    && known_device_count > 0
+                    && user.device_limit as usize == known_device_count.saturating_add(pending_new))
+                {
+                    return Err(DeviceLimitExceeded {
+                        user_uuid: user.uuid.clone(),
+                        limit: user.device_limit,
+                    });
+                }
+            }
+        }
+        devices.pending.entry(key).or_default().insert(ip, user.id);
+        Ok(())
+    }
+}
+
+impl DeviceLimitRuntimeState {
+    fn prune_reported(&mut self, now: Instant) {
+        for users in self.reported.values_mut() {
+            for ips in users.values_mut() {
+                ips.retain(|_, reported_at| {
+                    now.saturating_duration_since(*reported_at) <= REPORTED_ALIVE_BRIDGE_TTL
+                });
+            }
+            users.retain(|_, ips| !ips.is_empty());
+        }
+        self.reported.retain(|_, users| !users.is_empty());
+    }
+
+    fn is_known_alive_ip(&self, node_tag: &str, user_id: u64, ip: IpAddr) -> bool {
+        self.reported
+            .get(node_tag)
+            .and_then(|users| users.get(&user_id))
+            .map(|ips| ips.contains_key(&ip))
+            .unwrap_or(false)
+            || self
+                .snapshots
+                .get(node_tag)
+                .filter(|snapshot| snapshot.mode == 1)
+                .and_then(|snapshot| snapshot.alive_ips.get(&user_id))
+                .map(|ips| ips.contains(&ip))
+                .unwrap_or(false)
+    }
+
+    fn known_device_count(&self, node_tag: &str, user_id: u64) -> usize {
+        self.snapshot_alive_count(node_tag, user_id)
+            .saturating_add(self.recent_reported_local_count(node_tag, user_id))
+    }
+
+    fn snapshot_alive_count(&self, node_tag: &str, user_id: u64) -> usize {
+        self.snapshots
+            .get(node_tag)
+            .and_then(|snapshot| snapshot.alive.get(&user_id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn recent_reported_local_count(&self, node_tag: &str, user_id: u64) -> usize {
+        let last_alive_pull = self
+            .snapshots
+            .get(node_tag)
+            .map(|snapshot| snapshot.last_alive_pull);
+        self.reported
+            .get(node_tag)
+            .and_then(|users| users.get(&user_id))
+            .map(|ips| {
+                ips.values()
+                    .filter(|reported_at| {
+                        last_alive_pull
+                            .map(|last_alive_pull| **reported_at > last_alive_pull)
+                            .unwrap_or(true)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn pending_new_ip_count(&self, key: &str, node_tag: &str, user_id: u64) -> usize {
+        self.pending
+            .get(key)
+            .map(|pending| {
+                pending
+                    .iter()
+                    .filter(|(ip, pending_user_id)| {
+                        **pending_user_id == user_id
+                            && !self.is_known_alive_ip(node_tag, user_id, **ip)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn drop_one_pending_unknown_ip(&mut self, key: &str, node_tag: &str, user_id: u64) -> bool {
+        let Some(pending) = self.pending.get(key) else {
+            return false;
+        };
+        let drop_ip = pending.iter().find_map(|(ip, pending_user_id)| {
+            (*pending_user_id == user_id && !self.is_known_alive_ip(node_tag, user_id, *ip))
+                .then_some(*ip)
+        });
+        let Some(drop_ip) = drop_ip else {
+            return false;
+        };
+        if let Some(pending) = self.pending.get_mut(key) {
+            pending.remove(&drop_ip);
+        }
+        true
     }
 }
 
@@ -221,6 +491,14 @@ impl UserSessionState {
                 self.anonymous = self.anonymous.saturating_sub(1);
             }
         }
+    }
+}
+
+fn device_limit_user_key(node_tag: &str, user_uuid: &str) -> String {
+    if node_tag.trim().is_empty() {
+        user_uuid.to_string()
+    } else {
+        format!("{node_tag}|{user_uuid}")
     }
 }
 
@@ -749,15 +1027,16 @@ fn user_limit_shard_index(user_uuid: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io::Read;
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{IpAddr, TcpListener, TcpStream};
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
     use crate::limits::{
-        speed_limit_mbps_to_bytes_per_second, ActiveConnectionRegistry, UserBandwidthLimiters,
-        UserSessionTracker,
+        speed_limit_mbps_to_bytes_per_second, ActiveConnectionRegistry, DeviceLimitOnlineRecord,
+        DeviceLimitPolicy, DeviceLimitSnapshot, UserBandwidthLimiters, UserSessionTracker,
     };
     use crate::user::CoreUser;
 
@@ -769,6 +1048,30 @@ mod tests {
             email: None,
             speed_limit: 0,
             device_limit,
+        }
+    }
+
+    fn snapshot(
+        node_tag: &str,
+        alive: impl IntoIterator<Item = (u64, usize)>,
+        alive_ips: impl IntoIterator<Item = (u64, Vec<&'static str>)>,
+        mode: i32,
+    ) -> DeviceLimitSnapshot {
+        DeviceLimitSnapshot {
+            node_tag: node_tag.to_string(),
+            alive: alive.into_iter().collect(),
+            alive_ips: alive_ips
+                .into_iter()
+                .map(|(uid, ips)| {
+                    (
+                        uid,
+                        ips.into_iter()
+                            .map(|ip| ip.parse::<IpAddr>().expect("test ip"))
+                            .collect(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+            mode,
         }
     }
 
@@ -832,6 +1135,163 @@ mod tests {
         assert_eq!(tracker.active_count("user-a"), 1);
         drop(second);
         assert_eq!(tracker.active_count("user-a"), 0);
+    }
+
+    #[test]
+    fn rejects_burst_of_local_new_ips_before_alive_sync() {
+        let tracker = UserSessionTracker::default();
+        let user = user(2);
+        let node_tag = "panel|vless|1";
+
+        let first = tracker
+            .try_acquire_for_node_ip(node_tag, Some(&user), Some("198.51.100.1".parse().unwrap()))
+            .expect("first acquire")
+            .expect("first guard");
+        let second = tracker
+            .try_acquire_for_node_ip(node_tag, Some(&user), Some("198.51.100.2".parse().unwrap()))
+            .expect("second acquire")
+            .expect("second guard");
+
+        let error = tracker
+            .try_acquire_for_node_ip(node_tag, Some(&user), Some("198.51.100.3".parse().unwrap()))
+            .expect_err("third ip should be limited before alive sync");
+        assert_eq!(error.user_uuid(), "user-a");
+
+        drop(first);
+        drop(second);
+    }
+
+    #[test]
+    fn allows_same_global_ip_in_alive_ip_mode() {
+        let tracker = UserSessionTracker::default();
+        let user = user(1);
+        let node_tag = "panel|vless|1";
+        tracker.apply_device_limit_snapshot(snapshot(
+            node_tag,
+            [(1, 1usize)],
+            [(1, vec!["198.51.100.7"])],
+            1,
+        ));
+
+        let same = tracker
+            .try_acquire_for_node_ip(node_tag, Some(&user), Some("198.51.100.7".parse().unwrap()))
+            .expect("same global ip should be accepted");
+        assert!(same.is_some());
+
+        let error = tracker
+            .try_acquire_for_node_ip(node_tag, Some(&user), Some("198.51.100.8".parse().unwrap()))
+            .expect_err("different global ip should be limited");
+        assert_eq!(error.limit(), 1);
+    }
+
+    #[test]
+    fn committed_online_report_bridges_until_next_alive_pull() {
+        let tracker = UserSessionTracker::default();
+        let user = user(1);
+        let node_tag = "panel|vless|1";
+        let first_ip = "198.51.100.9".parse().unwrap();
+
+        let first = tracker
+            .try_acquire_for_node_ip(node_tag, Some(&user), Some(first_ip))
+            .expect("first acquire")
+            .expect("first guard");
+        tracker.commit_device_limit_report(&[DeviceLimitOnlineRecord {
+            node_tag: node_tag.to_string(),
+            user_id: 1,
+            ip: first_ip,
+        }]);
+        drop(first);
+
+        assert!(tracker
+            .try_acquire_for_node_ip(node_tag, Some(&user), Some(first_ip))
+            .expect("same reported ip should be accepted")
+            .is_some());
+        let error = tracker
+            .try_acquire_for_node_ip(
+                node_tag,
+                Some(&user),
+                Some("198.51.100.10".parse().unwrap()),
+            )
+            .expect_err("new ip should be limited while report bridge is fresh");
+        assert_eq!(error.user_uuid(), "user-a");
+    }
+
+    #[test]
+    fn committed_online_report_keeps_same_ip_for_different_users() {
+        let tracker = UserSessionTracker::default();
+        let user_a = user(1);
+        let mut user_b = user(1);
+        user_b.id = 2;
+        user_b.uuid = "user-b".to_string();
+        let node_tag = "panel|vless|1";
+        let ip = "198.51.100.7".parse().unwrap();
+        tracker.commit_device_limit_report(&[
+            DeviceLimitOnlineRecord {
+                node_tag: node_tag.to_string(),
+                user_id: 1,
+                ip,
+            },
+            DeviceLimitOnlineRecord {
+                node_tag: node_tag.to_string(),
+                user_id: 2,
+                ip,
+            },
+        ]);
+
+        assert!(tracker
+            .try_acquire_for_node_ip(
+                node_tag,
+                Some(&user_a),
+                Some("198.51.100.8".parse().unwrap())
+            )
+            .is_err());
+        assert!(tracker
+            .try_acquire_for_node_ip(node_tag, Some(&user_a), Some(ip))
+            .is_ok());
+        assert!(tracker
+            .try_acquire_for_node_ip(node_tag, Some(&user_b), Some(ip))
+            .is_ok());
+    }
+
+    #[test]
+    fn udp_rebind_policy_allows_one_transient_unknown_ip_when_alive_at_limit() {
+        let tracker = UserSessionTracker::default();
+        let user = user(1);
+        let node_tag = "panel|hysteria2|1";
+        tracker.apply_device_limit_snapshot(snapshot(node_tag, [(1, 1usize)], [], 0));
+
+        let first = tracker
+            .try_acquire_for_node_ip_with_policy(
+                node_tag,
+                Some(&user),
+                Some("198.51.100.20".parse().unwrap()),
+                DeviceLimitPolicy {
+                    udp_rebind_tolerant: true,
+                },
+            )
+            .expect("first transient rebind should be accepted");
+        assert!(first.is_some());
+
+        let second = tracker
+            .try_acquire_for_node_ip_with_policy(
+                node_tag,
+                Some(&user),
+                Some("198.51.100.21".parse().unwrap()),
+                DeviceLimitPolicy {
+                    udp_rebind_tolerant: true,
+                },
+            )
+            .expect("second transient rebind should replace the pending ip");
+        assert!(second.is_some());
+
+        let error = tracker
+            .try_acquire_for_node_ip(
+                node_tag,
+                Some(&user),
+                Some("198.51.100.22".parse().unwrap()),
+            )
+            .expect_err("strict protocol should still reject beyond the limit");
+        assert_eq!(error.limit(), 1);
     }
 
     #[test]

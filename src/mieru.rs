@@ -485,7 +485,7 @@ fn handle_mieru_session(
     let initial_payload = request_bytes.split_off(request.consumed);
     let _session = runtime
         .sessions
-        .try_acquire_for_ip(Some(&user), client_ip)
+        .try_acquire_for_node_ip(&runtime.node_tag, Some(&user), client_ip)
         .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))?;
     let bandwidth = runtime.bandwidth.limiter_for(Some(&user));
 

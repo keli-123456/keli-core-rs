@@ -330,7 +330,10 @@ impl HttpProxyServer {
         client: &mut TcpStream,
     ) -> io::Result<Option<UserSessionGuard>> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
-        match self.sessions.try_acquire_for_ip(user, client_ip) {
+        match self
+            .sessions
+            .try_acquire_for_node_ip(&self.config.node_tag, user, client_ip)
+        {
             Ok(guard) => Ok(guard),
             Err(error) => {
                 write_too_many_requests_response(client)?;

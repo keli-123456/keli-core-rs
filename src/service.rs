@@ -21,7 +21,9 @@ use crate::grpc::{
 use crate::http_proxy::{HttpProxyServer, HttpProxyServerConfig};
 use crate::httpupgrade::{accept_httpupgrade, accept_httpupgrade_tls};
 use crate::hysteria2::{Hysteria2ObfsConfig, Hysteria2Server, Hysteria2ServerConfig};
-use crate::limits::{UserBandwidthLimiters, UserSessionTracker};
+use crate::limits::{
+    DeviceLimitOnlineRecord, DeviceLimitSnapshot, UserBandwidthLimiters, UserSessionTracker,
+};
 use crate::mieru::{MieruServer, MieruServerConfig};
 use crate::naive::{NaiveServer, NaiveServerConfig};
 use crate::protocol::Protocol;
@@ -100,6 +102,7 @@ pub struct CoreService {
     config: CoreConfig,
     listeners: Vec<ListenerHandle>,
     traffic: SharedTrafficRegistry,
+    sessions: UserSessionTracker,
     bandwidth: UserBandwidthLimiters,
     quic_connections: Option<SharedQuicConnectionLimiter>,
     tls_failures: ClientFailureBackoff,
@@ -352,6 +355,7 @@ impl CoreService {
             config: active_config,
             listeners,
             traffic,
+            sessions,
             bandwidth,
             quic_connections,
             tls_failures,
@@ -388,6 +392,14 @@ impl CoreService {
 
     pub fn requeue_traffic(&self, records: Vec<TrafficDelta>) {
         self.traffic.add_deltas(records);
+    }
+
+    pub fn apply_device_limit_snapshot(&self, snapshot: DeviceLimitSnapshot) {
+        self.sessions.apply_device_limit_snapshot(snapshot);
+    }
+
+    pub fn commit_device_limit_report(&self, records: &[DeviceLimitOnlineRecord]) {
+        self.sessions.commit_device_limit_report(records);
     }
 
     pub fn can_update_users(&self, config: &CoreConfig) -> bool {

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 use crate::config::CoreConfig;
+use crate::limits::{DeviceLimitOnlineRecord, DeviceLimitSnapshot};
 use crate::metrics::{CoreMetrics, CoreMetricsSnapshot};
 use crate::runtime::{CoreStatus, ReloadDecision, RuntimeState};
 use crate::service::{CoreService, ListenerStatus};
@@ -20,6 +21,12 @@ pub enum CoreCommand {
     ApplyUserDelta {
         node_tag: String,
         delta: CoreUserDelta,
+    },
+    ApplyDeviceLimitSnapshot {
+        snapshot: DeviceLimitSnapshot,
+    },
+    CommitDeviceLimitReport {
+        records: Vec<DeviceLimitOnlineRecord>,
     },
     DrainTraffic {
         minimum_bytes: u64,
@@ -50,6 +57,13 @@ pub enum CoreResponse {
         records: Vec<TrafficDelta>,
     },
     TrafficRequeued {
+        count: usize,
+    },
+    DeviceLimitSnapshotApplied {
+        node_tag: String,
+        users: usize,
+    },
+    DeviceLimitReportCommitted {
         count: usize,
     },
     Status {
@@ -88,6 +102,12 @@ impl CoreController {
             CoreCommand::ApplyUserDelta { node_tag, delta } => {
                 self.apply_user_delta(node_tag, delta)
             }
+            CoreCommand::ApplyDeviceLimitSnapshot { snapshot } => {
+                self.apply_device_limit_snapshot(snapshot)
+            }
+            CoreCommand::CommitDeviceLimitReport { records } => {
+                self.commit_device_limit_report(records)
+            }
             CoreCommand::DrainTraffic { minimum_bytes } => CoreResponse::Traffic {
                 records: self.drain_traffic(minimum_bytes),
             },
@@ -120,6 +140,32 @@ impl CoreController {
                 CoreResponse::Stopped
             }
         }
+    }
+
+    fn apply_device_limit_snapshot(&mut self, snapshot: DeviceLimitSnapshot) -> CoreResponse {
+        let Some(service) = &self.service else {
+            return CoreResponse::Error {
+                message: "cannot apply device limit snapshot before config is applied".to_string(),
+            };
+        };
+        let node_tag = snapshot.node_tag.clone();
+        let users = snapshot.alive.len().max(snapshot.alive_ips.len());
+        service.apply_device_limit_snapshot(snapshot);
+        CoreResponse::DeviceLimitSnapshotApplied { node_tag, users }
+    }
+
+    fn commit_device_limit_report(
+        &mut self,
+        records: Vec<DeviceLimitOnlineRecord>,
+    ) -> CoreResponse {
+        let Some(service) = &self.service else {
+            return CoreResponse::Error {
+                message: "cannot commit device limit report before config is applied".to_string(),
+            };
+        };
+        let count = records.len();
+        service.commit_device_limit_report(&records);
+        CoreResponse::DeviceLimitReportCommitted { count }
     }
 
     fn apply_routes(&mut self, config: CoreConfig) -> CoreResponse {
@@ -281,14 +327,16 @@ fn decision_name(decision: ReloadDecision) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 
     use crate::config::{
         CoreConfig, DnsConfig, InboundConfig, OutboundConfig, PolicyConfig, RouteAction, RouteRule,
         SniffingConfig, StatsConfig, TransportConfig,
     };
     use crate::control::{CoreCommand, CoreController, CoreResponse};
+    use crate::limits::{DeviceLimitOnlineRecord, DeviceLimitSnapshot};
     use crate::protocol::Protocol;
     use crate::runtime::CoreStatus;
     use crate::traffic::TrafficDelta;
@@ -344,6 +392,52 @@ mod tests {
             routes: Vec::new(),
             stats: StatsConfig::default(),
         }
+    }
+
+    #[test]
+    fn device_limit_state_commands_require_running_service_and_apply() {
+        let mut controller = CoreController::new();
+        let snapshot = DeviceLimitSnapshot {
+            node_tag: "panel|proxy|1".to_string(),
+            alive: BTreeMap::from([(1, 1)]),
+            alive_ips: BTreeMap::from([(1, vec!["198.51.100.7".parse::<IpAddr>().unwrap()])]),
+            mode: 1,
+        };
+
+        match controller.handle(CoreCommand::ApplyDeviceLimitSnapshot {
+            snapshot: snapshot.clone(),
+        }) {
+            CoreResponse::Error { message } => {
+                assert!(message.contains("before config is applied"));
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
+
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyConfig {
+                config: config(Protocol::Socks),
+            }),
+            CoreResponse::Applied { .. }
+        ));
+
+        assert_eq!(
+            controller.handle(CoreCommand::ApplyDeviceLimitSnapshot { snapshot }),
+            CoreResponse::DeviceLimitSnapshotApplied {
+                node_tag: "panel|proxy|1".to_string(),
+                users: 1,
+            }
+        );
+        assert_eq!(
+            controller.handle(CoreCommand::CommitDeviceLimitReport {
+                records: vec![DeviceLimitOnlineRecord {
+                    node_tag: "panel|proxy|1".to_string(),
+                    user_id: 1,
+                    ip: "198.51.100.8".parse().unwrap(),
+                }]
+            }),
+            CoreResponse::DeviceLimitReportCommitted { count: 1 }
+        );
+        assert_eq!(controller.handle(CoreCommand::Stop), CoreResponse::Stopped);
     }
 
     #[test]

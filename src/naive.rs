@@ -399,10 +399,11 @@ impl NaiveServer {
         let user = self.users.get(&request.user_uuid).ok_or_else(|| {
             io::Error::new(io::ErrorKind::PermissionDenied, "naive user disappeared")
         })?;
-        let _session = match self
-            .sessions
-            .try_acquire_for_ip(Some(&user), request.client_ip)
-        {
+        let _session = match self.sessions.try_acquire_for_node_ip(
+            &self.config.node_tag,
+            Some(&user),
+            request.client_ip,
+        ) {
             Ok(guard) => guard,
             Err(error) => {
                 let _ = send_status(&mut respond, StatusCode::TOO_MANY_REQUESTS, request.padding);
@@ -489,10 +490,11 @@ impl NaiveServer {
         let user = self.users.get(&request.user_uuid).ok_or_else(|| {
             io::Error::new(io::ErrorKind::PermissionDenied, "naive user disappeared")
         })?;
-        let _session = match self
-            .sessions
-            .try_acquire_for_ip(Some(&user), request.client_ip)
-        {
+        let _session = match self.sessions.try_acquire_for_node_ip(
+            &self.config.node_tag,
+            Some(&user),
+            request.client_ip,
+        ) {
             Ok(guard) => guard,
             Err(error) => {
                 let _ = send_h3_status(&mut stream, StatusCode::TOO_MANY_REQUESTS, request.padding)

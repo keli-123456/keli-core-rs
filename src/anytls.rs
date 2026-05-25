@@ -569,7 +569,10 @@ impl AnyTlsServer {
         user: &CoreUser,
         client_ip: Option<IpAddr>,
     ) -> io::Result<Option<UserSessionGuard>> {
-        match self.sessions.try_acquire_for_ip(Some(user), client_ip) {
+        match self
+            .sessions
+            .try_acquire_for_node_ip(&self.config.node_tag, Some(user), client_ip)
+        {
             Ok(guard) => Ok(guard),
             Err(error) => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,

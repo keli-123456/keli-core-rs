@@ -72,8 +72,8 @@ pub use dns::DnsMetricsSnapshot;
 pub use http_proxy::{HttpProxyServer, HttpProxyServerConfig};
 pub use hysteria2::{Hysteria2Server, Hysteria2ServerConfig};
 pub use limits::{
-    BandwidthLimiter, DeviceLimitExceeded, UserBandwidthLimiters, UserSessionGuard,
-    UserSessionTracker,
+    BandwidthLimiter, DeviceLimitExceeded, DeviceLimitOnlineRecord, DeviceLimitPolicy,
+    DeviceLimitSnapshot, UserBandwidthLimiters, UserSessionGuard, UserSessionTracker,
 };
 pub use metrics::{CoreDurationMetrics, CoreMetricsSnapshot};
 pub use mieru::{MieruServer, MieruServerConfig};

@@ -15,8 +15,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::limits::{
-    sync_user_limit_delta, BandwidthLimiter, UserBandwidthLimiters, UserSessionGuard,
-    UserSessionTracker,
+    sync_user_limit_delta, BandwidthLimiter, DeviceLimitPolicy, UserBandwidthLimiters,
+    UserSessionGuard, UserSessionTracker,
 };
 use crate::quic_resources::{
     available_parallelism_count, memory_limit_mib, open_file_soft_limit, QuicConnectionPermit,
@@ -937,7 +937,14 @@ impl Hysteria2Server {
         client_ip: Option<IpAddr>,
     ) -> io::Result<Option<UserSessionGuard>> {
         self.sessions
-            .try_acquire_for_ip(Some(user), client_ip)
+            .try_acquire_for_node_ip_with_policy(
+                &self.config.node_tag,
+                Some(user),
+                client_ip,
+                DeviceLimitPolicy {
+                    udp_rebind_tolerant: true,
+                },
+            )
             .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))
     }
 }
