@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use socket2::SockRef;
 use tokio::sync::Notify;
@@ -53,9 +54,9 @@ pub struct DeviceLimitPolicy {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceLimitSnapshot {
     pub node_tag: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u64_keyed_map")]
     pub alive: BTreeMap<u64, usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u64_keyed_map")]
     pub alive_ips: BTreeMap<u64, Vec<IpAddr>>,
     #[serde(default)]
     pub mode: i32,
@@ -66,6 +67,22 @@ pub struct DeviceLimitOnlineRecord {
     pub node_tag: String,
     pub user_id: u64,
     pub ip: IpAddr,
+}
+
+fn deserialize_u64_keyed_map<'de, D, V>(deserializer: D) -> Result<BTreeMap<u64, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    BTreeMap::<String, V>::deserialize(deserializer)?
+        .into_iter()
+        .map(|(key, value)| {
+            let user_id = key.parse::<u64>().map_err(|_| {
+                de::Error::custom(format!("invalid device limit user id key: {key}"))
+            })?;
+            Ok((user_id, value))
+        })
+        .collect()
 }
 
 #[derive(Debug)]

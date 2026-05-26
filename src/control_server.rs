@@ -429,6 +429,48 @@ mod tests {
     }
 
     #[test]
+    fn control_server_accepts_device_limit_snapshot_with_json_object_user_ids() {
+        let controller = Arc::new(Mutex::new(CoreController::new()));
+        let mut server = start_control_server("127.0.0.1:0", controller).expect("start control");
+
+        assert!(matches!(
+            send(
+                server.local_addr(),
+                &CoreCommand::ApplyConfig { config: config() }
+            ),
+            CoreResponse::Applied { .. }
+        ));
+        match send_raw(
+            server.local_addr(),
+            serde_json::json!({
+                "type": "apply_device_limit_snapshot",
+                "snapshot": {
+                    "node_tag": "test-node",
+                    "alive": {
+                        "100089": 1
+                    },
+                    "alive_ips": {
+                        "100089": ["198.51.100.7"]
+                    },
+                    "mode": 1
+                }
+            }),
+        ) {
+            CoreResponse::DeviceLimitSnapshotApplied { node_tag, users } => {
+                assert_eq!(node_tag, "test-node");
+                assert_eq!(users, 1);
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
+
+        assert!(matches!(
+            send(server.local_addr(), &CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+        server.stop();
+    }
+
+    #[test]
     fn control_server_returns_error_for_malformed_command() {
         let controller = Arc::new(Mutex::new(CoreController::new()));
         let mut server = start_control_server("127.0.0.1:0", controller).expect("start control");
