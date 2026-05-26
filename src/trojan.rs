@@ -65,6 +65,7 @@ const CLIENT_CLOSE_CONNECT_POLL: Duration = Duration::from_millis(10);
 const TROJAN_TRACE_ENV: &str = "KELI_CORE_TROJAN_TRACE";
 const TROJAN_ROUTE_SLOW_LOG_MS: u128 = 1_000;
 const TROJAN_LOG_INTERVAL_MS: u64 = 60_000;
+const TROJAN_RELAY_FINISHED_LOG_INTERVAL_MS: u64 = 300_000;
 
 #[derive(Clone, Debug)]
 pub struct TrojanServerConfig {
@@ -2464,7 +2465,7 @@ fn trojan_relay_finished_log_decision_at(
         state.last_ms = now_ms;
         return Some(0);
     }
-    if now_ms.saturating_sub(state.last_ms) < TROJAN_LOG_INTERVAL_MS {
+    if now_ms.saturating_sub(state.last_ms) < TROJAN_RELAY_FINISHED_LOG_INTERVAL_MS {
         state.suppressed = state.suppressed.saturating_add(1);
         return None;
     }
@@ -4443,12 +4444,23 @@ mod tests {
                 "remote_read_error",
                 61_000,
             ),
-            Some(1)
+            None
+        );
+        assert_eq!(
+            super::trojan_relay_finished_log_decision_at(
+                &mut states,
+                "node",
+                "tls_websocket",
+                "ok",
+                "remote_read_error",
+                301_000,
+            ),
+            Some(2)
         );
     }
 
     #[test]
-    fn groups_trojan_udp_no_response_logs_for_minute_suppression() {
+    fn groups_trojan_udp_no_response_logs_for_five_minute_suppression() {
         let mut states = std::collections::HashMap::new();
         let outcome = super::trojan_udp_relay_log_outcome(0, 0, None, None);
         assert_eq!(outcome, "no_response");
@@ -4484,7 +4496,18 @@ mod tests {
                 outcome,
                 61_000,
             ),
-            Some(1)
+            None
+        );
+        assert_eq!(
+            super::trojan_relay_finished_log_decision_at(
+                &mut states,
+                "node",
+                "tls_websocket_udp",
+                "ok",
+                outcome,
+                301_000,
+            ),
+            Some(2)
         );
     }
 
