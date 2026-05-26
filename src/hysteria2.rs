@@ -2103,12 +2103,19 @@ fn log_hysteria2_error(scope: &'static str, error: &io::Error) {
     if class == Hysteria2ErrorClass::ExpectedClose {
         return;
     }
-    if !should_log_hysteria2_error(scope, class) {
+    let Some(suppressed) = should_log_hysteria2_error(scope, class) else {
         return;
-    }
+    };
     let level = class.log_level();
     let label = class.label();
-    crate::logging::emit_legacy_line(&format!("{level} core   hysteria2 {scope} {label}: {text}"));
+    let suppressed = if suppressed == 0 {
+        String::new()
+    } else {
+        format!(" suppressed={suppressed}")
+    };
+    crate::logging::emit_legacy_line(&format!(
+        "{level} core   hysteria2 {scope} {label}{suppressed}: {text}"
+    ));
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -2159,29 +2166,32 @@ struct Hysteria2ErrorLogState {
     suppressed: u64,
 }
 
-fn should_log_hysteria2_error(scope: &'static str, class: Hysteria2ErrorClass) -> bool {
+fn should_log_hysteria2_error(scope: &'static str, class: Hysteria2ErrorClass) -> Option<u64> {
     static STATE: OnceLock<Mutex<HashMap<Hysteria2ErrorLogKey, Hysteria2ErrorLogState>>> =
         OnceLock::new();
     let now = now_millis();
-    let key = Hysteria2ErrorLogKey { scope, class };
     let mut states = STATE
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .expect("hysteria2 error log state poisoned");
+    hysteria2_error_log_decision_at(&mut states, scope, class, now)
+}
+
+fn hysteria2_error_log_decision_at(
+    states: &mut HashMap<Hysteria2ErrorLogKey, Hysteria2ErrorLogState>,
+    scope: &'static str,
+    class: Hysteria2ErrorClass,
+    now: u64,
+) -> Option<u64> {
+    let key = Hysteria2ErrorLogKey { scope, class };
     let state = states.entry(key).or_default();
-    if now.saturating_sub(state.last_ms) < HY2_ERROR_LOG_INTERVAL_MS {
+    if state.last_ms != 0 && now.saturating_sub(state.last_ms) < HY2_ERROR_LOG_INTERVAL_MS {
         state.suppressed = state.suppressed.saturating_add(1);
-        return false;
+        return None;
     }
     let suppressed = std::mem::take(&mut state.suppressed);
     state.last_ms = now;
-    if suppressed != 0 {
-        crate::logging::emit_legacy_line(&format!(
-            "WARN  core   hysteria2 {scope} {} suppressed={suppressed}",
-            class.label()
-        ));
-    }
-    true
+    Some(suppressed)
 }
 
 #[cfg(test)]
@@ -3640,6 +3650,39 @@ mod tests {
         assert_eq!(
             classify_hysteria2_error(&io::Error::new(io::ErrorKind::Other, "Reset(268)")),
             Hysteria2ErrorClass::ExpectedClose
+        );
+    }
+
+    #[test]
+    fn hysteria2_error_log_decision_reports_suppressed_count_for_single_summary_line() {
+        let mut states = HashMap::new();
+
+        assert_eq!(
+            super::hysteria2_error_log_decision_at(
+                &mut states,
+                "connection",
+                Hysteria2ErrorClass::Timeout,
+                1_000,
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            super::hysteria2_error_log_decision_at(
+                &mut states,
+                "connection",
+                Hysteria2ErrorClass::Timeout,
+                1_001,
+            ),
+            None
+        );
+        assert_eq!(
+            super::hysteria2_error_log_decision_at(
+                &mut states,
+                "connection",
+                Hysteria2ErrorClass::Timeout,
+                61_000,
+            ),
+            Some(1)
         );
     }
 

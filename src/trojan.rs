@@ -2168,18 +2168,33 @@ fn log_trojan_connection_error(
         let Some(suppressed) = should_log_trojan_connection_error(node_tag, scope, reason) else {
             return;
         };
-        if suppressed != 0 {
-            crate::logging::emit_legacy_line(&format!(
-                "WARN  core   trojan connection failed suppressed node_tag={} scope={scope} reason={reason} suppressed={suppressed}",
-                trojan_log_field(node_tag),
-            ));
-        }
+        crate::logging::emit_legacy_line(&format_trojan_connection_failed_log(
+            node_tag, scope, reason, error, suppressed,
+        ));
+        return;
     }
-    crate::logging::emit_legacy_line(&format!(
-        "WARN  core   trojan connection failed node_tag={} scope={scope} reason={reason} error={}",
+    crate::logging::emit_legacy_line(&format_trojan_connection_failed_log(
+        node_tag, scope, reason, error, 0,
+    ));
+}
+
+fn format_trojan_connection_failed_log(
+    node_tag: &str,
+    scope: &'static str,
+    reason: &'static str,
+    error: &io::Error,
+    suppressed: u64,
+) -> String {
+    let suppressed = if suppressed == 0 {
+        String::new()
+    } else {
+        format!(" suppressed={suppressed}")
+    };
+    format!(
+        "WARN  core   trojan connection failed node_tag={} scope={scope} reason={reason}{suppressed} error={}",
         trojan_log_field(node_tag),
         trojan_log_message(&error.to_string())
-    ));
+    )
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -4363,6 +4378,22 @@ mod tests {
                 61_001,
             ),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn formats_repeated_trojan_connection_error_as_single_summary_line() {
+        let error = io::Error::new(io::ErrorKind::TimedOut, "target connect timed out");
+
+        assert_eq!(
+            super::format_trojan_connection_failed_log(
+                "panel|trojan|54",
+                "tls_websocket",
+                "upstream_timeout",
+                &error,
+                27,
+            ),
+            "WARN  core   trojan connection failed node_tag=panel|trojan|54 scope=tls_websocket reason=upstream_timeout suppressed=27 error=target connect timed out"
         );
     }
 
