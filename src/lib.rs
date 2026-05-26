@@ -13,6 +13,7 @@ pub mod http_proxy;
 pub mod httpupgrade;
 pub mod hysteria2;
 pub mod limits;
+mod logging;
 pub mod metrics;
 pub mod mieru;
 pub mod mkcp;

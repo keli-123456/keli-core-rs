@@ -64,7 +64,7 @@ const MAX_UDP_PACKET_SIZE: usize = 65_535;
 const CLIENT_CLOSE_CONNECT_POLL: Duration = Duration::from_millis(10);
 const TROJAN_TRACE_ENV: &str = "KELI_CORE_TROJAN_TRACE";
 const TROJAN_ROUTE_SLOW_LOG_MS: u128 = 1_000;
-const TROJAN_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
+const TROJAN_LOG_INTERVAL_MS: u64 = 60_000;
 
 #[derive(Clone, Debug)]
 pub struct TrojanServerConfig {
@@ -2169,17 +2169,17 @@ fn log_trojan_connection_error(
             return;
         };
         if suppressed != 0 {
-            eprintln!(
+            crate::logging::emit_legacy_line(&format!(
                 "WARN  core   trojan connection failed suppressed node_tag={} scope={scope} reason={reason} suppressed={suppressed}",
                 trojan_log_field(node_tag),
-            );
+            ));
         }
     }
-    eprintln!(
+    crate::logging::emit_legacy_line(&format!(
         "WARN  core   trojan connection failed node_tag={} scope={scope} reason={reason} error={}",
         trojan_log_field(node_tag),
         trojan_log_message(&error.to_string())
-    );
+    ));
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -2229,7 +2229,7 @@ fn trojan_connection_error_log_decision_at(
         state.last_ms = now_ms;
         return Some(0);
     }
-    if now_ms.saturating_sub(state.last_ms) < TROJAN_ERROR_LOG_INTERVAL_MS {
+    if now_ms.saturating_sub(state.last_ms) < TROJAN_LOG_INTERVAL_MS {
         state.suppressed = state.suppressed.saturating_add(1);
         return None;
     }
@@ -2251,14 +2251,14 @@ fn log_trojan_direct_connected(
     let peer = peer_addr
         .map(|addr| addr.to_string())
         .unwrap_or_else(|| "-".to_string());
-    eprintln!(
+    crate::logging::emit_legacy_line(&format!(
         "INFO  core   trojan direct connected node_tag={} scope={scope} target={}:{} peer={} elapsed_ms={}",
         trojan_log_field(node_tag),
         trojan_log_field(&target.host),
         target.port,
         trojan_log_field(&peer),
         elapsed.as_millis()
-    );
+    ));
 }
 
 fn log_trojan_route_outbound_connected(
@@ -2272,7 +2272,7 @@ fn log_trojan_route_outbound_connected(
         return;
     }
     let endpoint = trojan_outbound_endpoint(outbound);
-    eprintln!(
+    crate::logging::emit_legacy_line(&format!(
         "INFO  core   trojan route outbound connected node_tag={} scope={scope} outbound={} protocol={} endpoint={} target={}:{} elapsed_ms={}",
         trojan_log_field(node_tag),
         trojan_log_field(&outbound.tag),
@@ -2281,7 +2281,7 @@ fn log_trojan_route_outbound_connected(
         trojan_log_field(&target.host),
         target.port,
         elapsed.as_millis()
-    );
+    ));
 }
 
 fn log_trojan_relay_finished(
@@ -2308,21 +2308,32 @@ fn log_trojan_relay_finished(
     ) {
         return;
     }
-    eprintln!(
-        "{}",
-        format_trojan_relay_finished(
-            node_tag,
-            scope,
-            request,
-            upload,
-            download,
-            first_byte_ms,
-            elapsed,
-            finish_reason,
-            finish_detail,
-            error,
-        )
+    let trace_enabled = trojan_trace_enabled();
+    let status = error.map(classify_trojan_connection_error).unwrap_or("ok");
+    let suppressed = if trace_enabled {
+        Some(0)
+    } else {
+        should_log_trojan_relay_finished_event(node_tag, scope, status, finish_reason)
+    };
+    let Some(suppressed) = suppressed else {
+        return;
+    };
+    let mut line = format_trojan_relay_finished(
+        node_tag,
+        scope,
+        request,
+        upload,
+        download,
+        first_byte_ms,
+        elapsed,
+        finish_reason,
+        finish_detail,
+        error,
     );
+    if suppressed != 0 {
+        line.push_str(&format!(" suppressed={suppressed}"));
+    }
+    crate::logging::emit_legacy_line(&line);
 }
 
 fn should_log_trojan_relay_finished(
@@ -2349,6 +2360,9 @@ fn should_log_trojan_relay_finished(
     if download == 0 && elapsed.as_millis() >= TROJAN_ROUTE_SLOW_LOG_MS {
         return true;
     }
+    if is_trojan_benign_client_close_finish(finish_reason, finish_detail) {
+        return false;
+    }
     if finish_detail.is_some() {
         return true;
     }
@@ -2358,11 +2372,97 @@ fn should_log_trojan_relay_finished(
     )
 }
 
+fn is_trojan_benign_client_close_finish(
+    finish_reason: &'static str,
+    finish_detail: Option<&str>,
+) -> bool {
+    if finish_reason != "client_read_error" {
+        return false;
+    }
+    let Some(detail) = finish_detail else {
+        return false;
+    };
+    if !detail.starts_with("client_read:") {
+        return false;
+    }
+    detail.contains("UnexpectedEof")
+        || detail.contains("ConnectionReset")
+        || detail.contains("ConnectionAborted")
+        || detail.contains("BrokenPipe")
+        || detail.contains("TLS_close_notify")
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TrojanRelayFinishedLogKey {
+    node_tag: String,
+    scope: &'static str,
+    status: &'static str,
+    finish_reason: &'static str,
+}
+
+#[derive(Default)]
+struct TrojanRelayFinishedLogState {
+    has_logged: bool,
+    last_ms: u64,
+    suppressed: u64,
+}
+
+fn should_log_trojan_relay_finished_event(
+    node_tag: &str,
+    scope: &'static str,
+    status: &'static str,
+    finish_reason: &'static str,
+) -> Option<u64> {
+    static STATE: OnceLock<Mutex<HashMap<TrojanRelayFinishedLogKey, TrojanRelayFinishedLogState>>> =
+        OnceLock::new();
+    let mut states = STATE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("trojan relay finished log state poisoned");
+    trojan_relay_finished_log_decision_at(
+        &mut states,
+        node_tag,
+        scope,
+        status,
+        finish_reason,
+        now_millis(),
+    )
+}
+
+fn trojan_relay_finished_log_decision_at(
+    states: &mut HashMap<TrojanRelayFinishedLogKey, TrojanRelayFinishedLogState>,
+    node_tag: &str,
+    scope: &'static str,
+    status: &'static str,
+    finish_reason: &'static str,
+    now_ms: u64,
+) -> Option<u64> {
+    let key = TrojanRelayFinishedLogKey {
+        node_tag: node_tag.to_string(),
+        scope,
+        status,
+        finish_reason,
+    };
+    let state = states.entry(key).or_default();
+    if !state.has_logged {
+        state.has_logged = true;
+        state.last_ms = now_ms;
+        return Some(0);
+    }
+    if now_ms.saturating_sub(state.last_ms) < TROJAN_LOG_INTERVAL_MS {
+        state.suppressed = state.suppressed.saturating_add(1);
+        return None;
+    }
+    let suppressed = std::mem::take(&mut state.suppressed);
+    state.last_ms = now_ms;
+    Some(suppressed)
+}
+
 fn log_trojan_relay_started(node_tag: &str, scope: &'static str, request: &TrojanRequest) {
     if !trojan_trace_enabled() {
         return;
     }
-    eprintln!("{}", format_trojan_relay_started(node_tag, scope, request));
+    crate::logging::emit_legacy_line(&format_trojan_relay_started(node_tag, scope, request));
 }
 
 fn log_trojan_tls_websocket_initial_payload(
@@ -2373,10 +2473,11 @@ fn log_trojan_tls_websocket_initial_payload(
     if !trojan_trace_enabled() {
         return;
     }
-    eprintln!(
-        "{}",
-        format_trojan_tls_websocket_initial_payload(node_tag, request, initial_payload)
-    );
+    crate::logging::emit_legacy_line(&format_trojan_tls_websocket_initial_payload(
+        node_tag,
+        request,
+        initial_payload,
+    ));
 }
 
 fn log_trojan_tls_websocket_first_upload_payload(
@@ -2387,10 +2488,9 @@ fn log_trojan_tls_websocket_first_upload_payload(
     if !trojan_trace_enabled() {
         return;
     }
-    eprintln!(
-        "{}",
-        format_trojan_tls_websocket_first_upload_payload(node_tag, request, payload)
-    );
+    crate::logging::emit_legacy_line(&format_trojan_tls_websocket_first_upload_payload(
+        node_tag, request, payload,
+    ));
 }
 
 fn format_trojan_relay_started(
@@ -2748,21 +2848,18 @@ fn log_trojan_udp_relay_finished(
     ) {
         return;
     }
-    eprintln!(
-        "{}",
-        format_trojan_udp_relay_finished(
-            node_tag,
-            scope,
-            target,
-            upload,
-            download,
-            upload_packets,
-            download_packets,
-            first_response_ms,
-            elapsed,
-            error,
-        )
-    );
+    crate::logging::emit_legacy_line(&format_trojan_udp_relay_finished(
+        node_tag,
+        scope,
+        target,
+        upload,
+        download,
+        upload_packets,
+        download_packets,
+        first_response_ms,
+        elapsed,
+        error,
+    ));
 }
 
 fn should_log_trojan_udp_relay_finished(
@@ -4209,7 +4306,7 @@ mod tests {
                 "node",
                 "tls_websocket",
                 "upstream_timeout",
-                30_999,
+                60_999,
             ),
             None
         );
@@ -4219,7 +4316,7 @@ mod tests {
                 "node",
                 "tls_websocket",
                 "upstream_timeout",
-                31_000,
+                61_000,
             ),
             Some(2)
         );
@@ -4229,9 +4326,59 @@ mod tests {
                 "node",
                 "tls_websocket",
                 "permission_denied",
-                31_001,
+                61_001,
             ),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn rate_limits_repeated_trojan_relay_finished_logs_by_scope_status_and_reason() {
+        let mut states = std::collections::HashMap::new();
+
+        assert_eq!(
+            super::trojan_relay_finished_log_decision_at(
+                &mut states,
+                "node",
+                "tls_websocket",
+                "ok",
+                "remote_read_error",
+                1_000,
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            super::trojan_relay_finished_log_decision_at(
+                &mut states,
+                "node",
+                "tls_websocket",
+                "ok",
+                "remote_read_error",
+                1_500,
+            ),
+            None
+        );
+        assert_eq!(
+            super::trojan_relay_finished_log_decision_at(
+                &mut states,
+                "node",
+                "tls_websocket",
+                "ok",
+                "client_read_error",
+                2_000,
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            super::trojan_relay_finished_log_decision_at(
+                &mut states,
+                "node",
+                "tls_websocket",
+                "ok",
+                "remote_read_error",
+                61_000,
+            ),
+            Some(1)
         );
     }
 
@@ -5885,6 +6032,34 @@ mod tests {
             Some("Broken_pipe_(os_error_32)"),
             Some(&io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe")),
             false,
+        ));
+    }
+
+    #[test]
+    fn skips_trojan_websocket_client_close_notify_noise_without_trace() {
+        assert!(!super::should_log_trojan_relay_finished(
+            2_004,
+            6_898,
+            Some(16),
+            Duration::from_millis(125_241),
+            "client_read_error",
+            Some(
+                "client_read:UnexpectedEof:peer_closed_connection_without_sending_TLS_close_notify"
+            ),
+            None,
+            false,
+        ));
+        assert!(super::should_log_trojan_relay_finished(
+            2_004,
+            6_898,
+            Some(16),
+            Duration::from_millis(125_241),
+            "client_read_error",
+            Some(
+                "client_read:UnexpectedEof:peer_closed_connection_without_sending_TLS_close_notify"
+            ),
+            None,
+            true,
         ));
     }
 
