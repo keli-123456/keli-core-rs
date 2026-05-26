@@ -4,7 +4,7 @@ use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -39,6 +39,41 @@ const DETACHED_BLOCKING_RELAY_STACK_ENV: &str = "KELI_CORE_DETACHED_RELAY_STACK_
 
 pub type BlockingRelayHandle<T> = tokio::task::JoinHandle<T>;
 type NativeRelayJob = Box<dyn FnOnce() + Send + 'static>;
+
+#[derive(Debug)]
+pub(crate) struct RelayActivityDeadline {
+    idle_since: Instant,
+    one_side_finished_since: Option<Instant>,
+}
+
+impl RelayActivityDeadline {
+    pub(crate) fn new() -> Self {
+        Self {
+            idle_since: Instant::now(),
+            one_side_finished_since: None,
+        }
+    }
+
+    pub(crate) fn elapsed(&mut self, upload_done: bool, download_done: bool) -> Duration {
+        if upload_done ^ download_done {
+            self.one_side_finished_since
+                .get_or_insert_with(Instant::now)
+                .elapsed()
+        } else {
+            self.idle_since.elapsed()
+        }
+    }
+
+    pub(crate) fn note_progress(&mut self, upload_done: bool, download_done: bool) {
+        if upload_done ^ download_done {
+            self.one_side_finished_since
+                .get_or_insert_with(Instant::now);
+        } else {
+            self.idle_since = Instant::now();
+            self.one_side_finished_since = None;
+        }
+    }
+}
 
 pub struct NativeRelayHandle<T> {
     receiver: mpsc::Receiver<thread::Result<T>>,

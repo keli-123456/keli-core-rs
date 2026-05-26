@@ -9,6 +9,7 @@ use sha1::{Digest, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::limits::BandwidthLimiter;
+use crate::stream::RelayActivityDeadline;
 use crate::tls::{RawTcpStreamAccess, TlsConnection};
 
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -260,10 +261,20 @@ pub(crate) fn relay_websocket_tls_stream_stats(
     let mut client_buffer = [0u8; 16 * 1024];
     let mut remote_buffer = [0u8; 16 * 1024];
     let mut idle_rounds = 0u8;
-    let mut idle_since = Instant::now();
+    let mut activity_deadline = RelayActivityDeadline::new();
 
     while !upload_done || !download_done {
         let mut progressed = false;
+
+        let idle_limit = websocket_relay_idle_limit(&timeouts, upload_done, download_done);
+        let idle_elapsed = activity_deadline.elapsed(upload_done, download_done);
+        if idle_elapsed >= idle_limit {
+            stats.finish_reason = websocket_relay_timeout_reason(upload_done, download_done);
+            upload_done = true;
+            download_done = true;
+            shutdown_websocket_tls_pair(&mut client, &remote);
+            continue;
+        }
 
         if !upload_done {
             match client.read(&mut client_buffer) {
@@ -331,7 +342,7 @@ pub(crate) fn relay_websocket_tls_stream_stats(
 
         if !progressed {
             let idle_limit = websocket_relay_idle_limit(&timeouts, upload_done, download_done);
-            let idle_elapsed = idle_since.elapsed();
+            let idle_elapsed = activity_deadline.elapsed(upload_done, download_done);
             if idle_elapsed >= idle_limit {
                 stats.finish_reason = websocket_relay_timeout_reason(upload_done, download_done);
                 upload_done = true;
@@ -348,7 +359,7 @@ pub(crate) fn relay_websocket_tls_stream_stats(
             )?;
         } else {
             idle_rounds = 0;
-            idle_since = Instant::now();
+            activity_deadline.note_progress(upload_done, download_done);
         }
     }
 
@@ -373,7 +384,7 @@ where
     let mut download_done = false;
     let mut client_buffer = [0u8; 16 * 1024];
     let mut remote_buffer = [0u8; 16 * 1024];
-    let mut idle_since = Instant::now();
+    let mut activity_deadline = RelayActivityDeadline::new();
 
     while !upload_done || !download_done {
         if limiter
@@ -388,7 +399,7 @@ where
         }
 
         let idle_limit = websocket_relay_idle_limit(&timeouts, upload_done, download_done);
-        let idle_elapsed = idle_since.elapsed();
+        let idle_elapsed = activity_deadline.elapsed(upload_done, download_done);
         if idle_elapsed >= idle_limit {
             stats.finish_reason = websocket_relay_timeout_reason(upload_done, download_done);
             let _ = client.shutdown().await;
@@ -428,7 +439,7 @@ where
                         let _ = remote.shutdown().await;
                     }
                 }
-                idle_since = Instant::now();
+                activity_deadline.note_progress(upload_done, download_done);
             }
             result = remote.read(&mut remote_buffer), if !download_done => {
                 match result {
@@ -452,7 +463,7 @@ where
                         let _ = remote.shutdown().await;
                     }
                 }
-                idle_since = Instant::now();
+                activity_deadline.note_progress(upload_done, download_done);
             }
             _ = tokio::time::sleep(idle_left) => {
                 stats.finish_reason = websocket_relay_timeout_reason(upload_done, download_done);

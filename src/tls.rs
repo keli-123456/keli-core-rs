@@ -3,7 +3,7 @@ use std::io::{self, BufReader, Cursor, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, UdpSocket};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -16,6 +16,7 @@ use rustls::sign::{CertifiedKey, Signer, SigningKey, SingleCertAndKey};
 use rustls::{ServerConfig, ServerConnection, SignatureAlgorithm, SignatureScheme};
 
 use crate::limits::BandwidthLimiter;
+use crate::stream::RelayActivityDeadline;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TlsHandshakeErrorClass {
@@ -754,7 +755,7 @@ where
     let mut client_buffer = [0u8; 16 * 1024];
     let mut remote_buffer = [0u8; 16 * 1024];
     let mut idle_rounds = 0u8;
-    let mut idle_since = Instant::now();
+    let mut activity_deadline = RelayActivityDeadline::new();
 
     while !upload_done || !download_done {
         if limiter
@@ -767,6 +768,16 @@ where
             break;
         }
         let mut progressed = false;
+
+        let idle_limit = tls_relay_idle_limit(&timeouts, upload_done, download_done);
+        let idle_elapsed = activity_deadline.elapsed(upload_done, download_done);
+        if idle_elapsed >= idle_limit {
+            upload_done = true;
+            download_done = true;
+            let _ = client.shutdown(Shutdown::Both);
+            let _ = remote.shutdown(Shutdown::Both);
+            continue;
+        }
 
         if !upload_done {
             match client.read(&mut client_buffer) {
@@ -831,7 +842,7 @@ where
 
         if !progressed {
             let idle_limit = tls_relay_idle_limit(&timeouts, upload_done, download_done);
-            let idle_elapsed = idle_since.elapsed();
+            let idle_elapsed = activity_deadline.elapsed(upload_done, download_done);
             if idle_elapsed >= idle_limit {
                 upload_done = true;
                 download_done = true;
@@ -848,7 +859,7 @@ where
             )?;
         } else {
             idle_rounds = 0;
-            idle_since = Instant::now();
+            activity_deadline.note_progress(upload_done, download_done);
         }
     }
 
@@ -1047,7 +1058,7 @@ pub(crate) fn classify_tls_handshake_error(error: &io::Error) -> TlsHandshakeErr
 #[cfg(test)]
 mod tests {
     use std::io::{self, Read, Write};
-    use std::net::{TcpListener, TcpStream, UdpSocket};
+    use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
     use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -1193,6 +1204,102 @@ mod tests {
         drop(client);
 
         server.join().expect("server thread");
+    }
+
+    #[test]
+    fn tls_relay_enforces_uplink_only_after_remote_eof_despite_client_upload() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("temporary certificate");
+        let cert_der = cert.cert.der().clone();
+        let acceptor = super::TlsAcceptor::from_der(
+            vec![cert_der.clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())),
+            &[],
+        )
+        .expect("tls acceptor");
+        let inbound_listener = TcpListener::bind("127.0.0.1:0").expect("bind inbound listener");
+        let inbound_addr = inbound_listener.local_addr().expect("inbound addr");
+        let remote_listener = TcpListener::bind("127.0.0.1:0").expect("bind remote listener");
+        let remote_addr = remote_listener.local_addr().expect("remote addr");
+
+        let remote = thread::spawn(move || {
+            let (stream, _) = remote_listener.accept().expect("accept remote peer");
+            stream
+                .shutdown(Shutdown::Write)
+                .expect("remote peer half close");
+            thread::sleep(Duration::from_secs(2));
+        });
+
+        let (relay_done_tx, relay_done_rx) = mpsc::channel();
+        let relay = thread::spawn(move || {
+            let result = (|| -> io::Result<(u64, u64)> {
+                let (stream, _) = inbound_listener.accept()?;
+                let tls = acceptor.accept(stream)?;
+                let remote = TcpStream::connect(remote_addr)?;
+                super::relay_tls_stream_with_timeouts(
+                    tls,
+                    remote,
+                    None,
+                    super::TlsRelayTimeouts {
+                        connection_idle: Duration::from_secs(5),
+                        uplink_only: Duration::from_millis(120),
+                        downlink_only: Duration::from_millis(120),
+                    },
+                )
+            })();
+            let _ = relay_done_tx.send(result);
+        });
+
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let uploader = thread::spawn(move || {
+            let mut roots = RootCertStore::empty();
+            roots.add(cert_der).expect("root cert");
+            let config = ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let server_name = ServerName::try_from("localhost")
+                .expect("server name")
+                .to_owned();
+            let connection =
+                ClientConnection::new(Arc::new(config), server_name).expect("client tls");
+            let socket = TcpStream::connect(inbound_addr).expect("connect relay client");
+            let mut client = StreamOwned::new(connection, socket);
+            let deadline = Instant::now() + Duration::from_millis(700);
+            while Instant::now() < deadline && stop_rx.try_recv().is_err() {
+                if client.write_all(b"x").and_then(|_| client.flush()).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let early_result = relay_done_rx.recv_timeout(Duration::from_millis(500));
+        let _ = stop_tx.send(());
+        uploader.join().expect("uploader thread");
+
+        let early_completed = matches!(&early_result, Ok(Ok(_)));
+        let final_result = match early_result {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => relay_done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("relay finishes after client closes"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "relay completion channel disconnected",
+            )),
+        };
+
+        relay.join().expect("relay thread");
+        remote.join().expect("remote thread");
+
+        assert!(
+            final_result.is_ok(),
+            "relay should produce a result after the client closes"
+        );
+        assert!(
+            early_completed,
+            "relay must stop within uplink_only after remote EOF even while the client uploads"
+        );
     }
 
     #[test]

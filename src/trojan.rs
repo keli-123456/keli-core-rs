@@ -37,9 +37,9 @@ use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
     relay_tcp_fast_unlimited, relay_tcp_limited, spawn_background_io,
-    spawn_detached_blocking_relay, spawn_native_blocking_relay,
+    spawn_detached_blocking_relay, spawn_native_blocking_relay, RelayActivityDeadline,
 };
-use crate::tls::{relay_tls_stream, TlsConnection};
+use crate::tls::{relay_tls_stream_with_timeouts, TlsConnection, TlsRelayTimeouts};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::websocket::{
@@ -661,10 +661,23 @@ impl TrojanServer {
         let mut client_buffer = [0u8; 16 * 1024];
         let mut remote_buffer = [0u8; 16 * 1024];
         let mut idle_rounds = 0u8;
-        let mut idle_since = Instant::now();
+        let mut activity_deadline = RelayActivityDeadline::new();
 
         while !upload_done || !download_done {
             let mut progressed = false;
+
+            let timeouts = self.websocket_relay_timeouts();
+            let idle_limit = websocket_relay_idle_limit(&timeouts, upload_done, download_done);
+            let idle_elapsed = activity_deadline.elapsed(upload_done, download_done);
+            if idle_elapsed >= idle_limit {
+                finish_reason = websocket_relay_timeout_reason(upload_done, download_done);
+                upload_done = true;
+                download_done = true;
+                let _ = writer.shutdown();
+                let _ = reader.shutdown();
+                let _ = remote.shutdown(Shutdown::Both);
+                continue;
+            }
 
             if !upload_done {
                 match reader.read(&mut client_buffer) {
@@ -759,7 +772,7 @@ impl TrojanServer {
             if !progressed {
                 let timeouts = self.websocket_relay_timeouts();
                 let idle_limit = websocket_relay_idle_limit(&timeouts, upload_done, download_done);
-                let idle_elapsed = idle_since.elapsed();
+                let idle_elapsed = activity_deadline.elapsed(upload_done, download_done);
                 if idle_elapsed >= idle_limit {
                     finish_reason = websocket_relay_timeout_reason(upload_done, download_done);
                     upload_done = true;
@@ -787,7 +800,7 @@ impl TrojanServer {
                 }
             } else {
                 idle_rounds = 0;
-                idle_since = Instant::now();
+                activity_deadline.note_progress(upload_done, download_done);
             }
         }
 
@@ -859,7 +872,8 @@ impl TrojanServer {
         request: TrojanRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
-        let (upload, download) = relay_tls_stream(client, remote, bandwidth)?;
+        let (upload, download) =
+            relay_tls_stream_with_timeouts(client, remote, bandwidth, self.tls_relay_timeouts())?;
         self.traffic.add_with_user_id(
             self.config.node_tag.clone(),
             request.user_uuid,
@@ -1023,6 +1037,14 @@ impl TrojanServer {
 
     fn websocket_relay_timeouts(&self) -> WebSocketRelayTimeouts {
         WebSocketRelayTimeouts {
+            connection_idle: self.config.connection_idle,
+            uplink_only: self.config.uplink_only,
+            downlink_only: self.config.downlink_only,
+        }
+    }
+
+    fn tls_relay_timeouts(&self) -> TlsRelayTimeouts {
+        TlsRelayTimeouts {
             connection_idle: self.config.connection_idle,
             uplink_only: self.config.uplink_only,
             downlink_only: self.config.downlink_only,

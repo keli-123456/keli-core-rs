@@ -33,16 +33,18 @@ use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
     relay_tcp_fast_unlimited_close_on_eof, relay_tcp_limited, spawn_detached_blocking_relay,
-    spawn_native_blocking_relay, spawn_tcp_relay_background,
+    spawn_native_blocking_relay, spawn_tcp_relay_background, RelayActivityDeadline,
 };
-use crate::tls::{relay_tls_stream, RawTcpStreamAccess, TlsConnection, TlsSocket};
+use crate::tls::{
+    relay_tls_stream_with_timeouts, RawTcpStreamAccess, TlsConnection, TlsRelayTimeouts, TlsSocket,
+};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{CoreUser, CoreUserDelta, CoreUserDeltaResult, UserStore};
 use crate::vision::{VisionDecoder, VisionEncoder, VisionReader, VisionWriter};
 use crate::websocket::{
     accept_websocket_async_with_client_ip, accept_websocket_tls_with_client_ip,
     accept_websocket_with_client_ip, connect_websocket_client, relay_websocket_async_stream_stats,
-    relay_websocket_tls_stream, websocket_relay_idle_limit, websocket_tls_relay_idle_timeout,
+    relay_websocket_tls_stream_stats, websocket_relay_idle_limit, websocket_tls_relay_idle_timeout,
     AsyncWebSocketStream, WebSocketClientStream, WebSocketReader, WebSocketRelayTimeouts,
     WebSocketWriter,
 };
@@ -80,6 +82,9 @@ pub struct VlessServerConfig {
     pub routes: Vec<crate::RouteRule>,
     pub flow: String,
     pub connect_timeout: Duration,
+    pub connection_idle: Duration,
+    pub uplink_only: Duration,
+    pub downlink_only: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -1041,13 +1046,24 @@ impl VlessServer {
         let mut client_buffer = [0u8; 16 * 1024];
         let mut remote_buffer = [0u8; 16 * 1024];
         let mut idle_rounds = 0u8;
-        let mut idle_since = Instant::now();
-        let timeouts = WebSocketRelayTimeouts::default();
+        let mut activity_deadline = RelayActivityDeadline::new();
+        let timeouts = self.websocket_relay_timeouts();
         let result = loop {
             if upload_done && download_done {
                 break Ok(());
             }
             let mut progressed = false;
+
+            let idle_limit = websocket_relay_idle_limit(&timeouts, upload_done, download_done);
+            let idle_elapsed = activity_deadline.elapsed(upload_done, download_done);
+            if idle_elapsed >= idle_limit {
+                upload_done = true;
+                download_done = true;
+                let _ = reader.shutdown();
+                let _ = writer.shutdown();
+                let _ = remote.shutdown(Shutdown::Both);
+                continue;
+            }
 
             if !upload_done {
                 match reader.read(&mut client_buffer) {
@@ -1122,7 +1138,7 @@ impl VlessServer {
 
             if !progressed {
                 let idle_limit = websocket_relay_idle_limit(&timeouts, upload_done, download_done);
-                let idle_elapsed = idle_since.elapsed();
+                let idle_elapsed = activity_deadline.elapsed(upload_done, download_done);
                 if idle_elapsed >= idle_limit {
                     upload_done = true;
                     download_done = true;
@@ -1137,7 +1153,7 @@ impl VlessServer {
                 );
             } else {
                 idle_rounds = 0;
-                idle_since = Instant::now();
+                activity_deadline.note_progress(upload_done, download_done);
             }
         };
         self.traffic.add_with_user_id(
@@ -1344,7 +1360,7 @@ impl VlessServer {
                 },
             )?
         } else {
-            relay_tls_stream(client, remote, bandwidth)?
+            relay_tls_stream_with_timeouts(client, remote, bandwidth, self.tls_relay_timeouts())?
         };
         self.traffic.add_with_user_id(
             self.config.node_tag.clone(),
@@ -1390,13 +1406,19 @@ impl VlessServer {
         request: VlessRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
-        let (upload, download) = relay_websocket_tls_stream(client, remote, bandwidth)?;
+        let stats = relay_websocket_tls_stream_stats(
+            client,
+            remote,
+            bandwidth,
+            self.websocket_relay_timeouts(),
+            None,
+        )?;
         self.traffic.add_with_user_id(
             self.config.node_tag.clone(),
             request.user_uuid,
             Some(request.user_numeric_id),
-            upload,
-            download,
+            stats.upload,
+            stats.download,
             request.client_ip,
         );
         Ok(())
@@ -1416,7 +1438,7 @@ impl VlessServer {
             client,
             remote,
             bandwidth,
-            WebSocketRelayTimeouts::default(),
+            self.websocket_relay_timeouts(),
         )
         .await?;
         self.traffic.add_with_user_id(
@@ -1428,6 +1450,22 @@ impl VlessServer {
             request.client_ip,
         );
         Ok(())
+    }
+
+    fn websocket_relay_timeouts(&self) -> WebSocketRelayTimeouts {
+        WebSocketRelayTimeouts {
+            connection_idle: self.config.connection_idle,
+            uplink_only: self.config.uplink_only,
+            downlink_only: self.config.downlink_only,
+        }
+    }
+
+    fn tls_relay_timeouts(&self) -> TlsRelayTimeouts {
+        TlsRelayTimeouts {
+            connection_idle: self.config.connection_idle,
+            uplink_only: self.config.uplink_only,
+            downlink_only: self.config.downlink_only,
+        }
     }
 
     fn spawn_tls_websocket_relay(
@@ -4322,6 +4360,9 @@ mod tests {
             routes: Vec::new(),
             flow: String::new(),
             connect_timeout: Duration::from_secs(3),
+            connection_idle: Duration::from_secs(120),
+            uplink_only: Duration::from_secs(2),
+            downlink_only: Duration::from_secs(4),
         })
     }
 
@@ -4333,6 +4374,9 @@ mod tests {
             routes: Vec::new(),
             flow: flow.to_string(),
             connect_timeout: Duration::from_secs(3),
+            connection_idle: Duration::from_secs(120),
+            uplink_only: Duration::from_secs(2),
+            downlink_only: Duration::from_secs(4),
         })
     }
 
@@ -4344,6 +4388,9 @@ mod tests {
             routes,
             flow: String::new(),
             connect_timeout,
+            connection_idle: Duration::from_secs(120),
+            uplink_only: Duration::from_secs(2),
+            downlink_only: Duration::from_secs(4),
         })
     }
 
@@ -4374,6 +4421,9 @@ mod tests {
             }],
             flow: String::new(),
             connect_timeout: Duration::from_secs(3),
+            connection_idle: Duration::from_secs(120),
+            uplink_only: Duration::from_secs(2),
+            downlink_only: Duration::from_secs(4),
         });
 
         assert_eq!(server.users.len(), 1);
@@ -4423,6 +4473,9 @@ mod tests {
             }],
             flow: String::new(),
             connect_timeout: Duration::from_secs(2),
+            connection_idle: Duration::from_secs(120),
+            uplink_only: Duration::from_secs(2),
+            downlink_only: Duration::from_secs(4),
         });
         let listener = server.bind().expect("vless bind");
         let vless_addr = listener.local_addr().expect("vless addr");
