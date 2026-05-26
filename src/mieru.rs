@@ -87,7 +87,6 @@ pub struct MieruServer {
 #[derive(Clone, Debug)]
 struct MieruCredential {
     user: CoreUser,
-    username: String,
     key: [u8; 32],
 }
 
@@ -624,17 +623,13 @@ impl MieruReader {
             }
             buffer.extend_from_slice(&temp[..read]);
 
-            let credentials = candidate_credentials(users, &buffer);
             for offset in 0..buffer
                 .len()
                 .saturating_sub(NONCE_LEN + ENCRYPTED_METADATA_LEN)
                 + 1
             {
                 let nonce = &buffer[offset..offset + NONCE_LEN];
-                for credential in credentials
-                    .iter()
-                    .filter(|credential| nonce_matches_user_hint(nonce, &credential.username))
-                {
+                for credential in candidate_credentials_for_nonce(users, nonce) {
                     let mut nonce_bytes = [0u8; NONCE_LEN];
                     nonce_bytes.copy_from_slice(nonce);
                     match try_decode_segment(&buffer, offset, true, &credential.key, nonce_bytes) {
@@ -1215,17 +1210,14 @@ fn decrypt_aead(key: &[u8; 32], nonce: &[u8; NONCE_LEN], ciphertext: &[u8]) -> i
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "mieru decrypt failed"))
 }
 
-fn candidate_credentials(users: &[CoreUser], input: &[u8]) -> Vec<MieruCredential> {
+fn candidate_credentials_for_nonce(users: &[CoreUser], nonce: &[u8]) -> Vec<MieruCredential> {
     let now = rounded_unix_time(now_unix_secs());
     let time_slots = [now - KEY_WINDOW_SECS, now, now + KEY_WINDOW_SECS];
     users
         .iter()
         .filter_map(|user| {
             let username = mieru_username(user);
-            let has_nonce_hint = input
-                .windows(NONCE_LEN)
-                .any(|nonce| nonce_matches_user_hint(nonce, &username));
-            has_nonce_hint.then_some((user, username))
+            nonce_matches_user_hint(nonce, &username).then_some((user, username))
         })
         .flat_map(|user| {
             let (user, username) = user;
@@ -1234,7 +1226,6 @@ fn candidate_credentials(users: &[CoreUser], input: &[u8]) -> Vec<MieruCredentia
                 .into_iter()
                 .map(move |time_slot| MieruCredential {
                     user: user.clone(),
-                    username: username.clone(),
                     key: derive_mieru_key(&username, &password, time_slot),
                 })
         })
@@ -2092,7 +2083,7 @@ mod tests {
         apply_nonce_user_hint(&mut nonce, &target.uuid);
 
         super::MIERU_KEY_DERIVATIONS.with(|count| count.set(0));
-        let credentials = super::candidate_credentials(&users, &nonce);
+        let credentials = super::candidate_credentials_for_nonce(&users, &nonce);
 
         assert_eq!(credentials.len(), 3);
         assert!(credentials
