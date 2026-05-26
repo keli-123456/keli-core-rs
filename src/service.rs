@@ -212,7 +212,7 @@ impl CoreService {
             .then(|| SharedQuicConnectionLimiter::for_listener_count(quic_listener_count));
         if let Some(limiter) = &quic_connections {
             let snapshot = limiter.snapshot();
-            println!(
+            crate::logging::emit_legacy_line(&format!(
                 "INFO  core   quic resources auto total={} listeners={} per_listener_soft={} cpu={} mem_limit_mib={} fd_limit={}",
                 snapshot.total_limit,
                 snapshot.listener_count,
@@ -226,7 +226,7 @@ impl CoreService {
                     .fd_limit
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "unknown".to_string())
-            );
+            ));
         }
         let mut listeners = Vec::new();
         for inbound in config.inbounds {
@@ -526,10 +526,10 @@ impl CoreService {
                 .workers
                 .join_timeout(CONNECTION_WORKER_SHUTDOWN_TIMEOUT)
             {
-                eprintln!(
+                crate::logging::emit_legacy_line(&format!(
                     "WARN  core   listener worker shutdown timed out tag={} protocol={:?}",
                     handle.status.tag, handle.status.protocol
-                );
+                ));
             }
         }
     }
@@ -1248,9 +1248,9 @@ fn accept_tls_connection(
                 if let Some(ip) = peer_ip {
                     failures.record_failure(ip);
                 }
-                eprintln!(
+                crate::logging::emit_legacy_line(&format!(
                     "WARN  tls    handshake failed protocol={protocol:?} tag={tag} class={class:?} error={error}"
-                );
+                ));
             }
             Err(error)
         }
@@ -1291,9 +1291,9 @@ async fn accept_tls_connection_async(
                 if let Some(ip) = peer_ip {
                     failures.record_failure(ip);
                 }
-                eprintln!(
+                crate::logging::emit_legacy_line(&format!(
                     "WARN  tls    handshake failed protocol={protocol:?} tag={tag} class={class:?} error={error}"
-                );
+                ));
             }
             Err(error)
         }
@@ -1302,10 +1302,10 @@ async fn accept_tls_connection_async(
             if let Some(ip) = peer_ip {
                 failures.record_failure(ip);
             }
-            eprintln!(
+            crate::logging::emit_legacy_line(&format!(
                 "WARN  tls    handshake failed protocol={protocol:?} tag={tag} class={:?} error={error}",
                 TlsHandshakeErrorClass::Io
-            );
+            ));
             Err(error)
         }
     }

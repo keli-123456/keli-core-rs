@@ -207,15 +207,15 @@ impl NaiveServer {
         apply_proxy_quic_transport_defaults(&mut transport);
         apply_quic_congestion_control(&mut transport, "", "bbr", "naive")?;
         let resource = self.quic_connections.snapshot();
-        println!(
+        crate::logging::emit_legacy_line(&format!(
             "INFO  core   naive shared quic limit total={} active={} listeners={} per_listener_soft={}",
             resource.total_limit,
             resource.active_connections,
             resource.listener_count,
             resource.per_listener_soft_limit
-        );
+        ));
         let tuning = proxy_quic_tuning_snapshot();
-        println!(
+        crate::logging::emit_legacy_line(&format!(
             "INFO  core   naive quic tuning stream_window_mib={} conn_window_mib={} max_streams={} udp_socket_buffer_mib={} initial_rtt_ms={} idle_timeout_secs={}",
             tuning.stream_receive_window_mib,
             tuning.receive_window_mib,
@@ -223,7 +223,7 @@ impl NaiveServer {
             tuning.udp_socket_buffer_mib,
             tuning.initial_rtt_ms,
             tuning.max_idle_timeout_secs
-        );
+        ));
         server_config.transport_config(Arc::new(transport));
         server_endpoint_with_tuned_udp_socket(server_config, self.config.listen)
     }
@@ -240,10 +240,10 @@ impl NaiveServer {
                         break;
                     };
                     let Some(connection_slot) = self.quic_connections.try_acquire() else {
-                        eprintln!(
+                        crate::logging::emit_legacy_line(&format!(
                             "WARN  core   naive shared quic limit reached total={}",
                             self.quic_connections.total_limit()
-                        );
+                        ));
                         continue;
                     };
                     let server = self.clone();
@@ -284,10 +284,10 @@ impl NaiveServer {
                     if let Some(ip) = peer_ip {
                         self.tls_failures.record_failure(ip);
                     }
-                    eprintln!(
+                    crate::logging::emit_legacy_line(&format!(
                         "WARN  tls    handshake failed protocol=Naive tag={} class={class:?} error={error}",
                         self.config.node_tag
-                    );
+                    ));
                 }
                 return Err(error);
             }
@@ -1082,7 +1082,9 @@ fn log_naive_quic_error(context: &str, error: &io::Error) {
         | io::ErrorKind::ConnectionAborted
         | io::ErrorKind::ConnectionReset
         | io::ErrorKind::BrokenPipe => {}
-        _ => eprintln!("naive h3 {context} error: {error}"),
+        _ => crate::logging::emit_legacy_line(&format!(
+            "WARN  core   naive h3 {context} error: {error}"
+        )),
     }
 }
 

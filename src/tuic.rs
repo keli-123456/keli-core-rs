@@ -143,15 +143,15 @@ impl TuicServer {
             .datagram_send_buffer_size(UDP_DATAGRAM_BUFFER_SIZE);
         apply_tuic_congestion_control(&mut transport, &self.config.congestion_control)?;
         let resource = self.quic_connections.snapshot();
-        println!(
+        crate::logging::emit_legacy_line(&format!(
             "INFO  core   tuic shared quic limit total={} active={} listeners={} per_listener_soft={}",
             resource.total_limit,
             resource.active_connections,
             resource.listener_count,
             resource.per_listener_soft_limit
-        );
+        ));
         let tuning = proxy_quic_tuning_snapshot();
-        println!(
+        crate::logging::emit_legacy_line(&format!(
             "INFO  core   tuic quic tuning stream_window_mib={} conn_window_mib={} max_streams={} udp_socket_buffer_mib={} initial_rtt_ms={} idle_timeout_secs={}",
             tuning.stream_receive_window_mib,
             tuning.receive_window_mib,
@@ -159,7 +159,7 @@ impl TuicServer {
             tuning.udp_socket_buffer_mib,
             tuning.initial_rtt_ms,
             tuning.max_idle_timeout_secs
-        );
+        ));
         server_config.transport_config(Arc::new(transport));
         server_endpoint_with_tuned_udp_socket(server_config, self.config.listen)
     }
@@ -176,10 +176,10 @@ impl TuicServer {
                         break;
                     };
                     let Some(connection_slot) = self.quic_connections.try_acquire() else {
-                        eprintln!(
+                        crate::logging::emit_legacy_line(&format!(
                             "WARN  core   tuic shared quic limit reached total={}",
                             self.quic_connections.total_limit()
-                        );
+                        ));
                         continue;
                     };
                     let server = self.clone();

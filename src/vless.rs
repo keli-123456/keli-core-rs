@@ -1975,16 +1975,16 @@ fn log_vless_route_outbound_error(
         return;
     }
     if text.contains("node_tag=") {
-        eprintln!(
+        crate::logging::emit_legacy_line(&format!(
             "WARN  core   vless connection failed scope={scope} reason={reason} {}",
             vless_log_message(&text)
-        );
+        ));
     } else {
-        eprintln!(
+        crate::logging::emit_legacy_line(&format!(
             "WARN  core   vless connection failed node_tag={} scope={scope} reason={reason} error={}",
             vless_log_field(node_tag),
             vless_log_message(&text)
-        );
+        ));
     }
 }
 
@@ -2321,7 +2321,7 @@ fn log_vless_route_outbound_connected(
         return;
     }
     let endpoint = vless_outbound_endpoint(outbound);
-    eprintln!(
+    crate::logging::emit_legacy_line(&format!(
         "INFO  core   vless route outbound connected node_tag={} outbound={} protocol={} endpoint={} target={}:{} elapsed_ms={}",
         vless_log_field(node_tag),
         vless_log_field(&outbound.tag),
@@ -2330,7 +2330,7 @@ fn log_vless_route_outbound_connected(
         vless_log_field(&target.host),
         target.port,
         elapsed.as_millis()
-    );
+    ));
 }
 
 fn vless_outbound_endpoint(outbound: &OutboundConfig) -> String {

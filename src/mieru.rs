@@ -1895,7 +1895,7 @@ struct MieruSessionFinishedLog<'a> {
 }
 
 fn log_mieru_underlay_accepted(entry: MieruUnderlayAcceptedLog<'_>) {
-    eprintln!(
+    crate::logging::emit_legacy_line(&format!(
         "INFO  core   mieru underlay accepted node={} peer={} uid={} session={} users={} accept_ms={}",
         mieru_log_field(entry.node_tag),
         mieru_log_field(
@@ -1908,11 +1908,11 @@ fn log_mieru_underlay_accepted(entry: MieruUnderlayAcceptedLog<'_>) {
         entry.session_id,
         entry.users,
         entry.accept_ms
-    );
+    ));
 }
 
 fn log_mieru_session_opened(entry: MieruSessionOpenedLog<'_>) {
-    eprintln!("{}", format_mieru_session_opened(entry));
+    crate::logging::emit_legacy_line(&format_mieru_session_opened(entry));
 }
 
 fn format_mieru_session_opened(entry: MieruSessionOpenedLog<'_>) -> String {
@@ -1935,7 +1935,7 @@ fn format_mieru_session_opened(entry: MieruSessionOpenedLog<'_>) -> String {
 }
 
 fn log_mieru_first_payload(entry: MieruFirstPayloadLog<'_>) {
-    eprintln!(
+    crate::logging::emit_legacy_line(&format!(
         "INFO  core   mieru first_payload node={} session={} command={} client_ip={} target={} target_port={} direction={} wait_ms={} bytes={}",
         mieru_log_field(&entry.context.node_tag),
         entry.context.session_id,
@@ -1946,11 +1946,11 @@ fn log_mieru_first_payload(entry: MieruFirstPayloadLog<'_>) {
         entry.direction,
         entry.wait_ms,
         entry.bytes
-    );
+    ));
 }
 
 fn log_mieru_session_finished(entry: MieruSessionFinishedLog<'_>) {
-    eprintln!(
+    crate::logging::emit_legacy_line(&format!(
         "INFO  core   mieru session finished node={} session={} command={} client_ip={} target={} target_port={} upload={} download={} total_ms={}",
         mieru_log_field(&entry.context.node_tag),
         entry.context.session_id,
@@ -1961,7 +1961,7 @@ fn log_mieru_session_finished(entry: MieruSessionFinishedLog<'_>) {
         entry.upload,
         entry.download,
         entry.total_ms
-    );
+    ));
 }
 
 fn mieru_optional_ip(value: Option<IpAddr>) -> String {
