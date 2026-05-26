@@ -2848,7 +2848,19 @@ fn log_trojan_udp_relay_finished(
     ) {
         return;
     }
-    crate::logging::emit_legacy_line(&format_trojan_udp_relay_finished(
+    let trace_enabled = trojan_trace_enabled();
+    let status = error.map(classify_trojan_connection_error).unwrap_or("ok");
+    let outcome =
+        trojan_udp_relay_log_outcome(download, download_packets, first_response_ms, error);
+    let suppressed = if trace_enabled {
+        Some(0)
+    } else {
+        should_log_trojan_relay_finished_event(node_tag, scope, status, outcome)
+    };
+    let Some(suppressed) = suppressed else {
+        return;
+    };
+    let mut line = format_trojan_udp_relay_finished(
         node_tag,
         scope,
         target,
@@ -2859,7 +2871,11 @@ fn log_trojan_udp_relay_finished(
         first_response_ms,
         elapsed,
         error,
-    ));
+    );
+    if suppressed != 0 {
+        line.push_str(&format!(" suppressed={suppressed}"));
+    }
+    crate::logging::emit_legacy_line(&line);
 }
 
 fn should_log_trojan_udp_relay_finished(
@@ -2880,6 +2896,24 @@ fn should_log_trojan_udp_relay_finished(
         && download == 0
         && download_packets == 0
         && elapsed.as_millis() >= TROJAN_ROUTE_SLOW_LOG_MS
+}
+
+fn trojan_udp_relay_log_outcome(
+    download: u64,
+    download_packets: u64,
+    first_response_ms: Option<u128>,
+    error: Option<&io::Error>,
+) -> &'static str {
+    if error.is_some() {
+        return "error";
+    }
+    if first_response_ms.is_none() && download == 0 && download_packets == 0 {
+        return "no_response";
+    }
+    if first_response_ms.is_some_and(|value| value >= TROJAN_ROUTE_SLOW_LOG_MS) {
+        return "slow_response";
+    }
+    "ok"
 }
 
 fn format_trojan_udp_relay_finished(
@@ -4376,6 +4410,47 @@ mod tests {
                 "tls_websocket",
                 "ok",
                 "remote_read_error",
+                61_000,
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn groups_trojan_udp_no_response_logs_for_minute_suppression() {
+        let mut states = std::collections::HashMap::new();
+        let outcome = super::trojan_udp_relay_log_outcome(0, 0, None, None);
+        assert_eq!(outcome, "no_response");
+
+        assert_eq!(
+            super::trojan_relay_finished_log_decision_at(
+                &mut states,
+                "node",
+                "tls_websocket_udp",
+                "ok",
+                outcome,
+                1_000,
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            super::trojan_relay_finished_log_decision_at(
+                &mut states,
+                "node",
+                "tls_websocket_udp",
+                "ok",
+                outcome,
+                2_000,
+            ),
+            None
+        );
+        assert_eq!(
+            super::trojan_relay_finished_log_decision_at(
+                &mut states,
+                "node",
+                "tls_websocket_udp",
+                "ok",
+                outcome,
                 61_000,
             ),
             Some(1)

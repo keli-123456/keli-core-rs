@@ -54,7 +54,7 @@ const UDP_GLOBAL_MAX_SESSIONS: usize = 4096;
 const UDP_GLOBAL_RESERVED_FDS: usize = 1024;
 const UDP_GLOBAL_FDS_PER_SESSION: usize = 1;
 const UDP_GLOBAL_MEMORY_MIB_PER_SESSION: usize = 8;
-const HY2_ERROR_LOG_INTERVAL_MS: u64 = 30_000;
+const HY2_ERROR_LOG_INTERVAL_MS: u64 = 60_000;
 const HY2_STOP_POLL_INTERVAL_MS: u64 = 250;
 const HY2_INVALID_AUTH_BACKOFF_THRESHOLD: u32 = 4;
 const HY2_INVALID_AUTH_BACKOFF_WINDOW: Duration = Duration::from_secs(30);
@@ -205,7 +205,7 @@ impl Hysteria2Server {
             "hysteria2",
         )?;
         let resource = self.quic_connections.snapshot();
-        println!(
+        crate::logging::emit_legacy_line(&format!(
             "INFO  core   hysteria2 shared quic limit total={} active={} listeners={} per_listener_soft={} listener_limit={} preauth_limit={}",
             resource.total_limit,
             resource.active_connections,
@@ -213,9 +213,9 @@ impl Hysteria2Server {
             resource.per_listener_soft_limit,
             self.listener_connection_limit,
             self.preauth_connection_limit
-        );
+        ));
         let tuning = proxy_quic_tuning_snapshot();
-        println!(
+        crate::logging::emit_legacy_line(&format!(
             "INFO  core   hysteria2 quic tuning stream_window_mib={} conn_window_mib={} max_streams={} udp_socket_buffer_mib={} initial_rtt_ms={} idle_timeout_secs={}",
             tuning.stream_receive_window_mib,
             tuning.receive_window_mib,
@@ -223,7 +223,7 @@ impl Hysteria2Server {
             tuning.udp_socket_buffer_mib,
             tuning.initial_rtt_ms,
             tuning.max_idle_timeout_secs
-        );
+        ));
         transport
             .datagram_receive_buffer_size(Some(UDP_DATAGRAM_BUFFER_SIZE))
             .datagram_send_buffer_size(UDP_DATAGRAM_BUFFER_SIZE);
@@ -339,10 +339,10 @@ impl Hysteria2Server {
         {
             return;
         }
-        eprintln!(
+        crate::logging::emit_legacy_line(&format!(
             "WARN  core   hysteria2 preauth limit reached limit={}",
             self.preauth_connection_limit
-        );
+        ));
     }
 
     fn log_quic_limit_reached(&self) {
@@ -359,10 +359,10 @@ impl Hysteria2Server {
             return;
         }
         let resource = self.quic_connections.snapshot();
-        eprintln!(
+        crate::logging::emit_legacy_line(&format!(
             "WARN  core   hysteria2 quic limit reached total={} active={} listener_limit={}",
             resource.total_limit, resource.active_connections, self.listener_connection_limit
-        );
+        ));
     }
 
     async fn handle_incoming(
@@ -2108,7 +2108,7 @@ fn log_hysteria2_error(scope: &'static str, error: &io::Error) {
     }
     let level = class.log_level();
     let label = class.label();
-    eprintln!("{level} core   hysteria2 {scope} {label}: {text}");
+    crate::logging::emit_legacy_line(&format!("{level} core   hysteria2 {scope} {label}: {text}"));
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -2176,10 +2176,10 @@ fn should_log_hysteria2_error(scope: &'static str, class: Hysteria2ErrorClass) -
     let suppressed = std::mem::take(&mut state.suppressed);
     state.last_ms = now;
     if suppressed != 0 {
-        eprintln!(
+        crate::logging::emit_legacy_line(&format!(
             "WARN  core   hysteria2 {scope} {} suppressed={suppressed}",
             class.label()
-        );
+        ));
     }
     true
 }
@@ -2304,7 +2304,7 @@ fn log_hysteria2_route_outbound_connected(
         return;
     }
     let endpoint = hysteria2_outbound_endpoint(outbound);
-    eprintln!(
+    crate::logging::emit_legacy_line(&format!(
         "INFO  core   hysteria2 route outbound connected node_tag={} outbound={} protocol={} endpoint={} target={}:{} elapsed_ms={}",
         hysteria2_log_field(node_tag),
         hysteria2_log_field(&outbound.tag),
@@ -2313,7 +2313,7 @@ fn log_hysteria2_route_outbound_connected(
         hysteria2_log_field(&target.host),
         target.port,
         elapsed.as_millis()
-    );
+    ));
 }
 
 fn route_trace_enabled() -> bool {
