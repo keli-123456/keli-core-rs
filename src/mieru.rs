@@ -8,7 +8,7 @@ use std::net::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -230,10 +230,20 @@ impl MieruServer {
     }
 
     pub fn handle_tcp_client(&self, client: TcpStream) -> io::Result<()> {
-        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        let accepted_at = Instant::now();
+        let peer_addr = client.peer_addr().ok();
+        let client_ip = peer_addr.map(|addr| addr.ip());
         let users = self.users_snapshot();
         let mut reader = MieruReader::accept(client.try_clone()?, users.as_ref())?;
         let user = reader.user().clone();
+        log_mieru_underlay_accepted(MieruUnderlayAcceptedLog {
+            node_tag: &self.config.node_tag,
+            peer_addr,
+            user_id: user.id,
+            session_id: reader.session_id(),
+            users: users.len(),
+            accept_ms: accepted_at.elapsed().as_millis(),
+        });
         let _connection = self
             .bandwidth
             .register_tcp_connection(Some(&user.uuid), &[&client])?;
@@ -477,21 +487,46 @@ fn handle_mieru_session(
     client_ip: Option<IpAddr>,
     runtime: MieruSessionRuntime,
 ) -> io::Result<()> {
+    let session_started = Instant::now();
     let session_id = initial.metadata.session_id;
     let mut reader = MieruSessionReader::new(initial.payload, rx);
     let mut writer = MieruSessionWriter::new(writer, session_id);
     let mut request_bytes = Vec::new();
+    let socks_started = Instant::now();
     let request = read_socks_request_from_mieru(&mut reader, &mut request_bytes)?;
+    let socks_ms = socks_started.elapsed().as_millis();
     let initial_payload = request_bytes.split_off(request.consumed);
+    let limit_started = Instant::now();
     let _session = runtime
         .sessions
         .try_acquire_for_node_ip(&runtime.node_tag, Some(&user), client_ip)
         .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))?;
+    let limit_ms = limit_started.elapsed().as_millis();
     let bandwidth = runtime.bandwidth.limiter_for(Some(&user));
+    let command = match request.command {
+        MieruSocksCommand::TcpConnect => "tcp_connect",
+        MieruSocksCommand::UdpAssociate => "udp_associate",
+    };
+    let log_context = MieruRelayLogContext {
+        node_tag: runtime.node_tag.clone(),
+        session_id,
+        command,
+        target_host: request.target.host.clone(),
+        target_port: request.target.port,
+        client_ip,
+    };
 
     let (upload, download) = if request.command == MieruSocksCommand::UdpAssociate {
+        let open_started = Instant::now();
         writer.write_open_response()?;
         writer.write_all(&SOCKS_CONNECT_SUCCESS)?;
+        log_mieru_session_opened(MieruSessionOpenedLog {
+            context: &log_context,
+            socks_ms,
+            limit_ms,
+            connect_ms: None,
+            open_ms: open_started.elapsed().as_millis(),
+        });
         relay_mieru_udp_associate(
             reader,
             writer,
@@ -501,11 +536,21 @@ fn handle_mieru_session(
             bandwidth,
         )?
     } else {
+        let connect_started = Instant::now();
         let mut remote = runtime
             .router
             .connect_tcp(&request.target, &initial_payload)?;
+        let connect_ms = connect_started.elapsed().as_millis();
+        let open_started = Instant::now();
         writer.write_open_response()?;
         writer.write_all(&SOCKS_CONNECT_SUCCESS)?;
+        log_mieru_session_opened(MieruSessionOpenedLog {
+            context: &log_context,
+            socks_ms,
+            limit_ms,
+            connect_ms: Some(connect_ms),
+            open_ms: open_started.elapsed().as_millis(),
+        });
         let mut upload = 0u64;
         if !initial_payload.is_empty() {
             if let Some(limiter) = bandwidth.as_deref() {
@@ -516,10 +561,17 @@ fn handle_mieru_session(
             remote.write_all(&initial_payload)?;
             upload = initial_payload.len() as u64;
         }
-        let (relayed_upload, download) = relay_mieru_streams(reader, writer, remote, bandwidth)?;
+        let (relayed_upload, download) =
+            relay_mieru_streams(reader, writer, remote, bandwidth, log_context.clone())?;
         (upload.saturating_add(relayed_upload), download)
     };
 
+    log_mieru_session_finished(MieruSessionFinishedLog {
+        context: &log_context,
+        upload,
+        download,
+        total_ms: session_started.elapsed().as_millis(),
+    });
     runtime.traffic.add_with_user_id(
         runtime.node_tag,
         user.uuid,
@@ -1685,18 +1737,22 @@ fn socket_addr_to_target(addr: SocketAddr) -> SocksTarget {
 }
 
 fn relay_mieru_streams<R, W>(
-    mut reader: R,
-    mut writer: W,
+    reader: R,
+    writer: W,
     remote: TcpStream,
     limiter: Option<Arc<BandwidthLimiter>>,
+    log_context: MieruRelayLogContext,
 ) -> io::Result<(u64, u64)>
 where
     R: MieruInput + 'static,
     W: MieruOutput,
 {
+    let relay_started = Instant::now();
     let mut remote_read = remote.try_clone()?;
     let mut remote_write = remote;
     let upload_limiter = limiter.clone();
+    let mut reader = MieruTimedInput::new(reader, log_context.clone(), relay_started);
+    let mut writer = MieruTimedOutput::new(writer, log_context, relay_started);
     let stop_upload = reader.stop_handle();
     let upload_task = spawn_native_blocking_relay(move || {
         let upload = match upload_limiter.as_deref() {
@@ -1723,10 +1779,236 @@ where
     Ok((upload, download))
 }
 
+#[derive(Clone, Debug)]
+struct MieruRelayLogContext {
+    node_tag: String,
+    session_id: u32,
+    command: &'static str,
+    target_host: String,
+    target_port: u16,
+    client_ip: Option<IpAddr>,
+}
+
+struct MieruTimedInput<R> {
+    inner: R,
+    context: MieruRelayLogContext,
+    relay_started: Instant,
+    logged: bool,
+}
+
+impl<R> MieruTimedInput<R> {
+    fn new(inner: R, context: MieruRelayLogContext, relay_started: Instant) -> Self {
+        Self {
+            inner,
+            context,
+            relay_started,
+            logged: false,
+        }
+    }
+}
+
+impl<R: Read> Read for MieruTimedInput<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(output)?;
+        if read > 0 && !self.logged {
+            self.logged = true;
+            log_mieru_first_payload(MieruFirstPayloadLog {
+                context: &self.context,
+                direction: "upload",
+                wait_ms: self.relay_started.elapsed().as_millis(),
+                bytes: read,
+            });
+        }
+        Ok(read)
+    }
+}
+
+impl<R: MieruInput> MieruInput for MieruTimedInput<R> {
+    fn stop_handle(&self) -> Option<Arc<AtomicBool>> {
+        self.inner.stop_handle()
+    }
+}
+
+struct MieruTimedOutput<W> {
+    inner: W,
+    context: MieruRelayLogContext,
+    relay_started: Instant,
+    logged: bool,
+}
+
+impl<W> MieruTimedOutput<W> {
+    fn new(inner: W, context: MieruRelayLogContext, relay_started: Instant) -> Self {
+        Self {
+            inner,
+            context,
+            relay_started,
+            logged: false,
+        }
+    }
+}
+
+impl<W: Write> Write for MieruTimedOutput<W> {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if !input.is_empty() && !self.logged {
+            self.logged = true;
+            log_mieru_first_payload(MieruFirstPayloadLog {
+                context: &self.context,
+                direction: "download",
+                wait_ms: self.relay_started.elapsed().as_millis(),
+                bytes: input.len(),
+            });
+        }
+        self.inner.write(input)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: MieruOutput> MieruOutput for MieruTimedOutput<W> {
+    fn shutdown_session(&mut self) {
+        self.inner.shutdown_session();
+    }
+}
+
+struct MieruUnderlayAcceptedLog<'a> {
+    node_tag: &'a str,
+    peer_addr: Option<SocketAddr>,
+    user_id: u64,
+    session_id: u32,
+    users: usize,
+    accept_ms: u128,
+}
+
+struct MieruSessionOpenedLog<'a> {
+    context: &'a MieruRelayLogContext,
+    socks_ms: u128,
+    limit_ms: u128,
+    connect_ms: Option<u128>,
+    open_ms: u128,
+}
+
+struct MieruFirstPayloadLog<'a> {
+    context: &'a MieruRelayLogContext,
+    direction: &'static str,
+    wait_ms: u128,
+    bytes: usize,
+}
+
+struct MieruSessionFinishedLog<'a> {
+    context: &'a MieruRelayLogContext,
+    upload: u64,
+    download: u64,
+    total_ms: u128,
+}
+
+fn log_mieru_underlay_accepted(entry: MieruUnderlayAcceptedLog<'_>) {
+    eprintln!(
+        "INFO  core   mieru underlay accepted node={} peer={} uid={} session={} users={} accept_ms={}",
+        mieru_log_field(entry.node_tag),
+        mieru_log_field(
+            &entry
+                .peer_addr
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        entry.user_id,
+        entry.session_id,
+        entry.users,
+        entry.accept_ms
+    );
+}
+
+fn log_mieru_session_opened(entry: MieruSessionOpenedLog<'_>) {
+    eprintln!("{}", format_mieru_session_opened(entry));
+}
+
+fn format_mieru_session_opened(entry: MieruSessionOpenedLog<'_>) -> String {
+    format!(
+        "INFO  core   mieru session opened node={} session={} command={} client_ip={} target={} target_port={} socks_ms={} limit_ms={} connect_ms={} open_ms={}",
+        mieru_log_field(&entry.context.node_tag),
+        entry.context.session_id,
+        entry.context.command,
+        mieru_log_field(&mieru_optional_ip(entry.context.client_ip)),
+        mieru_log_field(&entry.context.target_host),
+        entry.context.target_port,
+        entry.socks_ms,
+        entry.limit_ms,
+        entry
+            .connect_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        entry.open_ms
+    )
+}
+
+fn log_mieru_first_payload(entry: MieruFirstPayloadLog<'_>) {
+    eprintln!(
+        "INFO  core   mieru first_payload node={} session={} command={} client_ip={} target={} target_port={} direction={} wait_ms={} bytes={}",
+        mieru_log_field(&entry.context.node_tag),
+        entry.context.session_id,
+        entry.context.command,
+        mieru_log_field(&mieru_optional_ip(entry.context.client_ip)),
+        mieru_log_field(&entry.context.target_host),
+        entry.context.target_port,
+        entry.direction,
+        entry.wait_ms,
+        entry.bytes
+    );
+}
+
+fn log_mieru_session_finished(entry: MieruSessionFinishedLog<'_>) {
+    eprintln!(
+        "INFO  core   mieru session finished node={} session={} command={} client_ip={} target={} target_port={} upload={} download={} total_ms={}",
+        mieru_log_field(&entry.context.node_tag),
+        entry.context.session_id,
+        entry.context.command,
+        mieru_log_field(&mieru_optional_ip(entry.context.client_ip)),
+        mieru_log_field(&entry.context.target_host),
+        entry.context.target_port,
+        entry.upload,
+        entry.download,
+        entry.total_ms
+    );
+}
+
+fn mieru_optional_ip(value: Option<IpAddr>) -> String {
+    value
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn mieru_log_field(value: &str) -> String {
+    if value.is_empty() {
+        return "-".to_string();
+    }
+    let needs_quote = value
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\\' | '='));
+    if !needs_quote {
+        return value.to_string();
+    }
+    let mut output = String::with_capacity(value.len() + 2);
+    output.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            other => output.push(other),
+        }
+    }
+    output.push('"');
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream, UdpSocket};
+    use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -1751,6 +2033,34 @@ mod tests {
             speed_limit: 0,
             device_limit: 0,
         }
+    }
+
+    #[test]
+    fn mieru_session_open_log_escapes_fields_without_user_secrets() {
+        let context = super::MieruRelayLogContext {
+            node_tag: "panel name\"x".to_string(),
+            session_id: 7,
+            command: "tcp_connect",
+            target_host: "www.gstatic.com".to_string(),
+            target_port: 80,
+            client_ip: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
+        };
+
+        let line = super::format_mieru_session_opened(super::MieruSessionOpenedLog {
+            context: &context,
+            socks_ms: 1,
+            limit_ms: 2,
+            connect_ms: Some(3),
+            open_ms: 4,
+        });
+
+        assert!(line.contains("node=\"panel name\\\"x\""));
+        assert!(line.contains("session=7"));
+        assert!(line.contains("client_ip=203.0.113.10"));
+        assert!(line.contains("target=www.gstatic.com"));
+        assert!(line.contains("connect_ms=3"));
+        assert!(!line.contains("password"));
+        assert!(!line.contains("uuid"));
     }
 
     #[test]
