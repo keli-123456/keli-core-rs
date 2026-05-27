@@ -2539,9 +2539,28 @@ struct ConnectionWorkerGroup {
     state: Arc<ConnectionWorkerGroupState>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ConnectionWorkerGroupSnapshot {
+    active_total: usize,
+    active_blocking: usize,
+    active_async: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectionWorkerKind {
+    Blocking,
+    Async,
+}
+
+#[derive(Debug, Default)]
+struct ConnectionWorkerCounts {
+    active_blocking: usize,
+    active_async: usize,
+}
+
 #[derive(Debug)]
 struct ConnectionWorkerGroupState {
-    active: Mutex<usize>,
+    counts: Mutex<ConnectionWorkerCounts>,
     finished: Condvar,
 }
 
@@ -2549,7 +2568,7 @@ impl ConnectionWorkerGroup {
     fn new() -> Self {
         Self {
             state: Arc::new(ConnectionWorkerGroupState {
-                active: Mutex::new(0),
+                counts: Mutex::new(ConnectionWorkerCounts::default()),
                 finished: Condvar::new(),
             }),
         }
@@ -2559,14 +2578,14 @@ impl ConnectionWorkerGroup {
     where
         F: FnOnce() + Send + 'static,
     {
-        if !self.state.acquire() {
+        if !self.state.acquire(ConnectionWorkerKind::Blocking) {
             return false;
         }
 
         let state = Arc::clone(&self.state);
         let job = move || {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
-            state.release();
+            state.release(ConnectionWorkerKind::Blocking);
         };
 
         if thread::Builder::new()
@@ -2577,7 +2596,7 @@ impl ConnectionWorkerGroup {
         {
             true
         } else {
-            self.state.release();
+            self.state.release(ConnectionWorkerKind::Blocking);
             false
         }
     }
@@ -2586,7 +2605,7 @@ impl ConnectionWorkerGroup {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        if !self.state.acquire() {
+        if !self.state.acquire(ConnectionWorkerKind::Async) {
             return false;
         }
 
@@ -2603,6 +2622,10 @@ impl ConnectionWorkerGroup {
     fn join_timeout(&self, timeout: Duration) -> bool {
         self.state.wait_until_idle_timeout(timeout)
     }
+
+    fn snapshot(&self) -> ConnectionWorkerGroupSnapshot {
+        self.state.snapshot()
+    }
 }
 
 struct ConnectionWorkerAsyncGuard {
@@ -2611,40 +2634,59 @@ struct ConnectionWorkerAsyncGuard {
 
 impl Drop for ConnectionWorkerAsyncGuard {
     fn drop(&mut self) {
-        self.state.release();
+        self.state.release(ConnectionWorkerKind::Async);
     }
 }
 
 impl ConnectionWorkerGroupState {
-    fn acquire(&self) -> bool {
-        let mut active = self.active.lock().expect("worker group lock poisoned");
-        *active += 1;
+    fn acquire(&self, kind: ConnectionWorkerKind) -> bool {
+        let mut counts = self.counts.lock().expect("worker group lock poisoned");
+        match kind {
+            ConnectionWorkerKind::Blocking => counts.active_blocking += 1,
+            ConnectionWorkerKind::Async => counts.active_async += 1,
+        }
         true
     }
 
-    fn release(&self) {
-        let mut active = self.active.lock().expect("worker group lock poisoned");
-        *active = active.saturating_sub(1);
-        if *active == 0 {
+    fn release(&self, kind: ConnectionWorkerKind) {
+        let mut counts = self.counts.lock().expect("worker group lock poisoned");
+        match kind {
+            ConnectionWorkerKind::Blocking => {
+                counts.active_blocking = counts.active_blocking.saturating_sub(1);
+            }
+            ConnectionWorkerKind::Async => {
+                counts.active_async = counts.active_async.saturating_sub(1);
+            }
+        }
+        if counts.active_blocking == 0 && counts.active_async == 0 {
             self.finished.notify_all();
+        }
+    }
+
+    fn snapshot(&self) -> ConnectionWorkerGroupSnapshot {
+        let counts = self.counts.lock().expect("worker group lock poisoned");
+        ConnectionWorkerGroupSnapshot {
+            active_total: counts.active_blocking + counts.active_async,
+            active_blocking: counts.active_blocking,
+            active_async: counts.active_async,
         }
     }
 
     fn wait_until_idle_timeout(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        let mut active = self.active.lock().expect("worker group lock poisoned");
-        while *active > 0 {
+        let mut counts = self.counts.lock().expect("worker group lock poisoned");
+        while counts.active_blocking + counts.active_async > 0 {
             let now = Instant::now();
             if now >= deadline {
                 return false;
             }
             let remaining = deadline.saturating_duration_since(now);
-            let (next_active, wait_result) = self
+            let (next_counts, wait_result) = self
                 .finished
-                .wait_timeout(active, remaining)
+                .wait_timeout(counts, remaining)
                 .expect("worker group lock poisoned");
-            active = next_active;
-            if wait_result.timed_out() && *active > 0 {
+            counts = next_counts;
+            if wait_result.timed_out() && counts.active_blocking + counts.active_async > 0 {
                 return false;
             }
         }
@@ -3256,6 +3298,53 @@ mod tests {
         completed.sort_unstable();
 
         assert_eq!(completed, (0..64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn connection_worker_group_reports_async_and_blocking_activity() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let group = super::ConnectionWorkerGroup::new();
+            let (blocking_release_tx, blocking_release_rx) = mpsc::channel();
+            assert!(group.spawn(move || {
+                let _ = blocking_release_rx.recv();
+            }));
+
+            let async_release = Arc::new(AtomicBool::new(false));
+            let async_release_for_task = async_release.clone();
+            assert!(group.spawn_async(async move {
+                while !async_release_for_task.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }));
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let snapshot = group.snapshot();
+                if snapshot.active_blocking == 1 && snapshot.active_async == 1 {
+                    assert_eq!(snapshot.active_total, 2);
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    panic!("connection scheduler did not report active async and blocking workers");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            blocking_release_tx
+                .send(())
+                .expect("release blocking worker");
+            async_release.store(true, Ordering::SeqCst);
+            assert!(group.join_timeout(Duration::from_secs(2)));
+            let snapshot = group.snapshot();
+            assert_eq!(snapshot.active_total, 0);
+            assert_eq!(snapshot.active_blocking, 0);
+            assert_eq!(snapshot.active_async, 0);
+        });
     }
 
     #[test]

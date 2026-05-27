@@ -31,7 +31,8 @@ Add the following test in `src/service.rs` near the existing `connection_worker_
 ```rust
 #[test]
 fn connection_worker_group_reports_async_and_blocking_activity() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
         .enable_time()
         .build()
         .expect("test runtime");
