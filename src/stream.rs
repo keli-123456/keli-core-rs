@@ -22,7 +22,7 @@ const TCP_RELAY_BLOCKING_THREADS_PER_CPU: usize = 16;
 const TCP_RELAY_BLOCKING_THREAD_MEMORY_MIB: usize = 4;
 const NATIVE_RELAY_WORKERS_MIN: usize = 16;
 const NATIVE_RELAY_WORKERS_MAX: usize = 512;
-const NATIVE_RELAY_WORKERS_PER_CPU: usize = 16;
+const NATIVE_RELAY_WORKERS_PER_CPU: usize = 64;
 const NATIVE_RELAY_WORKER_MEMORY_MIB: usize = 4;
 const NATIVE_RELAY_RESERVED_FDS: usize = 1024;
 const NATIVE_RELAY_FDS_PER_WORKER: usize = 4;
@@ -792,7 +792,7 @@ mod tests {
 
         assert_eq!(
             super::native_relay_worker_threads_from_resources(4, Some(4096), Some(100_000)),
-            64
+            256
         );
         assert_eq!(
             super::native_relay_worker_threads_from_resources(32, Some(4096), Some(100_000)),
