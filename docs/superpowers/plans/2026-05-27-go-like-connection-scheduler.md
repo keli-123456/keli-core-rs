@@ -422,7 +422,7 @@ workers: &mut Vec<NativeRelayHandle<()>>,
 to:
 
 ```rust
-workers: &mut Vec<()>,
+workers: &mut Vec<DetachedBlockingRelayHandle<()>>,
 ```
 
 Then replace:
@@ -441,18 +441,20 @@ workers.push(spawn_native_blocking_relay(move || {
 with:
 
 ```rust
-spawn_detached_blocking_relay("keli-core-mieru-session", move || {
-    let result = handle_mieru_session(initial, rx, writer.clone(), user, client_ip, runtime)
-        .map_err(|error| (error.kind(), error.to_string()));
-    if result.is_err() {
-        close_mieru_underlay(&writer);
-    }
-    let _ = done_tx.send((session_id, result));
-})?;
-workers.push(());
+workers.push(spawn_detached_blocking_relay_with_handle(
+    "keli-core-mieru-session",
+    move || {
+        let result = handle_mieru_session(initial, rx, writer.clone(), user, client_ip, runtime)
+            .map_err(|error| (error.kind(), error.to_string()));
+        if result.is_err() {
+            close_mieru_underlay(&writer);
+        }
+        let _ = done_tx.send((session_id, result));
+    },
+)?);
 ```
 
-Update the `use crate::stream::{...}` list in `src/mieru.rs` to import `spawn_detached_blocking_relay` and remove `NativeRelayHandle` if it is no longer used for session workers.
+Update the `use crate::stream::{...}` list in `src/mieru.rs` to import `DetachedBlockingRelayHandle`, `join_detached_blocking_relay`, and `spawn_detached_blocking_relay_with_handle`. Keep the final session join loop, but call `join_detached_blocking_relay` instead of `join_native_blocking_relay`.
 
 - [ ] **Step 4: Verify MIERU tests**
 

@@ -80,10 +80,22 @@ pub struct NativeRelayHandle<T> {
     receiver: mpsc::Receiver<thread::Result<T>>,
 }
 
+pub struct DetachedBlockingRelayHandle<T> {
+    receiver: mpsc::Receiver<thread::Result<T>>,
+}
+
 impl<T> std::fmt::Debug for NativeRelayHandle<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("NativeRelayHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> std::fmt::Debug for DetachedBlockingRelayHandle<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DetachedBlockingRelayHandle")
             .finish_non_exhaustive()
     }
 }
@@ -231,14 +243,27 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    let _ = spawn_detached_blocking_relay_with_handle(name, task)?;
+    Ok(())
+}
+
+pub fn spawn_detached_blocking_relay_with_handle<F, T>(
+    name: &'static str,
+    task: F,
+) -> io::Result<DetachedBlockingRelayHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
     thread::Builder::new()
         .name(name.to_string())
         .stack_size(detached_blocking_relay_stack_size())
         .spawn(move || {
             let _metrics = DetachedBlockingRelayMetricsGuard::new(name);
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+            let _ = sender.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)));
         })?;
-    Ok(())
+    Ok(DetachedBlockingRelayHandle { receiver })
 }
 
 pub(crate) struct DetachedBlockingRelayMetricsGuard {
@@ -396,6 +421,20 @@ pub fn join_native_blocking_relay<T>(
         Err(_) => Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
             "native relay task exited without result",
+        )),
+    }
+}
+
+pub fn join_detached_blocking_relay<T>(
+    handle: DetachedBlockingRelayHandle<T>,
+    panic_message: &'static str,
+) -> io::Result<T> {
+    match handle.receiver.recv() {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err(io::Error::new(io::ErrorKind::Other, panic_message)),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "detached blocking relay task exited without result",
         )),
     }
 }
@@ -1238,5 +1277,20 @@ mod tests {
             let snapshot = super::relay_scheduler_metrics_snapshot();
             assert_eq!(snapshot.active_async.get("test-async-relay"), None);
         });
+    }
+
+    #[test]
+    fn detached_blocking_relay_handle_returns_task_result() {
+        let handle = super::spawn_detached_blocking_relay_with_handle(
+            "test-detached-blocking-relay",
+            || 42,
+        )
+        .expect("spawn detached blocking relay");
+        let value = super::join_detached_blocking_relay(
+            handle,
+            "detached blocking relay panicked",
+        )
+        .expect("join detached blocking relay");
+        assert_eq!(value, 42);
     }
 }

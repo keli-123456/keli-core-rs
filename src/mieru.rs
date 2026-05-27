@@ -23,8 +23,9 @@ use crate::outbound::recv_udp_response;
 use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::SocksTarget;
 use crate::stream::{
-    copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
-    spawn_native_blocking_relay, NativeRelayHandle,
+    copy_count_best_effort, copy_count_best_effort_limited, join_detached_blocking_relay,
+    join_native_blocking_relay, spawn_detached_blocking_relay_with_handle,
+    spawn_native_blocking_relay, DetachedBlockingRelayHandle,
 };
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{apply_user_delta_to_vec, CoreUser, CoreUserDelta, CoreUserDeltaResult};
@@ -327,7 +328,7 @@ impl MieruServer {
 
         drop(sessions);
         for worker in workers {
-            let _ = join_native_blocking_relay(worker, "mieru session worker panicked");
+            let _ = join_detached_blocking_relay(worker, "mieru session worker panicked");
         }
         while let Ok((_, result)) = done_rx.try_recv() {
             if let Err(error) = result {
@@ -405,7 +406,7 @@ fn dispatch_mieru_segment(
     runtime: MieruSessionRuntime,
     done_tx: Sender<(u32, Result<(), (io::ErrorKind, String)>)>,
     sessions: &mut HashMap<u32, Sender<MieruSegment>>,
-    workers: &mut Vec<NativeRelayHandle<()>>,
+    workers: &mut Vec<DetachedBlockingRelayHandle<()>>,
 ) -> io::Result<()> {
     match segment.metadata.protocol_type {
         OPEN_SESSION_REQUEST => spawn_mieru_session(
@@ -449,7 +450,7 @@ fn spawn_mieru_session(
     runtime: MieruSessionRuntime,
     done_tx: Sender<(u32, Result<(), (io::ErrorKind, String)>)>,
     sessions: &mut HashMap<u32, Sender<MieruSegment>>,
-    workers: &mut Vec<NativeRelayHandle<()>>,
+    workers: &mut Vec<DetachedBlockingRelayHandle<()>>,
 ) -> io::Result<()> {
     let session_id = initial.metadata.session_id;
     if session_id == 0 {
@@ -467,14 +468,17 @@ fn spawn_mieru_session(
 
     let (tx, rx) = mpsc::channel();
     sessions.insert(session_id, tx);
-    workers.push(spawn_native_blocking_relay(move || {
-        let result = handle_mieru_session(initial, rx, writer.clone(), user, client_ip, runtime)
-            .map_err(|error| (error.kind(), error.to_string()));
-        if result.is_err() {
-            close_mieru_underlay(&writer);
-        }
-        let _ = done_tx.send((session_id, result));
-    })?);
+    workers.push(spawn_detached_blocking_relay_with_handle(
+        "keli-core-mieru-session",
+        move || {
+            let result = handle_mieru_session(initial, rx, writer.clone(), user, client_ip, runtime)
+                .map_err(|error| (error.kind(), error.to_string()));
+            if result.is_err() {
+                close_mieru_underlay(&writer);
+            }
+            let _ = done_tx.send((session_id, result));
+        },
+    )?);
     Ok(())
 }
 
@@ -2024,6 +2028,28 @@ mod tests {
             speed_limit: 0,
             device_limit: 0,
         }
+    }
+
+    #[test]
+    fn mieru_session_worker_uses_detached_blocking_fallback_metric() {
+        let snapshot = crate::stream::relay_scheduler_metrics_snapshot();
+        assert_eq!(
+            snapshot
+                .active_detached_blocking
+                .get("keli-core-mieru-session"),
+            None
+        );
+
+        let _guard = crate::stream::DetachedBlockingRelayMetricsGuard::new(
+            "keli-core-mieru-session",
+        );
+        let snapshot = crate::stream::relay_scheduler_metrics_snapshot();
+        assert_eq!(
+            snapshot
+                .active_detached_blocking
+                .get("keli-core-mieru-session"),
+            Some(&1)
+        );
     }
 
     #[test]
