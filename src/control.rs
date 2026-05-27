@@ -36,6 +36,7 @@ pub enum CoreCommand {
     },
     Status,
     Metrics,
+    TrimMemory,
     Stop,
 }
 
@@ -73,6 +74,7 @@ pub enum CoreResponse {
     Metrics {
         metrics: CoreMetricsSnapshot,
     },
+    MemoryTrimmed,
     Stopped,
     Error {
         message: String,
@@ -130,6 +132,10 @@ impl CoreController {
                     )
                 },
             },
+            CoreCommand::TrimMemory => {
+                crate::trim_process_memory();
+                CoreResponse::MemoryTrimmed
+            }
             CoreCommand::Stop => {
                 if let Some(service) = &mut self.service {
                     service.stop();
@@ -182,6 +188,7 @@ impl CoreController {
 
         service.update_routes(config);
         let decision = self.runtime.apply_runtime_update();
+        crate::trim_process_memory();
         CoreResponse::Applied {
             decision: decision_name(decision).to_string(),
             status: self.runtime.status().clone(),
@@ -217,6 +224,8 @@ impl CoreController {
             result.active_users,
         );
         self.runtime.apply_runtime_update();
+        drop(delta);
+        crate::trim_process_memory();
         CoreResponse::UserDeltaApplied {
             node_tag,
             result,
@@ -238,6 +247,7 @@ impl CoreController {
 
         if !self.runtime.needs_reload(&plan) {
             let decision = self.runtime.apply_plan(plan);
+            crate::trim_process_memory();
             return CoreResponse::Applied {
                 decision: decision_name(decision).to_string(),
                 status: self.runtime.status().clone(),
@@ -249,6 +259,7 @@ impl CoreController {
             if service.can_update_users(&config) {
                 service.update_users(config);
                 let decision = self.runtime.apply_update(plan);
+                crate::trim_process_memory();
                 return CoreResponse::Applied {
                     decision: decision_name(decision).to_string(),
                     status: self.runtime.status().clone(),
@@ -258,6 +269,7 @@ impl CoreController {
             if service.can_update_routes(&config) {
                 service.update_routes_and_users(config);
                 let decision = self.runtime.apply_update(plan);
+                crate::trim_process_memory();
                 return CoreResponse::Applied {
                     decision: decision_name(decision).to_string(),
                     status: self.runtime.status().clone(),
@@ -284,6 +296,7 @@ impl CoreController {
 
         self.service = Some(service);
         let decision = self.runtime.apply_plan(plan);
+        crate::trim_process_memory();
         CoreResponse::Applied {
             decision: decision_name(decision).to_string(),
             status: self.runtime.status().clone(),
@@ -565,6 +578,98 @@ mod tests {
             controller.handle(CoreCommand::Stop),
             CoreResponse::Stopped
         ));
+    }
+
+    #[test]
+    fn apply_config_hot_updates_trim_process_memory() {
+        let config = config(Protocol::Socks);
+        let mut route_updated = config.clone();
+        route_updated.routes.push(RouteRule {
+            targets: vec!["blocked.example.com".to_string()],
+            action: RouteAction::Block,
+            outbound: None,
+        });
+        let mut user_updated = route_updated.clone();
+        user_updated.inbounds[0].users[0].uuid = "user-b".to_string();
+        let mut controller = CoreController::new();
+
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyConfig { config }),
+            CoreResponse::Applied { .. }
+        ));
+        crate::reset_process_memory_trim_test_count();
+
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyConfig {
+                config: route_updated,
+            }),
+            CoreResponse::Applied { .. }
+        ));
+        assert_eq!(crate::process_memory_trim_test_count(), 1);
+
+        crate::reset_process_memory_trim_test_count();
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyConfig {
+                config: user_updated,
+            }),
+            CoreResponse::Applied { .. }
+        ));
+        assert_eq!(crate::process_memory_trim_test_count(), 1);
+
+        assert!(matches!(
+            controller.handle(CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+    }
+
+    #[test]
+    fn apply_user_delta_trims_process_memory() {
+        let config = config(Protocol::Socks);
+        let node_tag = config.inbounds[0].tag.clone();
+        let mut controller = CoreController::new();
+
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyConfig { config }),
+            CoreResponse::Applied { .. }
+        ));
+        crate::reset_process_memory_trim_test_count();
+
+        assert!(matches!(
+            controller.handle(CoreCommand::ApplyUserDelta {
+                node_tag,
+                delta: CoreUserDelta {
+                    added: vec![CoreUser {
+                        id: 2,
+                        uuid: "user-b".to_string(),
+                        password: None,
+                        email: None,
+                        speed_limit: 0,
+                        device_limit: 0,
+                    }],
+                    revision: Some("rev-2".to_string()),
+                    ..CoreUserDelta::default()
+                },
+            }),
+            CoreResponse::UserDeltaApplied { .. }
+        ));
+        assert_eq!(crate::process_memory_trim_test_count(), 1);
+
+        assert!(matches!(
+            controller.handle(CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+    }
+
+    #[test]
+    fn trim_memory_command_trims_process_memory() {
+        let mut controller = CoreController::new();
+        crate::reset_process_memory_trim_test_count();
+
+        assert_eq!(
+            controller.handle(CoreCommand::TrimMemory),
+            CoreResponse::MemoryTrimmed
+        );
+        assert_eq!(crate::process_memory_trim_test_count(), 1);
     }
 
     #[test]

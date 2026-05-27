@@ -102,6 +102,10 @@ pub use vmess::{VmessServer, VmessServerConfig};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[cfg(test)]
+static PROCESS_MEMORY_TRIM_TEST_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Applies Linux/glibc process defaults that keep relay memory behavior close to
 /// Go under many short-lived OS-threaded connection workers.
 pub fn apply_process_memory_defaults() {
@@ -114,10 +118,23 @@ pub fn apply_process_memory_defaults() {
 
 /// Returns free heap pages to the OS after large connection batches are closed.
 pub fn trim_process_memory() {
+    #[cfg(test)]
+    PROCESS_MEMORY_TRIM_TEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         let _ = libc::malloc_trim(0);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_process_memory_trim_test_count() {
+    PROCESS_MEMORY_TRIM_TEST_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn process_memory_trim_test_count() -> usize {
+    PROCESS_MEMORY_TRIM_TEST_COUNT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 #[cfg(test)]
