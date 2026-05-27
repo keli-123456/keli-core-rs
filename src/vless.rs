@@ -71,6 +71,11 @@ const DEFAULT_VLESS_ASYNC_RELAY_IO_TIMEOUT_SECS: u64 = 15;
 const VLESS_ROUTE_SLOW_LOG_MS: u128 = 1_000;
 const CLIENT_CLOSE_CONNECT_POLL: Duration = Duration::from_millis(10);
 const VLESS_CONNECT_THREAD_STACK: usize = 256 * 1024;
+const VLESS_ASYNC_RELAY_LABEL: &str = "keli-core-vless-relay";
+const VLESS_WEBSOCKET_DETACHED_RELAY_LABEL: &str = "keli-core-vless-ws-relay";
+const VLESS_PLAIN_WEBSOCKET_DETACHED_RELAY_LABEL: &str = "keli-core-vless-plain-ws-relay";
+const VLESS_TLS_DETACHED_RELAY_LABEL: &str = "keli-core-vless-tls-relay";
+const VLESS_TLS_WEBSOCKET_DETACHED_RELAY_LABEL: &str = "keli-core-vless-tls-ws-relay";
 
 #[cfg(test)]
 static VLESS_VISION_RAW_RELAY_SWITCHES: AtomicUsize = AtomicUsize::new(0);
@@ -1020,7 +1025,7 @@ impl VlessServer {
         W: Write + Send + 'static,
     {
         let server = self.clone();
-        spawn_detached_blocking_relay("keli-core-vless-relay", move || {
+        spawn_detached_blocking_relay(VLESS_WEBSOCKET_DETACHED_RELAY_LABEL, move || {
             let _session = session;
             server.relay_websocket(reader, writer, remote, request, bandwidth)
         })?;
@@ -1178,7 +1183,7 @@ impl VlessServer {
         session: Option<UserSessionGuard>,
     ) -> io::Result<()> {
         let server = self.clone();
-        spawn_detached_blocking_relay("keli-core-vless-relay", move || {
+        spawn_detached_blocking_relay(VLESS_PLAIN_WEBSOCKET_DETACHED_RELAY_LABEL, move || {
             let _session = session;
             server.relay_plain_websocket(reader, writer, remote, request, bandwidth)
         })?;
@@ -1392,7 +1397,7 @@ impl VlessServer {
                 server.relay_tls(client, remote, request, bandwidth)
             })?;
         } else {
-            spawn_detached_blocking_relay("keli-core-vless-relay", move || {
+            spawn_detached_blocking_relay(VLESS_TLS_DETACHED_RELAY_LABEL, move || {
                 let _session = session;
                 server.relay_tls(client, remote, request, bandwidth)
             })?;
@@ -1478,7 +1483,7 @@ impl VlessServer {
         session: Option<UserSessionGuard>,
     ) -> io::Result<()> {
         let server = self.clone();
-        spawn_detached_blocking_relay("keli-core-vless-relay", move || {
+        spawn_detached_blocking_relay(VLESS_TLS_WEBSOCKET_DETACHED_RELAY_LABEL, move || {
             let _session = session;
             server.relay_tls_websocket(client, remote, request, bandwidth)
         })?;
@@ -3395,7 +3400,7 @@ async fn relay_tcp_streams_async(
     let (mut client_read, mut client_write) = client.into_split();
     let (mut remote_read, mut remote_write) = remote.into_split();
     let upload_limiter = limiter.clone();
-    let upload = spawn_async_relay("keli-core-vless-relay", async move {
+    let upload = spawn_async_relay(VLESS_ASYNC_RELAY_LABEL, async move {
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
@@ -3447,7 +3452,7 @@ async fn relay_tcp_streams_async(
             total = total.saturating_add(read as u64);
         }
     })?;
-    let download = spawn_async_relay("keli-core-vless-relay", async move {
+    let download = spawn_async_relay(VLESS_ASYNC_RELAY_LABEL, async move {
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
@@ -6087,7 +6092,7 @@ mod tests {
         let server_clone = server.clone();
         let (handled_tx, handled_rx) = mpsc::channel();
         let detached_before = crate::stream::detached_blocking_relay_metrics_snapshot()
-            .get("keli-core-vless-relay")
+            .get(super::VLESS_ASYNC_RELAY_LABEL)
             .copied()
             .unwrap_or(0);
         let server_thread = thread::spawn(move || {
@@ -6115,7 +6120,7 @@ mod tests {
         for _ in 0..50 {
             detached_during = detached_during.max(
                 crate::stream::detached_blocking_relay_metrics_snapshot()
-                    .get("keli-core-vless-relay")
+                    .get(super::VLESS_ASYNC_RELAY_LABEL)
                     .copied()
                     .unwrap_or(0),
             );
@@ -6594,7 +6599,7 @@ mod tests {
 
             let server = server();
             let detached_before = crate::stream::detached_blocking_relay_metrics_snapshot()
-                .get("keli-core-vless-relay")
+                .get(super::VLESS_ASYNC_RELAY_LABEL)
                 .copied()
                 .unwrap_or(0);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -6632,7 +6637,7 @@ mod tests {
             let detached_deadline = Instant::now() + Duration::from_secs(2);
             loop {
                 let detached_during = crate::stream::detached_blocking_relay_metrics_snapshot()
-                    .get("keli-core-vless-relay")
+                    .get(super::VLESS_ASYNC_RELAY_LABEL)
                     .copied()
                     .unwrap_or(0);
                 if detached_during <= detached_before {

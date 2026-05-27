@@ -28,7 +28,12 @@ const NATIVE_RELAY_WORKER_MEMORY_MIB: usize = 4;
 const NATIVE_RELAY_RESERVED_FDS: usize = 1024;
 const NATIVE_RELAY_FDS_PER_WORKER: usize = 4;
 const WINDOWS_NATIVE_RELAY_STACK_KIB: usize = 2048;
-const UNIX_NATIVE_RELAY_STACK_KIB: usize = 2048;
+const UNIX_NATIVE_RELAY_STACK_KIB: usize = 256;
+const MIN_NATIVE_RELAY_STACK_KIB: usize = 128;
+const MAX_NATIVE_RELAY_STACK_KIB: usize = 8192;
+const NATIVE_RELAY_STACK_ENV: &str = "KELI_CORE_NATIVE_RELAY_STACK_KIB";
+const UNIX_NATIVE_RELAY_STACK_BUDGET_MIB: usize = 64;
+const UNIX_NATIVE_RELAY_STACK_MEMORY_BUDGET_DIVISOR: usize = 8;
 const WINDOWS_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 2048;
 // VLESS/Trojan WS+TLS relay frames can nest TLS/WebSocket buffers deeply enough to
 // overflow 128 KiB stacks under real Linux traffic. Keep Linux at 256 KiB until
@@ -835,11 +840,51 @@ fn native_relay_worker_threads_from_resources(
 }
 
 fn native_relay_stack_size() -> usize {
-    if cfg!(windows) {
-        WINDOWS_NATIVE_RELAY_STACK_KIB * 1024
-    } else {
-        UNIX_NATIVE_RELAY_STACK_KIB * 1024
+    let default = native_relay_default_stack_kib_from_resources(
+        available_parallelism_count(),
+        memory_limit_mib(),
+        open_file_soft_limit(),
+        cfg!(windows),
+    );
+    native_relay_stack_size_from_env(std::env::var(NATIVE_RELAY_STACK_ENV).ok(), default)
+}
+
+fn native_relay_default_stack_kib_from_resources(
+    cpu_count: usize,
+    memory_limit_mib: Option<usize>,
+    fd_limit: Option<usize>,
+    is_windows: bool,
+) -> usize {
+    if is_windows {
+        return WINDOWS_NATIVE_RELAY_STACK_KIB;
     }
+    let workers = native_relay_worker_threads_from_resources(cpu_count, memory_limit_mib, fd_limit);
+    unix_native_relay_stack_kib_for_workers(workers, memory_limit_mib)
+}
+
+fn unix_native_relay_stack_kib_for_workers(
+    worker_count: usize,
+    memory_limit_mib: Option<usize>,
+) -> usize {
+    let memory_budget_mib = memory_limit_mib
+        .map(|mib| {
+            (mib / UNIX_NATIVE_RELAY_STACK_MEMORY_BUDGET_DIVISOR)
+                .clamp(1, UNIX_NATIVE_RELAY_STACK_BUDGET_MIB)
+        })
+        .unwrap_or(UNIX_NATIVE_RELAY_STACK_BUDGET_MIB);
+    let stack_kib = memory_budget_mib
+        .saturating_mul(1024)
+        .checked_div(worker_count.max(1))
+        .unwrap_or(UNIX_NATIVE_RELAY_STACK_KIB);
+    stack_kib.clamp(MIN_NATIVE_RELAY_STACK_KIB, MAX_NATIVE_RELAY_STACK_KIB)
+}
+
+fn native_relay_stack_size_from_env(value: Option<String>, default_kib: usize) -> usize {
+    let stack_kib = value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default_kib)
+        .clamp(MIN_NATIVE_RELAY_STACK_KIB, MAX_NATIVE_RELAY_STACK_KIB);
+    stack_kib * 1024
 }
 
 fn native_relay_idle_timeout() -> Duration {
@@ -986,6 +1031,54 @@ mod tests {
 
     #[test]
     fn detached_blocking_relay_stack_size_is_small_and_configurable() {
+        assert_eq!(super::UNIX_NATIVE_RELAY_STACK_KIB, 256);
+        assert_eq!(
+            super::native_relay_default_stack_kib_from_resources(
+                4,
+                Some(4096),
+                Some(100_000),
+                false
+            ),
+            256
+        );
+        assert_eq!(
+            super::native_relay_default_stack_kib_from_resources(
+                32,
+                Some(4096),
+                Some(100_000),
+                false
+            ),
+            128
+        );
+        assert_eq!(
+            super::native_relay_default_stack_kib_from_resources(1, None, Some(100_000), false),
+            1024
+        );
+        assert_eq!(
+            super::native_relay_default_stack_kib_from_resources(4, Some(64), Some(100_000), false),
+            512
+        );
+        assert_eq!(
+            super::native_relay_default_stack_kib_from_resources(
+                4,
+                Some(4096),
+                Some(100_000),
+                true
+            ),
+            2048
+        );
+        assert_eq!(
+            super::native_relay_stack_size_from_env(None, 256),
+            256 * 1024
+        );
+        assert_eq!(
+            super::native_relay_stack_size_from_env(Some("64".to_string()), 256),
+            128 * 1024
+        );
+        assert_eq!(
+            super::native_relay_stack_size_from_env(Some("16384".to_string()), 256),
+            8192 * 1024
+        );
         assert_eq!(super::detached_blocking_relay_default_stack_kib(false), 256);
         assert_eq!(super::detached_blocking_relay_default_stack_kib(true), 2048);
         assert_eq!(
