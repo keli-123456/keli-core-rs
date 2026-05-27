@@ -18,7 +18,7 @@ use crate::limits::{
 use crate::outbound::recv_udp_response;
 use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::SocksTarget;
-use crate::stream::{join_native_blocking_relay, spawn_native_blocking_relay, NativeRelayHandle};
+use crate::stream::{join_async_relay, spawn_async_relay};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{
     apply_user_delta_to_keyed_arc_map, CoreUser, CoreUserDelta, CoreUserDeltaResult,
@@ -80,7 +80,7 @@ struct AnyTlsSession {
     client_ip: Option<IpAddr>,
     writer: Arc<Mutex<TcpStream>>,
     remotes: HashMap<u32, AnyTlsRemote>,
-    workers: Vec<NativeRelayHandle<()>>,
+    workers: Vec<tokio::task::JoinHandle<()>>,
     traffic: Arc<AnyTlsTrafficCounters>,
     bandwidth: Option<Arc<BandwidthLimiter>>,
     settings_done: bool,
@@ -205,7 +205,7 @@ impl AnyTlsServer {
             }
         }
         for worker in session.workers {
-            let _ = join_native_blocking_relay(worker, "anytls downlink worker panicked");
+            let _ = join_async_relay(worker, "anytls downlink worker panicked");
         }
         let (upload, download) = session.traffic.snapshot();
         if upload > 0 || download > 0 {
@@ -438,12 +438,14 @@ impl AnyTlsServer {
         initial_payload: &[u8],
     ) -> io::Result<()> {
         let remote = self.router.connect_tcp(&target, initial_payload)?;
-        let mut remote_read = remote.try_clone()?;
+        let remote_read = remote.try_clone()?;
+        remote_read.set_nonblocking(true)?;
         let writer = session.writer.clone();
         let traffic = session.traffic.clone();
-        session.workers.push(spawn_native_blocking_relay(move || {
-            pump_downlink(stream_id, &mut remote_read, writer, traffic);
-        })?);
+        session.workers.push(spawn_async_relay(
+            "keli-core-anytls-downlink",
+            pump_downlink_async(stream_id, remote_read, writer, traffic),
+        )?);
         session.remotes.insert(stream_id, AnyTlsRemote::Tcp(remote));
         write_frame(&session.writer, CMD_SYNACK, stream_id, &[])?;
 
@@ -590,15 +592,22 @@ fn sync_delta_bandwidth(
     sync_user_limit_delta(bandwidth, sessions, delta);
 }
 
-fn pump_downlink(
+async fn pump_downlink_async(
     stream_id: u32,
-    remote: &mut TcpStream,
+    remote: TcpStream,
     writer: Arc<Mutex<TcpStream>>,
     traffic: Arc<AnyTlsTrafficCounters>,
 ) {
+    let mut remote = match tokio::net::TcpStream::from_std(remote) {
+        Ok(remote) => remote,
+        Err(_) => {
+            let _ = write_frame(&writer, CMD_FIN, stream_id, &[]);
+            return;
+        }
+    };
     let mut buffer = [0u8; 16 * 1024];
     loop {
-        let read = match remote.read(&mut buffer) {
+        let read = match tokio::io::AsyncReadExt::read(&mut remote, &mut buffer).await {
             Ok(0) => break,
             Ok(read) => read,
             Err(_) => break,
@@ -1514,6 +1523,60 @@ mod tests {
         assert_eq!(records[0].user_id, Some(1));
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+    }
+
+    #[test]
+    fn tcp_downlink_uses_async_relay_scheduler() {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let echo_thread = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("echo accept");
+            let mut bytes = [0u8; 4];
+            stream.read_exact(&mut bytes).expect("echo read");
+            stream.write_all(&bytes).expect("echo write");
+            let _ = finish_rx.recv_timeout(Duration::from_secs(2));
+        });
+
+        let server = server();
+        let listener = server.bind().expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server_clone = server.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            server_clone.handle_tcp_client(stream)
+        });
+
+        let mut client = TcpStream::connect(addr).expect("client");
+        write_auth(&mut client, "anytls-password");
+        write_frame(&mut client, CMD_PSH, 1, &ipv4_target(echo_addr));
+        let (command, stream_id, body) = read_frame(&mut client);
+        assert_eq!(command, CMD_SYNACK);
+        assert_eq!(stream_id, 1);
+        assert!(body.is_empty());
+
+        write_frame(&mut client, CMD_PSH, 1, b"ping");
+        let (command, stream_id, body) = read_frame(&mut client);
+        assert_eq!(command, CMD_PSH);
+        assert_eq!(stream_id, 1);
+        assert_eq!(body, b"ping");
+
+        let async_active = crate::stream::relay_scheduler_metrics_snapshot()
+            .active_async
+            .get("keli-core-anytls-downlink")
+            .copied()
+            .unwrap_or_default();
+        assert!(
+            async_active > 0,
+            "AnyTLS TCP downlink should use async relay scheduler while the remote stream is open"
+        );
+
+        let _ = finish_tx.send(());
+        write_frame(&mut client, CMD_FIN, 1, &[]);
+        drop(client);
+
+        server_thread.join().expect("thread").expect("server");
+        echo_thread.join().expect("echo thread");
     }
 
     #[test]

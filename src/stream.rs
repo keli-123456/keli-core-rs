@@ -422,6 +422,15 @@ pub fn join_blocking_relay<T>(
         .map_err(|_| io::Error::new(io::ErrorKind::Other, panic_message))
 }
 
+pub fn join_async_relay<T>(
+    handle: tokio::task::JoinHandle<T>,
+    panic_message: &'static str,
+) -> io::Result<T> {
+    tcp_relay_runtime()?
+        .block_on(handle)
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, panic_message))
+}
+
 pub fn spawn_native_blocking_relay<F, T>(task: F) -> io::Result<NativeRelayHandle<T>>
 where
     F: FnOnce() -> T + Send + 'static,
