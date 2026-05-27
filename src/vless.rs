@@ -1401,11 +1401,10 @@ impl VlessServer {
     {
         let server = self.clone();
         if request.flow == FLOW_XTLS_RPRX_VISION {
-            let _handle =
-                spawn_named_native_blocking_relay(VLESS_VISION_NATIVE_RELAY_LABEL, move || {
-                    let _session = session;
-                    server.relay_tls(client, remote, request, bandwidth)
-                })?;
+            spawn_detached_blocking_relay(VLESS_VISION_NATIVE_RELAY_LABEL, move || {
+                let _session = session;
+                server.relay_tls(client, remote, request, bandwidth)
+            })?;
         } else {
             spawn_detached_blocking_relay(VLESS_TLS_DETACHED_RELAY_LABEL, move || {
                 let _session = session;
@@ -6091,7 +6090,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_vision_relay_does_not_spawn_detached_relay_thread() {
+    fn tls_vision_relay_does_not_occupy_native_worker_pool() {
         let cert = test_cert("vless-vision-native-relay");
         let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
         let echo_addr = echo.local_addr().expect("echo addr");
@@ -6108,8 +6107,12 @@ mod tests {
             TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
         let server_clone = server.clone();
         let (handled_tx, handled_rx) = mpsc::channel();
-        let detached_before = crate::stream::detached_blocking_relay_metrics_snapshot()
-            .get(super::VLESS_ASYNC_RELAY_LABEL)
+        let native_before = crate::stream::native_relay_metrics_snapshot()
+            .get(super::VLESS_VISION_NATIVE_RELAY_LABEL)
+            .copied()
+            .unwrap_or(0);
+        let blocking_before = crate::stream::detached_blocking_relay_metrics_snapshot()
+            .get(super::VLESS_VISION_NATIVE_RELAY_LABEL)
             .copied()
             .unwrap_or(0);
         let server_thread = thread::spawn(move || {
@@ -6133,22 +6136,33 @@ mod tests {
             .expect("tls vision relay should move off the connection worker after start")
             .expect("spawn background tls vision relay");
 
-        let mut detached_during = 0usize;
+        let mut native_during = 0usize;
+        let mut blocking_during = 0usize;
         for _ in 0..50 {
-            detached_during = detached_during.max(
-                crate::stream::detached_blocking_relay_metrics_snapshot()
-                    .get(super::VLESS_ASYNC_RELAY_LABEL)
+            native_during = native_during.max(
+                crate::stream::native_relay_metrics_snapshot()
+                    .get(super::VLESS_VISION_NATIVE_RELAY_LABEL)
                     .copied()
                     .unwrap_or(0),
             );
-            if detached_during > detached_before {
+            blocking_during = blocking_during.max(
+                crate::stream::detached_blocking_relay_metrics_snapshot()
+                    .get(super::VLESS_VISION_NATIVE_RELAY_LABEL)
+                    .copied()
+                    .unwrap_or(0),
+            );
+            if native_during > native_before || blocking_during > blocking_before {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            detached_during <= detached_before,
-            "vless vision relay must not add detached OS relay threads: before={detached_before} during={detached_during}"
+            native_during <= native_before,
+            "vless vision relay must not occupy native relay workers: before={native_before} during={native_during}"
+        );
+        assert!(
+            blocking_during > blocking_before,
+            "vless vision relay should run outside the shared native worker pool: before={blocking_before} during={blocking_during}"
         );
 
         drop(client);
