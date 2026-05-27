@@ -529,9 +529,13 @@ impl CoreService {
                 .workers
                 .join_timeout(CONNECTION_WORKER_SHUTDOWN_TIMEOUT)
             {
+                let worker_snapshot = format_connection_worker_snapshot(handle.workers.snapshot());
+                let relay_snapshot = crate::stream::format_relay_scheduler_metrics(
+                    crate::stream::relay_scheduler_metrics_snapshot(),
+                );
                 crate::logging::emit_legacy_line(&format!(
-                    "WARN  core   listener worker shutdown timed out tag={} protocol={:?}",
-                    handle.status.tag, handle.status.protocol
+                    "WARN  core   listener worker shutdown timed out tag={} protocol={:?} {} {}",
+                    handle.status.tag, handle.status.protocol, worker_snapshot, relay_snapshot
                 ));
             }
         }
@@ -2628,6 +2632,13 @@ impl ConnectionWorkerGroup {
     }
 }
 
+fn format_connection_worker_snapshot(snapshot: ConnectionWorkerGroupSnapshot) -> String {
+    format!(
+        "connection_active_total={} connection_active_blocking={} connection_active_async={}",
+        snapshot.active_total, snapshot.active_blocking, snapshot.active_async
+    )
+}
+
 struct ConnectionWorkerAsyncGuard {
     state: Arc<ConnectionWorkerGroupState>,
 }
@@ -3345,6 +3356,19 @@ mod tests {
             assert_eq!(snapshot.active_blocking, 0);
             assert_eq!(snapshot.active_async, 0);
         });
+    }
+
+    #[test]
+    fn connection_worker_snapshot_formats_low_cardinality_fields() {
+        let snapshot = super::ConnectionWorkerGroupSnapshot {
+            active_total: 3,
+            active_blocking: 1,
+            active_async: 2,
+        };
+        assert_eq!(
+            super::format_connection_worker_snapshot(snapshot),
+            "connection_active_total=3 connection_active_blocking=1 connection_active_async=2"
+        );
     }
 
     #[test]

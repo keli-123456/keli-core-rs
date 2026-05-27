@@ -393,6 +393,26 @@ pub(crate) fn relay_scheduler_metrics_snapshot() -> RelaySchedulerMetricsSnapsho
     }
 }
 
+pub(crate) fn format_relay_scheduler_metrics(snapshot: RelaySchedulerMetricsSnapshot) -> String {
+    let mut fields = Vec::new();
+    for (name, count) in snapshot.active_async {
+        fields.push(format!("relay_active_async.{name}={count}"));
+    }
+    for (name, count) in snapshot.active_detached_blocking {
+        fields.push(format!("relay_active_blocking.{name}={count}"));
+    }
+    fields.push(format!(
+        "native_relay_workers={}",
+        snapshot.native_worker_count
+    ));
+    fields.push(format!("native_relay_idle={}", snapshot.native_idle_count));
+    fields.push(format!(
+        "native_relay_pending={}",
+        snapshot.native_pending_count
+    ));
+    fields.join(" ")
+}
+
 pub fn join_blocking_relay<T>(
     handle: BlockingRelayHandle<T>,
     panic_message: &'static str,
@@ -1326,5 +1346,24 @@ mod tests {
         )
         .expect("join detached blocking relay");
         assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn relay_scheduler_snapshot_formats_low_cardinality_fields() {
+        let mut snapshot = super::RelaySchedulerMetricsSnapshot::default();
+        snapshot
+            .active_async
+            .insert("keli-core-vless-relay".to_string(), 2);
+        snapshot
+            .active_detached_blocking
+            .insert("keli-core-mieru-session".to_string(), 1);
+        snapshot.native_worker_count = 4;
+        snapshot.native_pending_count = 3;
+
+        let formatted = super::format_relay_scheduler_metrics(snapshot);
+        assert!(formatted.contains("relay_active_async.keli-core-vless-relay=2"));
+        assert!(formatted.contains("relay_active_blocking.keli-core-mieru-session=1"));
+        assert!(formatted.contains("native_relay_workers=4"));
+        assert!(formatted.contains("native_relay_pending=3"));
     }
 }
