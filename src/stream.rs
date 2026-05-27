@@ -13,6 +13,7 @@ use crate::quic_resources::{available_parallelism_count, memory_limit_mib, open_
 
 static TCP_RELAY_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static NATIVE_RELAY_POOL: OnceLock<NativeRelayPool> = OnceLock::new();
+static ASYNC_RELAY_ACTIVE: OnceLock<Mutex<BTreeMap<&'static str, usize>>> = OnceLock::new();
 static DETACHED_BLOCKING_RELAY_ACTIVE: OnceLock<Mutex<BTreeMap<&'static str, usize>>> =
     OnceLock::new();
 const RELAY_COPY_BUFFER_SIZE: usize = 64 * 1024;
@@ -94,6 +95,22 @@ struct NativeRelayPool {
     idle_count: AtomicUsize,
     pending_count: AtomicUsize,
     max_workers: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RelaySchedulerMetricsSnapshot {
+    pub active_async: BTreeMap<String, usize>,
+    pub active_detached_blocking: BTreeMap<String, usize>,
+    pub native_worker_count: usize,
+    pub native_idle_count: usize,
+    pub native_pending_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NativeRelayPoolSnapshot {
+    worker_count: usize,
+    idle_count: usize,
+    pending_count: usize,
 }
 
 pub fn relay_tcp_streams(client: TcpStream, remote: TcpStream) -> io::Result<(u64, u64)> {
@@ -269,12 +286,82 @@ fn detached_blocking_relay_metrics() -> &'static Mutex<BTreeMap<&'static str, us
     DETACHED_BLOCKING_RELAY_ACTIVE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+pub(crate) struct AsyncRelayMetricsGuard {
+    name: &'static str,
+}
+
+impl AsyncRelayMetricsGuard {
+    pub(crate) fn new(name: &'static str) -> Self {
+        {
+            let mut active = async_relay_metrics()
+                .lock()
+                .expect("async relay metrics poisoned");
+            let count = active.entry(name).or_default();
+            *count = count.saturating_add(1);
+        }
+        Self { name }
+    }
+}
+
+impl Drop for AsyncRelayMetricsGuard {
+    fn drop(&mut self) {
+        let mut active = async_relay_metrics()
+            .lock()
+            .expect("async relay metrics poisoned");
+        let Some(count) = active.get_mut(self.name) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            active.remove(self.name);
+        }
+    }
+}
+
+fn async_relay_metrics_snapshot() -> BTreeMap<String, usize> {
+    async_relay_metrics()
+        .lock()
+        .expect("async relay metrics poisoned")
+        .iter()
+        .map(|(name, count)| ((*name).to_string(), *count))
+        .collect()
+}
+
+fn async_relay_metrics() -> &'static Mutex<BTreeMap<&'static str, usize>> {
+    ASYNC_RELAY_ACTIVE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
 pub fn spawn_background_io<F>(future: F) -> io::Result<tokio::task::JoinHandle<F::Output>>
 where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
     Ok(tcp_relay_runtime()?.spawn(future))
+}
+
+pub fn spawn_async_relay<F>(
+    name: &'static str,
+    future: F,
+) -> io::Result<tokio::task::JoinHandle<F::Output>>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    spawn_background_io(async move {
+        let _metrics = AsyncRelayMetricsGuard::new(name);
+        future.await
+    })
+}
+
+pub(crate) fn relay_scheduler_metrics_snapshot() -> RelaySchedulerMetricsSnapshot {
+    let native = native_relay_pool().snapshot();
+    RelaySchedulerMetricsSnapshot {
+        active_async: async_relay_metrics_snapshot(),
+        active_detached_blocking: detached_blocking_relay_metrics_snapshot(),
+        native_worker_count: native.worker_count,
+        native_idle_count: native.idle_count,
+        native_pending_count: native.pending_count,
+    }
 }
 
 pub fn join_blocking_relay<T>(
@@ -490,14 +577,23 @@ fn detached_blocking_relay_stack_size_from_env(value: Option<String>, default_ki
 
 impl NativeRelayPool {
     fn new() -> Self {
+        Self::with_max_workers(native_relay_worker_threads())
+    }
+
+    fn with_max_workers(max_workers: usize) -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
             ready: Condvar::new(),
             worker_count: AtomicUsize::new(0),
             idle_count: AtomicUsize::new(0),
             pending_count: AtomicUsize::new(0),
-            max_workers: native_relay_worker_threads(),
+            max_workers,
         }
+    }
+
+    #[cfg(test)]
+    fn with_max_workers_for_test(max_workers: usize) -> &'static Self {
+        Box::leak(Box::new(Self::with_max_workers(max_workers)))
     }
 
     fn submit(&'static self, job: NativeRelayJob) -> io::Result<()> {
@@ -597,6 +693,14 @@ impl NativeRelayPool {
             {
                 return None;
             }
+        }
+    }
+
+    fn snapshot(&self) -> NativeRelayPoolSnapshot {
+        NativeRelayPoolSnapshot {
+            worker_count: self.worker_count.load(Ordering::Acquire),
+            idle_count: self.idle_count.load(Ordering::Acquire),
+            pending_count: self.pending_count.load(Ordering::Acquire),
         }
     }
 }
@@ -764,7 +868,7 @@ mod tests {
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::limits::{BandwidthLimiter, UserBandwidthLimiters};
     #[cfg(unix)]
@@ -1070,5 +1174,69 @@ mod tests {
         values.sort_unstable();
 
         assert_eq!(values, (0..64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn native_relay_pool_snapshot_reports_pending_and_workers() {
+        let pool = super::NativeRelayPool::with_max_workers_for_test(1);
+        let (release_tx, release_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+
+        pool.submit(Box::new(move || {
+            started_tx.send(()).expect("send started");
+            let _ = release_rx.recv();
+        }))
+        .expect("submit first native relay job");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first job started");
+
+        pool.submit(Box::new(|| {}))
+            .expect("submit queued native relay job");
+
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.worker_count, 1);
+        assert!(snapshot.pending_count >= 1);
+
+        release_tx.send(()).expect("release first job");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pool.snapshot().pending_count > 0 {
+            if Instant::now() >= deadline {
+                panic!("queued native relay job did not drain");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn async_relay_metrics_guard_tracks_active_task() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let handle = super::spawn_async_relay("test-async-relay", async move {
+                let _ = release_rx.await;
+            })
+            .expect("spawn async relay");
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let snapshot = super::relay_scheduler_metrics_snapshot();
+                if snapshot.active_async.get("test-async-relay") == Some(&1) {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    panic!("async relay metric did not become active");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            release_tx.send(()).expect("release async relay");
+            handle.await.expect("async relay task");
+            let snapshot = super::relay_scheduler_metrics_snapshot();
+            assert_eq!(snapshot.active_async.get("test-async-relay"), None);
+        });
     }
 }

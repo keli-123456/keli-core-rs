@@ -281,7 +281,8 @@ fn async_relay_metrics_guard_tracks_active_task() {
 Run:
 
 ```powershell
-cargo test -p keli-core-rs native_relay_pool_snapshot_reports_pending_and_workers async_relay_metrics_guard_tracks_active_task
+cargo test -p keli-core-rs native_relay_pool_snapshot_reports_pending_and_workers
+cargo test -p keli-core-rs async_relay_metrics_guard_tracks_active_task
 ```
 
 Expected: FAIL because `with_max_workers_for_test`, `snapshot`, `spawn_async_relay`, and `relay_scheduler_metrics_snapshot` do not exist.
@@ -353,7 +354,8 @@ fn snapshot(&self) -> NativeRelayPoolSnapshot {
 Run:
 
 ```powershell
-cargo test -p keli-core-rs native_relay_pool_snapshot_reports_pending_and_workers async_relay_metrics_guard_tracks_active_task
+cargo test -p keli-core-rs native_relay_pool_snapshot_reports_pending_and_workers
+cargo test -p keli-core-rs async_relay_metrics_guard_tracks_active_task
 ```
 
 Expected: PASS.
