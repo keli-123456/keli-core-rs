@@ -19,7 +19,7 @@ use tokio_rustls::{TlsAcceptor as TokioTlsAcceptor, TlsConnector};
 
 use crate::config::OutboundTlsConfig;
 use crate::socks5::SocksTarget;
-use crate::stream::{spawn_background_io, spawn_native_blocking_relay};
+use crate::stream::{spawn_background_io, spawn_named_native_blocking_relay};
 use crate::tls::server_config_from_files;
 
 const DEFAULT_H2_PATH: &str = "/";
@@ -172,7 +172,7 @@ pub(crate) fn local_bridge_for_http2(
     let (local_plain, _) = local_listener.accept()?;
     http2.set_nonblocking(true);
 
-    let _ = spawn_native_blocking_relay(move || {
+    let _ = spawn_named_native_blocking_relay("keli-core-http2-bridge", move || {
         let _ = relay_plain_to_http2(local_plain, http2);
     })?;
 

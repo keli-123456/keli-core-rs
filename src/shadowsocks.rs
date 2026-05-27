@@ -25,7 +25,7 @@ use crate::socket_bind::{bind_dual_stack_tcp_listener, bind_dual_stack_udp_socke
 use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
-    spawn_native_blocking_relay,
+    spawn_named_native_blocking_relay,
 };
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{apply_user_delta_to_vec, CoreUser, CoreUserDelta, CoreUserDeltaResult};
@@ -39,6 +39,10 @@ const NONCE_LEN: usize = 12;
 const MAX_CHUNK_LEN: usize = 0x3fff;
 const HKDF_INFO: &[u8] = b"ss-subkey";
 const UDP_SESSION_TTL: Duration = Duration::from_secs(300);
+const SHADOWSOCKS_UPLOAD_NATIVE_RELAY_LABEL: &str = "keli-core-shadowsocks-upload";
+const SHADOWSOCKS_BRIDGE_NATIVE_RELAY_LABEL: &str = "keli-core-shadowsocks-bridge";
+const SHADOWSOCKS_OUTBOUND_UPLOAD_NATIVE_RELAY_LABEL: &str =
+    "keli-core-shadowsocks-outbound-upload";
 
 #[derive(Clone, Debug)]
 pub struct ShadowsocksServerConfig {
@@ -472,18 +476,19 @@ impl ShadowsocksServer {
         let mut encrypted_client = request.client_reader;
         let mut remote_write = remote.try_clone()?;
         let upload_limiter = bandwidth.clone();
-        let upload_task = spawn_native_blocking_relay(move || {
-            let copied = match upload_limiter.as_deref() {
-                Some(limiter) => copy_count_best_effort_limited(
-                    &mut encrypted_client,
-                    &mut remote_write,
-                    Some(limiter),
-                ),
-                None => copy_count_best_effort(&mut encrypted_client, &mut remote_write),
-            };
-            let _ = remote_write.shutdown(Shutdown::Write);
-            copied
-        })?;
+        let upload_task =
+            spawn_named_native_blocking_relay(SHADOWSOCKS_UPLOAD_NATIVE_RELAY_LABEL, move || {
+                let copied = match upload_limiter.as_deref() {
+                    Some(limiter) => copy_count_best_effort_limited(
+                        &mut encrypted_client,
+                        &mut remote_write,
+                        Some(limiter),
+                    ),
+                    None => copy_count_best_effort(&mut encrypted_client, &mut remote_write),
+                };
+                let _ = remote_write.shutdown(Shutdown::Write);
+                copied
+            })?;
 
         let mut remote_read = remote;
         let mut encrypted_writer =
@@ -791,7 +796,7 @@ pub(crate) fn connect_shadowsocks_tcp_outbound(
     remote_writer.write_chunk(&request)?;
     remote_writer.flush()?;
 
-    let _ = spawn_native_blocking_relay(move || {
+    let _ = spawn_named_native_blocking_relay(SHADOWSOCKS_BRIDGE_NATIVE_RELAY_LABEL, move || {
         let _ =
             relay_plain_to_shadowsocks(local_plain, remote_reader, remote_writer, method, password);
     })?;
@@ -883,11 +888,15 @@ fn relay_plain_to_shadowsocks(
 ) -> io::Result<()> {
     let mut plain_read = plain.try_clone()?;
     let mut plain_write = plain;
-    let upload_task = spawn_native_blocking_relay(move || {
-        let uploaded = copy_count_best_effort_limited(&mut plain_read, &mut remote_writer, None);
-        let _ = remote_writer.shutdown();
-        uploaded
-    })?;
+    let upload_task = spawn_named_native_blocking_relay(
+        SHADOWSOCKS_OUTBOUND_UPLOAD_NATIVE_RELAY_LABEL,
+        move || {
+            let uploaded =
+                copy_count_best_effort_limited(&mut plain_read, &mut remote_writer, None);
+            let _ = remote_writer.shutdown();
+            uploaded
+        },
+    )?;
 
     let mut remote_reader = LazyShadowsocksReader::new(remote_reader, method, password);
     let _download = copy_count_best_effort_limited(&mut remote_reader, &mut plain_write, None);

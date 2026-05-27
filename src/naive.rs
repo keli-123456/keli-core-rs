@@ -24,7 +24,7 @@ use crate::quic_tuning::{
 };
 use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::stream::{
-    copy_count_best_effort_limited, join_native_blocking_relay, spawn_native_blocking_relay,
+    copy_count_best_effort_limited, join_native_blocking_relay, spawn_named_native_blocking_relay,
 };
 use crate::tls::server_config_from_files;
 use crate::tls::{classify_tls_handshake_error, TlsHandshakeErrorClass};
@@ -37,6 +37,7 @@ const MAX_PADDED_PAYLOAD: usize = u16::MAX as usize;
 const H2_BODY_CHANNEL_CAPACITY: usize = 64;
 const NAIVE_QUIC_STOP_POLL_INTERVAL_MS: u64 = 100;
 const NAIVE_QUIC_ENDPOINT_STOP_WAIT: Duration = Duration::from_secs(1);
+const NAIVE_UPLOAD_NATIVE_RELAY_LABEL: &str = "keli-core-naive-upload";
 
 type H3BidiStream = h3_quinn::BidiStream<Bytes>;
 type H3SendStream = h3_quinn::SendStream<Bytes>;
@@ -662,15 +663,16 @@ impl NaiveServer {
         };
 
         let upload_limiter = limiter.clone();
-        let upload_task = spawn_native_blocking_relay(move || {
-            let copied = copy_count_best_effort_limited(
-                &mut client_reader,
-                &mut remote_write,
-                upload_limiter.as_deref(),
-            );
-            let _ = remote_write.shutdown(Shutdown::Write);
-            copied
-        })?;
+        let upload_task =
+            spawn_named_native_blocking_relay(NAIVE_UPLOAD_NATIVE_RELAY_LABEL, move || {
+                let copied = copy_count_best_effort_limited(
+                    &mut client_reader,
+                    &mut remote_write,
+                    upload_limiter.as_deref(),
+                );
+                let _ = remote_write.shutdown(Shutdown::Write);
+                copied
+            })?;
         let download = copy_count_best_effort_limited(
             &mut remote_read,
             &mut client_writer,

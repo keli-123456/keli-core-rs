@@ -13,6 +13,7 @@ use crate::quic_resources::{available_parallelism_count, memory_limit_mib, open_
 
 static TCP_RELAY_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static NATIVE_RELAY_POOL: OnceLock<NativeRelayPool> = OnceLock::new();
+static NATIVE_RELAY_ACTIVE: OnceLock<Mutex<BTreeMap<&'static str, usize>>> = OnceLock::new();
 static ASYNC_RELAY_ACTIVE: OnceLock<Mutex<BTreeMap<&'static str, usize>>> = OnceLock::new();
 static DETACHED_BLOCKING_RELAY_ACTIVE: OnceLock<Mutex<BTreeMap<&'static str, usize>>> =
     OnceLock::new();
@@ -116,6 +117,7 @@ struct NativeRelayPool {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RelaySchedulerMetricsSnapshot {
+    pub active_native: BTreeMap<String, usize>,
     pub active_async: BTreeMap<String, usize>,
     pub active_detached_blocking: BTreeMap<String, usize>,
     pub native_worker_count: usize,
@@ -316,6 +318,51 @@ fn detached_blocking_relay_metrics() -> &'static Mutex<BTreeMap<&'static str, us
     DETACHED_BLOCKING_RELAY_ACTIVE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+pub(crate) struct NativeRelayMetricsGuard {
+    name: &'static str,
+}
+
+impl NativeRelayMetricsGuard {
+    pub(crate) fn new(name: &'static str) -> Self {
+        {
+            let mut active = native_relay_metrics()
+                .lock()
+                .expect("native relay metrics poisoned");
+            let count = active.entry(name).or_default();
+            *count = count.saturating_add(1);
+        }
+        Self { name }
+    }
+}
+
+impl Drop for NativeRelayMetricsGuard {
+    fn drop(&mut self) {
+        let mut active = native_relay_metrics()
+            .lock()
+            .expect("native relay metrics poisoned");
+        let Some(count) = active.get_mut(self.name) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            active.remove(self.name);
+        }
+    }
+}
+
+pub(crate) fn native_relay_metrics_snapshot() -> BTreeMap<String, usize> {
+    native_relay_metrics()
+        .lock()
+        .expect("native relay metrics poisoned")
+        .iter()
+        .map(|(name, count)| ((*name).to_string(), *count))
+        .collect()
+}
+
+fn native_relay_metrics() -> &'static Mutex<BTreeMap<&'static str, usize>> {
+    NATIVE_RELAY_ACTIVE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
 pub(crate) struct AsyncRelayMetricsGuard {
     name: &'static str,
 }
@@ -390,6 +437,7 @@ where
 pub(crate) fn relay_scheduler_metrics_snapshot() -> RelaySchedulerMetricsSnapshot {
     let native = native_relay_pool().snapshot();
     RelaySchedulerMetricsSnapshot {
+        active_native: native_relay_metrics_snapshot(),
         active_async: async_relay_metrics_snapshot(),
         active_detached_blocking: detached_blocking_relay_metrics_snapshot(),
         native_worker_count: native.worker_count,
@@ -400,6 +448,9 @@ pub(crate) fn relay_scheduler_metrics_snapshot() -> RelaySchedulerMetricsSnapsho
 
 pub(crate) fn format_relay_scheduler_metrics(snapshot: RelaySchedulerMetricsSnapshot) -> String {
     let mut fields = Vec::new();
+    for (name, count) in snapshot.active_native {
+        fields.push(format!("relay_active_native.{name}={count}"));
+    }
     for (name, count) in snapshot.active_async {
         fields.push(format!("relay_active_async.{name}={count}"));
     }
@@ -441,8 +492,20 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    spawn_named_native_blocking_relay("keli-core-native-relay", task)
+}
+
+pub fn spawn_named_native_blocking_relay<F, T>(
+    name: &'static str,
+    task: F,
+) -> io::Result<NativeRelayHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
     let (sender, receiver) = mpsc::channel();
     let job = Box::new(move || {
+        let _metrics = NativeRelayMetricsGuard::new(name);
         let _ = sender.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)));
     });
     native_relay_pool().submit(job)?;
@@ -1342,6 +1405,49 @@ mod tests {
     }
 
     #[test]
+    fn native_relay_metrics_track_active_tasks_by_name() {
+        let (release_tx, release_rx) = mpsc::channel();
+        let handle = super::spawn_named_native_blocking_relay("test-native-relay", move || {
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            7
+        })
+        .expect("spawn named native relay");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = super::relay_scheduler_metrics_snapshot();
+            if snapshot.active_native.get("test-native-relay") == Some(&1) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "named native relay metric was not observed"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        release_tx.send(()).expect("release native relay");
+        assert_eq!(
+            super::join_native_blocking_relay(handle, "native relay panicked")
+                .expect("join native relay"),
+            7
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = super::relay_scheduler_metrics_snapshot();
+            if snapshot.active_native.get("test-native-relay").is_none() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "named native relay metric did not clear"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
     fn native_relay_pool_snapshot_reports_pending_and_workers() {
         let pool = super::NativeRelayPool::with_max_workers_for_test(1);
         let (release_tx, release_rx) = mpsc::channel();
@@ -1449,6 +1555,9 @@ mod tests {
     fn relay_scheduler_snapshot_formats_low_cardinality_fields() {
         let mut snapshot = super::RelaySchedulerMetricsSnapshot::default();
         snapshot
+            .active_native
+            .insert("keli-core-vless-vision-relay".to_string(), 1);
+        snapshot
             .active_async
             .insert("keli-core-vless-relay".to_string(), 2);
         snapshot
@@ -1458,6 +1567,7 @@ mod tests {
         snapshot.native_pending_count = 3;
 
         let formatted = super::format_relay_scheduler_metrics(snapshot);
+        assert!(formatted.contains("relay_active_native.keli-core-vless-vision-relay=1"));
         assert!(formatted.contains("relay_active_async.keli-core-vless-relay=2"));
         assert!(formatted.contains("relay_active_blocking.keli-core-mieru-session=1"));
         assert!(formatted.contains("native_relay_workers=4"));

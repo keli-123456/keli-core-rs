@@ -32,6 +32,8 @@ pub struct CoreMetricsSnapshot {
     #[serde(default)]
     pub keli_core_connection_error_total: BTreeMap<String, u64>,
     #[serde(default)]
+    pub keli_core_native_relay_active: BTreeMap<String, usize>,
+    #[serde(default)]
     pub keli_core_async_relay_active: BTreeMap<String, usize>,
     #[serde(default)]
     pub keli_core_detached_blocking_relay_active: BTreeMap<String, usize>,
@@ -99,6 +101,7 @@ impl CoreMetrics {
             crate::hysteria2::hy2_udp_session_limit_for_metrics();
         snapshot.keli_core_connection_error_total = connection_error_metrics_snapshot();
         let relay = crate::stream::relay_scheduler_metrics_snapshot();
+        snapshot.keli_core_native_relay_active = relay.active_native;
         snapshot.keli_core_async_relay_active = relay.active_async;
         snapshot.keli_core_detached_blocking_relay_active = relay.active_detached_blocking;
         snapshot.keli_core_native_relay_workers = relay.native_worker_count;
@@ -388,10 +391,16 @@ mod tests {
     #[test]
     fn snapshots_include_relay_scheduler_counts() {
         let metrics = CoreMetrics::default();
+        let _native_guard =
+            crate::stream::NativeRelayMetricsGuard::new("keli-core-test-native-relay");
         let _guard = crate::stream::AsyncRelayMetricsGuard::new("keli-core-test-async-relay");
 
         let snapshot = metrics.snapshot_with_runtime_metrics(None, None, None);
 
+        assert_eq!(
+            snapshot.keli_core_native_relay_active["keli-core-test-native-relay"],
+            1
+        );
         assert_eq!(
             snapshot.keli_core_async_relay_active["keli-core-test-async-relay"],
             1

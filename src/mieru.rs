@@ -25,7 +25,7 @@ use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_detached_blocking_relay,
     join_native_blocking_relay, spawn_detached_blocking_relay_with_handle,
-    spawn_native_blocking_relay, DetachedBlockingRelayHandle,
+    spawn_named_native_blocking_relay, DetachedBlockingRelayHandle,
 };
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{apply_user_delta_to_vec, CoreUser, CoreUserDelta, CoreUserDeltaResult};
@@ -43,6 +43,7 @@ const OPEN_SESSION_REQUEST: u8 = 2;
 const OPEN_SESSION_RESPONSE: u8 = 3;
 const CLOSE_SESSION_REQUEST: u8 = 4;
 const CLOSE_SESSION_RESPONSE: u8 = 5;
+const MIERU_STREAM_UPLOAD_NATIVE_RELAY_LABEL: &str = "keli-core-mieru-stream-upload";
 const DATA_CLIENT_TO_SERVER: u8 = 6;
 const DATA_SERVER_TO_CLIENT: u8 = 7;
 const ACK_CLIENT_TO_SERVER: u8 = 8;
@@ -1750,16 +1751,17 @@ where
     let mut reader = MieruTimedInput::new(reader, log_context.clone(), relay_started);
     let mut writer = MieruTimedOutput::new(writer, log_context, relay_started);
     let stop_upload = reader.stop_handle();
-    let upload_task = spawn_native_blocking_relay(move || {
-        let upload = match upload_limiter.as_deref() {
-            Some(limiter) => {
-                copy_count_best_effort_limited(&mut reader, &mut remote_write, Some(limiter))
-            }
-            None => copy_count_best_effort(&mut reader, &mut remote_write),
-        };
-        let _ = remote_write.shutdown(Shutdown::Write);
-        upload
-    })?;
+    let upload_task =
+        spawn_named_native_blocking_relay(MIERU_STREAM_UPLOAD_NATIVE_RELAY_LABEL, move || {
+            let upload = match upload_limiter.as_deref() {
+                Some(limiter) => {
+                    copy_count_best_effort_limited(&mut reader, &mut remote_write, Some(limiter))
+                }
+                None => copy_count_best_effort(&mut reader, &mut remote_write),
+            };
+            let _ = remote_write.shutdown(Shutdown::Write);
+            upload
+        })?;
     let download = match limiter.as_deref() {
         Some(limiter) => {
             copy_count_best_effort_limited(&mut remote_read, &mut writer, Some(limiter))

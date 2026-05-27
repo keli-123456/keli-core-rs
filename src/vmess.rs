@@ -41,7 +41,7 @@ use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
-    spawn_native_blocking_relay,
+    spawn_named_native_blocking_relay,
 };
 use crate::tls::TlsConnection;
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
@@ -63,6 +63,9 @@ const OPTION_GLOBAL_PADDING: u8 = 0x08;
 const OPTION_AUTHENTICATED_LENGTH: u8 = 0x10;
 const SECURITY_AES128_GCM: u8 = 0x03;
 const SECURITY_CHACHA20_POLY1305: u8 = 0x04;
+const VMESS_BRIDGE_NATIVE_RELAY_LABEL: &str = "keli-core-vmess-bridge";
+const VMESS_TCP_BRIDGE_NATIVE_RELAY_LABEL: &str = "keli-core-vmess-tcp-bridge";
+const VMESS_TCP_UPLOAD_NATIVE_RELAY_LABEL: &str = "keli-core-vmess-tcp-upload";
 const SECURITY_NONE: u8 = 0x05;
 const KDF_ROOT: &[u8] = b"VMess AEAD KDF";
 const AUTH_ID_KEY: &[u8] = b"AES Auth ID Encryption";
@@ -2506,7 +2509,7 @@ where
     let local_client = TcpStream::connect(local_addr)?;
     let (local_plain, _) = local_listener.accept()?;
 
-    let _ = spawn_native_blocking_relay(move || {
+    let _ = spawn_named_native_blocking_relay(VMESS_BRIDGE_NATIVE_RELAY_LABEL, move || {
         let _ = relay_plain_to_vmess(local_plain, remote, request);
     })?;
 
@@ -2525,7 +2528,7 @@ fn local_bridge_for_vmess_tcp(remote: TcpStream, request: VmessRequest) -> io::R
     let plain_writer = local_plain;
     let remote_writer = remote.try_clone()?;
     let remote_reader = remote;
-    let _ = spawn_native_blocking_relay(move || {
+    let _ = spawn_named_native_blocking_relay(VMESS_TCP_BRIDGE_NATIVE_RELAY_LABEL, move || {
         let _ = relay_plain_to_vmess_tcp(
             plain_reader,
             plain_writer,
@@ -2546,27 +2549,28 @@ fn relay_plain_to_vmess_tcp(
     request: VmessRequest,
 ) -> io::Result<()> {
     let upload_request = request.clone();
-    let upload_task = spawn_native_blocking_relay(move || {
-        let mut request_body = VmessBodyEncoder::new_with_length_seed(
-            upload_request.request_body_key,
-            upload_request.request_body_iv,
-            upload_request.request_body_key,
-            upload_request.request_body_iv,
-            upload_request.options,
-            upload_request.security,
-        );
-        let mut buffer = [0u8; VMESS_RELAY_BUFFER_SIZE];
-        loop {
-            match plain_reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => request_body.write_plain(&mut remote_writer, &buffer[..read])?,
-                Err(error) => return Err(error),
-            };
-        }
-        let _ = request_body.finish(&mut remote_writer);
-        let _ = remote_writer.shutdown(Shutdown::Write);
-        Ok::<(), io::Error>(())
-    })?;
+    let upload_task =
+        spawn_named_native_blocking_relay(VMESS_TCP_UPLOAD_NATIVE_RELAY_LABEL, move || {
+            let mut request_body = VmessBodyEncoder::new_with_length_seed(
+                upload_request.request_body_key,
+                upload_request.request_body_iv,
+                upload_request.request_body_key,
+                upload_request.request_body_iv,
+                upload_request.options,
+                upload_request.security,
+            );
+            let mut buffer = [0u8; VMESS_RELAY_BUFFER_SIZE];
+            loop {
+                match plain_reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => request_body.write_plain(&mut remote_writer, &buffer[..read])?,
+                    Err(error) => return Err(error),
+                };
+            }
+            let _ = request_body.finish(&mut remote_writer);
+            let _ = remote_writer.shutdown(Shutdown::Write);
+            Ok::<(), io::Error>(())
+        })?;
 
     let mut response_body = VmessBodyDecoder::new_with_length_seed(
         request.response_body_key,

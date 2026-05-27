@@ -37,7 +37,7 @@ use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
     relay_tcp_fast_unlimited, relay_tcp_limited, spawn_background_io,
-    spawn_detached_blocking_relay, spawn_native_blocking_relay, RelayActivityDeadline,
+    spawn_detached_blocking_relay, spawn_named_native_blocking_relay, RelayActivityDeadline,
 };
 use crate::tls::{relay_tls_stream_with_timeouts, TlsConnection, TlsRelayTimeouts};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
@@ -66,6 +66,12 @@ const TROJAN_TRACE_ENV: &str = "KELI_CORE_TROJAN_TRACE";
 const TROJAN_ROUTE_SLOW_LOG_MS: u128 = 1_000;
 const TROJAN_LOG_INTERVAL_MS: u64 = 60_000;
 const TROJAN_RELAY_FINISHED_LOG_INTERVAL_MS: u64 = 300_000;
+const TROJAN_WEBSOCKET_UPLOAD_NATIVE_RELAY_LABEL: &str = "keli-core-trojan-ws-upload";
+const TROJAN_WEBSOCKET_UDP_UPLOAD_NATIVE_RELAY_LABEL: &str = "keli-core-trojan-ws-udp-upload";
+const TROJAN_HTTPUPGRADE_BRIDGE_NATIVE_RELAY_LABEL: &str = "keli-core-trojan-httpupgrade-bridge";
+const TROJAN_TLS_BRIDGE_NATIVE_RELAY_LABEL: &str = "keli-core-trojan-tls-bridge";
+const TROJAN_WEBSOCKET_BRIDGE_NATIVE_RELAY_LABEL: &str = "keli-core-trojan-ws-bridge";
+const TROJAN_GRPC_BRIDGE_NATIVE_RELAY_LABEL: &str = "keli-core-trojan-grpc-bridge";
 
 #[derive(Clone, Debug)]
 pub struct TrojanServerConfig {
@@ -607,16 +613,21 @@ impl TrojanServer {
             .bandwidth
             .register_tcp_connection(Some(&request.user_uuid), &[&remote_read])?;
         let upload_limiter = bandwidth.clone();
-        let upload_task = spawn_native_blocking_relay(move || {
-            let result = match upload_limiter.as_deref() {
-                Some(limiter) => {
-                    copy_count_best_effort_limited(&mut reader, &mut remote_write, Some(limiter))
-                }
-                None => copy_count_best_effort(&mut reader, &mut remote_write),
-            };
-            let _ = remote_shutdown.shutdown(Shutdown::Write);
-            result
-        })?;
+        let upload_task = spawn_named_native_blocking_relay(
+            TROJAN_WEBSOCKET_UPLOAD_NATIVE_RELAY_LABEL,
+            move || {
+                let result = match upload_limiter.as_deref() {
+                    Some(limiter) => copy_count_best_effort_limited(
+                        &mut reader,
+                        &mut remote_write,
+                        Some(limiter),
+                    ),
+                    None => copy_count_best_effort(&mut reader, &mut remote_write),
+                };
+                let _ = remote_shutdown.shutdown(Shutdown::Write);
+                result
+            },
+        )?;
         let download = match bandwidth.as_deref() {
             Some(limiter) => {
                 copy_count_best_effort_limited(&mut remote_read, &mut writer, Some(limiter))
@@ -1269,11 +1280,14 @@ impl TrojanServer {
             let stop = stop.clone();
             let upload = upload.clone();
             let download = download.clone();
-            spawn_native_blocking_relay(move || {
-                server.relay_udp_plain_websocket_upload(
-                    reader, state, writer, stop, upload, download, bandwidth,
-                )
-            })?
+            spawn_named_native_blocking_relay(
+                TROJAN_WEBSOCKET_UDP_UPLOAD_NATIVE_RELAY_LABEL,
+                move || {
+                    server.relay_udp_plain_websocket_upload(
+                        reader, state, writer, stop, upload, download, bandwidth,
+                    )
+                },
+            )?
         };
 
         let mut idle_rounds = 0u8;
@@ -3287,9 +3301,12 @@ fn connect_trojan_httpupgrade_tcp_outbound(
         let local_client = TcpStream::connect(local_addr)?;
         let (local_plain, _) = local_listener.accept()?;
 
-        let _ = spawn_native_blocking_relay(move || {
-            let _ = relay_plain_to_tls(local_plain, tls_stream);
-        })?;
+        let _ = spawn_named_native_blocking_relay(
+            TROJAN_HTTPUPGRADE_BRIDGE_NATIVE_RELAY_LABEL,
+            move || {
+                let _ = relay_plain_to_tls(local_plain, tls_stream);
+            },
+        )?;
 
         return Ok(local_client);
     }
@@ -3348,7 +3365,7 @@ fn connect_trojan_tls_tcp_outbound(
     let local_client = TcpStream::connect(local_addr)?;
     let (local_plain, _) = local_listener.accept()?;
 
-    let _ = spawn_native_blocking_relay(move || {
+    let _ = spawn_named_native_blocking_relay(TROJAN_TLS_BRIDGE_NATIVE_RELAY_LABEL, move || {
         let _ = relay_plain_to_tls(local_plain, tls_stream);
     })?;
 
@@ -3592,9 +3609,10 @@ where
     let local_client = TcpStream::connect(local_addr)?;
     let (local_plain, _) = local_listener.accept()?;
 
-    let _ = spawn_native_blocking_relay(move || {
-        let _ = relay_plain_to_websocket(local_plain, websocket);
-    })?;
+    let _ =
+        spawn_named_native_blocking_relay(TROJAN_WEBSOCKET_BRIDGE_NATIVE_RELAY_LABEL, move || {
+            let _ = relay_plain_to_websocket(local_plain, websocket);
+        })?;
 
     Ok(local_client)
 }
@@ -3605,7 +3623,7 @@ fn local_bridge_for_grpc(grpc: GrpcClientStream) -> io::Result<TcpStream> {
     let local_client = TcpStream::connect(local_addr)?;
     let (local_plain, _) = local_listener.accept()?;
 
-    let _ = spawn_native_blocking_relay(move || {
+    let _ = spawn_named_native_blocking_relay(TROJAN_GRPC_BRIDGE_NATIVE_RELAY_LABEL, move || {
         let _ = relay_plain_to_grpc(local_plain, grpc);
     })?;
 

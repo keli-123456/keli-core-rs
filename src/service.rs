@@ -1217,7 +1217,7 @@ fn local_bridge_for_tls(tls: TlsConnection) -> io::Result<TcpStream> {
     let local_client = TcpStream::connect(local_addr)?;
     let (local_plain, _) = local_listener.accept()?;
 
-    let _ = crate::stream::spawn_native_blocking_relay(move || {
+    let _ = crate::stream::spawn_named_native_blocking_relay("keli-core-tls-bridge", move || {
         let _ = relay_tls_stream(tls, local_plain, None);
     })?;
 

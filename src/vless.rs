@@ -33,7 +33,7 @@ use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
     relay_tcp_fast_unlimited_close_on_eof, relay_tcp_limited, spawn_async_relay,
-    spawn_detached_blocking_relay, spawn_native_blocking_relay, spawn_tcp_relay_background,
+    spawn_detached_blocking_relay, spawn_named_native_blocking_relay, spawn_tcp_relay_background,
     RelayActivityDeadline,
 };
 use crate::tls::{
@@ -76,6 +76,12 @@ const VLESS_WEBSOCKET_DETACHED_RELAY_LABEL: &str = "keli-core-vless-ws-relay";
 const VLESS_PLAIN_WEBSOCKET_DETACHED_RELAY_LABEL: &str = "keli-core-vless-plain-ws-relay";
 const VLESS_TLS_DETACHED_RELAY_LABEL: &str = "keli-core-vless-tls-relay";
 const VLESS_TLS_WEBSOCKET_DETACHED_RELAY_LABEL: &str = "keli-core-vless-tls-ws-relay";
+const VLESS_WEBSOCKET_UPLOAD_NATIVE_RELAY_LABEL: &str = "keli-core-vless-ws-upload";
+const VLESS_VISION_NATIVE_RELAY_LABEL: &str = "keli-core-vless-vision-relay";
+const VLESS_HTTPUPGRADE_BRIDGE_NATIVE_RELAY_LABEL: &str = "keli-core-vless-httpupgrade-bridge";
+const VLESS_TLS_BRIDGE_NATIVE_RELAY_LABEL: &str = "keli-core-vless-tls-bridge";
+const VLESS_WEBSOCKET_BRIDGE_NATIVE_RELAY_LABEL: &str = "keli-core-vless-ws-bridge";
+const VLESS_GRPC_BRIDGE_NATIVE_RELAY_LABEL: &str = "keli-core-vless-grpc-bridge";
 
 #[cfg(test)]
 static VLESS_VISION_RAW_RELAY_SWITCHES: AtomicUsize = AtomicUsize::new(0);
@@ -979,18 +985,21 @@ impl VlessServer {
                 .bandwidth
                 .register_tcp_connection(Some(&request.user_uuid), &[&remote_read])?;
             let upload_limiter = bandwidth.clone();
-            let upload_task = spawn_native_blocking_relay(move || {
-                let result = match upload_limiter.as_deref() {
-                    Some(limiter) => copy_count_best_effort_limited(
-                        &mut reader,
-                        &mut remote_write,
-                        Some(limiter),
-                    ),
-                    None => copy_count_best_effort(&mut reader, &mut remote_write),
-                };
-                let _ = remote_shutdown.shutdown(Shutdown::Both);
-                result
-            })?;
+            let upload_task = spawn_named_native_blocking_relay(
+                VLESS_WEBSOCKET_UPLOAD_NATIVE_RELAY_LABEL,
+                move || {
+                    let result = match upload_limiter.as_deref() {
+                        Some(limiter) => copy_count_best_effort_limited(
+                            &mut reader,
+                            &mut remote_write,
+                            Some(limiter),
+                        ),
+                        None => copy_count_best_effort(&mut reader, &mut remote_write),
+                    };
+                    let _ = remote_shutdown.shutdown(Shutdown::Both);
+                    result
+                },
+            )?;
             let download = match bandwidth.as_deref() {
                 Some(limiter) => {
                     copy_count_best_effort_limited(&mut remote_read, &mut writer, Some(limiter))
@@ -1392,10 +1401,11 @@ impl VlessServer {
     {
         let server = self.clone();
         if request.flow == FLOW_XTLS_RPRX_VISION {
-            let _handle = spawn_native_blocking_relay(move || {
-                let _session = session;
-                server.relay_tls(client, remote, request, bandwidth)
-            })?;
+            let _handle =
+                spawn_named_native_blocking_relay(VLESS_VISION_NATIVE_RELAY_LABEL, move || {
+                    let _session = session;
+                    server.relay_tls(client, remote, request, bandwidth)
+                })?;
         } else {
             spawn_detached_blocking_relay(VLESS_TLS_DETACHED_RELAY_LABEL, move || {
                 let _session = session;
@@ -2543,9 +2553,12 @@ fn connect_vless_httpupgrade_tcp_outbound(
         let local_client = TcpStream::connect(local_addr)?;
         let (local_plain, _) = local_listener.accept()?;
 
-        let _ = spawn_native_blocking_relay(move || {
-            let _ = relay_plain_to_tls(local_plain, tls_stream);
-        })?;
+        let _ = spawn_named_native_blocking_relay(
+            VLESS_HTTPUPGRADE_BRIDGE_NATIVE_RELAY_LABEL,
+            move || {
+                let _ = relay_plain_to_tls(local_plain, tls_stream);
+            },
+        )?;
 
         return Ok(local_client);
     }
@@ -2612,7 +2625,7 @@ fn connect_vless_tls_tcp_outbound(
     let use_vision = flow == FLOW_XTLS_RPRX_VISION;
     let user_id = *user_id;
 
-    let _ = spawn_native_blocking_relay(move || {
+    let _ = spawn_named_native_blocking_relay(VLESS_TLS_BRIDGE_NATIVE_RELAY_LABEL, move || {
         if use_vision {
             let _ = tls_stream.sock.set_nonblocking(true);
             let _ = relay_plain_to_vless_vision(local_plain, tls_stream, user_id);
@@ -3110,9 +3123,10 @@ where
     let local_client = TcpStream::connect(local_addr)?;
     let (local_plain, _) = local_listener.accept()?;
 
-    let _ = spawn_native_blocking_relay(move || {
-        let _ = relay_plain_to_websocket(local_plain, websocket);
-    })?;
+    let _ =
+        spawn_named_native_blocking_relay(VLESS_WEBSOCKET_BRIDGE_NATIVE_RELAY_LABEL, move || {
+            let _ = relay_plain_to_websocket(local_plain, websocket);
+        })?;
 
     Ok(local_client)
 }
@@ -3123,7 +3137,7 @@ fn local_bridge_for_grpc(grpc: GrpcClientStream) -> io::Result<TcpStream> {
     let local_client = TcpStream::connect(local_addr)?;
     let (local_plain, _) = local_listener.accept()?;
 
-    let _ = spawn_native_blocking_relay(move || {
+    let _ = spawn_named_native_blocking_relay(VLESS_GRPC_BRIDGE_NATIVE_RELAY_LABEL, move || {
         let _ = relay_plain_to_grpc(local_plain, grpc);
     })?;
 
@@ -3570,17 +3584,20 @@ where
     let mut remote_write = remote.try_clone()?;
     let mut remote_read = remote;
     let upload_limiter = limiter.clone();
-    let upload_task = spawn_native_blocking_relay(move || {
-        let mut vision_reader = VisionReader::new(reader, user_id);
-        let bytes = match upload_limiter.as_deref() {
-            Some(limiter) => {
-                copy_count_best_effort_limited(&mut vision_reader, &mut remote_write, Some(limiter))
-            }
-            None => copy_count_best_effort(&mut vision_reader, &mut remote_write),
-        };
-        let _ = remote_write.shutdown(Shutdown::Write);
-        bytes
-    })?;
+    let upload_task =
+        spawn_named_native_blocking_relay(VLESS_VISION_NATIVE_RELAY_LABEL, move || {
+            let mut vision_reader = VisionReader::new(reader, user_id);
+            let bytes = match upload_limiter.as_deref() {
+                Some(limiter) => copy_count_best_effort_limited(
+                    &mut vision_reader,
+                    &mut remote_write,
+                    Some(limiter),
+                ),
+                None => copy_count_best_effort(&mut vision_reader, &mut remote_write),
+            };
+            let _ = remote_write.shutdown(Shutdown::Write);
+            bytes
+        })?;
 
     let mut vision_writer = VisionWriter::new(writer, user_id);
     let download = match limiter.as_deref() {
