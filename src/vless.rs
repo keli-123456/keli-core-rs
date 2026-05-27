@@ -28,6 +28,7 @@ use crate::limits::{
 };
 use crate::outbound::recv_udp_response;
 use crate::quic::connect_quic_client_stream;
+use crate::reality::PrefixedAsyncTcpStream;
 use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::SocksTarget;
 use crate::stream::{
@@ -86,6 +87,40 @@ const VLESS_GRPC_BRIDGE_NATIVE_RELAY_LABEL: &str = "keli-core-vless-grpc-bridge"
 
 #[cfg(test)]
 static VLESS_VISION_RAW_RELAY_SWITCHES: AtomicUsize = AtomicUsize::new(0);
+
+pub trait AsyncRawTcpStreamAccess: AsyncRead + AsyncWrite + Unpin + Send + 'static {
+    fn raw_tcp_stream_ready(&self) -> bool;
+    fn raw_tcp_stream(&self) -> &tokio::net::TcpStream;
+    fn into_raw_tcp_stream(self) -> tokio::net::TcpStream;
+}
+
+impl AsyncRawTcpStreamAccess for tokio::net::TcpStream {
+    fn raw_tcp_stream_ready(&self) -> bool {
+        true
+    }
+
+    fn raw_tcp_stream(&self) -> &tokio::net::TcpStream {
+        self
+    }
+
+    fn into_raw_tcp_stream(self) -> tokio::net::TcpStream {
+        self
+    }
+}
+
+impl AsyncRawTcpStreamAccess for PrefixedAsyncTcpStream {
+    fn raw_tcp_stream_ready(&self) -> bool {
+        PrefixedAsyncTcpStream::raw_tcp_stream_ready(self)
+    }
+
+    fn raw_tcp_stream(&self) -> &tokio::net::TcpStream {
+        PrefixedAsyncTcpStream::raw_tcp_stream(self)
+    }
+
+    fn into_raw_tcp_stream(self) -> tokio::net::TcpStream {
+        PrefixedAsyncTcpStream::into_raw_tcp_stream(self)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct VlessServerConfig {
@@ -543,11 +578,14 @@ impl VlessServer {
         self.spawn_tls_relay(client, remote, request, bandwidth, session)
     }
 
-    pub async fn handle_tls_client_async(
+    pub async fn handle_tls_client_async<S>(
         &self,
-        client: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        client: tokio_rustls::server::TlsStream<S>,
         client_ip: Option<IpAddr>,
-    ) -> io::Result<()> {
+    ) -> io::Result<()>
+    where
+        S: AsyncRawTcpStreamAccess,
+    {
         let result = self.handle_tls_client_async_inner(client, client_ip).await;
         if let Err(error) = &result {
             record_vless_connection_error(&self.config.node_tag, "tls", error);
@@ -555,14 +593,25 @@ impl VlessServer {
         result
     }
 
-    async fn handle_tls_client_async_inner(
+    async fn handle_tls_client_async_inner<S>(
         &self,
-        mut client: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        mut client: tokio_rustls::server::TlsStream<S>,
         client_ip: Option<IpAddr>,
-    ) -> io::Result<()> {
-        let client_shutdown = clone_tokio_tcp_stream_for_shutdown(client.get_ref().0).ok();
-        let peer_ip =
-            client_ip.or_else(|| client.get_ref().0.peer_addr().ok().map(|addr| addr.ip()));
+    ) -> io::Result<()>
+    where
+        S: AsyncRawTcpStreamAccess,
+    {
+        let client_shutdown =
+            clone_tokio_tcp_stream_for_shutdown(client.get_ref().0.raw_tcp_stream()).ok();
+        let peer_ip = client_ip.or_else(|| {
+            client
+                .get_ref()
+                .0
+                .raw_tcp_stream()
+                .peer_addr()
+                .ok()
+                .map(|addr| addr.ip())
+        });
         let mut request = match tokio::time::timeout(
             self.config.connect_timeout,
             self.read_request_async(&mut client),
@@ -1421,14 +1470,17 @@ impl VlessServer {
         }
     }
 
-    async fn relay_tls_async(
+    async fn relay_tls_async<S>(
         &self,
-        client: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        client: tokio_rustls::server::TlsStream<S>,
         remote: tokio::net::TcpStream,
         request: VlessRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
         session: Option<UserSessionGuard>,
-    ) -> io::Result<()> {
+    ) -> io::Result<()>
+    where
+        S: AsyncRawTcpStreamAccess,
+    {
         let _session = session;
         if request.flow != FLOW_XTLS_RPRX_VISION {
             return Err(io::Error::new(
@@ -1439,7 +1491,7 @@ impl VlessServer {
 
         let _connection = self.bandwidth.register_tokio_tcp_connection(
             Some(&request.user_uuid),
-            &[client.get_ref().0, &remote],
+            &[client.get_ref().0.raw_tcp_stream(), &remote],
         )?;
         let upload_traffic = self.traffic.clone();
         let upload_node_tag = self.config.node_tag.clone();
@@ -3830,8 +3882,8 @@ where
     )
 }
 
-async fn relay_tls_vision_stream_async<FU, FD>(
-    mut client: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+async fn relay_tls_vision_stream_async<S, FU, FD>(
+    mut client: tokio_rustls::server::TlsStream<S>,
     mut remote: tokio::net::TcpStream,
     user_id: [u8; 16],
     limiter: Option<Arc<BandwidthLimiter>>,
@@ -3840,6 +3892,7 @@ async fn relay_tls_vision_stream_async<FU, FD>(
     mut on_download: FD,
 ) -> io::Result<()>
 where
+    S: AsyncRawTcpStreamAccess,
     FU: FnMut(u64) + Send + 'static,
     FD: FnMut(u64) + Send + 'static,
 {
@@ -3850,7 +3903,8 @@ where
     }
 
     let drain_after_client_eof = vless_vision_drain_after_client_eof();
-    let client_shutdown = clone_tokio_tcp_stream_for_shutdown(client.get_ref().0).ok();
+    let client_shutdown =
+        clone_tokio_tcp_stream_for_shutdown(client.get_ref().0.raw_tcp_stream()).ok();
     let remote_shutdown = clone_tokio_tcp_stream_for_shutdown(&remote).ok();
     let mut upload = 0u64;
     let mut download = 0u64;
@@ -3926,7 +3980,11 @@ where
             }
         }
 
-        if uplink_direct && downlink_direct && vision_decoder.is_drained() {
+        if uplink_direct
+            && downlink_direct
+            && vision_decoder.is_drained()
+            && client.get_ref().0.raw_tcp_stream_ready()
+        {
             #[cfg(test)]
             VLESS_VISION_RAW_RELAY_SWITCHES.fetch_add(1, Ordering::Relaxed);
             if trace {
@@ -3939,7 +3997,7 @@ where
             let (raw_client, _) = client.into_inner();
             relay_tcp_streams_async_with_label(
                 VLESS_VISION_ASYNC_RELAY_LABEL,
-                raw_client,
+                raw_client.into_raw_tcp_stream(),
                 remote,
                 limiter,
                 on_upload,

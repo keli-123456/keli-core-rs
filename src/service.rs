@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 
 use crate::abuse::{ClientFailureBackoff, ClientFailureBackoffSnapshot};
 use crate::anytls::{AnyTlsServer, AnyTlsServerConfig};
@@ -29,8 +30,9 @@ use crate::naive::{NaiveServer, NaiveServerConfig};
 use crate::protocol::Protocol;
 use crate::quic_resources::{QuicResourceSnapshot, SharedQuicConnectionLimiter};
 use crate::reality::{
-    decode_reality_private_key, decode_short_id, generate_reality_temporary_certificate,
-    handle_reality_preface, RealityAuthConfig, RealityGatewayConfig, RealityGatewayResult,
+    authenticate_reality_client_hello, decode_reality_private_key, decode_short_id,
+    fallback_reality_client_to_dest, generate_reality_temporary_certificate,
+    PrefixedAsyncTcpStream, RealityAuthConfig, RealityGatewayConfig,
 };
 use crate::shadowsocks::{ShadowsocksServer, ShadowsocksServerConfig};
 use crate::socket_bind::bind_dual_stack_tcp_listener;
@@ -2393,14 +2395,17 @@ fn start_vless_reality_listener(
     let workers = ConnectionWorkerGroup::new();
     let workers_for_thread = workers.clone();
     let runtime_server = server.clone();
-    let join = spawn_tcp_accept_loop(
+    let join = spawn_async_tcp_accept_loop(
         listener,
         stop_for_thread,
         workers_for_thread,
         move |stream| {
             let gateway = reality_gateway_for_connection(&gateway);
             let server = server.clone();
-            handle_vless_reality_connection(stream, gateway, server, connect_timeout);
+            async move {
+                handle_vless_reality_connection_async(stream, gateway, server, connect_timeout)
+                    .await;
+            }
         },
     );
 
@@ -2417,8 +2422,10 @@ fn start_vless_reality_listener(
     })
 }
 
-fn handle_vless_reality_connection(
-    stream: TcpStream,
+const REALITY_MAX_TLS_RECORD_LEN: usize = 64 * 1024;
+
+async fn handle_vless_reality_connection_async(
+    mut stream: tokio::net::TcpStream,
     gateway: RealityGatewayConfig,
     server: VlessServer,
     connect_timeout: Duration,
@@ -2428,25 +2435,40 @@ fn handle_vless_reality_connection(
         .peer_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
+    let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
     if trace {
-        eprintln!("keli-core-rs reality trace: accepted peer={peer}");
+        eprintln!("keli-core-rs reality trace: async accepted peer={peer}");
     }
-    let handshake_timeout = connect_timeout;
-    let _ = stream.set_read_timeout(Some(handshake_timeout));
-    let _ = stream.set_write_timeout(Some(handshake_timeout));
-    let result = handle_reality_preface(stream, &gateway);
-    match result {
-        Ok(RealityGatewayResult::Authenticated(authenticated)) => {
+    let first_record = match tokio::time::timeout(
+        connect_timeout,
+        read_reality_first_tls_record_async(&mut stream),
+    )
+    .await
+    {
+        Ok(Ok(record)) => record,
+        Ok(Err(error)) => {
+            if trace {
+                eprintln!("keli-core-rs reality trace: preface error peer={peer} error={error}");
+            }
+            return;
+        }
+        Err(_) => {
+            if trace {
+                eprintln!("keli-core-rs reality trace: preface timeout peer={peer}");
+            }
+            return;
+        }
+    };
+
+    match authenticate_reality_client_hello(&first_record, &gateway.auth) {
+        Ok(auth) => {
             if trace {
                 eprintln!(
-                    "keli-core-rs reality trace: authenticated peer={peer} sni={}",
-                    authenticated.auth.server_name
+                    "keli-core-rs reality trace: async authenticated peer={peer} sni={}",
+                    auth.server_name
                 );
             }
-            let acceptor = match reality_tls_acceptor(
-                &authenticated.auth.auth_key,
-                &authenticated.auth.server_name,
-            ) {
+            let acceptor = match reality_tls_acceptor(&auth.auth_key, &auth.server_name) {
                 Ok(acceptor) => acceptor,
                 Err(error) => {
                     if trace {
@@ -2457,16 +2479,17 @@ fn handle_vless_reality_connection(
                     return;
                 }
             };
-            let client = match acceptor
-                .accept_stream_with_timeout(authenticated.stream, handshake_timeout)
+            let client = PrefixedAsyncTcpStream::new(stream, first_record);
+            let acceptor = tokio_rustls::TlsAcceptor::from(acceptor.server_config());
+            let client = match tokio::time::timeout(connect_timeout, acceptor.accept(client)).await
             {
-                Ok(client) => {
+                Ok(Ok(client)) => {
                     if trace {
-                        eprintln!("keli-core-rs reality trace: tls accepted peer={peer}");
+                        eprintln!("keli-core-rs reality trace: async tls accepted peer={peer}");
                     }
                     client
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     if trace {
                         eprintln!(
                                 "keli-core-rs reality trace: tls accept error peer={peer} error={error}"
@@ -2474,26 +2497,71 @@ fn handle_vless_reality_connection(
                     }
                     return;
                 }
+                Err(_) => {
+                    if trace {
+                        eprintln!("keli-core-rs reality trace: tls accept timeout peer={peer}");
+                    }
+                    return;
+                }
             };
-            if let Err(error) = server.handle_tls_client(client) {
+            if let Err(error) = server.handle_tls_client_async(client, peer_ip).await {
                 if trace {
-                    eprintln!("keli-core-rs reality trace: vless error peer={peer} error={error}");
+                    eprintln!(
+                        "keli-core-rs reality trace: async vless error peer={peer} error={error}"
+                    );
                 }
             } else if trace {
-                eprintln!("keli-core-rs reality trace: vless finished peer={peer}");
+                eprintln!("keli-core-rs reality trace: async vless finished peer={peer}");
             }
         }
-        Ok(RealityGatewayResult::Fallback { reason, .. }) => {
+        Err(reason) => {
             if trace {
                 eprintln!("keli-core-rs reality trace: fallback peer={peer} reason={reason}");
             }
-        }
-        Err(error) => {
-            if trace {
-                eprintln!("keli-core-rs reality trace: preface error peer={peer} error={error}");
-            }
+            let std_stream = match stream.into_std() {
+                Ok(stream) => stream,
+                Err(error) => {
+                    if trace {
+                        eprintln!(
+                            "keli-core-rs reality trace: fallback convert error peer={peer} error={error}"
+                        );
+                    }
+                    return;
+                }
+            };
+            let _ = tokio::task::spawn_blocking(move || {
+                fallback_reality_client_to_dest(std_stream, first_record, &gateway)
+            })
+            .await;
         }
     }
+}
+
+async fn read_reality_first_tls_record_async(
+    stream: &mut tokio::net::TcpStream,
+) -> io::Result<Vec<u8>> {
+    let mut header = [0u8; 5];
+    match stream.read_exact(&mut header).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    }
+    if !is_reality_tls_record_type(header[0]) {
+        return Ok(header.to_vec());
+    }
+    let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if record_len > REALITY_MAX_TLS_RECORD_LEN {
+        return Ok(header.to_vec());
+    }
+    let mut record = Vec::with_capacity(5 + record_len);
+    record.extend_from_slice(&header);
+    record.resize(5 + record_len, 0);
+    stream.read_exact(&mut record[5..]).await?;
+    Ok(record)
+}
+
+fn is_reality_tls_record_type(value: u8) -> bool {
+    matches!(value, 0x14 | 0x15 | 0x16 | 0x17)
 }
 
 fn reality_gateway_for_connection(template: &RealityGatewayConfig) -> RealityGatewayConfig {

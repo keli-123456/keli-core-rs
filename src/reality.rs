@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Cursor as IoCursor, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, KeyInit};
@@ -11,6 +13,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
 use sha2::{Sha256, Sha512};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::tls::{RawTcpStreamAccess, TlsSocket};
@@ -125,6 +128,12 @@ pub struct RealityAuthenticatedStream {
 pub struct PrefixedTcpStream {
     prefix: IoCursor<Vec<u8>>,
     socket: TcpStream,
+}
+
+#[derive(Debug)]
+pub struct PrefixedAsyncTcpStream {
+    prefix: IoCursor<Vec<u8>>,
+    socket: tokio::net::TcpStream,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -596,6 +605,31 @@ impl RawTcpStreamAccess for PrefixedTcpStream {
     }
 }
 
+impl PrefixedAsyncTcpStream {
+    pub fn new(socket: tokio::net::TcpStream, prefix: Vec<u8>) -> Self {
+        Self {
+            prefix: IoCursor::new(prefix),
+            socket,
+        }
+    }
+
+    pub fn raw_tcp_stream_ready(&self) -> bool {
+        (self.prefix.position() as usize) >= self.prefix.get_ref().len()
+    }
+
+    pub fn raw_tcp_stream(&self) -> &tokio::net::TcpStream {
+        &self.socket
+    }
+
+    pub fn into_raw_tcp_stream(self) -> tokio::net::TcpStream {
+        self.socket
+    }
+
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.peer_addr()
+    }
+}
+
 impl RealityAuthenticatedStream {
     pub fn read_dest_handshake(
         &mut self,
@@ -669,6 +703,55 @@ impl Write for PrefixedTcpStream {
     fn flush(&mut self) -> io::Result<()> {
         self.socket.flush()
     }
+}
+
+impl AsyncRead for PrefixedAsyncTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let pos = self.prefix.position() as usize;
+        let prefix_len = self.prefix.get_ref().len();
+        if pos < prefix_len {
+            let available = prefix_len - pos;
+            let read = available.min(output.remaining());
+            if read > 0 {
+                output.put_slice(&self.prefix.get_ref()[pos..pos + read]);
+                self.prefix.set_position((pos + read) as u64);
+            }
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.socket).poll_read(cx, output)
+    }
+}
+
+impl AsyncWrite for PrefixedAsyncTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.socket).poll_write(cx, input)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.socket).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.socket).poll_shutdown(cx)
+    }
+}
+
+pub fn fallback_reality_client_to_dest(
+    client: TcpStream,
+    first_record: Vec<u8>,
+    config: &RealityGatewayConfig,
+) -> io::Result<(u64, u64)> {
+    let mut dest = connect_dest(&config.dest, config.connect_timeout)?;
+    dest.write_all(&first_record)?;
+    fallback_to_dest(client, first_record, dest)
 }
 
 fn read_first_tls_record(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
@@ -1323,6 +1406,7 @@ mod tests {
     use aes_gcm::{Aes256Gcm, Nonce};
     use hkdf::Hkdf;
     use sha2::Sha256;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use x25519_dalek::{PublicKey, StaticSecret};
 
     use crate::reality::{
@@ -1330,9 +1414,33 @@ mod tests {
         generate_reality_temporary_certificate, handle_reality_preface,
         parse_reality_dest_handshake, parse_reality_server_hello, parse_tls_records,
         sign_reality_certificate_public_key, validate_reality_server_hello,
-        verify_reality_certificate_public_key, RealityAuthConfig, RealityAuthError,
-        RealityGatewayConfig, RealityGatewayResult,
+        verify_reality_certificate_public_key, PrefixedAsyncTcpStream, RealityAuthConfig,
+        RealityAuthError, RealityGatewayConfig, RealityGatewayResult,
     };
+
+    #[tokio::test]
+    async fn prefixed_async_tcp_stream_replays_prefix_before_socket_bytes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            stream.write_all(b"socket").await.expect("write socket");
+        });
+        let (socket, _) = listener.accept().await.expect("accept");
+        let mut prefixed = PrefixedAsyncTcpStream::new(socket, b"prefix-".to_vec());
+        let mut received = vec![0u8; "prefix-socket".len()];
+
+        prefixed
+            .read_exact(&mut received)
+            .await
+            .expect("read prefixed stream");
+
+        assert_eq!(received, b"prefix-socket");
+        assert!(prefixed.raw_tcp_stream_ready());
+        client.await.expect("client task");
+    }
 
     #[test]
     fn decodes_short_ids_like_xray() {
