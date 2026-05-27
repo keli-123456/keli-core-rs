@@ -1722,6 +1722,11 @@ fn start_trojan_listener(
     })
 }
 
+fn vless_transport_is_tcp(network: &str) -> bool {
+    let network = network.trim();
+    network.is_empty() || network == "tcp"
+}
+
 fn start_vless_listener(
     inbound: &InboundConfig,
     routes: Vec<crate::RouteRule>,
@@ -1858,7 +1863,7 @@ fn start_vless_listener(
                 join: Some(join),
             });
         }
-        if network == "tcp" && inbound.flow.trim() == "xtls-rprx-vision" {
+        if vless_transport_is_tcp(&network) && inbound.flow.trim() == "xtls-rprx-vision" {
             let join = spawn_async_tcp_accept_loop(
                 listener,
                 stop_for_thread,
@@ -1902,7 +1907,7 @@ fn start_vless_listener(
             });
         }
     }
-    if tls_acceptor.is_none() && network == "tcp" {
+    if tls_acceptor.is_none() && vless_transport_is_tcp(&network) {
         let join = spawn_async_tcp_accept_loop(
             listener,
             stop_for_thread,
@@ -3090,6 +3095,15 @@ mod tests {
             super::resolve_listen_addr("127.0.0.1", 443).expect("explicit ipv4"),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 443))
         );
+    }
+
+    #[test]
+    fn vless_empty_transport_defaults_to_tcp() {
+        assert!(super::vless_transport_is_tcp(""));
+        assert!(super::vless_transport_is_tcp("tcp"));
+        assert!(super::vless_transport_is_tcp(" tcp "));
+        assert!(!super::vless_transport_is_tcp("ws"));
+        assert!(!super::vless_transport_is_tcp("httpupgrade"));
     }
 
     #[test]
