@@ -724,6 +724,7 @@ impl MieruReader {
 
     fn read_segment(&mut self) -> io::Result<Option<MieruSegment>> {
         loop {
+            let mut waiting_for_more = false;
             for offset in 0..self.buffer.len().saturating_sub(ENCRYPTED_METADATA_LEN) + 1 {
                 match try_decode_segment(&self.buffer, offset, false, &self.key, self.nonce) {
                     SegmentAttempt::Complete {
@@ -735,12 +736,18 @@ impl MieruReader {
                         self.nonce = next_nonce;
                         return Ok(Some(segment));
                     }
-                    SegmentAttempt::NeedMore => break,
+                    SegmentAttempt::NeedMore => {
+                        if offset > 0 {
+                            self.buffer.drain(..offset);
+                        }
+                        waiting_for_more = true;
+                        break;
+                    }
                     SegmentAttempt::Invalid => {}
                 }
             }
 
-            if self.buffer.len() > MAX_PADDING_SCAN + ENCRYPTED_METADATA_LEN {
+            if !waiting_for_more && self.buffer.len() > MAX_PADDING_SCAN + ENCRYPTED_METADATA_LEN {
                 let drain = self.buffer.len() - ENCRYPTED_METADATA_LEN;
                 self.buffer.drain(..drain.min(MAX_PADDING_SCAN));
             }
@@ -2052,7 +2059,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::config::{OutboundConfig, RouteAction, RouteRule};
     use crate::mieru::{
@@ -3370,6 +3377,90 @@ mod tests {
         writer
             .write_client_segment(DATA_CLIENT_TO_SERVER, b"ping")
             .expect("data");
+        server_thread.join().expect("server thread");
+    }
+
+    #[test]
+    fn reader_preserves_partial_large_data_segment_across_poll_timeouts() {
+        let test_user = user();
+        let payload = vec![0x42; super::MAX_PADDING_SCAN + 8192];
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let expected = payload.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader =
+                MieruReader::accept(stream, std::slice::from_ref(&test_user)).expect("reader");
+            let initial = reader.take_initial_segment().expect("initial");
+            assert_eq!(initial.metadata.protocol_type, OPEN_SESSION_REQUEST);
+            reader
+                .set_poll_timeout(Duration::from_millis(10))
+                .expect("poll timeout");
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match reader.read_segment() {
+                    Ok(Some(segment)) => {
+                        assert_eq!(segment.metadata.protocol_type, DATA_CLIENT_TO_SERVER);
+                        assert_eq!(segment.payload, expected);
+                        break;
+                    }
+                    Ok(None) => panic!("stream closed before large segment was decoded"),
+                    Err(error) if super::is_timeout_error(&error) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timed out waiting for large segment"
+                        );
+                    }
+                    Err(error) => panic!("read segment failed: {error}"),
+                }
+            }
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        let mut nonce = [7u8; super::NONCE_LEN];
+        apply_nonce_user_hint(&mut nonce, &user().uuid);
+        let key = derive_mieru_key(
+            &user().uuid,
+            &user().uuid,
+            rounded_unix_time(super::now_unix_secs()),
+        );
+        let mut write_nonce = nonce;
+        let mut open = nonce.to_vec();
+        let open_metadata = MieruMetadata {
+            protocol_type: OPEN_SESSION_REQUEST,
+            session_id: 71,
+            sequence: 0,
+            status_code: STATUS_OK,
+            payload_len: 0,
+            prefix_len: 0,
+            suffix_len: 0,
+        };
+        encode_segment_body(&mut open, &key, &mut write_nonce, &open_metadata, b"")
+            .expect("encode open");
+        client.write_all(&open).expect("write open");
+
+        let mut data = Vec::new();
+        let data_metadata = MieruMetadata {
+            protocol_type: DATA_CLIENT_TO_SERVER,
+            session_id: 71,
+            sequence: 1,
+            status_code: STATUS_OK,
+            payload_len: payload.len(),
+            prefix_len: 0,
+            suffix_len: 0,
+        };
+        encode_segment_body(&mut data, &key, &mut write_nonce, &data_metadata, &payload)
+            .expect("encode data");
+        let split_at = super::MAX_PADDING_SCAN + super::ENCRYPTED_METADATA_LEN + 128;
+        client
+            .write_all(&data[..split_at])
+            .expect("write partial data");
+        thread::sleep(Duration::from_millis(50));
+        client
+            .write_all(&data[split_at..])
+            .expect("write remaining data");
+
         server_thread.join().expect("server thread");
     }
 }
