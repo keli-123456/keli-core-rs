@@ -1335,16 +1335,11 @@ mod tests {
 
     #[test]
     fn detached_blocking_relay_handle_returns_task_result() {
-        let handle = super::spawn_detached_blocking_relay_with_handle(
-            "test-detached-blocking-relay",
-            || 42,
-        )
-        .expect("spawn detached blocking relay");
-        let value = super::join_detached_blocking_relay(
-            handle,
-            "detached blocking relay panicked",
-        )
-        .expect("join detached blocking relay");
+        let handle =
+            super::spawn_detached_blocking_relay_with_handle("test-detached-blocking-relay", || 42)
+                .expect("spawn detached blocking relay");
+        let value = super::join_detached_blocking_relay(handle, "detached blocking relay panicked")
+            .expect("join detached blocking relay");
         assert_eq!(value, 42);
     }
 

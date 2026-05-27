@@ -471,8 +471,9 @@ fn spawn_mieru_session(
     workers.push(spawn_detached_blocking_relay_with_handle(
         "keli-core-mieru-session",
         move || {
-            let result = handle_mieru_session(initial, rx, writer.clone(), user, client_ip, runtime)
-                .map_err(|error| (error.kind(), error.to_string()));
+            let result =
+                handle_mieru_session(initial, rx, writer.clone(), user, client_ip, runtime)
+                    .map_err(|error| (error.kind(), error.to_string()));
             if result.is_err() {
                 close_mieru_underlay(&writer);
             }
@@ -2040,9 +2041,8 @@ mod tests {
             None
         );
 
-        let _guard = crate::stream::DetachedBlockingRelayMetricsGuard::new(
-            "keli-core-mieru-session",
-        );
+        let _guard =
+            crate::stream::DetachedBlockingRelayMetricsGuard::new("keli-core-mieru-session");
         let snapshot = crate::stream::relay_scheduler_metrics_snapshot();
         assert_eq!(
             snapshot
