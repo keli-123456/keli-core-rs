@@ -32,7 +32,15 @@ pub struct CoreMetricsSnapshot {
     #[serde(default)]
     pub keli_core_connection_error_total: BTreeMap<String, u64>,
     #[serde(default)]
+    pub keli_core_async_relay_active: BTreeMap<String, usize>,
+    #[serde(default)]
     pub keli_core_detached_blocking_relay_active: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub keli_core_native_relay_workers: usize,
+    #[serde(default)]
+    pub keli_core_native_relay_idle: usize,
+    #[serde(default)]
+    pub keli_core_native_relay_pending: usize,
     pub keli_core_dns: DnsMetricsSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keli_core_quic_resource: Option<QuicResourceSnapshot>,
@@ -90,8 +98,12 @@ impl CoreMetrics {
         snapshot.keli_core_hy2_udp_session_limit =
             crate::hysteria2::hy2_udp_session_limit_for_metrics();
         snapshot.keli_core_connection_error_total = connection_error_metrics_snapshot();
-        snapshot.keli_core_detached_blocking_relay_active =
-            crate::stream::detached_blocking_relay_metrics_snapshot();
+        let relay = crate::stream::relay_scheduler_metrics_snapshot();
+        snapshot.keli_core_async_relay_active = relay.active_async;
+        snapshot.keli_core_detached_blocking_relay_active = relay.active_detached_blocking;
+        snapshot.keli_core_native_relay_workers = relay.native_worker_count;
+        snapshot.keli_core_native_relay_idle = relay.native_idle_count;
+        snapshot.keli_core_native_relay_pending = relay.native_pending_count;
         snapshot
     }
 
@@ -371,5 +383,20 @@ mod tests {
             snapshot.keli_core_detached_blocking_relay_active["keli-core-test-relay"],
             1
         );
+    }
+
+    #[test]
+    fn snapshots_include_relay_scheduler_counts() {
+        let metrics = CoreMetrics::default();
+        let _guard = crate::stream::AsyncRelayMetricsGuard::new("keli-core-test-async-relay");
+
+        let snapshot = metrics.snapshot_with_runtime_metrics(None, None, None);
+
+        assert_eq!(
+            snapshot.keli_core_async_relay_active["keli-core-test-async-relay"],
+            1
+        );
+        assert!(snapshot.keli_core_native_relay_workers <= 1024);
+        assert!(snapshot.keli_core_native_relay_idle <= snapshot.keli_core_native_relay_workers);
     }
 }
