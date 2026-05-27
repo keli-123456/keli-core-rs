@@ -40,6 +40,10 @@ const MAX_SESSION_PAYLOAD_LEN: usize = 1024;
 const MAX_PADDING_SCAN: usize = 8192;
 const MIERU_SESSION_RELAY_LABEL: &str = "keli-core-mieru-session";
 const KEY_WINDOW_SECS: i64 = 120;
+#[cfg(not(test))]
+const MIERU_UNDERLAY_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+#[cfg(test)]
+const MIERU_UNDERLAY_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
 const OPEN_SESSION_REQUEST: u8 = 2;
 const OPEN_SESSION_RESPONSE: u8 = 3;
 const CLOSE_SESSION_REQUEST: u8 = 4;
@@ -268,7 +272,7 @@ impl MieruServer {
         writer.set_session_id(initial.metadata.session_id);
         let writer = Arc::new(Mutex::new(writer));
         let mut sessions = HashMap::<u32, Sender<MieruSegment>>::new();
-        let mut workers = Vec::new();
+        let mut workers = HashMap::<u32, DetachedBlockingRelayHandle<()>>::new();
         let (done_tx, done_rx) = mpsc::channel();
         spawn_mieru_session(
             initial,
@@ -289,20 +293,44 @@ impl MieruServer {
         )?;
 
         let mut first_error = None::<(io::ErrorKind, String)>;
+        let mut idle_since = None::<Instant>;
         loop {
             while let Ok((session_id, result)) = done_rx.try_recv() {
                 sessions.remove(&session_id);
+                if let Some(worker) = workers.remove(&session_id) {
+                    if let Err(error) =
+                        join_detached_blocking_relay(worker, "mieru session worker panicked")
+                    {
+                        first_error.get_or_insert((error.kind(), error.to_string()));
+                        close_mieru_underlay(&writer);
+                    }
+                }
                 if let Err(error) = result {
-                    first_error.get_or_insert(error);
-                    close_mieru_underlay(&writer);
+                    write_mieru_close_request(&writer, session_id);
+                    crate::logging::emit_legacy_line(&format!(
+                        "WARN  core   mieru session failed node={} session={} kind={:?} error={}",
+                        mieru_log_field(&self.config.node_tag),
+                        session_id,
+                        error.0,
+                        mieru_log_field(&error.1)
+                    ));
                 }
             }
-            if first_error.is_some() || sessions.is_empty() {
+            if first_error.is_some() {
                 break;
+            }
+            if sessions.is_empty() {
+                let since = idle_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= MIERU_UNDERLAY_IDLE_TIMEOUT {
+                    break;
+                }
+            } else {
+                idle_since = None;
             }
 
             match reader.read_segment() {
                 Ok(Some(segment)) => {
+                    idle_since = None;
                     dispatch_mieru_segment(
                         segment,
                         &reader.user,
@@ -329,7 +357,7 @@ impl MieruServer {
         }
 
         drop(sessions);
-        for worker in workers {
+        for worker in workers.into_values() {
             let _ = join_detached_blocking_relay(worker, "mieru session worker panicked");
         }
         while let Ok((_, result)) = done_rx.try_recv() {
@@ -408,7 +436,7 @@ fn dispatch_mieru_segment(
     runtime: MieruSessionRuntime,
     done_tx: Sender<(u32, Result<(), (io::ErrorKind, String)>)>,
     sessions: &mut HashMap<u32, Sender<MieruSegment>>,
-    workers: &mut Vec<DetachedBlockingRelayHandle<()>>,
+    workers: &mut HashMap<u32, DetachedBlockingRelayHandle<()>>,
 ) -> io::Result<()> {
     match segment.metadata.protocol_type {
         OPEN_SESSION_REQUEST => spawn_mieru_session(
@@ -426,16 +454,17 @@ fn dispatch_mieru_segment(
             if let Some(tx) = sessions.get(&session_id) {
                 let _ = tx.send(segment);
             } else {
-                write_mieru_close_response(&writer, session_id);
+                write_mieru_close_request(&writer, session_id);
             }
             Ok(())
         }
         CLOSE_SESSION_REQUEST | CLOSE_SESSION_RESPONSE => {
             let session_id = segment.metadata.session_id;
+            if segment.metadata.protocol_type == CLOSE_SESSION_REQUEST {
+                write_mieru_close_response(&writer, session_id);
+            }
             if let Some(tx) = sessions.remove(&session_id) {
                 let _ = tx.send(segment);
-            } else {
-                write_mieru_close_response(&writer, session_id);
             }
             Ok(())
         }
@@ -452,7 +481,7 @@ fn spawn_mieru_session(
     runtime: MieruSessionRuntime,
     done_tx: Sender<(u32, Result<(), (io::ErrorKind, String)>)>,
     sessions: &mut HashMap<u32, Sender<MieruSegment>>,
-    workers: &mut Vec<DetachedBlockingRelayHandle<()>>,
+    workers: &mut HashMap<u32, DetachedBlockingRelayHandle<()>>,
 ) -> io::Result<()> {
     let session_id = initial.metadata.session_id;
     if session_id == 0 {
@@ -470,18 +499,12 @@ fn spawn_mieru_session(
 
     let (tx, rx) = mpsc::channel();
     sessions.insert(session_id, tx);
-    workers.push(spawn_detached_blocking_relay_with_handle(
-        MIERU_SESSION_RELAY_LABEL,
-        move || {
-            let result =
-                handle_mieru_session(initial, rx, writer.clone(), user, client_ip, runtime)
-                    .map_err(|error| (error.kind(), error.to_string()));
-            if result.is_err() {
-                close_mieru_underlay(&writer);
-            }
-            let _ = done_tx.send((session_id, result));
-        },
-    )?);
+    let worker = spawn_detached_blocking_relay_with_handle(MIERU_SESSION_RELAY_LABEL, move || {
+        let result = handle_mieru_session(initial, rx, writer.clone(), user, client_ip, runtime)
+            .map_err(|error| (error.kind(), error.to_string()));
+        let _ = done_tx.send((session_id, result));
+    })?;
+    workers.insert(session_id, worker);
     Ok(())
 }
 
@@ -592,6 +615,12 @@ fn handle_mieru_session(
 fn write_mieru_close_response(writer: &Arc<Mutex<MieruWriter>>, session_id: u32) {
     if let Ok(mut writer) = writer.lock() {
         let _ = writer.write_close_response_for_session(session_id);
+    }
+}
+
+fn write_mieru_close_request(writer: &Arc<Mutex<MieruWriter>>, session_id: u32) {
+    if let Ok(mut writer) = writer.lock() {
+        let _ = writer.write_close_request_for_session(session_id);
     }
 }
 
@@ -889,8 +918,22 @@ impl MieruWriter {
         self.write_segment(metadata, &[])
     }
 
-    fn write_close_response(&mut self) -> io::Result<()> {
-        self.write_close_response_for_session(self.session_id)
+    fn write_close_request(&mut self) -> io::Result<()> {
+        self.write_close_request_for_session(self.session_id)
+    }
+
+    fn write_close_request_for_session(&mut self, session_id: u32) -> io::Result<()> {
+        let metadata = MieruMetadata {
+            protocol_type: CLOSE_SESSION_REQUEST,
+            session_id,
+            sequence: self.sequence,
+            status_code: STATUS_OK,
+            payload_len: 0,
+            prefix_len: 0,
+            suffix_len: 0,
+        };
+        self.sequence = self.sequence.saturating_add(1);
+        self.write_segment(metadata, &[])
     }
 
     fn write_close_response_for_session(&mut self, session_id: u32) -> io::Result<()> {
@@ -940,8 +983,7 @@ impl MieruWriter {
     }
 
     fn shutdown(&mut self) {
-        let _ = self.write_close_response();
-        let _ = self.stream.shutdown(Shutdown::Write);
+        let _ = self.write_close_request();
     }
 
     fn close_underlay(&mut self) {
@@ -983,11 +1025,11 @@ impl MieruSessionWriter {
             .write_open_response_for_session(self.session_id)
     }
 
-    fn write_close_response(&mut self) -> io::Result<()> {
+    fn write_close_request(&mut self) -> io::Result<()> {
         self.inner
             .lock()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "mieru writer lock poisoned"))?
-            .write_close_response_for_session(self.session_id)
+            .write_close_request_for_session(self.session_id)
     }
 }
 
@@ -1016,7 +1058,7 @@ impl Write for MieruSessionWriter {
 
 impl MieruOutput for MieruSessionWriter {
     fn shutdown_session(&mut self) {
-        let _ = self.write_close_response();
+        let _ = self.write_close_request();
     }
 }
 
@@ -2017,8 +2059,8 @@ mod tests {
         apply_nonce_user_hint, derive_mieru_key, encode_mieru_udp_frame, encode_segment_body,
         encode_socks_udp_packet, parse_socks_request, parse_socks_udp_packet, read_mieru_udp_frame,
         rounded_unix_time, MieruMetadata, MieruReader, MieruSegment, MieruServer,
-        MieruServerConfig, MieruSocksCommand, MieruWriter, SocksParseResult, DATA_CLIENT_TO_SERVER,
-        DATA_SERVER_TO_CLIENT, OPEN_SESSION_REQUEST, OPEN_SESSION_RESPONSE,
+        MieruServerConfig, MieruSocksCommand, MieruWriter, SocksParseResult, CLOSE_SESSION_REQUEST,
+        DATA_CLIENT_TO_SERVER, DATA_SERVER_TO_CLIENT, OPEN_SESSION_REQUEST, OPEN_SESSION_RESPONSE,
         SOCKS_CMD_UDP_ASSOCIATE, SOCKS_CONNECT_SUCCESS, STATUS_OK,
     };
     use crate::user::{CoreUser, CoreUserDelta};
@@ -2593,6 +2635,112 @@ mod tests {
     }
 
     #[test]
+    fn server_keeps_mieru_underlay_open_between_burst_sessions() {
+        let echo_a = TcpListener::bind("127.0.0.1:0").expect("echo a bind");
+        let echo_a_addr = echo_a.local_addr().expect("echo a addr");
+        let echo_a_thread = thread::spawn(move || {
+            let (mut stream, _) = echo_a.accept().expect("echo a accept");
+            let mut bytes = [0u8; 3];
+            stream.read_exact(&mut bytes).expect("echo a read");
+            assert_eq!(&bytes, b"one");
+            stream.write_all(b"eno").expect("echo a write");
+        });
+        let echo_b = TcpListener::bind("127.0.0.1:0").expect("echo b bind");
+        let echo_b_addr = echo_b.local_addr().expect("echo b addr");
+        let echo_b_thread = thread::spawn(move || {
+            let (mut stream, _) = echo_b.accept().expect("echo b accept");
+            let mut bytes = [0u8; 3];
+            stream.read_exact(&mut bytes).expect("echo b read");
+            assert_eq!(&bytes, b"two");
+            stream.write_all(b"owt").expect("echo b write");
+        });
+
+        let server = MieruServer::new(MieruServerConfig {
+            node_tag: "panel|mieru|1".to_string(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            users: vec![user()],
+            routes: Vec::new(),
+            connect_timeout: Duration::from_secs(5),
+        });
+        let listener = server.bind().expect("server bind");
+        let listen_addr = listener.local_addr().expect("listen addr");
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            server.handle_tcp_client(stream).expect("handle");
+            server.drain_traffic(1)
+        });
+
+        let client = TcpStream::connect(listen_addr).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("client read timeout");
+        let mut writer = test_client_writer(client.try_clone().expect("clone"), &user(), 51);
+        writer
+            .write_client_segment_for_session(
+                51,
+                OPEN_SESSION_REQUEST,
+                &socks_connect_request(echo_a_addr),
+            )
+            .expect("open first");
+        let mut reader = MieruReader::accept(client, &[user()]).expect("client reader");
+        assert_eq!(
+            reader
+                .take_initial_segment()
+                .expect("open response")
+                .metadata
+                .protocol_type,
+            OPEN_SESSION_RESPONSE
+        );
+        assert_socks_connect_success(&mut reader);
+        writer
+            .write_client_segment_for_session(51, DATA_CLIENT_TO_SERVER, b"one")
+            .expect("first data");
+        let mut first = [0u8; 3];
+        reader.read_exact(&mut first).expect("first response");
+        assert_eq!(&first, b"eno");
+        echo_a_thread.join().expect("echo a thread");
+
+        thread::sleep(Duration::from_millis(150));
+        writer
+            .write_client_segment_for_session(
+                52,
+                OPEN_SESSION_REQUEST,
+                &socks_connect_request(echo_b_addr),
+            )
+            .expect("open second on same underlay");
+        let mut opened_second = false;
+        let mut socks_second = false;
+        while !opened_second || !socks_second {
+            let segment = next_mieru_segment(&mut reader).expect("second setup segment");
+            match segment.metadata.protocol_type {
+                OPEN_SESSION_RESPONSE if segment.metadata.session_id == 52 => opened_second = true,
+                DATA_SERVER_TO_CLIENT
+                    if segment.metadata.session_id == 52
+                        && segment.payload == SOCKS_CONNECT_SUCCESS =>
+                {
+                    socks_second = true
+                }
+                _ => {}
+            }
+        }
+
+        writer
+            .write_client_segment_for_session(52, DATA_CLIENT_TO_SERVER, b"two")
+            .expect("second data");
+        let mut second = [0u8; 3];
+        reader.read_exact(&mut second).expect("second response");
+        assert_eq!(&second, b"owt");
+
+        writer.shutdown_write();
+        drop(reader);
+        echo_b_thread.join().expect("echo b thread");
+        let records = server_thread.join().expect("server thread");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].upload, 6);
+        assert_eq!(records[0].download, 6);
+    }
+
+    #[test]
     fn block_route_rejects_mieru_tcp_connect() {
         let server = MieruServer::new(MieruServerConfig {
             node_tag: "panel|mieru|1".to_string(),
@@ -2609,10 +2757,7 @@ mod tests {
         let listen_addr = listener.local_addr().expect("listen addr");
         let server_thread = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
-            let err = server
-                .handle_tcp_client(stream)
-                .expect_err("block route should reject");
-            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            server.handle_tcp_client(stream).expect("handle");
         });
 
         let client = TcpStream::connect(listen_addr).expect("connect");
@@ -2624,9 +2769,12 @@ mod tests {
             )
             .expect("open");
 
-        let err = MieruReader::accept(client, &[user()]).expect_err("server should close");
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        let mut reader = MieruReader::accept(client, &[user()]).expect("close reader");
+        let close = reader.take_initial_segment().expect("close request");
+        assert_eq!(close.metadata.protocol_type, CLOSE_SESSION_REQUEST);
+        assert_eq!(close.metadata.session_id, 90);
         drop(writer);
+        drop(reader);
         server_thread.join().expect("server thread");
     }
 
