@@ -372,10 +372,14 @@ where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    spawn_background_io(async move {
+    let task = async move {
         let _metrics = AsyncRelayMetricsGuard::new(name);
         future.await
-    })
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => Ok(handle.spawn(task)),
+        Err(_) => spawn_background_io(task),
+    }
 }
 
 pub(crate) fn relay_scheduler_metrics_snapshot() -> RelaySchedulerMetricsSnapshot {
@@ -1276,6 +1280,36 @@ mod tests {
             handle.await.expect("async relay task");
             let snapshot = super::relay_scheduler_metrics_snapshot();
             assert_eq!(snapshot.active_async.get("test-async-relay"), None);
+        });
+    }
+
+    #[test]
+    fn async_relay_metrics_allow_protocol_named_tasks() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let handle = super::spawn_async_relay("keli-core-vless-relay", async move {
+                let _ = release_rx.await;
+            })
+            .expect("spawn async relay");
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while super::relay_scheduler_metrics_snapshot()
+                .active_async
+                .get("keli-core-vless-relay")
+                != Some(&1)
+            {
+                if Instant::now() >= deadline {
+                    panic!("vless async relay metric did not become active");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            release_tx.send(()).expect("release async relay");
+            handle.await.expect("join async relay");
         });
     }
 

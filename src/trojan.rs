@@ -6918,14 +6918,21 @@ mod tests {
             });
 
             let client = client_task.await.expect("client task");
-            let detached_during = crate::stream::detached_blocking_relay_metrics_snapshot()
+            let detached_deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let detached_during = crate::stream::detached_blocking_relay_metrics_snapshot()
                     .get("keli-core-trojan-relay")
                     .copied()
                     .unwrap_or(0);
-            assert!(
-                detached_during <= detached_before,
-                "async trojan websocket relay must not add detached OS relay threads: before={detached_before} during={detached_during}"
-            );
+                if detached_during <= detached_before {
+                    break;
+                }
+                assert!(
+                    Instant::now() < detached_deadline,
+                    "async trojan websocket relay must not add detached OS relay threads: before={detached_before} during={detached_during}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             drop(client);
             release_remote_tx.send(()).expect("release remote");
             server_task

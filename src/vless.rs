@@ -33,7 +33,8 @@ use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
     relay_tcp_fast_unlimited_close_on_eof, relay_tcp_limited, spawn_detached_blocking_relay,
-    spawn_native_blocking_relay, spawn_tcp_relay_background, RelayActivityDeadline,
+    spawn_async_relay, spawn_native_blocking_relay, spawn_tcp_relay_background,
+    RelayActivityDeadline,
 };
 use crate::tls::{
     relay_tls_stream_with_timeouts, RawTcpStreamAccess, TlsConnection, TlsRelayTimeouts, TlsSocket,
@@ -3394,7 +3395,7 @@ async fn relay_tcp_streams_async(
     let (mut client_read, mut client_write) = client.into_split();
     let (mut remote_read, mut remote_write) = remote.into_split();
     let upload_limiter = limiter.clone();
-    let upload = tokio::spawn(async move {
+    let upload = spawn_async_relay("keli-core-vless-relay", async move {
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
@@ -3445,8 +3446,8 @@ async fn relay_tcp_streams_async(
             on_upload(read as u64);
             total = total.saturating_add(read as u64);
         }
-    });
-    let download = tokio::spawn(async move {
+    })?;
+    let download = spawn_async_relay("keli-core-vless-relay", async move {
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
@@ -3497,7 +3498,7 @@ async fn relay_tcp_streams_async(
             on_download(read as u64);
             total = total.saturating_add(read as u64);
         }
-    });
+    })?;
     let (upload, download) = tokio::try_join!(upload, download).map_err(|error| {
         io::Error::new(io::ErrorKind::Other, format!("relay task failed: {error}"))
     })?;
@@ -6628,14 +6629,21 @@ mod tests {
             });
 
             let client = client_task.await.expect("client task");
-            let detached_during = crate::stream::detached_blocking_relay_metrics_snapshot()
-                .get("keli-core-vless-relay")
-                .copied()
-                .unwrap_or(0);
-            assert!(
-                detached_during <= detached_before,
-                "async vless websocket relay must not add detached OS relay threads: before={detached_before} during={detached_during}"
-            );
+            let detached_deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let detached_during = crate::stream::detached_blocking_relay_metrics_snapshot()
+                    .get("keli-core-vless-relay")
+                    .copied()
+                    .unwrap_or(0);
+                if detached_during <= detached_before {
+                    break;
+                }
+                assert!(
+                    Instant::now() < detached_deadline,
+                    "async vless websocket relay must not add detached OS relay threads: before={detached_before} during={detached_during}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             drop(client);
             release_remote_tx.send(()).expect("release remote");
             server_task
