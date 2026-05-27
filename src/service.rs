@@ -1858,6 +1858,49 @@ fn start_vless_listener(
                 join: Some(join),
             });
         }
+        if network == "tcp" && inbound.flow.trim() == "xtls-rprx-vision" {
+            let join = spawn_async_tcp_accept_loop(
+                listener,
+                stop_for_thread,
+                workers_for_thread,
+                move |stream| {
+                    let server = server.clone();
+                    let tls_acceptor = tls_acceptor.clone();
+                    let tls_failures = tls_failures.clone();
+                    let tag = tag.clone();
+                    async move {
+                        let _ = handle_tcp_connection_with_failure_backoff_async(
+                            stream,
+                            move |stream| async move {
+                                let (client, peer_ip) = accept_tls_connection_async(
+                                    &tls_acceptor,
+                                    stream,
+                                    Protocol::Vless,
+                                    &tag,
+                                    &tls_failures,
+                                    connect_timeout,
+                                )
+                                .await?;
+                                server.handle_tls_client_async(client, peer_ip).await
+                            },
+                        )
+                        .await;
+                    }
+                },
+            );
+
+            return Ok(ListenerHandle {
+                status: ListenerStatus {
+                    tag: inbound.tag.clone(),
+                    protocol: Protocol::Vless,
+                    local_addr,
+                },
+                runtime: ListenerRuntime::Vless(runtime_server),
+                stop,
+                workers,
+                join: Some(join),
+            });
+        }
     }
     if tls_acceptor.is_none() && network == "tcp" {
         let join = spawn_async_tcp_accept_loop(

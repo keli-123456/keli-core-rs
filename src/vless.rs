@@ -78,6 +78,7 @@ const VLESS_TLS_DETACHED_RELAY_LABEL: &str = "keli-core-vless-tls-relay";
 const VLESS_TLS_WEBSOCKET_DETACHED_RELAY_LABEL: &str = "keli-core-vless-tls-ws-relay";
 const VLESS_WEBSOCKET_UPLOAD_NATIVE_RELAY_LABEL: &str = "keli-core-vless-ws-upload";
 const VLESS_VISION_NATIVE_RELAY_LABEL: &str = "keli-core-vless-vision-relay";
+const VLESS_VISION_ASYNC_RELAY_LABEL: &str = "keli-core-vless-vision-relay";
 const VLESS_HTTPUPGRADE_BRIDGE_NATIVE_RELAY_LABEL: &str = "keli-core-vless-httpupgrade-bridge";
 const VLESS_TLS_BRIDGE_NATIVE_RELAY_LABEL: &str = "keli-core-vless-tls-bridge";
 const VLESS_WEBSOCKET_BRIDGE_NATIVE_RELAY_LABEL: &str = "keli-core-vless-ws-bridge";
@@ -540,6 +541,85 @@ impl VlessServer {
         });
         client.write_all(&[VERSION, 0x00])?;
         self.spawn_tls_relay(client, remote, request, bandwidth, session)
+    }
+
+    pub async fn handle_tls_client_async(
+        &self,
+        client: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        client_ip: Option<IpAddr>,
+    ) -> io::Result<()> {
+        let result = self.handle_tls_client_async_inner(client, client_ip).await;
+        if let Err(error) = &result {
+            record_vless_connection_error(&self.config.node_tag, "tls", error);
+        }
+        result
+    }
+
+    async fn handle_tls_client_async_inner(
+        &self,
+        mut client: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        client_ip: Option<IpAddr>,
+    ) -> io::Result<()> {
+        let client_shutdown = clone_tokio_tcp_stream_for_shutdown(client.get_ref().0).ok();
+        let peer_ip =
+            client_ip.or_else(|| client.get_ref().0.peer_addr().ok().map(|addr| addr.ip()));
+        let mut request = match tokio::time::timeout(
+            self.config.connect_timeout,
+            self.read_request_async(&mut client),
+        )
+        .await
+        {
+            Ok(Ok(request)) => request,
+            Ok(Err(error)) => {
+                shutdown_cloned_tcp_stream(&client_shutdown);
+                return Err(error);
+            }
+            Err(_) => {
+                shutdown_cloned_tcp_stream(&client_shutdown);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "vless tls auth timed out",
+                ));
+            }
+        };
+        request.client_ip = peer_ip;
+        let user = self.request_user(&request);
+        let session = self.acquire_user_session(user.as_ref(), peer_ip)?;
+        let bandwidth = if request.command == VlessCommand::Udp {
+            self.bandwidth.limiter_for(user.as_ref())
+        } else {
+            self.bandwidth.limiter_for_limited(user.as_ref())
+        };
+        if request.command == VlessCommand::Udp {
+            client.write_all(&[VERSION, 0x00]).await?;
+            client.flush().await?;
+            return self
+                .relay_udp_stream_async(client, request, bandwidth)
+                .await;
+        }
+        let remote = match self.connect_tcp_for_request_async(&request).await {
+            Ok(remote) => remote,
+            Err(error) => {
+                shutdown_cloned_tcp_stream(&client_shutdown);
+                return Err(error);
+            }
+        };
+        trace_vless(|| {
+            format!(
+                "async tls request target={}:{} flow={} user={}",
+                request.target.host, request.target.port, request.flow, request.user_key
+            )
+        });
+        if let Err(error) = client.write_all(&[VERSION, 0x00]).await {
+            shutdown_cloned_tcp_stream(&client_shutdown);
+            return Err(error);
+        }
+        if let Err(error) = client.flush().await {
+            shutdown_cloned_tcp_stream(&client_shutdown);
+            return Err(error);
+        }
+        self.relay_tls_async(client, remote, request, bandwidth, session)
+            .await
     }
 
     pub fn handle_tls_websocket_client(
@@ -1341,6 +1421,62 @@ impl VlessServer {
         }
     }
 
+    async fn relay_tls_async(
+        &self,
+        client: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        remote: tokio::net::TcpStream,
+        request: VlessRequest,
+        bandwidth: Option<Arc<BandwidthLimiter>>,
+        session: Option<UserSessionGuard>,
+    ) -> io::Result<()> {
+        let _session = session;
+        if request.flow != FLOW_XTLS_RPRX_VISION {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "async vless tls handler currently supports xtls-rprx-vision",
+            ));
+        }
+
+        let _connection = self.bandwidth.register_tokio_tcp_connection(
+            Some(&request.user_uuid),
+            &[client.get_ref().0, &remote],
+        )?;
+        let upload_traffic = self.traffic.clone();
+        let upload_node_tag = self.config.node_tag.clone();
+        let upload_user_uuid = request.user_uuid.clone();
+        let upload_user_id = request.user_numeric_id;
+        let download_traffic = self.traffic.clone();
+        let download_node_tag = self.config.node_tag.clone();
+        let download_user_uuid = request.user_uuid;
+        let download_user_id = request.user_numeric_id;
+        let upload_flush = traffic_flush_callback(
+            upload_traffic,
+            upload_node_tag,
+            upload_user_uuid,
+            Some(upload_user_id),
+            true,
+            request.client_ip,
+        );
+        let download_flush = traffic_flush_callback(
+            download_traffic,
+            download_node_tag,
+            download_user_uuid,
+            Some(download_user_id),
+            false,
+            None,
+        );
+        relay_tls_vision_stream_async(
+            client,
+            remote,
+            request.user_id,
+            bandwidth,
+            true,
+            upload_flush,
+            download_flush,
+        )
+        .await
+    }
+
     fn relay_tls<S>(
         &self,
         client: TlsConnection<S>,
@@ -1542,12 +1678,15 @@ impl VlessServer {
         result
     }
 
-    async fn relay_udp_stream_async(
+    async fn relay_udp_stream_async<S>(
         &self,
-        mut stream: tokio::net::TcpStream,
+        mut stream: S,
         request: VlessRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
-    ) -> io::Result<()> {
+    ) -> io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let mut state = AsyncVlessUdpRelayState::new(self.config.connect_timeout);
         let mut upload = 0u64;
         let mut download = 0u64;
@@ -3406,6 +3545,25 @@ async fn relay_tcp_streams_async(
     mut on_upload: impl FnMut(u64) + Send + 'static,
     mut on_download: impl FnMut(u64) + Send + 'static,
 ) -> io::Result<(u64, u64)> {
+    relay_tcp_streams_async_with_label(
+        VLESS_ASYNC_RELAY_LABEL,
+        client,
+        remote,
+        limiter,
+        move |bytes| on_upload(bytes),
+        move |bytes| on_download(bytes),
+    )
+    .await
+}
+
+async fn relay_tcp_streams_async_with_label(
+    label: &'static str,
+    client: tokio::net::TcpStream,
+    remote: tokio::net::TcpStream,
+    limiter: Option<Arc<BandwidthLimiter>>,
+    mut on_upload: impl FnMut(u64) + Send + 'static,
+    mut on_download: impl FnMut(u64) + Send + 'static,
+) -> io::Result<(u64, u64)> {
     let upload_client_shutdown = clone_tokio_tcp_stream_for_shutdown(&client)?;
     let upload_remote_shutdown = clone_tokio_tcp_stream_for_shutdown(&remote)?;
     let download_client_shutdown = clone_tokio_tcp_stream_for_shutdown(&client)?;
@@ -3413,7 +3571,7 @@ async fn relay_tcp_streams_async(
     let (mut client_read, mut client_write) = client.into_split();
     let (mut remote_read, mut remote_write) = remote.into_split();
     let upload_limiter = limiter.clone();
-    let upload = spawn_async_relay(VLESS_ASYNC_RELAY_LABEL, async move {
+    let upload = spawn_async_relay(label, async move {
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
@@ -3465,7 +3623,7 @@ async fn relay_tcp_streams_async(
             total = total.saturating_add(read as u64);
         }
     })?;
-    let download = spawn_async_relay(VLESS_ASYNC_RELAY_LABEL, async move {
+    let download = spawn_async_relay(label, async move {
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
         loop {
@@ -3532,6 +3690,12 @@ fn close_tcp_pair(left: &TcpStream, right: &TcpStream) {
     let _ = right.shutdown(Shutdown::Both);
 }
 
+fn shutdown_cloned_tcp_stream(socket: &Option<TcpStream>) {
+    if let Some(socket) = socket {
+        let _ = socket.shutdown(Shutdown::Both);
+    }
+}
+
 async fn async_write_all_with_timeout<W>(writer: &mut W, buffer: &[u8]) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -3552,6 +3716,19 @@ fn vless_async_relay_io_timeout() -> Duration {
         .filter(|seconds| *seconds > 0)
         .unwrap_or(DEFAULT_VLESS_ASYNC_RELAY_IO_TIMEOUT_SECS);
     Duration::from_secs(seconds)
+}
+
+async fn async_flush_with_timeout<W>(writer: &mut W) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(vless_async_relay_io_timeout(), writer.flush()).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "vless relay flush timed out",
+        )),
+    }
 }
 
 async fn wait_limiter_revoke(limiter: &BandwidthLimiter) {
@@ -3651,6 +3828,278 @@ where
         write_initial_padding,
         Some(on_raw_relay_finish),
     )
+}
+
+async fn relay_tls_vision_stream_async<FU, FD>(
+    mut client: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    mut remote: tokio::net::TcpStream,
+    user_id: [u8; 16],
+    limiter: Option<Arc<BandwidthLimiter>>,
+    write_initial_padding: bool,
+    mut on_upload: FU,
+    mut on_download: FD,
+) -> io::Result<()>
+where
+    FU: FnMut(u64) + Send + 'static,
+    FD: FnMut(u64) + Send + 'static,
+{
+    enum VisionAsyncRelayEvent {
+        Client(io::Result<usize>),
+        Remote(io::Result<usize>),
+        DrainTimeout,
+    }
+
+    let drain_after_client_eof = vless_vision_drain_after_client_eof();
+    let client_shutdown = clone_tokio_tcp_stream_for_shutdown(client.get_ref().0).ok();
+    let remote_shutdown = clone_tokio_tcp_stream_for_shutdown(&remote).ok();
+    let mut upload = 0u64;
+    let mut download = 0u64;
+    let mut upload_done = false;
+    let mut download_done = false;
+    let mut client_eof_at = None::<Instant>;
+    let mut client_buffer = [0u8; 16 * 1024];
+    let mut remote_buffer = [0u8; 16 * 1024];
+    let mut vision_decoder = VisionDecoder::new(user_id);
+    let mut vision_encoder = VisionEncoder::new(user_id);
+    let mut uplink_direct = false;
+    let mut downlink_direct = false;
+    let trace = vless_trace_enabled();
+
+    if trace {
+        eprintln!("keli-core-rs vless trace: async vision relay start");
+    }
+
+    if write_initial_padding {
+        let frame = vision_encoder
+            .empty_long_padding_frame()
+            .expect("new vision encoder should emit initial padding");
+        async_write_all_with_timeout(&mut client, &frame).await?;
+        async_flush_with_timeout(&mut client).await?;
+    }
+
+    while !upload_done || !download_done {
+        if limiter
+            .as_deref()
+            .map(BandwidthLimiter::is_revoked)
+            .unwrap_or(false)
+        {
+            shutdown_cloned_tcp_stream(&client_shutdown);
+            shutdown_cloned_tcp_stream(&remote_shutdown);
+            break;
+        }
+
+        if !upload_done && !uplink_direct {
+            let decoded = vision_decoder.read_decoded(&mut client_buffer)?;
+            if decoded > 0 {
+                if trace {
+                    eprintln!(
+                        "keli-core-rs vless trace: async vision upload decoded={} first={:02x?}",
+                        decoded,
+                        &client_buffer[..decoded.min(8)]
+                    );
+                }
+                if let Some(limiter) = limiter.as_deref() {
+                    if !limiter.wait_for_async(decoded).await {
+                        upload_done = true;
+                        download_done = true;
+                        shutdown_cloned_tcp_stream(&client_shutdown);
+                        shutdown_cloned_tcp_stream(&remote_shutdown);
+                        continue;
+                    }
+                }
+                async_write_all_with_timeout(&mut remote, &client_buffer[..decoded]).await?;
+                upload = upload.saturating_add(decoded as u64);
+                if vision_decoder.is_direct_copy() {
+                    uplink_direct = true;
+                    if trace {
+                        eprintln!("keli-core-rs vless trace: async vision upload switched direct");
+                    }
+                }
+                continue;
+            }
+            if vision_decoder.is_direct_copy() {
+                uplink_direct = true;
+                if trace {
+                    eprintln!("keli-core-rs vless trace: async vision upload switched direct");
+                }
+                continue;
+            }
+        }
+
+        if uplink_direct && downlink_direct && vision_decoder.is_drained() {
+            #[cfg(test)]
+            VLESS_VISION_RAW_RELAY_SWITCHES.fetch_add(1, Ordering::Relaxed);
+            if trace {
+                eprintln!("keli-core-rs vless trace: async vision switched to raw tcp relay");
+            }
+            on_upload(upload);
+            on_upload(0);
+            on_download(download);
+            on_download(0);
+            let (raw_client, _) = client.into_inner();
+            relay_tcp_streams_async_with_label(
+                VLESS_VISION_ASYNC_RELAY_LABEL,
+                raw_client,
+                remote,
+                limiter,
+                on_upload,
+                on_download,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if client_eof_at
+            .map(|instant| instant.elapsed() >= drain_after_client_eof)
+            .unwrap_or(false)
+        {
+            shutdown_cloned_tcp_stream(&client_shutdown);
+            shutdown_cloned_tcp_stream(&remote_shutdown);
+            break;
+        }
+
+        let drain_wait = client_eof_at
+            .map(|instant| drain_after_client_eof.saturating_sub(instant.elapsed()))
+            .unwrap_or(Duration::from_secs(0));
+        let event = tokio::select! {
+            result = async {
+                if uplink_direct {
+                    client.get_mut().0.read(&mut client_buffer).await
+                } else {
+                    client.read(&mut client_buffer).await
+                }
+            }, if !upload_done => VisionAsyncRelayEvent::Client(result),
+            result = remote.read(&mut remote_buffer), if !download_done => {
+                VisionAsyncRelayEvent::Remote(result)
+            },
+            _ = tokio::time::sleep(drain_wait), if client_eof_at.is_some() => {
+                VisionAsyncRelayEvent::DrainTimeout
+            },
+        };
+
+        match event {
+            VisionAsyncRelayEvent::Client(Ok(0)) => {
+                upload_done = true;
+                client_eof_at = Some(Instant::now());
+                if !uplink_direct {
+                    vision_decoder.finish();
+                }
+                let _ = remote.shutdown().await;
+            }
+            VisionAsyncRelayEvent::Client(Ok(read)) if uplink_direct => {
+                if trace {
+                    eprintln!(
+                        "keli-core-rs vless trace: async vision upload raw={} first={:02x?}",
+                        read,
+                        &client_buffer[..read.min(8)]
+                    );
+                }
+                if let Some(limiter) = limiter.as_deref() {
+                    if !limiter.wait_for_async(read).await {
+                        upload_done = true;
+                        download_done = true;
+                        shutdown_cloned_tcp_stream(&client_shutdown);
+                        shutdown_cloned_tcp_stream(&remote_shutdown);
+                        continue;
+                    }
+                }
+                async_write_all_with_timeout(&mut remote, &client_buffer[..read]).await?;
+                upload = upload.saturating_add(read as u64);
+            }
+            VisionAsyncRelayEvent::Client(Ok(read)) => {
+                vision_decoder.push(&client_buffer[..read]);
+                if vision_decoder.is_direct_copy() {
+                    uplink_direct = true;
+                    if trace {
+                        eprintln!("keli-core-rs vless trace: async vision upload switched direct");
+                    }
+                }
+            }
+            VisionAsyncRelayEvent::Client(Err(error)) => {
+                if !is_stream_closed(&error) {
+                    return Err(error);
+                }
+                upload_done = true;
+                client_eof_at = Some(Instant::now());
+                let _ = remote.shutdown().await;
+            }
+            VisionAsyncRelayEvent::Remote(Ok(0)) => {
+                if !downlink_direct {
+                    if let Some(frame) = vision_encoder.finish_padding() {
+                        let _ = async_write_all_with_timeout(&mut client, &frame).await;
+                        let _ = async_flush_with_timeout(&mut client).await;
+                    }
+                }
+                download_done = true;
+                upload_done = true;
+                shutdown_cloned_tcp_stream(&client_shutdown);
+                shutdown_cloned_tcp_stream(&remote_shutdown);
+            }
+            VisionAsyncRelayEvent::Remote(Ok(read)) => {
+                if trace {
+                    eprintln!(
+                        "keli-core-rs vless trace: async vision download read={} first={:02x?}",
+                        read,
+                        &remote_buffer[..read.min(8)]
+                    );
+                }
+                if let Some(limiter) = limiter.as_deref() {
+                    if !limiter.wait_for_async(read).await {
+                        download_done = true;
+                        upload_done = true;
+                        shutdown_cloned_tcp_stream(&client_shutdown);
+                        shutdown_cloned_tcp_stream(&remote_shutdown);
+                        continue;
+                    }
+                }
+                if downlink_direct {
+                    async_write_all_with_timeout(client.get_mut().0, &remote_buffer[..read])
+                        .await?;
+                } else {
+                    let frame = vision_encoder.encode(&remote_buffer[..read]);
+                    async_write_all_with_timeout(&mut client, &frame).await?;
+                    async_flush_with_timeout(&mut client).await?;
+                    if vision_encoder.is_direct_copy() {
+                        downlink_direct = true;
+                        if trace {
+                            eprintln!(
+                                "keli-core-rs vless trace: async vision download switched direct"
+                            );
+                        }
+                    }
+                }
+                download = download.saturating_add(read as u64);
+            }
+            VisionAsyncRelayEvent::Remote(Err(error)) => {
+                if !is_stream_closed(&error) {
+                    return Err(error);
+                }
+                download_done = true;
+                upload_done = true;
+                shutdown_cloned_tcp_stream(&client_shutdown);
+                shutdown_cloned_tcp_stream(&remote_shutdown);
+            }
+            VisionAsyncRelayEvent::DrainTimeout => {
+                shutdown_cloned_tcp_stream(&client_shutdown);
+                shutdown_cloned_tcp_stream(&remote_shutdown);
+                break;
+            }
+        }
+    }
+
+    shutdown_cloned_tcp_stream(&client_shutdown);
+    shutdown_cloned_tcp_stream(&remote_shutdown);
+    on_upload(upload);
+    on_upload(0);
+    on_download(download);
+    on_download(0);
+    if trace {
+        eprintln!(
+            "keli-core-rs vless trace: async vision relay finish upload={} download={}",
+            upload, download
+        );
+    }
+    Ok(())
 }
 
 fn relay_tls_vision_stream_inner<S, F>(
@@ -6161,8 +6610,8 @@ mod tests {
             "vless vision relay must not occupy native relay workers: before={native_before} during={native_during}"
         );
         assert!(
-            blocking_during > blocking_before,
-            "vless vision relay should run outside the shared native worker pool: before={blocking_before} during={blocking_during}"
+            blocking_during > 0,
+            "vless vision relay should run outside the shared native worker pool using detached blocking fallback: before={blocking_before} during={blocking_during}"
         );
 
         drop(client);
@@ -6308,6 +6757,110 @@ mod tests {
             super::VLESS_VISION_RAW_RELAY_SWITCHES.load(Ordering::SeqCst) > 0,
             "VLESS Vision relay should switch to the raw TCP fast path after direct copy"
         );
+    }
+
+    #[test]
+    fn tls_vision_async_switches_to_raw_tcp_fast_path() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            super::VLESS_VISION_RAW_RELAY_SWITCHES.store(0, Ordering::SeqCst);
+            let cert = test_cert("vless-vision-async-raw-fast-path");
+            let echo = TcpListener::bind("127.0.0.1:0").expect("echo bind");
+            let echo_addr = echo.local_addr().expect("echo addr");
+            let client_hello = tls_client_hello_like_record();
+            let app_data = tls_application_data_record(b"GET / HTTP/1.1\r\n\r\n");
+            let expected_len = client_hello.len() + app_data.len();
+            let client_hello_len = client_hello.len();
+            let app_data_len = app_data.len();
+            let (release_remote_tx, release_remote_rx) = mpsc::channel();
+            let echo_thread = thread::spawn(move || {
+                let (mut stream, _) = echo.accept().expect("echo accept");
+                let mut first = vec![0u8; client_hello_len];
+                stream.read_exact(&mut first).expect("echo first read");
+                stream.write_all(&first).expect("echo first write");
+                let mut second = vec![0u8; app_data_len];
+                stream.read_exact(&mut second).expect("echo second read");
+                stream.write_all(&second).expect("echo second write");
+                let _ = release_remote_rx.recv_timeout(Duration::from_secs(3));
+            });
+
+            let server = server_with_flow("xtls-rprx-vision");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("vless bind");
+            let vless_addr = listener.local_addr().expect("vless addr");
+            let acceptor =
+                TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+            let acceptor = tokio_rustls::TlsAcceptor::from(acceptor.server_config());
+            let server_task = tokio::spawn(async move {
+                let (stream, peer) = listener.accept().await.expect("vless accept");
+                let client = acceptor.accept(stream).await.expect("tls accept");
+                server
+                    .handle_tls_client_async(client, Some(peer.ip()))
+                    .await
+            });
+
+            let client_task = tokio::task::spawn_blocking(move || {
+                let mut client = tls_client(vless_addr, cert.cert_der.clone());
+                client
+                    .write_all(&vless_request_with_flow(echo_addr, "xtls-rprx-vision"))
+                    .expect("client request");
+                let mut response = [0u8; 2];
+                client.read_exact(&mut response).expect("client response");
+                assert_eq!(response, [0x00, 0x00]);
+
+                let mut encoder = VisionEncoder::new([0x11; 16]);
+                let first_encoded = encoder.encode(&client_hello);
+                let second_encoded = encoder.encode(&app_data);
+                client
+                    .write_all(&first_encoded)
+                    .expect("client write client hello");
+                thread::sleep(Duration::from_millis(50));
+                client
+                    .write_all(&second_encoded)
+                    .expect("client write app data");
+
+                let mut vision_reader = VisionReader::new(&mut client, [0x11; 16]);
+                let mut echoed = vec![0u8; expected_len];
+                vision_reader
+                    .read_exact(&mut echoed)
+                    .expect("client read payload");
+                assert_eq!(echoed.len(), expected_len);
+                drop(vision_reader);
+                client
+            });
+
+            let client = client_task.await.expect("client task");
+            let async_deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let snapshot = crate::stream::relay_scheduler_metrics_snapshot();
+                let active_async = snapshot
+                    .active_async
+                    .get(super::VLESS_VISION_ASYNC_RELAY_LABEL)
+                    .copied()
+                    .unwrap_or(0);
+                if active_async > 0 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < async_deadline,
+                    "async VLESS Vision relay should move raw TCP fast path onto async relay metrics"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            drop(client);
+            release_remote_tx.send(()).expect("release remote");
+            server_task
+                .await
+                .expect("server task")
+                .expect("async tls vision relay");
+            echo_thread.join().expect("echo thread");
+            assert!(
+                super::VLESS_VISION_RAW_RELAY_SWITCHES.load(Ordering::SeqCst) > 0,
+                "async VLESS Vision relay should switch to the raw TCP fast path"
+            );
+        });
     }
 
     #[test]

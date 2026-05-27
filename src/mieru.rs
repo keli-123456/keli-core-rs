@@ -38,6 +38,7 @@ const ENCRYPTED_METADATA_LEN: usize = METADATA_LEN + TAG_LEN;
 const MAX_TCP_FRAGMENT_LEN: usize = 32 * 1024;
 const MAX_SESSION_PAYLOAD_LEN: usize = 1024;
 const MAX_PADDING_SCAN: usize = 8192;
+const MIERU_SESSION_RELAY_LABEL: &str = "keli-core-mieru-session";
 const KEY_WINDOW_SECS: i64 = 120;
 const OPEN_SESSION_REQUEST: u8 = 2;
 const OPEN_SESSION_RESPONSE: u8 = 3;
@@ -470,7 +471,7 @@ fn spawn_mieru_session(
     let (tx, rx) = mpsc::channel();
     sessions.insert(session_id, tx);
     workers.push(spawn_detached_blocking_relay_with_handle(
-        "keli-core-mieru-session",
+        MIERU_SESSION_RELAY_LABEL,
         move || {
             let result =
                 handle_mieru_session(initial, rx, writer.clone(), user, client_ip, runtime)
@@ -2035,23 +2036,14 @@ mod tests {
 
     #[test]
     fn mieru_session_worker_uses_detached_blocking_fallback_metric() {
+        assert_eq!(super::MIERU_SESSION_RELAY_LABEL, "keli-core-mieru-session");
+        let test_label = "keli-core-mieru-session-test";
         let snapshot = crate::stream::relay_scheduler_metrics_snapshot();
-        assert_eq!(
-            snapshot
-                .active_detached_blocking
-                .get("keli-core-mieru-session"),
-            None
-        );
+        assert_eq!(snapshot.active_detached_blocking.get(test_label), None);
 
-        let _guard =
-            crate::stream::DetachedBlockingRelayMetricsGuard::new("keli-core-mieru-session");
+        let _guard = crate::stream::DetachedBlockingRelayMetricsGuard::new(test_label);
         let snapshot = crate::stream::relay_scheduler_metrics_snapshot();
-        assert_eq!(
-            snapshot
-                .active_detached_blocking
-                .get("keli-core-mieru-session"),
-            Some(&1)
-        );
+        assert_eq!(snapshot.active_detached_blocking.get(test_label), Some(&1));
     }
 
     #[test]
