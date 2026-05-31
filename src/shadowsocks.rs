@@ -167,6 +167,7 @@ impl ShadowsocksServer {
 
     pub fn handle_tcp_client(&self, client: TcpStream) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        self.router.ensure_source_ip_allowed(client_ip)?;
         let method = ShadowsocksMethod::parse(&self.config.method)?;
         let mut request = self.read_request(client, method)?;
         request.client_ip = client_ip;
@@ -337,6 +338,8 @@ impl ShadowsocksServer {
         remotes: &mut HashMap<SocketAddr, UdpClientContext>,
         client_sessions: &mut HashMap<SocketAddr, UdpClientSession>,
     ) -> io::Result<()> {
+        self.router
+            .ensure_source_ip_allowed(Some(client_addr.ip()))?;
         let decision =
             self.router
                 .decide_udp(&request.target.host, request.target.port, &request.payload);
@@ -428,6 +431,8 @@ impl ShadowsocksServer {
         user: &CoreUser,
         client_sessions: &mut HashMap<SocketAddr, UdpClientSession>,
     ) -> io::Result<()> {
+        self.router
+            .ensure_source_ip_allowed(Some(client_addr.ip()))?;
         if let Some(session) = client_sessions.get_mut(&client_addr) {
             if session.user_uuid == user.uuid {
                 session.last_seen = Instant::now();

@@ -1,5 +1,5 @@
 use std::io;
-use std::net::{SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -111,6 +111,20 @@ impl RouteDispatcher {
 
     pub fn decide_target(&self, host: &str, port: u16, protocol_labels: &str) -> RouteDecision {
         self.decide_with_labels(host, port, protocol_labels)
+    }
+
+    pub fn source_ip_blocked(&self, source_ip: Option<IpAddr>) -> bool {
+        source_ip.is_some_and(|ip| self.router.load().source_ip_blocked(ip))
+    }
+
+    pub fn ensure_source_ip_allowed(&self, source_ip: Option<IpAddr>) -> io::Result<()> {
+        if self.source_ip_blocked(source_ip) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "source ip blocked by route",
+            ));
+        }
+        Ok(())
     }
 
     pub fn connect_tcp(

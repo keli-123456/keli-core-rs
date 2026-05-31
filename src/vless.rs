@@ -230,6 +230,7 @@ impl VlessServer {
         let _ = client.set_read_timeout(Some(self.config.connect_timeout));
         let _ = client.set_write_timeout(Some(self.config.connect_timeout));
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        self.router.ensure_source_ip_allowed(client_ip)?;
         let mut request = match self.read_request(&mut client) {
             Ok(request) => request,
             Err(error) => {
@@ -311,6 +312,7 @@ impl VlessServer {
     ) -> io::Result<()> {
         let client_shutdown = clone_tokio_tcp_stream_for_shutdown(&client).ok();
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        self.router.ensure_source_ip_allowed(client_ip)?;
         let mut request = match self.read_request_async(&mut client).await {
             Ok(request) => request,
             Err(error) => {
@@ -413,7 +415,9 @@ impl VlessServer {
     ) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let (reader, writer, forwarded_ip) = accept_websocket_with_client_ip(client, path)?;
-        self.handle_websocket_split_client_with_ip(reader, writer, forwarded_ip.or(client_ip))
+        let source_ip = forwarded_ip.or(client_ip);
+        self.router.ensure_source_ip_allowed(source_ip)?;
+        self.handle_websocket_split_client_with_ip(reader, writer, source_ip)
     }
 
     pub fn handle_split_client<R, W>(&self, reader: R, writer: W) -> io::Result<()>
@@ -438,6 +442,7 @@ impl VlessServer {
         R: Read + Send + 'static,
         W: Write + Send + 'static,
     {
+        self.router.ensure_source_ip_allowed(client_ip)?;
         let mut request = self.read_request(&mut reader)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
@@ -486,6 +491,7 @@ impl VlessServer {
         mut writer: WebSocketWriter,
         client_ip: Option<IpAddr>,
     ) -> io::Result<()> {
+        self.router.ensure_source_ip_allowed(client_ip)?;
         let mut request = self.read_request(&mut reader)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
@@ -529,6 +535,7 @@ impl VlessServer {
     {
         let _ = client.set_io_timeout(Some(self.config.connect_timeout));
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        self.router.ensure_source_ip_allowed(client_ip)?;
         let mut request = self.read_request(&mut client)?;
         let _ = client.set_io_timeout(None);
         request.client_ip = client_ip;
@@ -612,6 +619,7 @@ impl VlessServer {
                 .ok()
                 .map(|addr| addr.ip())
         });
+        self.router.ensure_source_ip_allowed(peer_ip)?;
         let mut request = match tokio::time::timeout(
             self.config.connect_timeout,
             self.read_request_async(&mut client),
@@ -690,8 +698,10 @@ impl VlessServer {
     ) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let (mut websocket, forwarded_ip) = accept_websocket_tls_with_client_ip(client, path)?;
+        let source_ip = forwarded_ip.or(client_ip);
+        self.router.ensure_source_ip_allowed(source_ip)?;
         let mut request = self.read_request(&mut websocket)?;
-        request.client_ip = forwarded_ip.or(client_ip);
+        request.client_ip = source_ip;
         let user = self.request_user(&request);
         let session = self.acquire_user_session(user.as_ref(), request.client_ip)?;
         let bandwidth = if request.command == VlessCommand::Udp {
@@ -744,13 +754,15 @@ impl VlessServer {
     {
         let (mut websocket, forwarded_ip) =
             accept_websocket_async_with_client_ip(client, path).await?;
+        let source_ip = forwarded_ip.or(client_ip);
+        self.router.ensure_source_ip_allowed(source_ip)?;
         let mut request = tokio::time::timeout(
             self.config.connect_timeout,
             self.read_request_from_async_websocket(&mut websocket),
         )
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "vless websocket auth timed out"))??;
-        request.client_ip = forwarded_ip.or(client_ip);
+        request.client_ip = source_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), request.client_ip)?;
         let bandwidth = if request.command == VlessCommand::Udp {

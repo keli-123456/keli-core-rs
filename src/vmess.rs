@@ -214,6 +214,7 @@ impl VmessServer {
 
     pub fn handle_tcp_client(&self, mut client: TcpStream) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        self.router.ensure_source_ip_allowed(client_ip)?;
         let mut request = self.read_request(&mut client)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
@@ -238,7 +239,9 @@ impl VmessServer {
     pub fn handle_websocket_client(&self, client: TcpStream, path: Option<&str>) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let (reader, writer, forwarded_ip) = accept_websocket_with_client_ip(client, path)?;
-        self.handle_split_client_with_ip(reader, writer, forwarded_ip.or(client_ip))
+        let source_ip = forwarded_ip.or(client_ip);
+        self.router.ensure_source_ip_allowed(source_ip)?;
+        self.handle_split_client_with_ip(reader, writer, source_ip)
     }
 
     pub fn handle_split_client<R, W>(&self, reader: R, writer: W) -> io::Result<()>
@@ -259,6 +262,7 @@ impl VmessServer {
         R: Read + Send + 'static,
         W: Write,
     {
+        self.router.ensure_source_ip_allowed(client_ip)?;
         let mut request = self.read_request(&mut reader)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
@@ -279,6 +283,7 @@ impl VmessServer {
 
     pub fn handle_tls_client(&self, mut client: TlsConnection) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        self.router.ensure_source_ip_allowed(client_ip)?;
         let mut request = self.read_request(&mut client)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
@@ -305,8 +310,10 @@ impl VmessServer {
     ) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let (mut websocket, forwarded_ip) = accept_websocket_tls_with_client_ip(client, path)?;
+        let source_ip = forwarded_ip.or(client_ip);
+        self.router.ensure_source_ip_allowed(source_ip)?;
         let mut request = self.read_request(&mut websocket)?;
-        request.client_ip = forwarded_ip.or(client_ip);
+        request.client_ip = source_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), request.client_ip)?;
         let bandwidth = if request.command == VmessCommand::Udp {

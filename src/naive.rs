@@ -264,6 +264,7 @@ impl NaiveServer {
     pub async fn handle_tcp_client(&self, client: tokio::net::TcpStream) -> io::Result<()> {
         let peer_addr = client.peer_addr().ok();
         let peer_ip = peer_addr.map(|addr| addr.ip());
+        self.router.ensure_source_ip_allowed(peer_ip)?;
         if let Some(ip) = peer_ip {
             if self.tls_failures.is_blocked(ip) {
                 return Err(io::Error::new(
@@ -307,6 +308,12 @@ impl NaiveServer {
     async fn handle_quic_incoming(&self, incoming: quinn::Incoming) -> io::Result<()> {
         let peer_addr = incoming.remote_address();
         let peer_ip = peer_addr.ip();
+        if self.router.source_ip_blocked(Some(peer_ip)) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "source ip blocked by route",
+            ));
+        }
         if self.tls_failures.is_blocked(peer_ip) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -370,6 +377,13 @@ impl NaiveServer {
         peer_addr: Option<SocketAddr>,
     ) -> io::Result<()> {
         let wants_padding = h2_request.headers().get("padding").is_some();
+        if let Err(error) = self
+            .router
+            .ensure_source_ip_allowed(peer_addr.map(|addr| addr.ip()))
+        {
+            let _ = send_status(&mut respond, StatusCode::FORBIDDEN, wants_padding);
+            return Err(error);
+        }
         if let Some(ip) = peer_addr.map(|addr| addr.ip()) {
             if self.auth_failures.is_blocked(ip) {
                 let _ = send_status(&mut respond, StatusCode::TOO_MANY_REQUESTS, wants_padding);
@@ -460,6 +474,13 @@ impl NaiveServer {
         peer_addr: Option<SocketAddr>,
     ) -> io::Result<()> {
         let wants_padding = h3_request.headers().get("padding").is_some();
+        if let Err(error) = self
+            .router
+            .ensure_source_ip_allowed(peer_addr.map(|addr| addr.ip()))
+        {
+            let _ = send_h3_status(&mut stream, StatusCode::FORBIDDEN, wants_padding).await;
+            return Err(error);
+        }
         if let Some(ip) = peer_addr.map(|addr| addr.ip()) {
             if self.auth_failures.is_blocked(ip) {
                 let _ =

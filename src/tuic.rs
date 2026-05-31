@@ -230,6 +230,14 @@ impl TuicServer {
     }
 
     async fn handle_incoming(&self, incoming: quinn::Incoming) -> io::Result<()> {
+        let client_ip = incoming.remote_address().ip();
+        if self.router.source_ip_blocked(Some(client_ip)) {
+            incoming.refuse();
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "source ip blocked by route",
+            ));
+        }
         let connection = incoming.await.map_err(io_other)?;
         let client_ip = connection.remote_address().ip();
         let mut auth_stream = connection.accept_uni().await.map_err(io_other)?;

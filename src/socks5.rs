@@ -119,6 +119,7 @@ impl Socks5Server {
 
     pub fn handle_tcp_client(&self, mut client: TcpStream) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        self.router.ensure_source_ip_allowed(client_ip)?;
         let mut request = match self.read_request(&mut client) {
             Ok(request) => request,
             Err(error) => {

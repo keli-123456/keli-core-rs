@@ -178,6 +178,7 @@ impl TrojanServer {
 
     pub fn handle_tcp_client(&self, mut client: TcpStream) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        self.router.ensure_source_ip_allowed(client_ip)?;
         client.set_read_timeout(Some(self.config.connect_timeout))?;
         let mut request = self.read_request(&mut client)?;
         client.set_read_timeout(None)?;
@@ -200,7 +201,9 @@ impl TrojanServer {
         client.set_read_timeout(Some(self.config.connect_timeout))?;
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let (reader, writer, forwarded_ip) = accept_websocket_with_client_ip(client, path)?;
-        self.handle_websocket_split_client_with_ip(reader, writer, forwarded_ip.or(client_ip))
+        let source_ip = forwarded_ip.or(client_ip);
+        self.router.ensure_source_ip_allowed(source_ip)?;
+        self.handle_websocket_split_client_with_ip(reader, writer, source_ip)
     }
 
     pub fn handle_split_client<R, W>(&self, reader: R, writer: W) -> io::Result<()>
@@ -221,6 +224,7 @@ impl TrojanServer {
         R: Read + Send + 'static,
         W: Write,
     {
+        self.router.ensure_source_ip_allowed(client_ip)?;
         let mut request = self.read_request(&mut reader)?;
         request.client_ip = client_ip;
         let user = self.request_user(&request);
@@ -243,6 +247,7 @@ impl TrojanServer {
         writer: WebSocketWriter,
         client_ip: Option<IpAddr>,
     ) -> io::Result<()> {
+        self.router.ensure_source_ip_allowed(client_ip)?;
         reader.set_read_timeout(Some(self.config.connect_timeout))?;
         let mut request = self.read_request(&mut reader)?;
         reader.set_read_timeout(None)?;
@@ -270,6 +275,7 @@ impl TrojanServer {
 
     pub fn handle_tls_client(&self, mut client: TlsConnection) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        self.router.ensure_source_ip_allowed(client_ip)?;
         client.set_io_timeout(Some(self.config.connect_timeout))?;
         let mut request = self.read_request(&mut client)?;
         client.set_io_timeout(None)?;
@@ -297,10 +303,12 @@ impl TrojanServer {
         client.set_io_timeout(Some(self.config.connect_timeout))?;
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let (mut websocket, forwarded_ip) = accept_websocket_tls_with_client_ip(client, path)?;
+        let source_ip = forwarded_ip.or(client_ip);
+        self.router.ensure_source_ip_allowed(source_ip)?;
         websocket.set_io_timeout(Some(self.config.connect_timeout))?;
         let mut request = self.read_request(&mut websocket)?;
         websocket.set_io_timeout(None)?;
-        request.client_ip = forwarded_ip.or(client_ip);
+        request.client_ip = source_ip;
         let user = self.request_user(&request);
         let session = self.acquire_user_session(user.as_ref(), request.client_ip)?;
         let bandwidth = if request.command == TrojanCommand::UdpAssociate {
@@ -348,6 +356,8 @@ impl TrojanServer {
     {
         let (mut websocket, forwarded_ip) =
             accept_websocket_async_with_client_ip(client, path).await?;
+        let source_ip = forwarded_ip.or(client_ip);
+        self.router.ensure_source_ip_allowed(source_ip)?;
         let mut request = tokio::time::timeout(
             self.config.connect_timeout,
             self.read_request_from_async_websocket(&mut websocket),
@@ -356,7 +366,7 @@ impl TrojanServer {
         .map_err(|_| {
             io::Error::new(io::ErrorKind::TimedOut, "trojan websocket auth timed out")
         })??;
-        request.client_ip = forwarded_ip.or(client_ip);
+        request.client_ip = source_ip;
         let user = self.request_user(&request);
         let _session = self.acquire_user_session(user.as_ref(), request.client_ip)?;
         let bandwidth = if request.command == TrojanCommand::UdpAssociate {

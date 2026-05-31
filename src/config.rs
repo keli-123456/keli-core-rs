@@ -791,10 +791,19 @@ fn validate_route_targets(route: &RouteRule) -> Result<(), ValidationError> {
             }
             continue;
         }
+        if let Some(rule) = normalized.strip_prefix("source_ip:") {
+            if route.action != RouteAction::Block || !is_supported_source_ip_route_rule(rule) {
+                return Err(ValidationError::new(format!(
+                    "route target {target} is not supported in keli-core-rs yet"
+                )));
+            }
+            continue;
+        }
         if normalized.starts_with("geoip:")
             || normalized.starts_with("geosite:")
             || normalized.starts_with("regexp:")
             || normalized.starts_with("protocol:")
+            || normalized.starts_with("source_ip:")
         {
             return Err(ValidationError::new(format!(
                 "route target {target} is not supported in keli-core-rs yet"
@@ -825,6 +834,12 @@ fn is_supported_ip_route_rule(rule: &str) -> bool {
         IpAddr::V4(_) => prefix <= 32,
         IpAddr::V6(_) => prefix <= 128,
     }
+}
+
+fn is_supported_source_ip_route_rule(rule: &str) -> bool {
+    let rule = rule.trim();
+    let rule = rule.strip_prefix("ip:").unwrap_or(rule);
+    is_supported_ip_route_rule(rule)
 }
 
 fn is_supported_port_route_rule(rule: &str) -> bool {
@@ -2210,6 +2225,7 @@ mod tests {
                     "ip:10.0.0.0/8".to_string(),
                     "port:6881-6889,6969".to_string(),
                     "network:udp".to_string(),
+                    "source_ip:203.0.113.0/24".to_string(),
                 ],
                 action: crate::config::RouteAction::Block,
                 outbound: None,
@@ -2239,6 +2255,19 @@ mod tests {
             .validate()
             .expect_err("invalid regexp route target should fail");
         assert!(error.to_string().contains("invalid regexp"));
+
+        config.routes[0].targets = vec!["source_ip:not-an-ip".to_string()];
+        let error = config
+            .validate()
+            .expect_err("invalid source_ip route target should fail");
+        assert!(error.to_string().contains("source_ip:not-an-ip"));
+
+        config.routes[0].targets = vec!["source_ip:203.0.113.0/24".to_string()];
+        config.routes[0].action = crate::config::RouteAction::Direct;
+        let error = config
+            .validate()
+            .expect_err("source_ip should be block-only");
+        assert!(error.to_string().contains("source_ip:203.0.113.0/24"));
     }
 
     #[test]

@@ -181,6 +181,7 @@ impl AnyTlsServer {
 
     pub fn handle_tcp_client(&self, mut client: TcpStream) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        self.router.ensure_source_ip_allowed(client_ip)?;
         let user = self.read_auth(&mut client)?;
         let _session = self.acquire_user_session(&user, client_ip)?;
         let _connection = self

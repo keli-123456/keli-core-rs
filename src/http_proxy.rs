@@ -103,6 +103,8 @@ impl HttpProxyServer {
     }
 
     pub fn handle_tcp_client(&self, mut client: TcpStream) -> io::Result<()> {
+        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
+        self.router.ensure_source_ip_allowed(client_ip)?;
         let mut reader = BufReader::new(client.try_clone()?);
         let request = match self.read_request(&mut reader) {
             Ok(request) => request,
@@ -113,7 +115,6 @@ impl HttpProxyServer {
             Err(error) => return Err(error),
         };
         let user = self.request_user(&request);
-        let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
         let _session = self.acquire_user_session(user.as_ref(), &mut client)?;
         let bandwidth = self.bandwidth.limiter_for_limited(user.as_ref());
         if request.method.eq_ignore_ascii_case("CONNECT") {

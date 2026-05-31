@@ -371,6 +371,13 @@ impl Hysteria2Server {
         preauth_slot: OwnedSemaphorePermit,
     ) -> io::Result<()> {
         let client_ip = incoming.remote_address().ip();
+        if self.router.source_ip_blocked(Some(client_ip)) {
+            incoming.refuse();
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "source ip blocked by route",
+            ));
+        }
         if self.auth_backoff.is_blocked(client_ip) {
             incoming.refuse();
             return Ok(());

@@ -57,6 +57,16 @@ impl RouteMatcher {
         }
         RouteDecision::Direct
     }
+
+    pub fn source_ip_blocked(&self, source_ip: IpAddr) -> bool {
+        self.routes.iter().any(|route| {
+            route.action == RouteAction::Block
+                && route
+                    .targets
+                    .iter()
+                    .any(|target| matches_source_ip_target(source_ip, target))
+        })
+    }
 }
 
 pub fn route_targets_match(
@@ -185,6 +195,21 @@ fn matches_target(
         return matches_domain_suffix(host, suffix);
     }
     host == target
+}
+
+fn matches_source_ip_target(source_ip: IpAddr, target: &str) -> bool {
+    let target = target.trim().to_ascii_lowercase();
+    let Some(rule) = target.strip_prefix("source_ip:") else {
+        return false;
+    };
+    let rule = rule.trim();
+    if let Some(rule) = rule.strip_prefix("ip:") {
+        return matches_ip_rule(source_ip, rule);
+    }
+    if let Some(rule) = rule.strip_prefix("geoip:") {
+        return matches_geoip_rule(source_ip, rule);
+    }
+    matches_ip_rule(source_ip, rule)
 }
 
 fn matches_domain_suffix(host: &str, suffix: &str) -> bool {
@@ -601,6 +626,33 @@ mod tests {
     }
 
     #[test]
+    fn source_ip_block_rules_match_client_ip_without_matching_targets() {
+        let matcher = RouteMatcher::new(vec![RouteRule {
+            targets: vec!["source_ip:203.0.113.0/24".to_string()],
+            action: RouteAction::Block,
+            outbound: None,
+        }]);
+
+        assert!(matcher.source_ip_blocked("203.0.113.42".parse().unwrap()));
+        assert!(!matcher.source_ip_blocked("198.51.100.42".parse().unwrap()));
+        assert_eq!(
+            matcher.decide_target("203.0.113.42", 443, "tcp"),
+            RouteDecision::Direct
+        );
+    }
+
+    #[test]
+    fn source_ip_block_rules_ignore_non_block_actions() {
+        let matcher = RouteMatcher::new(vec![RouteRule {
+            targets: vec!["source_ip:203.0.113.0/24".to_string()],
+            action: RouteAction::Direct,
+            outbound: None,
+        }]);
+
+        assert!(!matcher.source_ip_blocked("203.0.113.42".parse().unwrap()));
+    }
+
+    #[test]
     fn matches_geo_regexp_and_protocol_rules() {
         let matcher = RouteMatcher::new(vec![
             RouteRule {
@@ -837,6 +889,24 @@ mod tests {
         }]);
 
         assert_eq!(cloned.decide("blocked.example.com"), RouteDecision::Block);
+    }
+
+    #[test]
+    fn dispatcher_rejects_blocked_source_ip() {
+        let dispatcher = RouteDispatcher::new(vec![RouteRule {
+            targets: vec!["source_ip:203.0.113.0/24".to_string()],
+            action: RouteAction::Block,
+            outbound: None,
+        }]);
+
+        let error = dispatcher
+            .ensure_source_ip_allowed(Some("203.0.113.42".parse().unwrap()))
+            .expect_err("source should be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        dispatcher
+            .ensure_source_ip_allowed(Some("198.51.100.42".parse().unwrap()))
+            .expect("other sources are allowed");
     }
 
     #[test]

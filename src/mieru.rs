@@ -239,6 +239,7 @@ impl MieruServer {
         let accepted_at = Instant::now();
         let peer_addr = client.peer_addr().ok();
         let client_ip = peer_addr.map(|addr| addr.ip());
+        self.router.ensure_source_ip_allowed(client_ip)?;
         let users = self.users_snapshot();
         let mut reader = MieruReader::accept(client.try_clone()?, users.as_ref())?;
         let user = reader.user().clone();
