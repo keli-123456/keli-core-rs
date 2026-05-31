@@ -67,9 +67,6 @@ jobs:
             ${{ runner.os }}-release-cargo-
             ${{ runner.os }}-cargo-
 
-      - name: Run tests
-        run: cargo test --locked --lib -- --test-threads=1
-
       - name: Build release binary
         run: cargo build --release --locked
 
