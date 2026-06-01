@@ -171,6 +171,9 @@ fn serve_control_stream_with_token(
     required_token: Option<&str>,
 ) -> Result<CoreResponse, ControlServerError> {
     stream
+        .set_nonblocking(false)
+        .map_err(ControlServerError::Io)?;
+    stream
         .set_read_timeout(Some(CONTROL_IO_TIMEOUT))
         .map_err(ControlServerError::Io)?;
     stream

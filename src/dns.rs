@@ -30,6 +30,7 @@ static DNS_NEGATIVE_CACHE_HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DNS_RESOLVE_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DNS_PRIVATE_IP_FILTER_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DNS_PRIVATE_IP_BLOCK_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TCP_CONNECT_BACKOFF_REJECT_TOTAL: AtomicU64 = AtomicU64::new(0);
 const DNS_POSITIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const DNS_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(15);
 const GOOGLEVIDEO_FALLBACK_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -51,6 +52,10 @@ pub struct DnsMetricsSnapshot {
     pub keli_core_dns_resolve_error_total: u64,
     pub keli_core_dns_private_ip_filter_total: u64,
     pub keli_core_dns_private_ip_block_total: u64,
+    #[serde(default)]
+    pub keli_core_tcp_connect_backoff_reject_total: u64,
+    #[serde(default)]
+    pub keli_core_tcp_connect_backoff_active_targets: usize,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -106,6 +111,9 @@ pub fn dns_metrics_snapshot() -> DnsMetricsSnapshot {
         keli_core_dns_resolve_error_total: DNS_RESOLVE_ERROR_TOTAL.load(Ordering::Relaxed),
         keli_core_dns_private_ip_filter_total: DNS_PRIVATE_IP_FILTER_TOTAL.load(Ordering::Relaxed),
         keli_core_dns_private_ip_block_total: DNS_PRIVATE_IP_BLOCK_TOTAL.load(Ordering::Relaxed),
+        keli_core_tcp_connect_backoff_reject_total: TCP_CONNECT_BACKOFF_REJECT_TOTAL
+            .load(Ordering::Relaxed),
+        keli_core_tcp_connect_backoff_active_targets: tcp_connect_backoff_active_targets(),
     }
 }
 
@@ -578,6 +586,7 @@ fn tcp_connect_backoff_error(key: &DnsCacheKey, now: Instant) -> Option<io::Erro
         return None;
     };
     if now < blocked_until {
+        TCP_CONNECT_BACKOFF_REJECT_TOTAL.fetch_add(1, Ordering::Relaxed);
         return Some(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
@@ -655,6 +664,20 @@ fn clear_tcp_connect_failure_backoff() {
             .expect("tcp connect failure backoff poisoned")
             .clear();
     }
+}
+
+fn tcp_connect_backoff_active_targets() -> usize {
+    let now = Instant::now();
+    tcp_connect_failure_backoff()
+        .lock()
+        .expect("tcp connect failure backoff poisoned")
+        .values()
+        .filter(|entry| {
+            entry
+                .blocked_until
+                .is_some_and(|blocked_until| now < blocked_until)
+        })
+        .count()
 }
 
 impl TcpConnectFailureEntry {
@@ -1748,6 +1771,30 @@ mod tests {
         );
 
         assert!(tcp_connect_backoff_error(&key, now + Duration::from_secs(8)).is_none());
+        clear_tcp_connect_failure_backoff();
+    }
+
+    #[test]
+    fn tcp_connect_backoff_metrics_count_rejects_without_host_labels() {
+        let _guard = crate::test_support::network_test_lock();
+        clear_tcp_connect_failure_backoff();
+        let before = dns_metrics_snapshot();
+        let key = dns_cache_key("203.0.113.80", 443);
+        let now = Instant::now();
+
+        record_tcp_connect_failure_at(&key, now);
+        record_tcp_connect_failure_at(&key, now + Duration::from_secs(1));
+        record_tcp_connect_failure_at(&key, now + Duration::from_secs(2));
+        let error = tcp_connect_backoff_error(&key, now + Duration::from_secs(3))
+            .expect("target should be temporarily backed off");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let after = dns_metrics_snapshot();
+        assert!(
+            after.keli_core_tcp_connect_backoff_reject_total
+                > before.keli_core_tcp_connect_backoff_reject_total
+        );
+        assert_eq!(after.keli_core_tcp_connect_backoff_active_targets, 1);
         clear_tcp_connect_failure_backoff();
     }
 

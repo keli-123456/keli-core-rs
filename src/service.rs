@@ -4,7 +4,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
@@ -59,6 +59,8 @@ const MIN_CONNECTION_WORKER_STACK_KIB: usize = 256;
 const MAX_CONNECTION_WORKER_STACK_KIB: usize = 8192;
 const QUIC_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 static TCP_ACCEPT_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static CONNECTION_WORKER_ACTIVE_BLOCKING: AtomicUsize = AtomicUsize::new(0);
+static CONNECTION_WORKER_ACTIVE_ASYNC: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerStatus {
@@ -2889,10 +2891,10 @@ struct ConnectionWorkerGroup {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ConnectionWorkerGroupSnapshot {
-    active_total: usize,
-    active_blocking: usize,
-    active_async: usize,
+pub(crate) struct ConnectionWorkerGroupSnapshot {
+    pub(crate) active_total: usize,
+    pub(crate) active_blocking: usize,
+    pub(crate) active_async: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2984,6 +2986,16 @@ fn format_connection_worker_snapshot(snapshot: ConnectionWorkerGroupSnapshot) ->
     )
 }
 
+pub(crate) fn connection_worker_metrics_snapshot() -> ConnectionWorkerGroupSnapshot {
+    let active_blocking = CONNECTION_WORKER_ACTIVE_BLOCKING.load(Ordering::Acquire);
+    let active_async = CONNECTION_WORKER_ACTIVE_ASYNC.load(Ordering::Acquire);
+    ConnectionWorkerGroupSnapshot {
+        active_total: active_blocking.saturating_add(active_async),
+        active_blocking,
+        active_async,
+    }
+}
+
 struct ConnectionWorkerAsyncGuard {
     state: Arc<ConnectionWorkerGroupState>,
 }
@@ -2998,8 +3010,14 @@ impl ConnectionWorkerGroupState {
     fn acquire(&self, kind: ConnectionWorkerKind) -> bool {
         let mut counts = self.counts.lock().expect("worker group lock poisoned");
         match kind {
-            ConnectionWorkerKind::Blocking => counts.active_blocking += 1,
-            ConnectionWorkerKind::Async => counts.active_async += 1,
+            ConnectionWorkerKind::Blocking => {
+                counts.active_blocking += 1;
+                CONNECTION_WORKER_ACTIVE_BLOCKING.fetch_add(1, Ordering::Relaxed);
+            }
+            ConnectionWorkerKind::Async => {
+                counts.active_async += 1;
+                CONNECTION_WORKER_ACTIVE_ASYNC.fetch_add(1, Ordering::Relaxed);
+            }
         }
         true
     }
@@ -3009,9 +3027,11 @@ impl ConnectionWorkerGroupState {
         match kind {
             ConnectionWorkerKind::Blocking => {
                 counts.active_blocking = counts.active_blocking.saturating_sub(1);
+                decrement_connection_worker_metric(&CONNECTION_WORKER_ACTIVE_BLOCKING);
             }
             ConnectionWorkerKind::Async => {
                 counts.active_async = counts.active_async.saturating_sub(1);
+                decrement_connection_worker_metric(&CONNECTION_WORKER_ACTIVE_ASYNC);
             }
         }
         if counts.active_blocking == 0 && counts.active_async == 0 {
@@ -3048,6 +3068,12 @@ impl ConnectionWorkerGroupState {
         }
         true
     }
+}
+
+fn decrement_connection_worker_metric(counter: &AtomicUsize) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        Some(value.saturating_sub(1))
+    });
 }
 
 fn inbound_binds_quic(inbound: &InboundConfig) -> bool {
@@ -3710,6 +3736,33 @@ mod tests {
             assert_eq!(snapshot.active_blocking, 0);
             assert_eq!(snapshot.active_async, 0);
         });
+    }
+
+    #[test]
+    fn connection_worker_metrics_snapshot_tracks_global_activity() {
+        let group = super::ConnectionWorkerGroup::new();
+        let before = super::connection_worker_metrics_snapshot();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        assert!(group.spawn(move || {
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        }));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = super::connection_worker_metrics_snapshot();
+            if snapshot.active_total >= before.active_total + 1 {
+                assert!(snapshot.active_blocking >= before.active_blocking + 1);
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("connection worker global metrics did not report active worker");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        release_tx.send(()).expect("release worker");
+        assert!(group.join_timeout(Duration::from_secs(2)));
     }
 
     #[test]

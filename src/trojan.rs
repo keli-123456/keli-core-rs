@@ -119,6 +119,7 @@ struct TrojanUdpRelayState {
     target: Option<SocksTarget>,
     target_addr: Option<SocketAddr>,
     timeout: Duration,
+    last_activity: Option<Instant>,
 }
 
 struct AsyncTrojanUdpRelayState {
@@ -127,6 +128,7 @@ struct AsyncTrojanUdpRelayState {
     target: Option<SocksTarget>,
     target_addr: Option<SocketAddr>,
     timeout: Duration,
+    last_activity: Option<Instant>,
 }
 
 impl TrojanServer {
@@ -1189,6 +1191,7 @@ impl TrojanServer {
     where
         S: Read + Write,
     {
+        let _udp_metrics = crate::metrics::UdpRelayMetricsGuard::new("trojan", "tcp_udp");
         let mut state = TrojanUdpRelayState::new(self.config.connect_timeout);
         let mut upload = 0u64;
         let mut download = 0u64;
@@ -1220,6 +1223,11 @@ impl TrojanServer {
             download,
             request.client_ip,
         );
+        crate::metrics::record_udp_relay_finished(
+            "trojan",
+            "tcp_udp",
+            if result.is_ok() { "ok" } else { "error" },
+        );
         result
     }
 
@@ -1234,6 +1242,7 @@ impl TrojanServer {
         R: Read,
         W: Write,
     {
+        let _udp_metrics = crate::metrics::UdpRelayMetricsGuard::new("trojan", "tcp_udp");
         let mut state = TrojanUdpRelayState::new(self.config.connect_timeout);
         let mut upload = 0u64;
         let mut download = 0u64;
@@ -1265,6 +1274,11 @@ impl TrojanServer {
             download,
             request.client_ip,
         );
+        crate::metrics::record_udp_relay_finished(
+            "trojan",
+            "tcp_udp",
+            if result.is_ok() { "ok" } else { "error" },
+        );
         result
     }
 
@@ -1275,6 +1289,7 @@ impl TrojanServer {
         request: TrojanRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
+        let _udp_metrics = crate::metrics::UdpRelayMetricsGuard::new("trojan", "websocket_udp");
         let state = Arc::new(Mutex::new(TrojanUdpRelayState::new(
             self.config.connect_timeout,
         )));
@@ -1306,7 +1321,7 @@ impl TrojanServer {
             let mut progressed = false;
             loop {
                 let packet = {
-                    let state = state
+                    let mut state = state
                         .lock()
                         .map_err(|_| io::Error::new(io::ErrorKind::Other, "udp state poisoned"))?;
                     state.recv_available()?
@@ -1340,6 +1355,9 @@ impl TrojanServer {
                 break;
             }
             if !progressed {
+                if let Ok(mut state) = state.lock() {
+                    state.release_idle_sockets();
+                }
                 let timeout = websocket_udp_relay_idle_timeout(&mut idle_rounds);
                 thread::sleep(timeout);
             } else {
@@ -1362,6 +1380,11 @@ impl TrojanServer {
             upload.load(Ordering::Relaxed),
             download.load(Ordering::Relaxed),
             request.client_ip,
+        );
+        crate::metrics::record_udp_relay_finished(
+            "trojan",
+            "websocket_udp",
+            if result.is_ok() { "ok" } else { "error" },
         );
         result
     }
@@ -1420,6 +1443,7 @@ impl TrojanServer {
         request: TrojanRequest,
         bandwidth: Option<Arc<BandwidthLimiter>>,
     ) -> io::Result<()> {
+        let _udp_metrics = crate::metrics::UdpRelayMetricsGuard::new("trojan", "tls_websocket_udp");
         log_trojan_relay_started(&self.config.node_tag, "tls_websocket_udp", &request);
         client.set_nonblocking(true)?;
         let started = Instant::now();
@@ -1482,6 +1506,7 @@ impl TrojanServer {
             }
 
             if !progressed {
+                state.release_idle_sockets();
                 let timeout = websocket_udp_relay_idle_timeout(&mut idle_rounds);
                 client.wait_readable_with_udp(state.ipv4.as_ref(), state.ipv6.as_ref(), timeout)?;
             } else {
@@ -1500,6 +1525,16 @@ impl TrojanServer {
             first_response_ms,
             started.elapsed(),
             result.as_ref().err(),
+        );
+        crate::metrics::record_udp_relay_finished(
+            "trojan",
+            "tls_websocket_udp",
+            trojan_udp_relay_log_outcome(
+                download,
+                download_packets,
+                first_response_ms,
+                result.as_ref().err(),
+            ),
         );
         self.record_traffic(
             request.user_uuid,
@@ -1520,6 +1555,7 @@ impl TrojanServer {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        let _udp_metrics = crate::metrics::UdpRelayMetricsGuard::new("trojan", "tls_websocket_udp");
         log_trojan_relay_started(&self.config.node_tag, "tls_websocket_udp", &request);
         let started = Instant::now();
         let mut state = AsyncTrojanUdpRelayState::new(self.config.connect_timeout);
@@ -1590,6 +1626,8 @@ impl TrojanServer {
 
             if progressed {
                 idle_rounds = 0;
+            } else {
+                state.release_idle_sockets();
             }
         };
         let _ = client.shutdown().await;
@@ -1604,6 +1642,16 @@ impl TrojanServer {
             first_response_ms,
             started.elapsed(),
             result.as_ref().err(),
+        );
+        crate::metrics::record_udp_relay_finished(
+            "trojan",
+            "tls_websocket_udp",
+            trojan_udp_relay_log_outcome(
+                download,
+                download_packets,
+                first_response_ms,
+                result.as_ref().err(),
+            ),
         );
         self.record_traffic(
             request.user_uuid,
@@ -3071,6 +3119,7 @@ impl TrojanUdpRelayState {
             target: None,
             target_addr: None,
             timeout,
+            last_activity: None,
         }
     }
 
@@ -3087,38 +3136,86 @@ impl TrojanUdpRelayState {
     }
 
     fn socket_for(&mut self, remote: SocketAddr) -> io::Result<&UdpSocket> {
-        let slot = if remote.is_ipv4() {
-            &mut self.ipv4
+        let is_ipv4 = remote.is_ipv4();
+        if is_ipv4 {
+            if self.ipv4.is_none() {
+                let socket = UdpSocket::bind(udp_bind_addr_for_remote(remote))?;
+                socket.set_read_timeout(Some(self.timeout))?;
+                self.ipv4 = Some(socket);
+            }
         } else {
-            &mut self.ipv6
-        };
-        if slot.is_none() {
-            let socket = UdpSocket::bind(udp_bind_addr_for_remote(remote))?;
-            socket.set_read_timeout(Some(self.timeout))?;
-            *slot = Some(socket);
+            if self.ipv6.is_none() {
+                let socket = UdpSocket::bind(udp_bind_addr_for_remote(remote))?;
+                socket.set_read_timeout(Some(self.timeout))?;
+                self.ipv6 = Some(socket);
+            }
         }
-        Ok(slot.as_ref().expect("udp socket initialized"))
+        self.mark_activity();
+        Ok(if is_ipv4 {
+            self.ipv4.as_ref().expect("udp socket initialized")
+        } else {
+            self.ipv6.as_ref().expect("udp socket initialized")
+        })
     }
 
     fn socket_for_nonblocking(&mut self, remote: SocketAddr) -> io::Result<&UdpSocket> {
-        let slot = if remote.is_ipv4() {
-            &mut self.ipv4
+        let is_ipv4 = remote.is_ipv4();
+        if is_ipv4 {
+            if self.ipv4.is_none() {
+                let socket = UdpSocket::bind(udp_bind_addr_for_remote(remote))?;
+                socket.set_nonblocking(true)?;
+                self.ipv4 = Some(socket);
+            }
         } else {
-            &mut self.ipv6
-        };
-        if slot.is_none() {
-            let socket = UdpSocket::bind(udp_bind_addr_for_remote(remote))?;
-            socket.set_nonblocking(true)?;
-            *slot = Some(socket);
+            if self.ipv6.is_none() {
+                let socket = UdpSocket::bind(udp_bind_addr_for_remote(remote))?;
+                socket.set_nonblocking(true)?;
+                self.ipv6 = Some(socket);
+            }
         }
-        Ok(slot.as_ref().expect("udp socket initialized"))
+        self.mark_activity();
+        Ok(if is_ipv4 {
+            self.ipv4.as_ref().expect("udp socket initialized")
+        } else {
+            self.ipv6.as_ref().expect("udp socket initialized")
+        })
     }
 
-    fn recv_available(&self) -> io::Result<Option<(SocketAddr, Vec<u8>)>> {
+    fn recv_available(&mut self) -> io::Result<Option<(SocketAddr, Vec<u8>)>> {
         if let Some(packet) = recv_available_from_socket(self.ipv4.as_ref())? {
+            self.mark_activity();
             return Ok(Some(packet));
         }
-        recv_available_from_socket(self.ipv6.as_ref())
+        let packet = recv_available_from_socket(self.ipv6.as_ref())?;
+        if packet.is_some() {
+            self.mark_activity();
+        }
+        Ok(packet)
+    }
+
+    fn release_idle_sockets(&mut self) {
+        self.release_idle_sockets_at(Instant::now());
+    }
+
+    fn release_idle_sockets_at(&mut self, now: Instant) {
+        let Some(last_activity) = self.last_activity else {
+            return;
+        };
+        if now.saturating_duration_since(last_activity) < udp_relay_socket_idle_timeout() {
+            return;
+        }
+        self.ipv4 = None;
+        self.ipv6 = None;
+        self.last_activity = None;
+    }
+
+    #[cfg(test)]
+    fn open_socket_count(&self) -> usize {
+        usize::from(self.ipv4.is_some()) + usize::from(self.ipv6.is_some())
+    }
+
+    fn mark_activity(&mut self) {
+        self.last_activity = Some(Instant::now());
     }
 }
 
@@ -3130,6 +3227,7 @@ impl AsyncTrojanUdpRelayState {
             target: None,
             target_addr: None,
             timeout,
+            last_activity: None,
         }
     }
 
@@ -3147,31 +3245,59 @@ impl AsyncTrojanUdpRelayState {
     }
 
     fn socket_for(&mut self, remote: SocketAddr) -> io::Result<&tokio::net::UdpSocket> {
-        let slot = if remote.is_ipv4() {
-            &mut self.ipv4
+        let is_ipv4 = remote.is_ipv4();
+        if is_ipv4 {
+            if self.ipv4.is_none() {
+                let socket = UdpSocket::bind(udp_bind_addr_for_remote(remote))?;
+                socket.set_nonblocking(true)?;
+                self.ipv4 = Some(tokio::net::UdpSocket::from_std(socket)?);
+            }
         } else {
-            &mut self.ipv6
-        };
-        if slot.is_none() {
-            let socket = UdpSocket::bind(udp_bind_addr_for_remote(remote))?;
-            socket.set_nonblocking(true)?;
-            *slot = Some(tokio::net::UdpSocket::from_std(socket)?);
+            if self.ipv6.is_none() {
+                let socket = UdpSocket::bind(udp_bind_addr_for_remote(remote))?;
+                socket.set_nonblocking(true)?;
+                self.ipv6 = Some(tokio::net::UdpSocket::from_std(socket)?);
+            }
         }
-        Ok(slot.as_ref().expect("udp socket initialized"))
+        self.mark_activity();
+        Ok(if is_ipv4 {
+            self.ipv4.as_ref().expect("udp socket initialized")
+        } else {
+            self.ipv6.as_ref().expect("udp socket initialized")
+        })
     }
 
-    fn recv_available(&self) -> io::Result<Option<(SocketAddr, Vec<u8>)>> {
+    fn recv_available(&mut self) -> io::Result<Option<(SocketAddr, Vec<u8>)>> {
         if let Some(socket) = self.ipv4.as_ref() {
             if let Some(packet) = try_recv_available_from_tokio_socket(socket)? {
+                self.mark_activity();
                 return Ok(Some(packet));
             }
         }
         if let Some(socket) = self.ipv6.as_ref() {
             if let Some(packet) = try_recv_available_from_tokio_socket(socket)? {
+                self.mark_activity();
                 return Ok(Some(packet));
             }
         }
         Ok(None)
+    }
+
+    fn release_idle_sockets(&mut self) {
+        let Some(last_activity) = self.last_activity else {
+            return;
+        };
+        if Instant::now().saturating_duration_since(last_activity) < udp_relay_socket_idle_timeout()
+        {
+            return;
+        }
+        self.ipv4 = None;
+        self.ipv6 = None;
+        self.last_activity = None;
+    }
+
+    fn mark_activity(&mut self) {
+        self.last_activity = Some(Instant::now());
     }
 }
 
@@ -4094,6 +4220,10 @@ fn websocket_udp_relay_idle_timeout(idle_rounds: &mut u8) -> Duration {
         .saturating_add(1)
         .min((BACKOFF_MS.len() - 1) as u8);
     Duration::from_millis(BACKOFF_MS[idx])
+}
+
+fn udp_relay_socket_idle_timeout() -> Duration {
+    Duration::from_secs(30)
 }
 
 fn is_stream_closed(error: &io::Error) -> bool {
@@ -6095,6 +6225,26 @@ mod tests {
             line,
             "INFO  core   trojan udp relay finished node_tag=node_tag scope=tls_websocket_udp target=rr5---sn-test.gvt1.com:443 status=ok first_response_ms=1 duration_ms=2427 upload_bytes=1532 download_bytes=20856660 upload_packets=1 download_packets=1 error=-"
         );
+    }
+
+    #[test]
+    fn trojan_udp_state_releases_idle_sockets_without_closing_session() {
+        let mut state = super::TrojanUdpRelayState::new(Duration::from_secs(3));
+        let target = SocksTarget {
+            host: "127.0.0.1".to_string(),
+            port: 443,
+        };
+        let remote = state.remote_addr_for(&target).expect("remote addr");
+        let now = Instant::now();
+
+        state.socket_for_nonblocking(remote).expect("udp socket");
+        state.last_activity = Some(now);
+        assert_eq!(state.open_socket_count(), 1);
+        state.release_idle_sockets_at(now + Duration::from_secs(1));
+        assert_eq!(state.open_socket_count(), 1);
+        state.release_idle_sockets_at(now + super::udp_relay_socket_idle_timeout());
+        assert_eq!(state.open_socket_count(), 0);
+        assert_eq!(state.target_addr, Some(remote));
     }
 
     #[test]

@@ -32,6 +32,18 @@ pub struct CoreMetricsSnapshot {
     #[serde(default)]
     pub keli_core_connection_error_total: BTreeMap<String, u64>,
     #[serde(default)]
+    pub keli_core_connection_active_total: usize,
+    #[serde(default)]
+    pub keli_core_connection_active_blocking: usize,
+    #[serde(default)]
+    pub keli_core_connection_active_async: usize,
+    #[serde(default)]
+    pub keli_core_udp_relay_active: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub keli_core_udp_relay_finished_total: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keli_core_process_open_fds: Option<usize>,
+    #[serde(default)]
     pub keli_core_native_relay_active: BTreeMap<String, usize>,
     #[serde(default)]
     pub keli_core_async_relay_active: BTreeMap<String, usize>,
@@ -106,6 +118,13 @@ impl CoreMetrics {
         snapshot.keli_core_hy2_udp_session_limit =
             crate::hysteria2::hy2_udp_session_limit_for_metrics();
         snapshot.keli_core_connection_error_total = connection_error_metrics_snapshot();
+        let connection_workers = crate::service::connection_worker_metrics_snapshot();
+        snapshot.keli_core_connection_active_total = connection_workers.active_total;
+        snapshot.keli_core_connection_active_blocking = connection_workers.active_blocking;
+        snapshot.keli_core_connection_active_async = connection_workers.active_async;
+        snapshot.keli_core_udp_relay_active = udp_relay_active_snapshot();
+        snapshot.keli_core_udp_relay_finished_total = udp_relay_finished_snapshot();
+        snapshot.keli_core_process_open_fds = process_open_fd_count();
         let relay = crate::stream::relay_scheduler_metrics_snapshot();
         snapshot.keli_core_native_relay_active = relay.active_native;
         snapshot.keli_core_async_relay_active = relay.active_async;
@@ -214,6 +233,49 @@ pub fn record_connection_error(protocol: &'static str, scope: &'static str, reas
     *counter = counter.saturating_add(1);
 }
 
+pub(crate) struct UdpRelayMetricsGuard {
+    key: String,
+}
+
+impl UdpRelayMetricsGuard {
+    pub(crate) fn new(protocol: &str, scope: &str) -> Self {
+        let key = udp_relay_key(protocol, scope);
+        let mut metrics = udp_relay_active()
+            .lock()
+            .expect("udp relay active metrics poisoned");
+        let counter = metrics.entry(key.clone()).or_default();
+        *counter = counter.saturating_add(1);
+        Self { key }
+    }
+}
+
+impl Drop for UdpRelayMetricsGuard {
+    fn drop(&mut self) {
+        let mut metrics = udp_relay_active()
+            .lock()
+            .expect("udp relay active metrics poisoned");
+        if let Some(counter) = metrics.get_mut(&self.key) {
+            *counter = counter.saturating_sub(1);
+            if *counter == 0 {
+                metrics.remove(&self.key);
+            }
+        }
+    }
+}
+
+pub(crate) fn record_udp_relay_finished(protocol: &str, scope: &str, status: &str) {
+    let key = format!(
+        "{}.{}",
+        udp_relay_key(protocol, scope),
+        sanitize_connection_error_part(status)
+    );
+    let mut metrics = udp_relay_finished()
+        .lock()
+        .expect("udp relay finished metrics poisoned");
+    let counter = metrics.entry(key).or_default();
+    *counter = counter.saturating_add(1);
+}
+
 fn connection_error_metrics_snapshot() -> BTreeMap<String, u64> {
     connection_error_metrics()
         .lock()
@@ -224,6 +286,50 @@ fn connection_error_metrics_snapshot() -> BTreeMap<String, u64> {
 fn connection_error_metrics() -> &'static Mutex<BTreeMap<String, u64>> {
     static METRICS: OnceLock<Mutex<BTreeMap<String, u64>>> = OnceLock::new();
     METRICS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn udp_relay_active_snapshot() -> BTreeMap<String, usize> {
+    udp_relay_active()
+        .lock()
+        .expect("udp relay active metrics poisoned")
+        .clone()
+}
+
+fn udp_relay_finished_snapshot() -> BTreeMap<String, u64> {
+    udp_relay_finished()
+        .lock()
+        .expect("udp relay finished metrics poisoned")
+        .clone()
+}
+
+fn udp_relay_active() -> &'static Mutex<BTreeMap<String, usize>> {
+    static METRICS: OnceLock<Mutex<BTreeMap<String, usize>>> = OnceLock::new();
+    METRICS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn udp_relay_finished() -> &'static Mutex<BTreeMap<String, u64>> {
+    static METRICS: OnceLock<Mutex<BTreeMap<String, u64>>> = OnceLock::new();
+    METRICS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn udp_relay_key(protocol: &str, scope: &str) -> String {
+    format!(
+        "{}.{}",
+        sanitize_connection_error_part(protocol),
+        sanitize_connection_error_part(scope)
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn process_open_fd_count() -> Option<usize> {
+    std::fs::read_dir("/proc/self/fd")
+        .ok()
+        .map(|entries| entries.filter_map(Result::ok).count())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_open_fd_count() -> Option<usize> {
+    None
 }
 
 fn connection_error_key(protocol: &str, scope: &str, reason: &str) -> String {
@@ -249,7 +355,9 @@ fn sanitize_connection_error_part(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::abuse::ClientFailureBackoffSnapshot;
-    use crate::metrics::{record_connection_error, CoreMetrics};
+    use crate::metrics::{
+        record_connection_error, record_udp_relay_finished, CoreMetrics, UdpRelayMetricsGuard,
+    };
     use crate::quic_resources::QuicResourceSnapshot;
 
     #[test]
@@ -386,6 +494,33 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_include_udp_relay_metrics_without_dynamic_labels() {
+        let metrics = CoreMetrics::default();
+
+        {
+            let _guard = UdpRelayMetricsGuard::new("Trojan", "tls websocket udp");
+            let snapshot = metrics.snapshot_with_runtime_metrics(None, None, None);
+            assert_eq!(
+                snapshot.keli_core_udp_relay_active["trojan.tls_websocket_udp"],
+                1
+            );
+        }
+        record_udp_relay_finished("Trojan", "tls websocket udp", "ok");
+
+        let snapshot = metrics.snapshot_with_runtime_metrics(None, None, None);
+        assert!(!snapshot
+            .keli_core_udp_relay_active
+            .contains_key("trojan.tls_websocket_udp"));
+        assert_eq!(
+            snapshot.keli_core_udp_relay_finished_total["trojan.tls_websocket_udp.ok"],
+            1
+        );
+        assert!(!snapshot
+            .keli_core_udp_relay_finished_total
+            .contains_key("user-a"));
+    }
+
+    #[test]
     fn snapshots_include_detached_blocking_relay_active_counts() {
         let metrics = CoreMetrics::default();
         let _guard = crate::stream::DetachedBlockingRelayMetricsGuard::new("keli-core-test-relay");
@@ -417,5 +552,21 @@ mod tests {
         );
         assert!(snapshot.keli_core_native_relay_workers <= 1024);
         assert!(snapshot.keli_core_native_relay_idle <= snapshot.keli_core_native_relay_workers);
+    }
+
+    #[test]
+    fn snapshots_include_process_and_connection_resource_metrics() {
+        let metrics = CoreMetrics::default();
+
+        let snapshot = metrics.snapshot_with_runtime_metrics(None, None, None);
+
+        assert_eq!(
+            snapshot.keli_core_connection_active_total,
+            snapshot
+                .keli_core_connection_active_blocking
+                .saturating_add(snapshot.keli_core_connection_active_async)
+        );
+        #[cfg(target_os = "linux")]
+        assert!(snapshot.keli_core_process_open_fds.is_some());
     }
 }

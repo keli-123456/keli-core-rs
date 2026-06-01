@@ -1708,6 +1708,7 @@ impl VlessServer {
     where
         S: Read + Write,
     {
+        let _udp_metrics = crate::metrics::UdpRelayMetricsGuard::new("vless", "tcp_udp");
         let mut state = VlessUdpRelayState::new(self.config.connect_timeout);
         let mut upload = 0u64;
         let mut download = 0u64;
@@ -1739,6 +1740,11 @@ impl VlessServer {
             download,
             request.client_ip,
         );
+        crate::metrics::record_udp_relay_finished(
+            "vless",
+            "tcp_udp",
+            if result.is_ok() { "ok" } else { "error" },
+        );
         result
     }
 
@@ -1751,6 +1757,7 @@ impl VlessServer {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        let _udp_metrics = crate::metrics::UdpRelayMetricsGuard::new("vless", "tcp_udp");
         let mut state = AsyncVlessUdpRelayState::new(self.config.connect_timeout);
         let mut upload = 0u64;
         let mut download = 0u64;
@@ -1785,6 +1792,11 @@ impl VlessServer {
             download,
             request.client_ip,
         );
+        crate::metrics::record_udp_relay_finished(
+            "vless",
+            "tcp_udp",
+            if result.is_ok() { "ok" } else { "error" },
+        );
         result
     }
 
@@ -1797,6 +1809,7 @@ impl VlessServer {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        let _udp_metrics = crate::metrics::UdpRelayMetricsGuard::new("vless", "tls_websocket_udp");
         let mut state = AsyncVlessUdpRelayState::new(self.config.connect_timeout);
         let mut upload = 0u64;
         let mut download = 0u64;
@@ -1831,6 +1844,11 @@ impl VlessServer {
             download,
             request.client_ip,
         );
+        crate::metrics::record_udp_relay_finished(
+            "vless",
+            "tls_websocket_udp",
+            if result.is_ok() { "ok" } else { "error" },
+        );
         result
     }
 
@@ -1845,6 +1863,7 @@ impl VlessServer {
         R: Read,
         W: Write,
     {
+        let _udp_metrics = crate::metrics::UdpRelayMetricsGuard::new("vless", "tcp_udp");
         let mut state = VlessUdpRelayState::new(self.config.connect_timeout);
         let mut upload = 0u64;
         let mut download = 0u64;
@@ -1875,6 +1894,11 @@ impl VlessServer {
             upload,
             download,
             request.client_ip,
+        );
+        crate::metrics::record_udp_relay_finished(
+            "vless",
+            "tcp_udp",
+            if result.is_ok() { "ok" } else { "error" },
         );
         result
     }
