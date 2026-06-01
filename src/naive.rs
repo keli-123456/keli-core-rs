@@ -264,13 +264,18 @@ impl NaiveServer {
     pub async fn handle_tcp_client(&self, client: tokio::net::TcpStream) -> io::Result<()> {
         let peer_addr = client.peer_addr().ok();
         let peer_ip = peer_addr.map(|addr| addr.ip());
-        self.router.ensure_source_ip_allowed(peer_ip)?;
+        if let Err(error) = self.router.ensure_source_ip_allowed(peer_ip) {
+            record_naive_connection_error("source_ip", &error);
+            return Err(error);
+        }
         if let Some(ip) = peer_ip {
             if self.tls_failures.is_blocked(ip) {
-                return Err(io::Error::new(
+                let error = io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "naive tls handshake backoff active",
-                ));
+                );
+                record_naive_connection_error("tls_backoff", &error);
+                return Err(error);
             }
         }
         let stream = match self.tls_acceptor.accept(client).await {
@@ -286,6 +291,7 @@ impl NaiveServer {
                     if let Some(ip) = peer_ip {
                         self.tls_failures.record_failure(ip);
                     }
+                    record_naive_connection_error("tls_handshake", &error);
                     crate::logging::emit_legacy_line(&format!(
                         "WARN  tls    handshake failed protocol=Naive tag={} class={class:?} error={error}",
                         self.config.node_tag
@@ -294,12 +300,18 @@ impl NaiveServer {
                 return Err(error);
             }
         };
-        let mut connection = h2::server::handshake(stream).await.map_err(io_other)?;
+        let mut connection = h2::server::handshake(stream).await.map_err(|error| {
+            let error = io_other(error);
+            record_naive_connection_error("h2_handshake", &error);
+            error
+        })?;
         while let Some(request) = connection.accept().await {
             let (request, respond) = request.map_err(io_other)?;
             let server = self.clone();
             tokio::spawn(async move {
-                let _ = server.handle_h2_request(request, respond, peer_addr).await;
+                if let Err(error) = server.handle_h2_request(request, respond, peer_addr).await {
+                    record_naive_connection_error("h2_request", &error);
+                }
             });
         }
         Ok(())
@@ -461,7 +473,9 @@ impl NaiveServer {
         let server = self.clone();
         tokio::task::spawn_blocking(move || {
             let _session = _session;
-            let _ = server.relay_h2_tunnel(reader, writer, remote, request, limiter);
+            if let Err(error) = server.relay_h2_tunnel(reader, writer, remote, request, limiter) {
+                record_naive_connection_error("relay", &error);
+            }
         })
         .await
         .map_err(io_other)
@@ -561,7 +575,9 @@ impl NaiveServer {
         let server = self.clone();
         tokio::task::spawn_blocking(move || {
             let _session = _session;
-            let _ = server.relay_h2_tunnel(reader, writer, remote, request, limiter);
+            if let Err(error) = server.relay_h2_tunnel(reader, writer, remote, request, limiter) {
+                record_naive_connection_error("relay", &error);
+            }
         })
         .await
         .map_err(io_other)
@@ -629,28 +645,37 @@ impl NaiveServer {
         decision: &RouteDecision,
     ) -> io::Result<TcpStream> {
         let remote = match decision {
-            RouteDecision::Direct => {
-                crate::dns::connect_tcp_tokio(
-                    &target.host,
-                    target.port,
-                    self.config.connect_timeout,
-                )
-                .await?
-            }
+            RouteDecision::Direct => crate::dns::connect_tcp_tokio(
+                &target.host,
+                target.port,
+                self.config.connect_timeout,
+            )
+            .await
+            .map_err(|error| {
+                record_naive_connection_error("tcp_connect", &error);
+                error
+            })?,
             RouteDecision::Outbound(outbound) => {
-                connect_tcp_outbound_tokio(outbound, target, self.config.connect_timeout).await?
+                connect_tcp_outbound_tokio(outbound, target, self.config.connect_timeout)
+                    .await
+                    .map_err(|error| {
+                        record_naive_connection_error("tcp_connect", &error);
+                        error
+                    })?
             }
             RouteDecision::Block => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target blocked by route",
-                ));
+                let error =
+                    io::Error::new(io::ErrorKind::PermissionDenied, "target blocked by route");
+                record_naive_connection_error("tcp_connect", &error);
+                return Err(error);
             }
             RouteDecision::UnsupportedOutbound(tag) => {
-                return Err(io::Error::new(
+                let error = io::Error::new(
                     io::ErrorKind::Unsupported,
                     format!("outbound route {tag} is not implemented"),
-                ));
+                );
+                record_naive_connection_error("tcp_connect", &error);
+                return Err(error);
             }
         };
         remote.set_nodelay(true)?;
@@ -1100,6 +1125,7 @@ fn naive_tls_acceptor(config: &NaiveServerConfig) -> io::Result<TokioTlsAcceptor
 }
 
 fn log_naive_quic_error(context: &str, error: &io::Error) {
+    record_naive_connection_error("h3", error);
     match error.kind() {
         io::ErrorKind::UnexpectedEof
         | io::ErrorKind::ConnectionAborted
@@ -1108,6 +1134,27 @@ fn log_naive_quic_error(context: &str, error: &io::Error) {
         _ => crate::logging::emit_legacy_line(&format!(
             "WARN  core   naive h3 {context} error: {error}"
         )),
+    }
+}
+
+fn record_naive_connection_error(scope: &'static str, error: &io::Error) {
+    crate::metrics::record_connection_error("Naive", scope, naive_error_reason(error.kind()));
+}
+
+fn naive_error_reason(kind: io::ErrorKind) -> &'static str {
+    match kind {
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => "timeout",
+        io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::ConnectionRefused => "connection_refused",
+        io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::UnexpectedEof => "connection_closed",
+        io::ErrorKind::InvalidData => "invalid_data",
+        io::ErrorKind::AddrNotAvailable => "addr_not_available",
+        io::ErrorKind::Unsupported => "unsupported",
+        io::ErrorKind::NotFound => "not_found",
+        _ => "io_error",
     }
 }
 

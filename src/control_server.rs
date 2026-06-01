@@ -372,6 +372,7 @@ mod tests {
 
     #[test]
     fn control_server_handles_apply_config_command() {
+        let _network_guard = crate::test_support::network_test_lock();
         let controller = Arc::new(Mutex::new(CoreController::new()));
         let mut server = start_control_server("127.0.0.1:0", controller).expect("start control");
 
@@ -400,6 +401,7 @@ mod tests {
 
     #[test]
     fn control_server_handles_status_traffic_and_stop_commands() {
+        let _network_guard = crate::test_support::network_test_lock();
         let mut controller = CoreController::new();
         let apply = controller.handle(CoreCommand::ApplyConfig { config: config() });
         assert!(matches!(apply, CoreResponse::Applied { .. }));
@@ -430,6 +432,7 @@ mod tests {
 
     #[test]
     fn control_server_accepts_device_limit_snapshot_with_json_object_user_ids() {
+        let _network_guard = crate::test_support::network_test_lock();
         let controller = Arc::new(Mutex::new(CoreController::new()));
         let mut server = start_control_server("127.0.0.1:0", controller).expect("start control");
 

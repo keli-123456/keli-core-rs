@@ -276,6 +276,24 @@ impl CoreController {
                     listeners: self.listeners(),
                 };
             }
+            match service.update_changed_listeners_and_users(config.clone()) {
+                Ok(true) => {
+                    let decision = self.runtime.apply_update(plan);
+                    crate::trim_process_memory();
+                    return CoreResponse::Applied {
+                        decision: decision_name(decision).to_string(),
+                        status: self.runtime.status().clone(),
+                        listeners: self.listeners(),
+                    };
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.runtime.fail(error.to_string());
+                    return CoreResponse::Error {
+                        message: error.to_string(),
+                    };
+                }
+            }
         }
 
         if let Some(service) = &mut self.service {
@@ -571,6 +589,66 @@ mod tests {
                 assert_eq!(decision, "updated");
                 assert_eq!(status, CoreStatus::Running);
                 assert_eq!(listeners[0].local_addr, first_addr);
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
+        assert!(matches!(
+            controller.handle(CoreCommand::Stop),
+            CoreResponse::Stopped
+        ));
+    }
+
+    #[test]
+    fn apply_config_updates_changed_listener_without_full_core_reload() {
+        let _network_guard = crate::test_support::network_test_lock();
+        let mut config = config(Protocol::Socks);
+        let mut second = config.inbounds[0].clone();
+        let first_tag = config.inbounds[0].tag.clone();
+        second.tag = "panel|socks|2".to_string();
+        second.port = free_port();
+        config.inbounds.push(second);
+        let mut controller = CoreController::new();
+
+        let first = controller.handle(CoreCommand::ApplyConfig {
+            config: config.clone(),
+        });
+        let first_addr = match first {
+            CoreResponse::Applied {
+                decision,
+                listeners,
+                ..
+            } => {
+                assert_eq!(decision, "reloaded");
+                listeners
+                    .iter()
+                    .find(|listener| listener.tag == first_tag)
+                    .expect("first listener")
+                    .local_addr
+            }
+            response => panic!("unexpected response: {response:?}"),
+        };
+
+        let mut updated = config;
+        updated.inbounds[1].port = free_port();
+        let second = controller.handle(CoreCommand::ApplyConfig { config: updated });
+
+        match second {
+            CoreResponse::Applied {
+                decision,
+                status,
+                listeners,
+            } => {
+                assert_eq!(decision, "updated");
+                assert_eq!(status, CoreStatus::Running);
+                assert_eq!(listeners.len(), 2);
+                assert_eq!(
+                    listeners
+                        .iter()
+                        .find(|listener| listener.tag == first_tag)
+                        .expect("first listener after update")
+                        .local_addr,
+                    first_addr
+                );
             }
             response => panic!("unexpected response: {response:?}"),
         }

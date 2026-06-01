@@ -23,9 +23,8 @@ use crate::outbound::recv_udp_response;
 use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::SocksTarget;
 use crate::stream::{
-    copy_count_best_effort, copy_count_best_effort_limited, join_detached_blocking_relay,
-    join_native_blocking_relay, spawn_detached_blocking_relay_with_handle,
-    spawn_named_native_blocking_relay, DetachedBlockingRelayHandle,
+    copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
+    spawn_named_native_blocking_relay, NativeRelayHandle,
 };
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{apply_user_delta_to_vec, CoreUser, CoreUserDelta, CoreUserDeltaResult};
@@ -39,6 +38,9 @@ const MAX_TCP_FRAGMENT_LEN: usize = 32 * 1024;
 const MAX_SESSION_PAYLOAD_LEN: usize = 1024;
 const MAX_PADDING_SCAN: usize = 8192;
 const MIERU_SESSION_RELAY_LABEL: &str = "keli-core-mieru-session";
+const MIERU_TRACE_ENV: &str = "KELI_CORE_MIERU_TRACE";
+const MIERU_LOG_INTERVAL_MS: u64 = 60_000;
+const MIERU_SLOW_PAYLOAD_LOG_MS: u128 = 1_000;
 const KEY_WINDOW_SECS: i64 = 120;
 #[cfg(not(test))]
 const MIERU_UNDERLAY_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -273,7 +275,7 @@ impl MieruServer {
         writer.set_session_id(initial.metadata.session_id);
         let writer = Arc::new(Mutex::new(writer));
         let mut sessions = HashMap::<u32, Sender<MieruSegment>>::new();
-        let mut workers = HashMap::<u32, DetachedBlockingRelayHandle<()>>::new();
+        let mut workers = HashMap::<u32, NativeRelayHandle<()>>::new();
         let (done_tx, done_rx) = mpsc::channel();
         spawn_mieru_session(
             initial,
@@ -300,7 +302,7 @@ impl MieruServer {
                 sessions.remove(&session_id);
                 if let Some(worker) = workers.remove(&session_id) {
                     if let Err(error) =
-                        join_detached_blocking_relay(worker, "mieru session worker panicked")
+                        join_native_blocking_relay(worker, "mieru session worker panicked")
                     {
                         first_error.get_or_insert((error.kind(), error.to_string()));
                         close_mieru_underlay(&writer);
@@ -359,7 +361,7 @@ impl MieruServer {
 
         drop(sessions);
         for worker in workers.into_values() {
-            let _ = join_detached_blocking_relay(worker, "mieru session worker panicked");
+            let _ = join_native_blocking_relay(worker, "mieru session worker panicked");
         }
         while let Ok((_, result)) = done_rx.try_recv() {
             if let Err(error) = result {
@@ -437,7 +439,7 @@ fn dispatch_mieru_segment(
     runtime: MieruSessionRuntime,
     done_tx: Sender<(u32, Result<(), (io::ErrorKind, String)>)>,
     sessions: &mut HashMap<u32, Sender<MieruSegment>>,
-    workers: &mut HashMap<u32, DetachedBlockingRelayHandle<()>>,
+    workers: &mut HashMap<u32, NativeRelayHandle<()>>,
 ) -> io::Result<()> {
     match segment.metadata.protocol_type {
         OPEN_SESSION_REQUEST => spawn_mieru_session(
@@ -482,7 +484,7 @@ fn spawn_mieru_session(
     runtime: MieruSessionRuntime,
     done_tx: Sender<(u32, Result<(), (io::ErrorKind, String)>)>,
     sessions: &mut HashMap<u32, Sender<MieruSegment>>,
-    workers: &mut HashMap<u32, DetachedBlockingRelayHandle<()>>,
+    workers: &mut HashMap<u32, NativeRelayHandle<()>>,
 ) -> io::Result<()> {
     let session_id = initial.metadata.session_id;
     if session_id == 0 {
@@ -500,9 +502,12 @@ fn spawn_mieru_session(
 
     let (tx, rx) = mpsc::channel();
     sessions.insert(session_id, tx);
-    let worker = spawn_detached_blocking_relay_with_handle(MIERU_SESSION_RELAY_LABEL, move || {
+    let worker = spawn_named_native_blocking_relay(MIERU_SESSION_RELAY_LABEL, move || {
         let result = handle_mieru_session(initial, rx, writer.clone(), user, client_ip, runtime)
             .map_err(|error| (error.kind(), error.to_string()));
+        if let Err((kind, _)) = &result {
+            record_mieru_connection_error("session", *kind);
+        }
         let _ = done_tx.send((session_id, result));
     })?;
     workers.insert(session_id, worker);
@@ -1953,7 +1958,15 @@ struct MieruSessionFinishedLog<'a> {
 }
 
 fn log_mieru_underlay_accepted(entry: MieruUnderlayAcceptedLog<'_>) {
-    crate::logging::emit_legacy_line(&format!(
+    let suppressed = if mieru_trace_enabled() {
+        Some(0)
+    } else {
+        should_log_mieru_event(entry.node_tag, "underlay_accepted", "ok")
+    };
+    let Some(suppressed) = suppressed else {
+        return;
+    };
+    let mut line = format!(
         "INFO  core   mieru underlay accepted node={} peer={} uid={} session={} users={} accept_ms={}",
         mieru_log_field(entry.node_tag),
         mieru_log_field(
@@ -1966,11 +1979,31 @@ fn log_mieru_underlay_accepted(entry: MieruUnderlayAcceptedLog<'_>) {
         entry.session_id,
         entry.users,
         entry.accept_ms
-    ));
+    );
+    if suppressed != 0 {
+        line.push_str(&format!(" suppressed={suppressed}"));
+    }
+    crate::logging::emit_legacy_line(&line);
 }
 
 fn log_mieru_session_opened(entry: MieruSessionOpenedLog<'_>) {
-    crate::logging::emit_legacy_line(&format_mieru_session_opened(entry));
+    let suppressed = if mieru_trace_enabled() {
+        Some(0)
+    } else {
+        should_log_mieru_event(
+            &entry.context.node_tag,
+            "session_opened",
+            entry.context.command,
+        )
+    };
+    let Some(suppressed) = suppressed else {
+        return;
+    };
+    let mut line = format_mieru_session_opened(entry);
+    if suppressed != 0 {
+        line.push_str(&format!(" suppressed={suppressed}"));
+    }
+    crate::logging::emit_legacy_line(&line);
 }
 
 fn format_mieru_session_opened(entry: MieruSessionOpenedLog<'_>) -> String {
@@ -1993,7 +2026,18 @@ fn format_mieru_session_opened(entry: MieruSessionOpenedLog<'_>) -> String {
 }
 
 fn log_mieru_first_payload(entry: MieruFirstPayloadLog<'_>) {
-    crate::logging::emit_legacy_line(&format!(
+    if !mieru_trace_enabled() && entry.wait_ms < MIERU_SLOW_PAYLOAD_LOG_MS {
+        return;
+    }
+    let suppressed = if mieru_trace_enabled() {
+        Some(0)
+    } else {
+        should_log_mieru_event(&entry.context.node_tag, "first_payload", entry.direction)
+    };
+    let Some(suppressed) = suppressed else {
+        return;
+    };
+    let mut line = format!(
         "INFO  core   mieru first_payload node={} session={} command={} client_ip={} target={} target_port={} direction={} wait_ms={} bytes={}",
         mieru_log_field(&entry.context.node_tag),
         entry.context.session_id,
@@ -2004,11 +2048,27 @@ fn log_mieru_first_payload(entry: MieruFirstPayloadLog<'_>) {
         entry.direction,
         entry.wait_ms,
         entry.bytes
-    ));
+    );
+    if suppressed != 0 {
+        line.push_str(&format!(" suppressed={suppressed}"));
+    }
+    crate::logging::emit_legacy_line(&line);
 }
 
 fn log_mieru_session_finished(entry: MieruSessionFinishedLog<'_>) {
-    crate::logging::emit_legacy_line(&format!(
+    let suppressed = if mieru_trace_enabled() {
+        Some(0)
+    } else {
+        should_log_mieru_event(
+            &entry.context.node_tag,
+            "session_finished",
+            entry.context.command,
+        )
+    };
+    let Some(suppressed) = suppressed else {
+        return;
+    };
+    let mut line = format!(
         "INFO  core   mieru session finished node={} session={} command={} client_ip={} target={} target_port={} upload={} download={} total_ms={}",
         mieru_log_field(&entry.context.node_tag),
         entry.context.session_id,
@@ -2019,7 +2079,88 @@ fn log_mieru_session_finished(entry: MieruSessionFinishedLog<'_>) {
         entry.upload,
         entry.download,
         entry.total_ms
-    ));
+    );
+    if suppressed != 0 {
+        line.push_str(&format!(" suppressed={suppressed}"));
+    }
+    crate::logging::emit_legacy_line(&line);
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MieruLogKey {
+    node_tag: String,
+    event: &'static str,
+    outcome: &'static str,
+}
+
+#[derive(Default)]
+struct MieruLogState {
+    has_logged: bool,
+    last_ms: u64,
+    suppressed: u64,
+}
+
+fn should_log_mieru_event(
+    node_tag: &str,
+    event: &'static str,
+    outcome: &'static str,
+) -> Option<u64> {
+    static STATE: std::sync::OnceLock<Mutex<HashMap<MieruLogKey, MieruLogState>>> =
+        std::sync::OnceLock::new();
+    let mut states = STATE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("mieru log state poisoned");
+    let key = MieruLogKey {
+        node_tag: node_tag.to_string(),
+        event,
+        outcome,
+    };
+    let state = states.entry(key).or_default();
+    let now_ms = now_millis();
+    if !state.has_logged {
+        state.has_logged = true;
+        state.last_ms = now_ms;
+        return Some(0);
+    }
+    if now_ms.saturating_sub(state.last_ms) < MIERU_LOG_INTERVAL_MS {
+        state.suppressed = state.suppressed.saturating_add(1);
+        return None;
+    }
+    let suppressed = std::mem::take(&mut state.suppressed);
+    state.last_ms = now_ms;
+    Some(suppressed)
+}
+
+fn record_mieru_connection_error(scope: &'static str, kind: io::ErrorKind) {
+    crate::metrics::record_connection_error("Mieru", scope, mieru_error_reason(kind));
+}
+
+fn mieru_error_reason(kind: io::ErrorKind) -> &'static str {
+    match kind {
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => "timeout",
+        io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::ConnectionRefused => "connection_refused",
+        io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::UnexpectedEof => "connection_closed",
+        io::ErrorKind::InvalidData => "invalid_data",
+        io::ErrorKind::AddrNotAvailable => "addr_not_available",
+        io::ErrorKind::NotFound => "not_found",
+        _ => "io_error",
+    }
+}
+
+fn mieru_trace_enabled() -> bool {
+    std::env::var_os(MIERU_TRACE_ENV).is_some()
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 fn mieru_optional_ip(value: Option<IpAddr>) -> String {
@@ -2085,15 +2226,15 @@ mod tests {
     }
 
     #[test]
-    fn mieru_session_worker_uses_detached_blocking_fallback_metric() {
+    fn mieru_session_worker_uses_native_relay_pool_metric() {
         assert_eq!(super::MIERU_SESSION_RELAY_LABEL, "keli-core-mieru-session");
         let test_label = "keli-core-mieru-session-test";
         let snapshot = crate::stream::relay_scheduler_metrics_snapshot();
-        assert_eq!(snapshot.active_detached_blocking.get(test_label), None);
+        assert_eq!(snapshot.active_native.get(test_label), None);
 
-        let _guard = crate::stream::DetachedBlockingRelayMetricsGuard::new(test_label);
+        let _guard = crate::stream::NativeRelayMetricsGuard::new(test_label);
         let snapshot = crate::stream::relay_scheduler_metrics_snapshot();
-        assert_eq!(snapshot.active_detached_blocking.get(test_label), Some(&1));
+        assert_eq!(snapshot.active_native.get(test_label), Some(&1));
     }
 
     #[test]

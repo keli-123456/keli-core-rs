@@ -181,9 +181,24 @@ impl AnyTlsServer {
 
     pub fn handle_tcp_client(&self, mut client: TcpStream) -> io::Result<()> {
         let client_ip = client.peer_addr().ok().map(|addr| addr.ip());
-        self.router.ensure_source_ip_allowed(client_ip)?;
-        let user = self.read_auth(&mut client)?;
-        let _session = self.acquire_user_session(&user, client_ip)?;
+        if let Err(error) = self.router.ensure_source_ip_allowed(client_ip) {
+            record_anytls_connection_error("source_ip", &error);
+            return Err(error);
+        }
+        let user = match self.read_auth(&mut client) {
+            Ok(user) => user,
+            Err(error) => {
+                record_anytls_connection_error("auth", &error);
+                return Err(error);
+            }
+        };
+        let _session = match self.acquire_user_session(&user, client_ip) {
+            Ok(session) => session,
+            Err(error) => {
+                record_anytls_connection_error("device_limit", &error);
+                return Err(error);
+            }
+        };
         let _connection = self
             .bandwidth
             .register_tcp_connection(Some(&user.uuid), &[&client])?;
@@ -218,6 +233,9 @@ impl AnyTlsServer {
                 download,
                 session.client_ip,
             );
+        }
+        if let Err(error) = &result {
+            record_anytls_connection_error("frame", error);
         }
         result
     }
@@ -1040,6 +1058,26 @@ fn anytls_user_map(users: &[CoreUser]) -> HashMap<[u8; 32], Arc<CoreUser>> {
         .filter(|user| !user.is_empty())
         .map(|user| (sha256(user.credential()), Arc::new(user.clone())))
         .collect()
+}
+
+fn record_anytls_connection_error(scope: &'static str, error: &io::Error) {
+    crate::metrics::record_connection_error("AnyTLS", scope, anytls_error_reason(error.kind()));
+}
+
+fn anytls_error_reason(kind: io::ErrorKind) -> &'static str {
+    match kind {
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => "timeout",
+        io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::ConnectionRefused => "connection_refused",
+        io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::UnexpectedEof => "connection_closed",
+        io::ErrorKind::InvalidData => "invalid_data",
+        io::ErrorKind::AddrNotAvailable => "addr_not_available",
+        io::ErrorKind::NotFound => "not_found",
+        _ => "io_error",
+    }
 }
 
 #[cfg(test)]

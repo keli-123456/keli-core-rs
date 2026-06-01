@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -232,127 +232,20 @@ impl CoreService {
         }
         let mut listeners = Vec::new();
         for inbound in config.inbounds {
-            let routes = active_config.resolved_inbound_routes(&inbound);
-            let handle = match inbound.protocol {
-                Protocol::Socks => start_socks_listener(
-                    &inbound,
-                    routes.clone(),
-                    connect_timeout,
-                    traffic.clone(),
-                    sessions.clone(),
-                    bandwidth.clone(),
-                )?,
-                Protocol::Http => start_http_listener(
-                    &inbound,
-                    routes.clone(),
-                    connect_timeout,
-                    traffic.clone(),
-                    sessions.clone(),
-                    bandwidth.clone(),
-                )?,
-                Protocol::Vless => start_vless_listener(
-                    &inbound,
-                    routes.clone(),
-                    connect_timeout,
-                    connection_idle,
-                    uplink_only,
-                    downlink_only,
-                    traffic.clone(),
-                    sessions.clone(),
-                    bandwidth.clone(),
-                    tls_failures.clone(),
-                )?,
-                Protocol::Vmess => start_vmess_listener(
-                    &inbound,
-                    routes.clone(),
-                    connect_timeout,
-                    traffic.clone(),
-                    sessions.clone(),
-                    bandwidth.clone(),
-                    tls_failures.clone(),
-                )?,
-                Protocol::Trojan => start_trojan_listener(
-                    &inbound,
-                    routes.clone(),
-                    connect_timeout,
-                    connection_idle,
-                    uplink_only,
-                    downlink_only,
-                    sniffing_cache,
-                    traffic.clone(),
-                    sessions.clone(),
-                    bandwidth.clone(),
-                    tls_failures.clone(),
-                )?,
-                Protocol::Shadowsocks => start_shadowsocks_listener(
-                    &inbound,
-                    routes.clone(),
-                    connect_timeout,
-                    traffic.clone(),
-                    sessions.clone(),
-                    bandwidth.clone(),
-                )?,
-                Protocol::AnyTls => start_anytls_listener(
-                    &inbound,
-                    routes.clone(),
-                    connect_timeout,
-                    traffic.clone(),
-                    sessions.clone(),
-                    bandwidth.clone(),
-                    tls_failures.clone(),
-                )?,
-                Protocol::Tuic => start_tuic_listener(
-                    &inbound,
-                    routes.clone(),
-                    connect_timeout,
-                    traffic.clone(),
-                    sessions.clone(),
-                    bandwidth.clone(),
-                    quic_connections
-                        .as_ref()
-                        .expect("quic limiter should exist for tuic")
-                        .clone(),
-                )?,
-                Protocol::Hysteria2 => start_hysteria2_listener(
-                    &inbound,
-                    routes.clone(),
-                    connect_timeout,
-                    traffic.clone(),
-                    sessions.clone(),
-                    bandwidth.clone(),
-                    quic_connections
-                        .as_ref()
-                        .expect("quic limiter should exist for hysteria2")
-                        .clone(),
-                )?,
-                Protocol::Mieru => start_mieru_listener(
-                    &inbound,
-                    routes.clone(),
-                    connect_timeout,
-                    traffic.clone(),
-                    sessions.clone(),
-                    bandwidth.clone(),
-                )?,
-                Protocol::Naive => start_naive_listener(
-                    &inbound,
-                    routes.clone(),
-                    connect_timeout,
-                    traffic.clone(),
-                    sessions.clone(),
-                    bandwidth.clone(),
-                    tls_failures.clone(),
-                    if naive_uses_quic(&inbound) {
-                        Some(
-                            quic_connections
-                                .as_ref()
-                                .expect("quic limiter should exist for naive h3")
-                                .clone(),
-                        )
-                    } else {
-                        None
-                    },
-                )?,
-            };
+            let handle = start_listener_handle(
+                &inbound,
+                &active_config,
+                connect_timeout,
+                connection_idle,
+                uplink_only,
+                downlink_only,
+                sniffing_cache,
+                traffic.clone(),
+                sessions.clone(),
+                bandwidth.clone(),
+                tls_failures.clone(),
+                quic_connections.as_ref(),
+            )?;
             listeners.push(handle);
         }
 
@@ -471,6 +364,141 @@ impl CoreService {
             }
         }
         self.config = active_config;
+    }
+
+    pub fn update_changed_listeners_and_users(
+        &mut self,
+        config: CoreConfig,
+    ) -> Result<bool, CoreServiceError> {
+        config.validate().map_err(CoreServiceError::InvalidConfig)?;
+        validate_unique_listener_binds(&config.inbounds)
+            .map_err(CoreServiceError::InvalidConfig)?;
+        let active_config = config_without_users(&config);
+        if !config_allows_listener_level_update(&self.config, &active_config) {
+            return Ok(false);
+        }
+        if !quic_listener_structures_unchanged(&self.config.inbounds, &active_config.inbounds) {
+            return Ok(false);
+        }
+
+        let old_config_by_tag = self
+            .config
+            .inbounds
+            .iter()
+            .map(|inbound| (inbound.tag.clone(), inbound.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut new_handles = HashMap::new();
+        let connect_timeout = outbound_connect_timeout(&config.policy);
+        let connection_idle = connection_idle_timeout(&config.policy);
+        let uplink_only = uplink_only_timeout(&config.policy);
+        let downlink_only = downlink_only_timeout(&config.policy);
+        let sniffing_cache = sniffing_cache_timeout(&config.policy);
+
+        for inbound in &config.inbounds {
+            let active_inbound = inbound_without_users(inbound);
+            let needs_new_listener = old_config_by_tag
+                .get(&inbound.tag)
+                .map(|old| !inbound_eq_without_users_routes(old, &active_inbound))
+                .unwrap_or(true);
+            if !needs_new_listener {
+                continue;
+            }
+            if old_config_by_tag
+                .get(&inbound.tag)
+                .is_some_and(|old| listener_bind_eq(old, &active_inbound))
+            {
+                stop_new_listener_handles(new_handles);
+                return Ok(false);
+            }
+
+            match start_listener_handle(
+                inbound,
+                &active_config,
+                connect_timeout,
+                connection_idle,
+                uplink_only,
+                downlink_only,
+                sniffing_cache,
+                self.traffic.clone(),
+                self.sessions.clone(),
+                self.bandwidth.clone(),
+                self.tls_failures.clone(),
+                self.quic_connections.as_ref(),
+            ) {
+                Ok(handle) => {
+                    new_handles.insert(inbound.tag.clone(), handle);
+                }
+                Err(error) => {
+                    stop_new_listener_handles(new_handles);
+                    return Err(error);
+                }
+            }
+        }
+
+        if new_handles.is_empty()
+            && inbounds_same_tags(&self.config.inbounds, &active_config.inbounds)
+        {
+            return Ok(false);
+        }
+
+        let desired_tags = active_config
+            .inbounds
+            .iter()
+            .map(|inbound| inbound.tag.clone())
+            .collect::<HashSet<_>>();
+        let mut old_handles = std::mem::take(&mut self.listeners)
+            .into_iter()
+            .map(|handle| (handle.status.tag.clone(), handle))
+            .collect::<HashMap<_, _>>();
+        let mut listeners = Vec::with_capacity(active_config.inbounds.len());
+        let mut restarted_tags = HashSet::new();
+
+        for inbound in &config.inbounds {
+            if let Some(handle) = new_handles.remove(&inbound.tag) {
+                if let Some(mut old_handle) = old_handles.remove(&inbound.tag) {
+                    stop_listener_handle(&mut old_handle);
+                }
+                self.user_revisions.remove(&inbound.tag);
+                self.user_fingerprints.insert(
+                    inbound.tag.clone(),
+                    UserFingerprintState::from_users(&inbound.users),
+                );
+                restarted_tags.insert(inbound.tag.clone());
+                listeners.push(handle);
+                continue;
+            }
+
+            if let Some(handle) = old_handles.remove(&inbound.tag) {
+                let fingerprint = UserFingerprintState::from_users(&inbound.users);
+                if self.user_fingerprints.get(&inbound.tag) != Some(&fingerprint) {
+                    handle.runtime.replace_users(inbound.users.clone());
+                    self.user_revisions.remove(&inbound.tag);
+                    self.user_fingerprints
+                        .insert(inbound.tag.clone(), fingerprint);
+                }
+                handle
+                    .runtime
+                    .replace_routes(active_config.resolved_inbound_routes(inbound));
+                listeners.push(handle);
+            }
+        }
+
+        for (tag, mut handle) in old_handles {
+            if !desired_tags.contains(&tag) {
+                self.user_revisions.remove(&tag);
+                self.user_fingerprints.remove(&tag);
+            }
+            stop_listener_handle(&mut handle);
+        }
+
+        crate::logging::emit_legacy_line(&format!(
+            "INFO  core   listener hot update changed={} total={}",
+            restarted_tags.len(),
+            listeners.len()
+        ));
+        self.listeners = listeners;
+        self.config = active_config;
+        Ok(true)
     }
 
     pub fn apply_user_delta(
@@ -633,6 +661,72 @@ fn inbound_eq_without_users_routes(left: &InboundConfig, right: &InboundConfig) 
         && left.sniffing == right.sniffing
 }
 
+fn config_allows_listener_level_update(left: &CoreConfig, right: &CoreConfig) -> bool {
+    left.instance_id == right.instance_id
+        && left.log_level == right.log_level
+        && left.dns == right.dns
+        && left.policy == right.policy
+        && left.stats == right.stats
+}
+
+fn quic_listener_structures_unchanged(left: &[InboundConfig], right: &[InboundConfig]) -> bool {
+    let left = left
+        .iter()
+        .filter(|inbound| inbound_binds_quic(inbound))
+        .map(|inbound| (inbound.tag.as_str(), inbound))
+        .collect::<HashMap<_, _>>();
+    let right = right
+        .iter()
+        .filter(|inbound| inbound_binds_quic(inbound))
+        .map(|inbound| (inbound.tag.as_str(), inbound))
+        .collect::<HashMap<_, _>>();
+    left.len() == right.len()
+        && left.iter().all(|(tag, left_inbound)| {
+            right.get(tag).is_some_and(|right_inbound| {
+                inbound_eq_without_users_routes(left_inbound, right_inbound)
+            })
+        })
+}
+
+fn inbounds_same_tags(left: &[InboundConfig], right: &[InboundConfig]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| left.tag == right.tag)
+}
+
+fn listener_bind_eq(left: &InboundConfig, right: &InboundConfig) -> bool {
+    left.listen == right.listen && left.port == right.port
+}
+
+fn stop_new_listener_handles(handles: HashMap<String, ListenerHandle>) {
+    for (_, mut handle) in handles {
+        stop_listener_handle(&mut handle);
+    }
+}
+
+fn stop_listener_handle(handle: &mut ListenerHandle) {
+    handle.stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(handle.status.local_addr);
+    if let Some(join) = handle.join.take() {
+        let _ = join.join();
+    }
+    if !handle
+        .workers
+        .join_timeout(CONNECTION_WORKER_SHUTDOWN_TIMEOUT)
+    {
+        let worker_snapshot = format_connection_worker_snapshot(handle.workers.snapshot());
+        let relay_snapshot = crate::stream::format_relay_scheduler_metrics(
+            crate::stream::relay_scheduler_metrics_snapshot(),
+        );
+        crate::logging::emit_legacy_line(&format!(
+            "WARN  core   listener worker shutdown timed out tag={} protocol={:?} {} {}",
+            handle.status.tag, handle.status.protocol, worker_snapshot, relay_snapshot
+        ));
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct UserFingerprintState {
     users: HashMap<String, u64>,
@@ -721,6 +815,141 @@ fn outbound_connect_timeout_from_env(value: Option<String>, default_secs: u64) -
         .filter(|seconds| *seconds > 0)
         .map(|seconds| Duration::from_secs(seconds.clamp(1, 60)))
         .unwrap_or_else(|| Duration::from_secs(default_secs.clamp(1, 60)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_listener_handle(
+    inbound: &InboundConfig,
+    active_config: &CoreConfig,
+    connect_timeout: Duration,
+    connection_idle: Duration,
+    uplink_only: Duration,
+    downlink_only: Duration,
+    sniffing_cache: Duration,
+    traffic: SharedTrafficRegistry,
+    sessions: UserSessionTracker,
+    bandwidth: UserBandwidthLimiters,
+    tls_failures: ClientFailureBackoff,
+    quic_connections: Option<&SharedQuicConnectionLimiter>,
+) -> Result<ListenerHandle, CoreServiceError> {
+    let routes = active_config.resolved_inbound_routes(inbound);
+    match inbound.protocol {
+        Protocol::Socks => start_socks_listener(
+            inbound,
+            routes,
+            connect_timeout,
+            traffic,
+            sessions,
+            bandwidth,
+        ),
+        Protocol::Http => start_http_listener(
+            inbound,
+            routes,
+            connect_timeout,
+            traffic,
+            sessions,
+            bandwidth,
+        ),
+        Protocol::Vless => start_vless_listener(
+            inbound,
+            routes,
+            connect_timeout,
+            connection_idle,
+            uplink_only,
+            downlink_only,
+            traffic,
+            sessions,
+            bandwidth,
+            tls_failures,
+        ),
+        Protocol::Vmess => start_vmess_listener(
+            inbound,
+            routes,
+            connect_timeout,
+            traffic,
+            sessions,
+            bandwidth,
+            tls_failures,
+        ),
+        Protocol::Trojan => start_trojan_listener(
+            inbound,
+            routes,
+            connect_timeout,
+            connection_idle,
+            uplink_only,
+            downlink_only,
+            sniffing_cache,
+            traffic,
+            sessions,
+            bandwidth,
+            tls_failures,
+        ),
+        Protocol::Shadowsocks => start_shadowsocks_listener(
+            inbound,
+            routes,
+            connect_timeout,
+            traffic,
+            sessions,
+            bandwidth,
+        ),
+        Protocol::AnyTls => start_anytls_listener(
+            inbound,
+            routes,
+            connect_timeout,
+            traffic,
+            sessions,
+            bandwidth,
+            tls_failures,
+        ),
+        Protocol::Tuic => start_tuic_listener(
+            inbound,
+            routes,
+            connect_timeout,
+            traffic,
+            sessions,
+            bandwidth,
+            quic_connections
+                .expect("quic limiter should exist for tuic")
+                .clone(),
+        ),
+        Protocol::Hysteria2 => start_hysteria2_listener(
+            inbound,
+            routes,
+            connect_timeout,
+            traffic,
+            sessions,
+            bandwidth,
+            quic_connections
+                .expect("quic limiter should exist for hysteria2")
+                .clone(),
+        ),
+        Protocol::Mieru => start_mieru_listener(
+            inbound,
+            routes,
+            connect_timeout,
+            traffic,
+            sessions,
+            bandwidth,
+        ),
+        Protocol::Naive => start_naive_listener(
+            inbound,
+            routes,
+            connect_timeout,
+            traffic,
+            sessions,
+            bandwidth,
+            tls_failures,
+            if naive_uses_quic(inbound) {
+                Some(
+                    quic_connections
+                        .expect("quic limiter should exist for naive h3")
+                        .clone(),
+                )
+            } else {
+                None
+            },
+        ),
+    }
 }
 
 fn start_grpc_transport_listener(
