@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::hash::Hash;
-use std::sync::{Arc, Mutex};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,8 @@ pub struct CoreUser {
     pub speed_limit: u64,
     pub device_limit: u32,
 }
+
+static SHARED_CORE_USERS: OnceLock<Mutex<HashMap<u64, Vec<Weak<CoreUser>>>>> = OnceLock::new();
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreUserDelta {
@@ -42,6 +44,13 @@ pub struct CoreUserDeltaResult {
     pub full_applied: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SharedCoreUserPoolSnapshot {
+    pub buckets: usize,
+    pub active: usize,
+    pub stale: usize,
+}
+
 impl CoreUser {
     pub fn credential(&self) -> &str {
         self.password.as_deref().unwrap_or(&self.uuid)
@@ -54,6 +63,56 @@ impl CoreUser {
     pub fn is_empty(&self) -> bool {
         self.uuid.trim().is_empty()
     }
+}
+
+pub fn shared_core_user(user: &CoreUser) -> Arc<CoreUser> {
+    let fingerprint = core_user_fingerprint(user);
+    let pool = SHARED_CORE_USERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut pool = pool.lock().expect("shared core user pool poisoned");
+    let bucket = pool.entry(fingerprint).or_default();
+    bucket.retain(|candidate| candidate.strong_count() > 0);
+    for candidate in bucket.iter() {
+        if let Some(existing) = candidate.upgrade() {
+            if existing.as_ref() == user {
+                return existing;
+            }
+        }
+    }
+    let shared = Arc::new(user.clone());
+    bucket.push(Arc::downgrade(&shared));
+    shared
+}
+
+fn core_user_fingerprint(user: &CoreUser) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    user.id.hash(&mut hasher);
+    user.uuid.hash(&mut hasher);
+    user.password.hash(&mut hasher);
+    user.email.hash(&mut hasher);
+    user.speed_limit.hash(&mut hasher);
+    user.device_limit.hash(&mut hasher);
+    hasher.finish()
+}
+
+pub fn shared_core_user_pool_snapshot() -> SharedCoreUserPoolSnapshot {
+    let Some(pool) = SHARED_CORE_USERS.get() else {
+        return SharedCoreUserPoolSnapshot::default();
+    };
+    let pool = pool.lock().expect("shared core user pool poisoned");
+    let mut snapshot = SharedCoreUserPoolSnapshot {
+        buckets: pool.len(),
+        ..SharedCoreUserPoolSnapshot::default()
+    };
+    for bucket in pool.values() {
+        for candidate in bucket {
+            if candidate.strong_count() > 0 {
+                snapshot.active = snapshot.active.saturating_add(1);
+            } else {
+                snapshot.stale = snapshot.stale.saturating_add(1);
+            }
+        }
+    }
+    snapshot
 }
 
 #[derive(Clone)]
@@ -159,7 +218,7 @@ impl UserStore {
             } else {
                 result.added += 1;
             }
-            current.users.insert(key, Arc::new(user.clone()));
+            current.users.insert(key, shared_core_user(user));
         }
         for user in &delta.updated {
             if user.is_empty() {
@@ -167,7 +226,7 @@ impl UserStore {
             }
             let key = key(user);
             if remove_arc_user_by_uuid(&mut current.users, &user.uuid).is_some() {
-                current.users.insert(key, Arc::new(user.clone()));
+                current.users.insert(key, shared_core_user(user));
                 result.updated += 1;
             } else {
                 result.missing_updated += 1;
@@ -348,7 +407,7 @@ where
         for user in full {
             if !user.is_empty() {
                 if let Some(key) = key(user) {
-                    users.insert(key, Arc::new(user.clone()));
+                    users.insert(key, shared_core_user(user));
                 }
             }
         }
@@ -377,7 +436,7 @@ where
         } else {
             result.added += 1;
         }
-        users.insert(key, Arc::new(user.clone()));
+        users.insert(key, shared_core_user(user));
     }
     for user in &delta.updated {
         if user.is_empty() {
@@ -389,7 +448,7 @@ where
         };
         if let Some(old_key) = uuid_keys.insert(user.uuid.clone(), key.clone()) {
             users.remove(&old_key);
-            users.insert(key, Arc::new(user.clone()));
+            users.insert(key, shared_core_user(user));
             result.updated += 1;
         } else {
             uuid_keys.remove(&user.uuid);
@@ -431,7 +490,7 @@ where
     for user in users {
         if !user.is_empty() {
             let key = key(user);
-            state.users.insert(key, Arc::new(user.clone()));
+            state.users.insert(key, shared_core_user(user));
         }
     }
     state
@@ -453,7 +512,7 @@ mod tests {
 
     use super::{
         apply_user_delta_to_keyed_arc_map, apply_user_delta_to_keyed_map, apply_user_delta_to_vec,
-        CoreUser, CoreUserDelta, UserStore,
+        shared_core_user, CoreUser, CoreUserDelta, UserStore,
     };
     use std::sync::Arc;
 
@@ -488,6 +547,22 @@ mod tests {
             &user_a,
             users.get("user-a").expect("existing user should remain")
         ));
+    }
+
+    #[test]
+    fn shared_core_user_reuses_matching_user_arcs() {
+        let first = shared_core_user(&user("shared-user"));
+        let second = shared_core_user(&user("shared-user"));
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn user_store_shares_matching_core_user_arcs_across_stores() {
+        let first = UserStore::from_uuid_users(&[user("shared-store-user")]);
+        let second = UserStore::from_uuid_users(&[user("shared-store-user")]);
+        let first_user = first.get_arc("shared-store-user").unwrap();
+        let second_user = second.get_arc("shared-store-user").unwrap();
+        assert!(Arc::ptr_eq(&first_user, &second_user));
     }
 
     #[test]

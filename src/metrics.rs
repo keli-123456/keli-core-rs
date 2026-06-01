@@ -44,6 +44,12 @@ pub struct CoreMetricsSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keli_core_process_open_fds: Option<usize>,
     #[serde(default)]
+    pub keli_core_shared_user_pool_buckets: usize,
+    #[serde(default)]
+    pub keli_core_shared_user_pool_active: usize,
+    #[serde(default)]
+    pub keli_core_shared_user_pool_stale: usize,
+    #[serde(default)]
     pub keli_core_native_relay_active: BTreeMap<String, usize>,
     #[serde(default)]
     pub keli_core_async_relay_active: BTreeMap<String, usize>,
@@ -125,6 +131,10 @@ impl CoreMetrics {
         snapshot.keli_core_udp_relay_active = udp_relay_active_snapshot();
         snapshot.keli_core_udp_relay_finished_total = udp_relay_finished_snapshot();
         snapshot.keli_core_process_open_fds = process_open_fd_count();
+        let shared_users = crate::user::shared_core_user_pool_snapshot();
+        snapshot.keli_core_shared_user_pool_buckets = shared_users.buckets;
+        snapshot.keli_core_shared_user_pool_active = shared_users.active;
+        snapshot.keli_core_shared_user_pool_stale = shared_users.stale;
         let relay = crate::stream::relay_scheduler_metrics_snapshot();
         snapshot.keli_core_native_relay_active = relay.active_native;
         snapshot.keli_core_async_relay_active = relay.active_async;

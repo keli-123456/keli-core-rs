@@ -25,7 +25,8 @@ use crate::socks5::SocksTarget;
 use crate::tls::server_config_from_files;
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{
-    apply_user_delta_to_keyed_arc_map, CoreUser, CoreUserDelta, CoreUserDeltaResult,
+    apply_user_delta_to_keyed_arc_map, shared_core_user, CoreUser, CoreUserDelta,
+    CoreUserDeltaResult,
 };
 use crate::RouteDispatcher;
 use crate::{connect_tcp_outbound_tokio, send_udp_outbound_tokio};
@@ -1372,7 +1373,7 @@ fn tuic_user_map(users: &[CoreUser]) -> HashMap<[u8; 16], Arc<CoreUser>> {
         .filter_map(|user| {
             parse_uuid_bytes(&user.uuid)
                 .ok()
-                .map(|uuid| (uuid, Arc::new(user.clone())))
+                .map(|uuid| (uuid, shared_core_user(user)))
         })
         .collect()
 }

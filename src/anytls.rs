@@ -21,7 +21,8 @@ use crate::socks5::SocksTarget;
 use crate::stream::{join_async_relay, spawn_async_relay};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
 use crate::user::{
-    apply_user_delta_to_keyed_arc_map, CoreUser, CoreUserDelta, CoreUserDeltaResult,
+    apply_user_delta_to_keyed_arc_map, shared_core_user, CoreUser, CoreUserDelta,
+    CoreUserDeltaResult,
 };
 use crate::{send_udp_outbound, RouteDecision, RouteDispatcher};
 
@@ -1056,7 +1057,7 @@ fn anytls_user_map(users: &[CoreUser]) -> HashMap<[u8; 32], Arc<CoreUser>> {
     users
         .iter()
         .filter(|user| !user.is_empty())
-        .map(|user| (sha256(user.credential()), Arc::new(user.clone())))
+        .map(|user| (sha256(user.credential()), shared_core_user(user)))
         .collect()
 }
 
