@@ -43,6 +43,12 @@ pub struct CoreMetricsSnapshot {
     pub keli_core_native_relay_idle: usize,
     #[serde(default)]
     pub keli_core_native_relay_pending: usize,
+    #[serde(default)]
+    pub keli_core_native_relay_label_soft_limit: usize,
+    #[serde(default)]
+    pub keli_core_native_relay_pending_by_label: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub keli_core_native_relay_queue_wait_ms_by_label: BTreeMap<String, u64>,
     pub keli_core_dns: DnsMetricsSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keli_core_quic_resource: Option<QuicResourceSnapshot>,
@@ -107,6 +113,10 @@ impl CoreMetrics {
         snapshot.keli_core_native_relay_workers = relay.native_worker_count;
         snapshot.keli_core_native_relay_idle = relay.native_idle_count;
         snapshot.keli_core_native_relay_pending = relay.native_pending_count;
+        snapshot.keli_core_native_relay_label_soft_limit = relay.native_label_soft_limit;
+        snapshot.keli_core_native_relay_pending_by_label = relay.native_pending_by_label;
+        snapshot.keli_core_native_relay_queue_wait_ms_by_label =
+            relay.native_queue_wait_ms_by_label;
         snapshot
     }
 

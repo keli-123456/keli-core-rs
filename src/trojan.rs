@@ -36,8 +36,8 @@ use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
-    relay_tcp_fast_unlimited, relay_tcp_limited, spawn_background_io,
-    spawn_detached_blocking_relay, spawn_named_native_blocking_relay, RelayActivityDeadline,
+    relay_tcp_fast_unlimited, relay_tcp_limited, spawn_background_io, spawn_detached_native_relay,
+    spawn_named_native_blocking_relay, RelayActivityDeadline,
 };
 use crate::tls::{relay_tls_stream_with_timeouts, TlsConnection, TlsRelayTimeouts};
 use crate::traffic::{SharedTrafficRegistry, TrafficRegistry};
@@ -863,7 +863,7 @@ impl TrojanServer {
         session: Option<UserSessionGuard>,
     ) -> io::Result<()> {
         let server = self.clone();
-        spawn_detached_blocking_relay("keli-core-trojan-relay", move || {
+        spawn_detached_native_relay("keli-core-trojan-relay", move || {
             let _session = session;
             server.relay_plain_websocket(reader, writer, remote, request, bandwidth)
         })?;
@@ -879,7 +879,7 @@ impl TrojanServer {
         session: Option<UserSessionGuard>,
     ) -> io::Result<()> {
         let server = self.clone();
-        spawn_detached_blocking_relay("keli-core-trojan-relay", move || {
+        spawn_detached_native_relay("keli-core-trojan-relay", move || {
             let _session = session;
             server.relay_udp_plain_websocket(reader, writer, request, bandwidth)
         })?;
@@ -1081,7 +1081,7 @@ impl TrojanServer {
         session: Option<UserSessionGuard>,
     ) -> io::Result<()> {
         let server = self.clone();
-        spawn_detached_blocking_relay("keli-core-trojan-relay", move || {
+        spawn_detached_native_relay("keli-core-trojan-relay", move || {
             let _session = session;
             server.relay_tls(client, remote, request, bandwidth)
         })?;
@@ -1098,7 +1098,7 @@ impl TrojanServer {
         initial_payload: Vec<u8>,
     ) -> io::Result<()> {
         let server = self.clone();
-        spawn_detached_blocking_relay("keli-core-trojan-relay", move || {
+        spawn_detached_native_relay("keli-core-trojan-relay", move || {
             let _session = session;
             server.relay_tls_websocket(client, remote, request, bandwidth, initial_payload)
         })?;

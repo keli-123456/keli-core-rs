@@ -34,8 +34,8 @@ use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
     relay_tcp_fast_unlimited_close_on_eof, relay_tcp_limited, spawn_async_relay,
-    spawn_detached_blocking_relay, spawn_named_native_blocking_relay, spawn_tcp_relay_background,
-    RelayActivityDeadline,
+    spawn_detached_blocking_relay, spawn_detached_native_relay, spawn_named_native_blocking_relay,
+    spawn_tcp_relay_background, RelayActivityDeadline,
 };
 use crate::tls::{
     relay_tls_stream_with_timeouts, RawTcpStreamAccess, TlsConnection, TlsRelayTimeouts, TlsSocket,
@@ -1175,7 +1175,7 @@ impl VlessServer {
         W: Write + Send + 'static,
     {
         let server = self.clone();
-        spawn_detached_blocking_relay(VLESS_WEBSOCKET_DETACHED_RELAY_LABEL, move || {
+        spawn_detached_native_relay(VLESS_WEBSOCKET_DETACHED_RELAY_LABEL, move || {
             let _session = session;
             server.relay_websocket(reader, writer, remote, request, bandwidth)
         })?;
@@ -1333,7 +1333,7 @@ impl VlessServer {
         session: Option<UserSessionGuard>,
     ) -> io::Result<()> {
         let server = self.clone();
-        spawn_detached_blocking_relay(VLESS_PLAIN_WEBSOCKET_DETACHED_RELAY_LABEL, move || {
+        spawn_detached_native_relay(VLESS_PLAIN_WEBSOCKET_DETACHED_RELAY_LABEL, move || {
             let _session = session;
             server.relay_plain_websocket(reader, writer, remote, request, bandwidth)
         })?;
@@ -1606,7 +1606,7 @@ impl VlessServer {
                 server.relay_tls(client, remote, request, bandwidth)
             })?;
         } else {
-            spawn_detached_blocking_relay(VLESS_TLS_DETACHED_RELAY_LABEL, move || {
+            spawn_detached_native_relay(VLESS_TLS_DETACHED_RELAY_LABEL, move || {
                 let _session = session;
                 server.relay_tls(client, remote, request, bandwidth)
             })?;
@@ -1692,7 +1692,7 @@ impl VlessServer {
         session: Option<UserSessionGuard>,
     ) -> io::Result<()> {
         let server = self.clone();
-        spawn_detached_blocking_relay(VLESS_TLS_WEBSOCKET_DETACHED_RELAY_LABEL, move || {
+        spawn_detached_native_relay(VLESS_TLS_WEBSOCKET_DETACHED_RELAY_LABEL, move || {
             let _session = session;
             server.relay_tls_websocket(client, remote, request, bandwidth)
         })?;

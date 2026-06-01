@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -45,7 +45,13 @@ const MAX_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 8192;
 const DETACHED_BLOCKING_RELAY_STACK_ENV: &str = "KELI_CORE_DETACHED_RELAY_STACK_KIB";
 
 pub type BlockingRelayHandle<T> = tokio::task::JoinHandle<T>;
-type NativeRelayJob = Box<dyn FnOnce() + Send + 'static>;
+type NativeRelayTask = Box<dyn FnOnce() + Send + 'static>;
+
+struct NativeRelayJob {
+    label: &'static str,
+    enqueued_at: Instant,
+    task: NativeRelayTask,
+}
 
 #[derive(Debug)]
 pub(crate) struct RelayActivityDeadline {
@@ -107,12 +113,32 @@ impl<T> std::fmt::Debug for DetachedBlockingRelayHandle<T> {
 }
 
 struct NativeRelayPool {
-    queue: Mutex<VecDeque<NativeRelayJob>>,
+    queue: Mutex<NativeRelayQueueState>,
     ready: Condvar,
     worker_count: AtomicUsize,
     idle_count: AtomicUsize,
     pending_count: AtomicUsize,
-    max_workers: usize,
+    max_workers: AtomicUsize,
+    label_soft_limit: AtomicUsize,
+    dynamic_limits: AtomicBool,
+}
+
+struct NativeRelayActiveLabelGuard {
+    pool: &'static NativeRelayPool,
+    label: &'static str,
+}
+
+impl Drop for NativeRelayActiveLabelGuard {
+    fn drop(&mut self) {
+        self.pool.finish_job_label(self.label);
+    }
+}
+
+#[derive(Default)]
+struct NativeRelayQueueState {
+    jobs: VecDeque<NativeRelayJob>,
+    active_by_label: BTreeMap<&'static str, usize>,
+    queue_wait_ms_by_label: BTreeMap<&'static str, u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -123,13 +149,19 @@ pub(crate) struct RelaySchedulerMetricsSnapshot {
     pub native_worker_count: usize,
     pub native_idle_count: usize,
     pub native_pending_count: usize,
+    pub native_label_soft_limit: usize,
+    pub native_pending_by_label: BTreeMap<String, usize>,
+    pub native_queue_wait_ms_by_label: BTreeMap<String, u64>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct NativeRelayPoolSnapshot {
     worker_count: usize,
     idle_count: usize,
     pending_count: usize,
+    label_soft_limit: usize,
+    pending_by_label: BTreeMap<String, usize>,
+    queue_wait_ms_by_label: BTreeMap<String, u64>,
 }
 
 pub fn relay_tcp_streams(client: TcpStream, remote: TcpStream) -> io::Result<(u64, u64)> {
@@ -443,6 +475,9 @@ pub(crate) fn relay_scheduler_metrics_snapshot() -> RelaySchedulerMetricsSnapsho
         native_worker_count: native.worker_count,
         native_idle_count: native.idle_count,
         native_pending_count: native.pending_count,
+        native_label_soft_limit: native.label_soft_limit,
+        native_pending_by_label: native.pending_by_label,
+        native_queue_wait_ms_by_label: native.queue_wait_ms_by_label,
     }
 }
 
@@ -466,6 +501,16 @@ pub(crate) fn format_relay_scheduler_metrics(snapshot: RelaySchedulerMetricsSnap
         "native_relay_pending={}",
         snapshot.native_pending_count
     ));
+    fields.push(format!(
+        "native_relay_label_soft_limit={}",
+        snapshot.native_label_soft_limit
+    ));
+    for (name, count) in snapshot.native_pending_by_label {
+        fields.push(format!("native_relay_pending.{name}={count}"));
+    }
+    for (name, wait_ms) in snapshot.native_queue_wait_ms_by_label {
+        fields.push(format!("native_relay_queue_wait_ms.{name}={wait_ms}"));
+    }
     fields.join(" ")
 }
 
@@ -508,8 +553,17 @@ where
         let _metrics = NativeRelayMetricsGuard::new(name);
         let _ = sender.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)));
     });
-    native_relay_pool().submit(job)?;
+    native_relay_pool().submit_named(name, job)?;
     Ok(NativeRelayHandle { receiver })
+}
+
+pub fn spawn_detached_native_relay<F, T>(name: &'static str, task: F) -> io::Result<()>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let _ = spawn_named_native_blocking_relay(name, task)?;
+    Ok(())
 }
 
 pub fn join_native_blocking_relay<T>(
@@ -717,17 +771,34 @@ fn detached_blocking_relay_stack_size_from_env(value: Option<String>, default_ki
 
 impl NativeRelayPool {
     fn new() -> Self {
-        Self::with_max_workers(native_relay_worker_threads())
+        let max_workers = native_relay_worker_threads();
+        Self::with_limits(
+            max_workers,
+            native_relay_label_soft_limit(max_workers),
+            true,
+        )
     }
 
+    #[cfg(test)]
     fn with_max_workers(max_workers: usize) -> Self {
+        Self::with_limits(
+            max_workers,
+            native_relay_label_soft_limit(max_workers),
+            false,
+        )
+    }
+
+    fn with_limits(max_workers: usize, label_soft_limit: usize, dynamic_limits: bool) -> Self {
+        let max_workers = max_workers.max(1);
         Self {
-            queue: Mutex::new(VecDeque::new()),
+            queue: Mutex::new(NativeRelayQueueState::default()),
             ready: Condvar::new(),
             worker_count: AtomicUsize::new(0),
             idle_count: AtomicUsize::new(0),
             pending_count: AtomicUsize::new(0),
-            max_workers,
+            max_workers: AtomicUsize::new(max_workers),
+            label_soft_limit: AtomicUsize::new(label_soft_limit.clamp(1, max_workers)),
+            dynamic_limits: AtomicBool::new(dynamic_limits),
         }
     }
 
@@ -736,7 +807,22 @@ impl NativeRelayPool {
         Box::leak(Box::new(Self::with_max_workers(max_workers)))
     }
 
-    fn submit(&'static self, job: NativeRelayJob) -> io::Result<()> {
+    #[cfg(test)]
+    fn with_limits_for_test(max_workers: usize, label_soft_limit: usize) -> &'static Self {
+        Box::leak(Box::new(Self::with_limits(
+            max_workers,
+            label_soft_limit,
+            false,
+        )))
+    }
+
+    #[cfg(test)]
+    fn submit(&'static self, task: NativeRelayTask) -> io::Result<()> {
+        self.submit_named("keli-core-native-relay", task)
+    }
+
+    fn submit_named(&'static self, label: &'static str, task: NativeRelayTask) -> io::Result<()> {
+        self.refresh_limits();
         if !self.ensure_worker_available() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -747,11 +833,27 @@ impl NativeRelayPool {
         self.pending_count.fetch_add(1, Ordering::Relaxed);
         {
             let mut queue = self.queue.lock().expect("native relay queue lock poisoned");
-            queue.push_back(job);
+            queue.jobs.push_back(NativeRelayJob {
+                label,
+                enqueued_at: Instant::now(),
+                task,
+            });
         }
         self.ready.notify_one();
         self.spawn_extra_worker_if_needed();
         Ok(())
+    }
+
+    fn refresh_limits(&self) {
+        if !self.dynamic_limits.load(Ordering::Relaxed) {
+            return;
+        }
+        let max_workers = native_relay_worker_threads();
+        self.max_workers.store(max_workers, Ordering::Release);
+        self.label_soft_limit.store(
+            native_relay_label_soft_limit(max_workers),
+            Ordering::Release,
+        );
     }
 
     fn ensure_worker_available(&'static self) -> bool {
@@ -769,7 +871,10 @@ impl NativeRelayPool {
             return;
         }
         let workers = self.worker_count.load(Ordering::Acquire);
-        let capacity = self.max_workers.saturating_sub(workers);
+        let capacity = self
+            .max_workers
+            .load(Ordering::Acquire)
+            .saturating_sub(workers);
         for _ in 0..deficit.min(capacity).min(8) {
             let _ = self.spawn_worker();
         }
@@ -778,7 +883,7 @@ impl NativeRelayPool {
     fn spawn_worker(&'static self) -> bool {
         loop {
             let current = self.worker_count.load(Ordering::Acquire);
-            if current >= self.max_workers {
+            if current >= self.max_workers.load(Ordering::Acquire) {
                 return current > 0;
             }
             if self
@@ -808,14 +913,30 @@ impl NativeRelayPool {
                 break;
             };
             self.pending_count.fetch_sub(1, Ordering::Relaxed);
-            job();
+            let label = job.label;
+            let _active_label = NativeRelayActiveLabelGuard { pool: self, label };
+            (job.task)();
         }
     }
 
     fn wait_for_job(&'static self) -> Option<NativeRelayJob> {
         let mut queue = self.queue.lock().expect("native relay queue lock poisoned");
         loop {
-            if let Some(job) = queue.pop_front() {
+            if let Some(index) = self.next_runnable_job_index(&queue) {
+                let job = queue
+                    .jobs
+                    .remove(index)
+                    .expect("native relay runnable job disappeared");
+                let wait_ms = job
+                    .enqueued_at
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                let previous = queue.queue_wait_ms_by_label.entry(job.label).or_default();
+                *previous = (*previous).max(wait_ms);
+                let active = queue.active_by_label.entry(job.label).or_default();
+                *active = active.saturating_add(1);
+                maybe_log_native_relay_queue_wait(job.label, wait_ms);
                 return Some(job);
             }
 
@@ -828,7 +949,7 @@ impl NativeRelayPool {
             queue = next_queue;
 
             if wait_result.timed_out()
-                && queue.is_empty()
+                && queue.jobs.is_empty()
                 && self.pending_count.load(Ordering::Acquire) == 0
             {
                 return None;
@@ -836,11 +957,43 @@ impl NativeRelayPool {
         }
     }
 
+    fn next_runnable_job_index(&self, queue: &NativeRelayQueueState) -> Option<usize> {
+        let label_soft_limit = self.label_soft_limit.load(Ordering::Acquire).max(1);
+        queue.jobs.iter().position(|job| {
+            queue.active_by_label.get(job.label).copied().unwrap_or(0) < label_soft_limit
+        })
+    }
+
+    fn finish_job_label(&self, label: &'static str) {
+        let mut queue = self.queue.lock().expect("native relay queue lock poisoned");
+        if let Some(count) = queue.active_by_label.get_mut(label) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                queue.active_by_label.remove(label);
+            }
+        }
+        drop(queue);
+        self.ready.notify_all();
+    }
+
     fn snapshot(&self) -> NativeRelayPoolSnapshot {
+        let queue = self.queue.lock().expect("native relay queue lock poisoned");
+        let mut pending_by_label = BTreeMap::<String, usize>::new();
+        for job in &queue.jobs {
+            let count = pending_by_label.entry(job.label.to_string()).or_default();
+            *count = count.saturating_add(1);
+        }
         NativeRelayPoolSnapshot {
             worker_count: self.worker_count.load(Ordering::Acquire),
             idle_count: self.idle_count.load(Ordering::Acquire),
             pending_count: self.pending_count.load(Ordering::Acquire),
+            label_soft_limit: self.label_soft_limit.load(Ordering::Acquire),
+            pending_by_label,
+            queue_wait_ms_by_label: queue
+                .queue_wait_ms_by_label
+                .iter()
+                .map(|(label, wait_ms)| ((*label).to_string(), *wait_ms))
+                .collect(),
         }
     }
 }
@@ -860,6 +1013,20 @@ fn native_relay_worker_threads() -> usize {
         memory_limit_mib(),
         open_file_soft_limit(),
     )
+}
+
+fn native_relay_label_soft_limit(max_workers: usize) -> usize {
+    if let Ok(value) = std::env::var("KELI_CORE_NATIVE_RELAY_LABEL_WORKERS") {
+        if let Ok(parsed) = value.trim().parse::<usize>() {
+            return parsed.clamp(1, max_workers.max(1));
+        }
+    }
+    native_relay_label_soft_limit_from_max_workers(max_workers)
+}
+
+fn native_relay_label_soft_limit_from_max_workers(max_workers: usize) -> usize {
+    let max_workers = max_workers.max(1);
+    ((max_workers / 2).max(32)).min(max_workers)
 }
 
 fn tcp_relay_blocking_threads_from_resources(
@@ -952,6 +1119,38 @@ fn native_relay_stack_size_from_env(value: Option<String>, default_kib: usize) -
 
 fn native_relay_idle_timeout() -> Duration {
     Duration::from_secs(10)
+}
+
+fn native_relay_queue_wait_warn_ms() -> u64 {
+    std::env::var("KELI_CORE_NATIVE_RELAY_QUEUE_WARN_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(250)
+}
+
+fn maybe_log_native_relay_queue_wait(label: &'static str, wait_ms: u64) {
+    let threshold = native_relay_queue_wait_warn_ms();
+    if wait_ms < threshold {
+        return;
+    }
+    const LOG_INTERVAL: Duration = Duration::from_secs(60);
+    static LAST_LOG: OnceLock<Mutex<BTreeMap<&'static str, Instant>>> = OnceLock::new();
+    let last_log = LAST_LOG.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut last_log = last_log
+        .lock()
+        .expect("native relay queue wait log lock poisoned");
+    let now = Instant::now();
+    if last_log
+        .get(label)
+        .map(|last| last.elapsed() < LOG_INTERVAL)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    last_log.insert(label, now);
+    crate::logging::emit_legacy_line(&format!(
+        "WARN  core   native relay queue wait label={label} wait_ms={wait_ms} threshold_ms={threshold}"
+    ));
 }
 
 async fn copy_count_best_effort_limited_async<R, W>(
@@ -1477,6 +1676,133 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn native_relay_pool_schedules_unsaturated_labels_ahead_of_saturated_label_queue() {
+        let pool = super::NativeRelayPool::with_limits_for_test(4, 2);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+        let (started_tx, started_rx) = mpsc::channel();
+
+        for index in 0..2 {
+            let release = release.clone();
+            let started_tx = started_tx.clone();
+            pool.submit_named(
+                "label-a",
+                Box::new(move || {
+                    started_tx
+                        .send(format!("a{index}"))
+                        .expect("send label-a start");
+                    let _ = release
+                        .lock()
+                        .expect("release lock")
+                        .recv_timeout(Duration::from_secs(2));
+                }),
+            )
+            .expect("submit blocking label-a job");
+        }
+
+        assert!(started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first label-a start")
+            .starts_with('a'));
+        assert!(started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second label-a start")
+            .starts_with('a'));
+
+        pool.submit_named("label-a", Box::new(|| {}))
+            .expect("submit queued saturated label-a job");
+        pool.submit_named(
+            "label-b",
+            Box::new(move || {
+                started_tx
+                    .send("b".to_string())
+                    .expect("send label-b start");
+            }),
+        )
+        .expect("submit label-b job");
+
+        assert_eq!(
+            started_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("label-b should start while label-a is saturated"),
+            "b"
+        );
+        assert!(
+            pool.snapshot()
+                .pending_by_label
+                .get("label-a")
+                .copied()
+                .unwrap_or(0)
+                >= 1
+        );
+
+        release_tx.send(()).expect("release first label-a");
+        release_tx.send(()).expect("release second label-a");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pool.snapshot().pending_count > 0 {
+            if Instant::now() >= deadline {
+                panic!("saturated label-a queue did not drain");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn native_relay_pool_records_per_label_pending_and_queue_wait() {
+        let pool = super::NativeRelayPool::with_limits_for_test(1, 1);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (started_tx, started_rx) = mpsc::channel();
+        let first_started_tx = started_tx.clone();
+
+        pool.submit_named(
+            "label-wait",
+            Box::new(move || {
+                first_started_tx.send("first").expect("send first start");
+                let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            }),
+        )
+        .expect("submit first job");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first job started");
+
+        pool.submit_named(
+            "label-wait",
+            Box::new(move || {
+                started_tx.send("second").expect("send second start");
+            }),
+        )
+        .expect("submit queued job");
+        assert_eq!(
+            pool.snapshot()
+                .pending_by_label
+                .get("label-wait")
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+
+        thread::sleep(Duration::from_millis(20));
+        release_tx.send(()).expect("release first job");
+        assert_eq!(
+            started_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second job started"),
+            "second"
+        );
+        let snapshot = pool.snapshot();
+        assert!(
+            snapshot
+                .queue_wait_ms_by_label
+                .get("label-wait")
+                .copied()
+                .unwrap_or(0)
+                >= 10,
+            "queue wait should be recorded by label: {snapshot:?}"
+        );
     }
 
     #[test]
