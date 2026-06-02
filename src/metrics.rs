@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -8,6 +10,8 @@ use crate::dns::{dns_metrics_snapshot, DnsMetricsSnapshot};
 use crate::quic_resources::QuicResourceSnapshot;
 
 const USER_DELTA_DURATION_BUCKETS_MS: [u64; 10] = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000];
+#[cfg(target_os = "linux")]
+const PROCESS_OPEN_FD_CACHE_TTL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreMetricsSnapshot {
@@ -332,9 +336,36 @@ fn udp_relay_key(protocol: &str, scope: &str) -> String {
 
 #[cfg(target_os = "linux")]
 fn process_open_fd_count() -> Option<usize> {
+    static CACHE: OnceLock<Mutex<Option<(Instant, Option<usize>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut cached = cache.lock().expect("process open fd cache poisoned");
+    cached_process_open_fd_count(Instant::now(), &mut cached, read_process_open_fd_count)
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_open_fd_count() -> Option<usize> {
     std::fs::read_dir("/proc/self/fd")
         .ok()
         .map(|entries| entries.filter_map(Result::ok).count())
+}
+
+#[cfg(target_os = "linux")]
+fn cached_process_open_fd_count<F>(
+    now: Instant,
+    cached: &mut Option<(Instant, Option<usize>)>,
+    read: F,
+) -> Option<usize>
+where
+    F: FnOnce() -> Option<usize>,
+{
+    if let Some((last, value)) = *cached {
+        if now.duration_since(last) < PROCESS_OPEN_FD_CACHE_TTL {
+            return value;
+        }
+    }
+    let value = read();
+    *cached = Some((now, value));
+    value
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -364,6 +395,11 @@ fn sanitize_connection_error_part(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use std::time::{Duration, Instant};
+
+    #[cfg(target_os = "linux")]
+    use super::{cached_process_open_fd_count, PROCESS_OPEN_FD_CACHE_TTL};
     use crate::abuse::ClientFailureBackoffSnapshot;
     use crate::metrics::{
         record_connection_error, record_udp_relay_finished, CoreMetrics, UdpRelayMetricsGuard,
@@ -578,5 +614,33 @@ mod tests {
         );
         #[cfg(target_os = "linux")]
         assert!(snapshot.keli_core_process_open_fds.is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_open_fd_count_reuses_recent_cached_sample() {
+        let start = Instant::now();
+        let mut cached = None;
+        let mut reads = 0;
+
+        let first = cached_process_open_fd_count(start, &mut cached, || {
+            reads += 1;
+            Some(41)
+        });
+        let second =
+            cached_process_open_fd_count(start + Duration::from_secs(1), &mut cached, || {
+                reads += 1;
+                Some(99)
+            });
+        let third =
+            cached_process_open_fd_count(start + PROCESS_OPEN_FD_CACHE_TTL, &mut cached, || {
+                reads += 1;
+                Some(99)
+            });
+
+        assert_eq!(first, Some(41));
+        assert_eq!(second, Some(41));
+        assert_eq!(third, Some(99));
+        assert_eq!(reads, 2);
     }
 }
