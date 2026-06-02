@@ -63,6 +63,9 @@ const TROJAN_PASSWORD_HEX_LEN: usize = 56;
 const MAX_UDP_PACKET_SIZE: usize = 65_535;
 const CLIENT_CLOSE_CONNECT_POLL: Duration = Duration::from_millis(10);
 const TROJAN_TRACE_ENV: &str = "KELI_CORE_TROJAN_TRACE";
+const TROJAN_LOG_INTERVAL_ENV: &str = "KELI_CORE_TROJAN_ERROR_LOG_INTERVAL_MS";
+const TROJAN_RELAY_FINISHED_LOG_INTERVAL_ENV: &str =
+    "KELI_CORE_TROJAN_RELAY_FINISHED_LOG_INTERVAL_MS";
 const TROJAN_ROUTE_SLOW_LOG_MS: u128 = 1_000;
 const TROJAN_LOG_INTERVAL_MS: u64 = 60_000;
 const TROJAN_RELAY_FINISHED_LOG_INTERVAL_MS: u64 = 300_000;
@@ -2318,15 +2321,41 @@ fn should_log_trojan_connection_error(
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .expect("trojan connection error log state poisoned");
-    trojan_connection_error_log_decision_at(&mut states, node_tag, scope, reason, now_millis())
+    trojan_connection_error_log_decision_at_with_interval(
+        &mut states,
+        node_tag,
+        scope,
+        reason,
+        now_millis(),
+        trojan_connection_error_log_interval_ms(),
+    )
 }
 
+#[cfg(test)]
 fn trojan_connection_error_log_decision_at(
     states: &mut HashMap<TrojanConnectionErrorLogKey, TrojanConnectionErrorLogState>,
     node_tag: &str,
     scope: &'static str,
     reason: &'static str,
     now_ms: u64,
+) -> Option<u64> {
+    trojan_connection_error_log_decision_at_with_interval(
+        states,
+        node_tag,
+        scope,
+        reason,
+        now_ms,
+        TROJAN_LOG_INTERVAL_MS,
+    )
+}
+
+fn trojan_connection_error_log_decision_at_with_interval(
+    states: &mut HashMap<TrojanConnectionErrorLogKey, TrojanConnectionErrorLogState>,
+    node_tag: &str,
+    scope: &'static str,
+    reason: &'static str,
+    now_ms: u64,
+    interval_ms: u64,
 ) -> Option<u64> {
     let key = TrojanConnectionErrorLogKey {
         node_tag: node_tag.to_string(),
@@ -2339,7 +2368,7 @@ fn trojan_connection_error_log_decision_at(
         state.last_ms = now_ms;
         return Some(0);
     }
-    if now_ms.saturating_sub(state.last_ms) < TROJAN_LOG_INTERVAL_MS {
+    if now_ms.saturating_sub(state.last_ms) < interval_ms {
         state.suppressed = state.suppressed.saturating_add(1);
         return None;
     }
@@ -2529,16 +2558,18 @@ fn should_log_trojan_relay_finished_event(
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .expect("trojan relay finished log state poisoned");
-    trojan_relay_finished_log_decision_at(
+    trojan_relay_finished_log_decision_at_with_interval(
         &mut states,
         node_tag,
         scope,
         status,
         finish_reason,
         now_millis(),
+        trojan_relay_finished_log_interval_ms(),
     )
 }
 
+#[cfg(test)]
 fn trojan_relay_finished_log_decision_at(
     states: &mut HashMap<TrojanRelayFinishedLogKey, TrojanRelayFinishedLogState>,
     node_tag: &str,
@@ -2546,6 +2577,26 @@ fn trojan_relay_finished_log_decision_at(
     status: &'static str,
     finish_reason: &'static str,
     now_ms: u64,
+) -> Option<u64> {
+    trojan_relay_finished_log_decision_at_with_interval(
+        states,
+        node_tag,
+        scope,
+        status,
+        finish_reason,
+        now_ms,
+        TROJAN_RELAY_FINISHED_LOG_INTERVAL_MS,
+    )
+}
+
+fn trojan_relay_finished_log_decision_at_with_interval(
+    states: &mut HashMap<TrojanRelayFinishedLogKey, TrojanRelayFinishedLogState>,
+    node_tag: &str,
+    scope: &'static str,
+    status: &'static str,
+    finish_reason: &'static str,
+    now_ms: u64,
+    interval_ms: u64,
 ) -> Option<u64> {
     let key = TrojanRelayFinishedLogKey {
         node_tag: node_tag.to_string(),
@@ -2559,7 +2610,7 @@ fn trojan_relay_finished_log_decision_at(
         state.last_ms = now_ms;
         return Some(0);
     }
-    if now_ms.saturating_sub(state.last_ms) < TROJAN_RELAY_FINISHED_LOG_INTERVAL_MS {
+    if now_ms.saturating_sub(state.last_ms) < interval_ms {
         state.suppressed = state.suppressed.saturating_add(1);
         return None;
     }
@@ -3109,6 +3160,33 @@ fn now_millis() -> u64 {
 
 fn trojan_trace_enabled() -> bool {
     env::var_os(TROJAN_TRACE_ENV).is_some()
+}
+
+fn trojan_configured_log_interval_ms(env_name: &str, default_ms: u64, min_ms: u64) -> u64 {
+    match env::var(env_name) {
+        Ok(value) => trojan_log_interval_from_value(Some(&value), default_ms, min_ms),
+        Err(_) => default_ms,
+    }
+}
+
+fn trojan_log_interval_from_value(value: Option<&str>, default_ms: u64, min_ms: u64) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.max(min_ms))
+        .unwrap_or(default_ms)
+}
+
+fn trojan_connection_error_log_interval_ms() -> u64 {
+    trojan_configured_log_interval_ms(TROJAN_LOG_INTERVAL_ENV, TROJAN_LOG_INTERVAL_MS, 1_000)
+}
+
+fn trojan_relay_finished_log_interval_ms() -> u64 {
+    trojan_configured_log_interval_ms(
+        TROJAN_RELAY_FINISHED_LOG_INTERVAL_ENV,
+        TROJAN_RELAY_FINISHED_LOG_INTERVAL_MS,
+        60_000,
+    )
 }
 
 impl TrojanUdpRelayState {
@@ -4559,6 +4637,26 @@ mod tests {
                 61_001,
             ),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn parses_trojan_log_interval_with_minimums_and_defaults() {
+        assert_eq!(
+            super::trojan_log_interval_from_value(Some("250"), 60_000, 1_000),
+            1_000
+        );
+        assert_eq!(
+            super::trojan_log_interval_from_value(Some("120000"), 60_000, 1_000),
+            120_000
+        );
+        assert_eq!(
+            super::trojan_log_interval_from_value(Some("bad"), 60_000, 1_000),
+            60_000
+        );
+        assert_eq!(
+            super::trojan_log_interval_from_value(None, 300_000, 60_000),
+            300_000
         );
     }
 
