@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
+#[cfg(any(target_os = "linux", test))]
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,7 @@ use crate::quic_resources::QuicResourceSnapshot;
 const USER_DELTA_DURATION_BUCKETS_MS: [u64; 10] = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000];
 #[cfg(target_os = "linux")]
 const PROCESS_OPEN_FD_CACHE_TTL: Duration = Duration::from_secs(15);
+#[cfg(any(target_os = "linux", test))]
 const PROCESS_CPU_CACHE_TTL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,6 +369,7 @@ struct ProcessResourceSnapshot {
     cpu_percent_x100: Option<u64>,
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProcessCpuSample {
     total_jiffies: u64,
@@ -389,6 +392,7 @@ fn read_process_status_snapshot() -> Option<ProcessResourceSnapshot> {
     None
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_linux_process_status(input: &str) -> Option<ProcessResourceSnapshot> {
     let mut snapshot = ProcessResourceSnapshot::default();
     for line in input.lines() {
@@ -409,11 +413,13 @@ fn parse_linux_process_status(input: &str) -> Option<ProcessResourceSnapshot> {
     (snapshot != ProcessResourceSnapshot::default()).then_some(snapshot)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn linux_status_kib_value(line: &str, key: &str) -> Option<u64> {
     let rest = line.trim_start().strip_prefix(key)?;
     rest.split_whitespace().next()?.parse::<u64>().ok()
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn linux_status_plain_value(line: &str, key: &str) -> Option<u64> {
     let rest = line.trim_start().strip_prefix(key)?;
     rest.split_whitespace().next()?.parse::<u64>().ok()
@@ -437,6 +443,7 @@ fn process_cpu_percent_x100() -> Option<u64> {
     None
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn cached_process_cpu_percent_x100<ReadSample, ReadClock>(
     now: Instant,
     cached: &mut Option<(Instant, ProcessCpuSample)>,
