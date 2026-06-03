@@ -17,7 +17,8 @@ static NATIVE_RELAY_ACTIVE: OnceLock<Mutex<BTreeMap<&'static str, usize>>> = Onc
 static ASYNC_RELAY_ACTIVE: OnceLock<Mutex<BTreeMap<&'static str, usize>>> = OnceLock::new();
 static DETACHED_BLOCKING_RELAY_ACTIVE: OnceLock<Mutex<BTreeMap<&'static str, usize>>> =
     OnceLock::new();
-const RELAY_COPY_BUFFER_SIZE: usize = 64 * 1024;
+// Keep per-direction relay buffers modest; thousands of active TCP relays otherwise amplify RSS.
+const RELAY_COPY_BUFFER_SIZE: usize = 16 * 1024;
 const TCP_RELAY_BLOCKING_THREADS_MIN: usize = 16;
 const TCP_RELAY_BLOCKING_THREADS_MAX: usize = 128;
 const TCP_RELAY_BLOCKING_THREADS_PER_CPU: usize = 16;
@@ -1260,6 +1261,8 @@ mod tests {
 
     #[test]
     fn relay_thread_counts_scale_with_machine_resources() {
+        assert_eq!(super::RELAY_COPY_BUFFER_SIZE, 16 * 1024);
+
         assert_eq!(
             super::tcp_relay_blocking_threads_from_resources(1, None),
             16
