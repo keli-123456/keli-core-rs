@@ -300,12 +300,24 @@ A soak pass requires:
 - No listener crash.
 - No process restart outside the planned test.
 - No unbounded memory growth.
+- RSS, peak RSS, anonymous RSS, thread count, CPU percentage, open FD count, and active
+  connection count are sampled at the start, during the steady-state window, and after drain.
 - No traffic drain loss after report/requeue cycles.
 - Deleted users cannot create new sessions.
 - Existing deleted-user connections stop forwarding on the next limiter or relay checkpoint.
 - Valid users are not falsely rejected.
 - p99 latency does not degrade progressively during the run.
 - Error bursts are attributable to client/network conditions and recover without manual core restart.
+
+Linux side-check commands:
+
+```bash
+pid=$(pgrep -f 'keli-core-rs|kelinode server --config' | head -n1)
+grep -E 'VmRSS|VmHWM|RssAnon|RssFile|VmData|Threads' /proc/$pid/status
+ls /proc/$pid/fd | wc -l
+ps -p "$pid" -o pid,pcpu,pmem,rss,vsz,nlwp,comm
+ss -tanp 2>/dev/null | grep "pid=$pid," | awk '{count[$1]++} END {for (s in count) print s,count[s]}'
+```
 
 Keep the protocol marked as `Partial` in `docs/PARITY.md` until the real-client matrix and soak notes are attached to the release candidate.
 

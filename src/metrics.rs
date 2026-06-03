@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
-#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +11,7 @@ use crate::quic_resources::QuicResourceSnapshot;
 const USER_DELTA_DURATION_BUCKETS_MS: [u64; 10] = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000];
 #[cfg(target_os = "linux")]
 const PROCESS_OPEN_FD_CACHE_TTL: Duration = Duration::from_secs(15);
+const PROCESS_CPU_CACHE_TTL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreMetricsSnapshot {
@@ -47,6 +47,20 @@ pub struct CoreMetricsSnapshot {
     pub keli_core_udp_relay_finished_total: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keli_core_process_open_fds: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keli_core_process_rss_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keli_core_process_peak_rss_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keli_core_process_anonymous_rss_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keli_core_process_file_rss_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keli_core_process_data_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keli_core_process_threads: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keli_core_process_cpu_percent_x100: Option<u64>,
     #[serde(default)]
     pub keli_core_shared_user_pool_buckets: usize,
     #[serde(default)]
@@ -135,6 +149,14 @@ impl CoreMetrics {
         snapshot.keli_core_udp_relay_active = udp_relay_active_snapshot();
         snapshot.keli_core_udp_relay_finished_total = udp_relay_finished_snapshot();
         snapshot.keli_core_process_open_fds = process_open_fd_count();
+        let process = process_resource_snapshot();
+        snapshot.keli_core_process_rss_bytes = process.rss_bytes;
+        snapshot.keli_core_process_peak_rss_bytes = process.peak_rss_bytes;
+        snapshot.keli_core_process_anonymous_rss_bytes = process.anonymous_rss_bytes;
+        snapshot.keli_core_process_file_rss_bytes = process.file_rss_bytes;
+        snapshot.keli_core_process_data_bytes = process.data_bytes;
+        snapshot.keli_core_process_threads = process.threads;
+        snapshot.keli_core_process_cpu_percent_x100 = process.cpu_percent_x100;
         let shared_users = crate::user::shared_core_user_pool_snapshot();
         snapshot.keli_core_shared_user_pool_buckets = shared_users.buckets;
         snapshot.keli_core_shared_user_pool_active = shared_users.active;
@@ -334,6 +356,144 @@ fn udp_relay_key(protocol: &str, scope: &str) -> String {
     )
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ProcessResourceSnapshot {
+    rss_bytes: Option<u64>,
+    peak_rss_bytes: Option<u64>,
+    anonymous_rss_bytes: Option<u64>,
+    file_rss_bytes: Option<u64>,
+    data_bytes: Option<u64>,
+    threads: Option<usize>,
+    cpu_percent_x100: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessCpuSample {
+    total_jiffies: u64,
+}
+
+fn process_resource_snapshot() -> ProcessResourceSnapshot {
+    let mut snapshot = read_process_status_snapshot().unwrap_or_default();
+    snapshot.cpu_percent_x100 = process_cpu_percent_x100();
+    snapshot
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_status_snapshot() -> Option<ProcessResourceSnapshot> {
+    let content = std::fs::read_to_string("/proc/self/status").ok()?;
+    parse_linux_process_status(&content)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_process_status_snapshot() -> Option<ProcessResourceSnapshot> {
+    None
+}
+
+fn parse_linux_process_status(input: &str) -> Option<ProcessResourceSnapshot> {
+    let mut snapshot = ProcessResourceSnapshot::default();
+    for line in input.lines() {
+        if let Some(value) = linux_status_kib_value(line, "VmRSS:") {
+            snapshot.rss_bytes = Some(value.saturating_mul(1024));
+        } else if let Some(value) = linux_status_kib_value(line, "VmHWM:") {
+            snapshot.peak_rss_bytes = Some(value.saturating_mul(1024));
+        } else if let Some(value) = linux_status_kib_value(line, "RssAnon:") {
+            snapshot.anonymous_rss_bytes = Some(value.saturating_mul(1024));
+        } else if let Some(value) = linux_status_kib_value(line, "RssFile:") {
+            snapshot.file_rss_bytes = Some(value.saturating_mul(1024));
+        } else if let Some(value) = linux_status_kib_value(line, "VmData:") {
+            snapshot.data_bytes = Some(value.saturating_mul(1024));
+        } else if let Some(value) = linux_status_plain_value(line, "Threads:") {
+            snapshot.threads = Some(value as usize);
+        }
+    }
+    (snapshot != ProcessResourceSnapshot::default()).then_some(snapshot)
+}
+
+fn linux_status_kib_value(line: &str, key: &str) -> Option<u64> {
+    let rest = line.trim_start().strip_prefix(key)?;
+    rest.split_whitespace().next()?.parse::<u64>().ok()
+}
+
+fn linux_status_plain_value(line: &str, key: &str) -> Option<u64> {
+    let rest = line.trim_start().strip_prefix(key)?;
+    rest.split_whitespace().next()?.parse::<u64>().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn process_cpu_percent_x100() -> Option<u64> {
+    static CACHE: OnceLock<Mutex<Option<(Instant, ProcessCpuSample)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut cached = cache.lock().expect("process cpu cache poisoned");
+    cached_process_cpu_percent_x100(
+        Instant::now(),
+        &mut cached,
+        read_process_cpu_sample,
+        process_clock_ticks_per_second,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_cpu_percent_x100() -> Option<u64> {
+    None
+}
+
+fn cached_process_cpu_percent_x100<ReadSample, ReadClock>(
+    now: Instant,
+    cached: &mut Option<(Instant, ProcessCpuSample)>,
+    read_sample: ReadSample,
+    read_clock_ticks: ReadClock,
+) -> Option<u64>
+where
+    ReadSample: FnOnce() -> Option<ProcessCpuSample>,
+    ReadClock: FnOnce() -> Option<u64>,
+{
+    let sample = read_sample()?;
+    let Some((last, previous)) = *cached else {
+        *cached = Some((now, sample));
+        return None;
+    };
+    if now.duration_since(last) < PROCESS_CPU_CACHE_TTL {
+        return None;
+    }
+    *cached = Some((now, sample));
+    let elapsed = now.duration_since(last).as_secs_f64();
+    if elapsed <= 0.0 {
+        return None;
+    }
+    let clock_ticks = read_clock_ticks()? as f64;
+    if clock_ticks <= 0.0 {
+        return None;
+    }
+    let delta = sample.total_jiffies.saturating_sub(previous.total_jiffies);
+    Some((((delta as f64 / clock_ticks) / elapsed) * 100.0 * 100.0).round() as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_cpu_sample() -> Option<ProcessCpuSample> {
+    let content = std::fs::read_to_string("/proc/self/stat").ok()?;
+    parse_linux_process_stat(&content)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_stat(input: &str) -> Option<ProcessCpuSample> {
+    let close = input.rfind(')')?;
+    let fields = input
+        .get(close + 1..)?
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let user_jiffies = fields.get(11)?.parse::<u64>().ok()?;
+    let system_jiffies = fields.get(12)?.parse::<u64>().ok()?;
+    Some(ProcessCpuSample {
+        total_jiffies: user_jiffies.saturating_add(system_jiffies),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn process_clock_ticks_per_second() -> Option<u64> {
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    (ticks > 0).then_some(ticks as u64)
+}
+
 #[cfg(target_os = "linux")]
 fn process_open_fd_count() -> Option<usize> {
     static CACHE: OnceLock<Mutex<Option<(Instant, Option<usize>)>>> = OnceLock::new();
@@ -395,7 +555,6 @@ fn sanitize_connection_error_part(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "linux")]
     use std::time::{Duration, Instant};
 
     #[cfg(target_os = "linux")]
@@ -614,6 +773,12 @@ mod tests {
         );
         #[cfg(target_os = "linux")]
         assert!(snapshot.keli_core_process_open_fds.is_some());
+        #[cfg(target_os = "linux")]
+        {
+            assert!(snapshot.keli_core_process_rss_bytes.is_some());
+            assert!(snapshot.keli_core_process_peak_rss_bytes.is_some());
+            assert!(snapshot.keli_core_process_threads.is_some());
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -642,5 +807,46 @@ mod tests {
         assert_eq!(second, Some(41));
         assert_eq!(third, Some(99));
         assert_eq!(reads, 2);
+    }
+
+    #[test]
+    fn parses_linux_proc_status_resource_metrics() {
+        let snapshot = super::parse_linux_process_status(
+            "Name:\tkelinode\n\
+             VmHWM:\t  950952 kB\n\
+             VmRSS:\t  809384 kB\n\
+             RssAnon:\t  800708 kB\n\
+             RssFile:\t    8676 kB\n\
+             VmData:\t  928356 kB\n\
+             Threads:\t64\n",
+        )
+        .expect("process status snapshot");
+
+        assert_eq!(snapshot.rss_bytes, Some(809_384 * 1024));
+        assert_eq!(snapshot.peak_rss_bytes, Some(950_952 * 1024));
+        assert_eq!(snapshot.anonymous_rss_bytes, Some(800_708 * 1024));
+        assert_eq!(snapshot.file_rss_bytes, Some(8_676 * 1024));
+        assert_eq!(snapshot.data_bytes, Some(928_356 * 1024));
+        assert_eq!(snapshot.threads, Some(64));
+    }
+
+    #[test]
+    fn calculates_process_cpu_percent_x100_between_samples() {
+        let mut cached = None;
+        let first = super::cached_process_cpu_percent_x100(
+            Instant::now(),
+            &mut cached,
+            || Some(super::ProcessCpuSample { total_jiffies: 100 }),
+            || Some(100),
+        );
+        let second = super::cached_process_cpu_percent_x100(
+            Instant::now() + Duration::from_secs(2),
+            &mut cached,
+            || Some(super::ProcessCpuSample { total_jiffies: 150 }),
+            || Some(100),
+        );
+
+        assert_eq!(first, None);
+        assert_eq!(second, Some(2_500));
     }
 }
