@@ -190,10 +190,8 @@ pub fn spawn_tcp_relay_background<F>(
 where
     F: FnOnce(u64, u64) + Send + 'static,
 {
-    let upload_client_shutdown = client.try_clone()?;
-    let upload_remote_shutdown = remote.try_clone()?;
-    let download_client_shutdown = client.try_clone()?;
-    let download_remote_shutdown = remote.try_clone()?;
+    let client_shutdown = Arc::new(client.try_clone()?);
+    let remote_shutdown = Arc::new(remote.try_clone()?);
 
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
@@ -222,15 +220,15 @@ where
                     let upload = relay_copy_unlimited_async(
                         &mut client_read,
                         &mut remote_write,
-                        upload_client_shutdown,
-                        upload_remote_shutdown,
+                        Arc::clone(&client_shutdown),
+                        Arc::clone(&remote_shutdown),
                         close_peer_on_eof,
                     );
                     let download = relay_copy_unlimited_async(
                         &mut remote_read,
                         &mut client_write,
-                        download_client_shutdown,
-                        download_remote_shutdown,
+                        Arc::clone(&client_shutdown),
+                        Arc::clone(&remote_shutdown),
                         close_peer_on_eof,
                     );
                     tokio::join!(upload, download)
@@ -648,10 +646,8 @@ fn relay_tcp_streams_unlimited_tokio(
     remote: TcpStream,
     close_peer_on_eof: bool,
 ) -> io::Result<(u64, u64)> {
-    let upload_client_shutdown = client.try_clone()?;
-    let upload_remote_shutdown = remote.try_clone()?;
-    let download_client_shutdown = client.try_clone()?;
-    let download_remote_shutdown = remote.try_clone()?;
+    let client_shutdown = Arc::new(client.try_clone()?);
+    let remote_shutdown = Arc::new(remote.try_clone()?);
 
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
@@ -665,15 +661,15 @@ fn relay_tcp_streams_unlimited_tokio(
         let upload = relay_copy_unlimited_async(
             &mut client_read,
             &mut remote_write,
-            upload_client_shutdown,
-            upload_remote_shutdown,
+            Arc::clone(&client_shutdown),
+            Arc::clone(&remote_shutdown),
             close_peer_on_eof,
         );
         let download = relay_copy_unlimited_async(
             &mut remote_read,
             &mut client_write,
-            download_client_shutdown,
-            download_remote_shutdown,
+            Arc::clone(&client_shutdown),
+            Arc::clone(&remote_shutdown),
             close_peer_on_eof,
         );
         let (upload, download) = tokio::join!(upload, download);
@@ -684,8 +680,8 @@ fn relay_tcp_streams_unlimited_tokio(
 async fn relay_copy_unlimited_async<R, W>(
     reader: &mut R,
     writer: &mut W,
-    client_shutdown: TcpStream,
-    remote_shutdown: TcpStream,
+    client_shutdown: Arc<TcpStream>,
+    remote_shutdown: Arc<TcpStream>,
     close_peer_on_eof: bool,
 ) -> u64
 where
@@ -1250,6 +1246,9 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    #[cfg(unix)]
+    use std::os::fd::AsRawFd;
+
     use crate::limits::{BandwidthLimiter, UserBandwidthLimiters};
     #[cfg(unix)]
     use crate::stream::relay_tcp_fast_unlimited_close_on_eof;
@@ -1458,6 +1457,65 @@ mod tests {
             .expect("remote timeout");
         assert!(matches!(remote_peer.read(&mut byte), Ok(0) | Err(_)));
         relay.join().expect("relay thread");
+    }
+
+    #[cfg(unix)]
+    fn socket_inode(stream: &TcpStream) -> String {
+        let fd_path = format!("/proc/self/fd/{}", stream.as_raw_fd());
+        let target = std::fs::read_link(fd_path).expect("socket fd link");
+        let target = target.to_string_lossy();
+        target
+            .strip_prefix("socket:[")
+            .and_then(|value| value.strip_suffix(']'))
+            .expect("socket inode")
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    fn socket_fd_ref_count(inode: &str) -> usize {
+        let expected = format!("socket:[{inode}]");
+        std::fs::read_dir("/proc/self/fd")
+            .expect("fd dir")
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter(|target| target.to_string_lossy() == expected)
+            .count()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_relay_uses_single_shutdown_fd_per_socket() {
+        let client_listener = TcpListener::bind("127.0.0.1:0").expect("client bind");
+        let remote_listener = TcpListener::bind("127.0.0.1:0").expect("remote bind");
+        let client_addr = client_listener.local_addr().expect("client addr");
+        let remote_addr = remote_listener.local_addr().expect("remote addr");
+        let client_peer = thread::spawn(move || TcpStream::connect(client_addr).expect("client"));
+        let remote_peer = thread::spawn(move || TcpStream::connect(remote_addr).expect("remote"));
+        let (client, _) = client_listener.accept().expect("client accept");
+        let (remote, _) = remote_listener.accept().expect("remote accept");
+        let client_inode = socket_inode(&client);
+        let remote_inode = socket_inode(&remote);
+        let client_peer = client_peer.join().expect("client thread");
+        let remote_peer = remote_peer.join().expect("remote thread");
+
+        let relay = super::spawn_tcp_relay_background(client, remote, None, true, |_, _| {})
+            .expect("spawn relay");
+        thread::sleep(Duration::from_millis(100));
+
+        let client_refs = socket_fd_ref_count(&client_inode);
+        let remote_refs = socket_fd_ref_count(&remote_inode);
+        let _ = client_peer.shutdown(Shutdown::Both);
+        let _ = remote_peer.shutdown(Shutdown::Both);
+        relay.abort();
+
+        assert!(
+            client_refs <= 2,
+            "client socket should keep at most one shutdown fd clone, got {client_refs}"
+        );
+        assert!(
+            remote_refs <= 2,
+            "remote socket should keep at most one shutdown fd clone, got {remote_refs}"
+        );
     }
 
     #[test]

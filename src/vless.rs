@@ -3652,13 +3652,13 @@ async fn relay_tcp_streams_async_with_label(
     mut on_upload: impl FnMut(u64) + Send + 'static,
     mut on_download: impl FnMut(u64) + Send + 'static,
 ) -> io::Result<(u64, u64)> {
-    let upload_client_shutdown = clone_tokio_tcp_stream_for_shutdown(&client)?;
-    let upload_remote_shutdown = clone_tokio_tcp_stream_for_shutdown(&remote)?;
-    let download_client_shutdown = clone_tokio_tcp_stream_for_shutdown(&client)?;
-    let download_remote_shutdown = clone_tokio_tcp_stream_for_shutdown(&remote)?;
+    let client_shutdown = Arc::new(clone_tokio_tcp_stream_for_shutdown(&client)?);
+    let remote_shutdown = Arc::new(clone_tokio_tcp_stream_for_shutdown(&remote)?);
     let (mut client_read, mut client_write) = client.into_split();
     let (mut remote_read, mut remote_write) = remote.into_split();
     let upload_limiter = limiter.clone();
+    let upload_client_shutdown = Arc::clone(&client_shutdown);
+    let upload_remote_shutdown = Arc::clone(&remote_shutdown);
     let upload = spawn_async_relay(label, async move {
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
@@ -3711,6 +3711,8 @@ async fn relay_tcp_streams_async_with_label(
             total = total.saturating_add(read as u64);
         }
     })?;
+    let download_client_shutdown = Arc::clone(&client_shutdown);
+    let download_remote_shutdown = Arc::clone(&remote_shutdown);
     let download = spawn_async_relay(label, async move {
         let mut total = 0u64;
         let mut buffer = [0u8; 16 * 1024];
@@ -4030,6 +4032,8 @@ where
             on_upload(0);
             on_download(download);
             on_download(0);
+            drop(client_shutdown);
+            drop(remote_shutdown);
             let (raw_client, _) = client.into_inner();
             relay_tcp_streams_async_with_label(
                 VLESS_VISION_ASYNC_RELAY_LABEL,
