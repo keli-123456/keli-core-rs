@@ -328,6 +328,7 @@ impl VlessServer {
         if request.command == VlessCommand::Udp {
             let bandwidth = self.bandwidth.limiter_for(user.as_ref());
             client.write_all(&[VERSION, 0x00]).await?;
+            drop(client_shutdown);
             return self
                 .relay_udp_stream_async(client, request, bandwidth)
                 .await;
@@ -397,6 +398,7 @@ impl VlessServer {
             }
             return Err(error);
         }
+        drop(client_shutdown);
         self.relay_async(client, remote, request, bandwidth).await
     }
 
@@ -650,6 +652,7 @@ impl VlessServer {
         if request.command == VlessCommand::Udp {
             client.write_all(&[VERSION, 0x00]).await?;
             client.flush().await?;
+            drop(client_shutdown);
             return self
                 .relay_udp_stream_async(client, request, bandwidth)
                 .await;
@@ -675,6 +678,7 @@ impl VlessServer {
             shutdown_cloned_tcp_stream(&client_shutdown);
             return Err(error);
         }
+        drop(client_shutdown);
         self.relay_tls_async(client, remote, request, bandwidth, session)
             .await
     }
@@ -4798,6 +4802,8 @@ mod tests {
     use std::fs;
     use std::io::{self, Cursor, Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
+    #[cfg(unix)]
+    use std::os::fd::AsRawFd;
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::sync::{
@@ -4840,6 +4846,29 @@ mod tests {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             std::io::Read::read(&mut self.input, buf)
         }
+    }
+
+    #[cfg(unix)]
+    fn socket_inode_tokio(stream: &tokio::net::TcpStream) -> String {
+        let fd_path = format!("/proc/self/fd/{}", stream.as_raw_fd());
+        let target = std::fs::read_link(fd_path).expect("socket fd link");
+        let target = target.to_string_lossy();
+        target
+            .strip_prefix("socket:[")
+            .and_then(|value| value.strip_suffix(']'))
+            .expect("socket inode")
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    fn socket_fd_ref_count(inode: &str) -> usize {
+        let expected = format!("socket:[{inode}]");
+        std::fs::read_dir("/proc/self/fd")
+            .expect("fd dir")
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter(|target| target.to_string_lossy() == expected)
+            .count()
     }
 
     fn user() -> CoreUser {
@@ -6890,8 +6919,14 @@ mod tests {
             let acceptor =
                 TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
             let acceptor = tokio_rustls::TlsAcceptor::from(acceptor.server_config());
+            #[cfg(unix)]
+            let (server_inode_tx, server_inode_rx) = mpsc::channel();
             let server_task = tokio::spawn(async move {
                 let (stream, peer) = listener.accept().await.expect("vless accept");
+                #[cfg(unix)]
+                server_inode_tx
+                    .send(socket_inode_tokio(&stream))
+                    .expect("server socket inode");
                 let client = acceptor.accept(stream).await.expect("tls accept");
                 server
                     .handle_tls_client_async(client, Some(peer.ip()))
@@ -6945,6 +6980,17 @@ mod tests {
                     "async VLESS Vision relay should move raw TCP fast path onto async relay metrics"
                 );
                 tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            #[cfg(unix)]
+            {
+                let server_inode = server_inode_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("server socket inode");
+                let refs = socket_fd_ref_count(&server_inode);
+                assert!(
+                    refs <= 3,
+                    "VLESS Vision raw relay should not retain preauth shutdown fd clone, got {refs}"
+                );
             }
 
             drop(client);
