@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,10 +15,12 @@ const TCP_AUTH_FAILURE_THRESHOLD: u32 = 12;
 const TCP_AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(30);
 const TCP_AUTH_FAILURE_BLOCK_DURATION: Duration = Duration::from_secs(10);
 const TCP_AUTH_FAILURE_MAX_ENTRIES: usize = 8192;
+const CLIENT_FAILURE_BACKOFF_MAX_SHARDS: usize = 32;
+const CLIENT_FAILURE_BACKOFF_TARGET_ENTRIES_PER_SHARD: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct ClientFailureBackoff {
-    entries: Arc<Mutex<HashMap<IpAddr, ClientFailureEntry>>>,
+    shards: Arc<Vec<Mutex<HashMap<IpAddr, ClientFailureEntry>>>>,
     metrics: Arc<ClientFailureBackoffMetrics>,
     policy: ClientFailureBackoffPolicy,
 }
@@ -53,8 +56,12 @@ struct ClientFailureBackoffMetrics {
 
 impl ClientFailureBackoff {
     pub fn new(policy: ClientFailureBackoffPolicy) -> Self {
+        let shard_count = client_failure_backoff_shard_count(policy.max_entries);
+        let shards = (0..shard_count)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect::<Vec<_>>();
         Self {
-            entries: Arc::new(Mutex::new(HashMap::new())),
+            shards: Arc::new(shards),
             metrics: Arc::new(ClientFailureBackoffMetrics::default()),
             policy,
         }
@@ -85,34 +92,42 @@ impl ClientFailureBackoff {
 
     pub fn record_success(&self, ip: IpAddr) {
         let mut entries = self
-            .entries
+            .shard(ip)
             .lock()
             .expect("client failure backoff state poisoned");
         entries.remove(&ip);
     }
 
     pub fn len(&self) -> usize {
-        self.entries
-            .lock()
-            .expect("client failure backoff state poisoned")
-            .len()
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .lock()
+                    .expect("client failure backoff state poisoned")
+                    .len()
+            })
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn snapshot(&self) -> ClientFailureBackoffSnapshot {
         let now = Instant::now();
-        let entries = self
-            .entries
-            .lock()
-            .expect("client failure backoff state poisoned");
         let mut active_ips = 0usize;
         let mut blocked_ips = 0usize;
-        for entry in entries.values() {
-            if entry.is_expired(now, self.policy.window) {
-                continue;
-            }
-            active_ips += 1;
-            if entry.blocked_until.is_some_and(|until| now < until) {
-                blocked_ips += 1;
+        for shard in self.shards.iter() {
+            let entries = shard.lock().expect("client failure backoff state poisoned");
+            for entry in entries.values() {
+                if entry.is_expired(now, self.policy.window) {
+                    continue;
+                }
+                active_ips += 1;
+                if entry.blocked_until.is_some_and(|until| now < until) {
+                    blocked_ips += 1;
+                }
             }
         }
         ClientFailureBackoffSnapshot {
@@ -125,7 +140,7 @@ impl ClientFailureBackoff {
 
     pub(crate) fn is_blocked_at(&self, ip: IpAddr, now: Instant) -> bool {
         let mut entries = self
-            .entries
+            .shard(ip)
             .lock()
             .expect("client failure backoff state poisoned");
         let Some(entry) = entries.get_mut(&ip) else {
@@ -145,11 +160,16 @@ impl ClientFailureBackoff {
 
     pub(crate) fn record_failure_at(&self, ip: IpAddr, now: Instant) {
         let mut entries = self
-            .entries
+            .shard(ip)
             .lock()
             .expect("client failure backoff state poisoned");
-        if entries.len() >= self.policy.max_entries {
+        if entries.len() >= self.max_entries_per_shard() {
             entries.retain(|_, entry| !entry.is_expired(now, self.policy.window));
+            if entries.len() >= self.max_entries_per_shard() {
+                if let Some(first) = entries.keys().next().copied() {
+                    entries.remove(&first);
+                }
+            }
         }
         let entry = entries.entry(ip).or_insert(ClientFailureEntry {
             failures: 0,
@@ -170,6 +190,22 @@ impl ClientFailureBackoff {
             entry.blocked_until = Some(now + self.policy.block_duration);
         }
     }
+
+    fn shard(&self, ip: IpAddr) -> &Mutex<HashMap<IpAddr, ClientFailureEntry>> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        ip.hash(&mut hasher);
+        let index = (hasher.finish() as usize) % self.shards.len();
+        &self.shards[index]
+    }
+
+    fn max_entries_per_shard(&self) -> usize {
+        self.policy.max_entries.div_ceil(self.shards.len()).max(1)
+    }
+}
+
+fn client_failure_backoff_shard_count(max_entries: usize) -> usize {
+    (max_entries / CLIENT_FAILURE_BACKOFF_TARGET_ENTRIES_PER_SHARD)
+        .clamp(1, CLIENT_FAILURE_BACKOFF_MAX_SHARDS)
 }
 
 impl ClientFailureBackoffPolicy {

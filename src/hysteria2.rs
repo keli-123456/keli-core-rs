@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
@@ -60,6 +61,7 @@ const HY2_INVALID_AUTH_BACKOFF_THRESHOLD: u32 = 4;
 const HY2_INVALID_AUTH_BACKOFF_WINDOW: Duration = Duration::from_secs(30);
 const HY2_INVALID_AUTH_BACKOFF_DURATION: Duration = Duration::from_secs(60);
 const HY2_INVALID_AUTH_BACKOFF_MAX_ENTRIES: usize = 4096;
+const HY2_INVALID_AUTH_BACKOFF_SHARDS: usize = 16;
 const HY2_PREAUTH_LIMIT_ENV: &str = "KELI_CORE_HY2_PREAUTH_CONNECTIONS";
 const HY2_PREAUTH_MIN: usize = 32;
 const HY2_PREAUTH_MAX: usize = 4096;
@@ -1205,6 +1207,16 @@ fn prune_udp_sessions(
 }
 
 fn make_room_for_udp_session(sessions: &Arc<Mutex<HashMap<u32, Arc<UdpRelaySession>>>>) {
+    let needs_room = {
+        let sessions = sessions
+            .lock()
+            .expect("hysteria2 udp session lock poisoned");
+        sessions.len() >= UDP_MAX_SESSIONS_PER_CONNECTION
+    };
+    if !needs_room {
+        return;
+    }
+
     let now_ms = now_millis();
     let _ = prune_udp_sessions(sessions, now_ms);
     let mut sessions = sessions
@@ -2010,9 +2022,9 @@ fn io_other(error: impl std::fmt::Debug) -> io::Error {
     io::Error::new(io::ErrorKind::Other, format!("{error:?}"))
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Hysteria2AuthBackoff {
-    entries: Mutex<HashMap<IpAddr, Hysteria2AuthBackoffEntry>>,
+    shards: Vec<Mutex<HashMap<IpAddr, Hysteria2AuthBackoffEntry>>>,
 }
 
 #[derive(Debug)]
@@ -2023,6 +2035,13 @@ struct Hysteria2AuthBackoffEntry {
 }
 
 impl Hysteria2AuthBackoff {
+    fn new() -> Self {
+        let shards = (0..HY2_INVALID_AUTH_BACKOFF_SHARDS)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect();
+        Self { shards }
+    }
+
     fn is_blocked(&self, ip: IpAddr) -> bool {
         self.is_blocked_at(ip, Instant::now())
     }
@@ -2033,7 +2052,7 @@ impl Hysteria2AuthBackoff {
 
     fn record_success(&self, ip: IpAddr) {
         let mut entries = self
-            .entries
+            .shard(ip)
             .lock()
             .expect("hysteria2 auth backoff state poisoned");
         entries.remove(&ip);
@@ -2041,7 +2060,7 @@ impl Hysteria2AuthBackoff {
 
     fn is_blocked_at(&self, ip: IpAddr, now: Instant) -> bool {
         let mut entries = self
-            .entries
+            .shard(ip)
             .lock()
             .expect("hysteria2 auth backoff state poisoned");
         let Some(entry) = entries.get_mut(&ip) else {
@@ -2061,11 +2080,16 @@ impl Hysteria2AuthBackoff {
 
     fn record_invalid_at(&self, ip: IpAddr, now: Instant) {
         let mut entries = self
-            .entries
+            .shard(ip)
             .lock()
             .expect("hysteria2 auth backoff state poisoned");
-        if entries.len() > HY2_INVALID_AUTH_BACKOFF_MAX_ENTRIES {
+        if entries.len() >= self.max_entries_per_shard() {
             entries.retain(|_, entry| !entry.is_expired(now));
+            if entries.len() >= self.max_entries_per_shard() {
+                if let Some(first) = entries.keys().next().copied() {
+                    entries.remove(&first);
+                }
+            }
         }
         let entry = entries.entry(ip).or_insert(Hysteria2AuthBackoffEntry {
             failures: 0,
@@ -2085,6 +2109,29 @@ impl Hysteria2AuthBackoff {
         if entry.failures >= HY2_INVALID_AUTH_BACKOFF_THRESHOLD {
             entry.blocked_until = Some(now + HY2_INVALID_AUTH_BACKOFF_DURATION);
         }
+    }
+
+    fn shard(&self, ip: IpAddr) -> &Mutex<HashMap<IpAddr, Hysteria2AuthBackoffEntry>> {
+        let index = self.shard_index(ip);
+        &self.shards[index]
+    }
+
+    fn shard_index(&self, ip: IpAddr) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        ip.hash(&mut hasher);
+        (hasher.finish() as usize) % self.shards.len()
+    }
+
+    fn max_entries_per_shard(&self) -> usize {
+        HY2_INVALID_AUTH_BACKOFF_MAX_ENTRIES
+            .div_ceil(self.shards.len())
+            .max(1)
+    }
+}
+
+impl Default for Hysteria2AuthBackoff {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -3770,6 +3817,38 @@ mod tests {
 
         backoff.record_success(ip);
         assert!(!backoff.is_blocked_at(ip, start + Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn hysteria2_invalid_auth_backoff_caps_each_shard() {
+        let backoff = Hysteria2AuthBackoff::default();
+        let start = Instant::now();
+        let shard = 0;
+        let limit = backoff.max_entries_per_shard();
+        let mut inserted = 0usize;
+
+        'outer: for third in 0..=255u8 {
+            for fourth in 0..=255u8 {
+                let ip = IpAddr::from([198, 51, third, fourth]);
+                if backoff.shard_index(ip) != shard {
+                    continue;
+                }
+                backoff.record_invalid_at(ip, start);
+                inserted += 1;
+                if inserted >= limit + 8 {
+                    break 'outer;
+                }
+            }
+        }
+
+        assert!(
+            inserted >= limit + 8,
+            "test did not find enough IPs for the selected shard"
+        );
+        let entries = backoff.shards[shard]
+            .lock()
+            .expect("hysteria2 auth backoff state poisoned");
+        assert!(entries.len() <= limit);
     }
 
     #[test]

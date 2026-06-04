@@ -186,7 +186,56 @@ impl UserStore {
     }
 
     pub fn apply_uuid_delta(&self, delta: &CoreUserDelta) -> CoreUserDeltaResult {
-        self.apply_keyed_delta(delta, |user| user.uuid.clone())
+        if let Some(full) = delta.full.as_ref() {
+            let _guard = self.writes.lock().expect("user store write lock poisoned");
+            let next = keyed_user_state(full, |user| user.uuid.clone());
+            let active_users = next.users.len();
+            self.users.store(Arc::new(next));
+            return CoreUserDeltaResult {
+                active_users,
+                full_applied: true,
+                ..CoreUserDeltaResult::default()
+            };
+        }
+
+        let mut result = CoreUserDeltaResult::default();
+        let _guard = self.writes.lock().expect("user store write lock poisoned");
+        let mut current = self.users.load_full().as_ref().clone();
+        for user in &delta.added {
+            if user.is_empty() {
+                continue;
+            }
+            if current
+                .users
+                .insert(user.uuid.clone(), shared_core_user(user))
+                .is_some()
+            {
+                result.updated += 1;
+            } else {
+                result.added += 1;
+            }
+        }
+        for user in &delta.updated {
+            if user.is_empty() {
+                continue;
+            }
+            if let Some(existing) = current.users.get_mut(&user.uuid) {
+                *existing = shared_core_user(user);
+                result.updated += 1;
+            } else {
+                result.missing_updated += 1;
+            }
+        }
+        for uuid in &delta.deleted {
+            if current.users.remove(uuid).is_some() {
+                result.deleted += 1;
+            } else {
+                result.missing_deleted += 1;
+            }
+        }
+        result.active_users = current.users.len();
+        self.users.store(Arc::new(current));
+        result
     }
 
     pub fn apply_keyed_delta<F>(&self, delta: &CoreUserDelta, key: F) -> CoreUserDeltaResult

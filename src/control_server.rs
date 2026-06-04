@@ -53,6 +53,7 @@ impl ControlServerHandle {
 
     pub fn is_stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
+            || self.join.as_ref().is_some_and(|join| join.is_finished())
     }
 
     pub fn stop(&mut self) {
@@ -156,6 +157,7 @@ fn serve_control_listener(
             Err(_) => break,
         }
     }
+    stop.store(true, Ordering::SeqCst);
 }
 
 pub fn serve_control_stream(
@@ -285,7 +287,10 @@ fn write_control_response(
 mod tests {
     use std::io::{BufRead, BufReader, Cursor, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::read_control_line_with_limit;
     use crate::config::{
@@ -348,6 +353,22 @@ mod tests {
             routes: Vec::new(),
             stats: StatsConfig::default(),
         }
+    }
+
+    #[test]
+    fn control_server_handle_reports_finished_thread_as_stopped() {
+        let join = thread::spawn(|| {});
+        let handle = super::ControlServerHandle {
+            local_addr: "127.0.0.1:0".parse().expect("addr"),
+            stop: Arc::new(AtomicBool::new(false)),
+            join: Some(join),
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !handle.is_stopped() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(handle.is_stopped());
     }
 
     fn send(addr: SocketAddr, command: &CoreCommand) -> CoreResponse {

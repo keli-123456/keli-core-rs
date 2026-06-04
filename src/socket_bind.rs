@@ -1,13 +1,19 @@
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
 use std::sync::OnceLock;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, Socket, Type};
 
 const DEFAULT_TCP_LISTEN_BACKLOG: i32 = 4096;
 const MIN_TCP_LISTEN_BACKLOG: i32 = 128;
 const MAX_TCP_LISTEN_BACKLOG: i32 = 65535;
+const DEFAULT_TCP_BIND_RETRY_MILLIS: u64 = 3_000;
+const MAX_TCP_BIND_RETRY_MILLIS: u64 = 30_000;
+const TCP_BIND_RETRY_SLEEP: Duration = Duration::from_millis(50);
 static TCP_LISTEN_BACKLOG: OnceLock<i32> = OnceLock::new();
+static TCP_BIND_RETRY_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 
 pub(crate) fn bind_dual_stack_tcp_listener(listen: SocketAddr) -> io::Result<TcpListener> {
     let listen = dual_stack_wildcard_addr(listen);
@@ -54,7 +60,7 @@ fn bind_ipv6_tcp_listener(listen: SocketAddr) -> io::Result<TcpListener> {
     socket.set_reuse_address(true)?;
     set_reuse_port_like_go(&socket);
     socket.set_only_v6(false)?;
-    socket.bind(&listen.into())?;
+    bind_tcp_socket_with_retry(&socket, listen)?;
     socket.listen(tcp_listen_backlog())?;
     Ok(socket.into())
 }
@@ -76,7 +82,7 @@ fn bind_tcp_listener(listen: SocketAddr) -> io::Result<TcpListener> {
     )?;
     socket.set_reuse_address(true)?;
     set_reuse_port_like_go(&socket);
-    socket.bind(&listen.into())?;
+    bind_tcp_socket_with_retry(&socket, listen)?;
     socket.listen(tcp_listen_backlog())?;
     Ok(socket.into())
 }
@@ -105,6 +111,29 @@ fn set_reuse_port_like_go(socket: &Socket) {
     }
 }
 
+fn bind_tcp_socket_with_retry(socket: &Socket, listen: SocketAddr) -> io::Result<()> {
+    let deadline = Instant::now() + tcp_bind_retry_timeout();
+    let addr = listen.into();
+    loop {
+        match socket.bind(&addr) {
+            Ok(()) => return Ok(()),
+            Err(error) if should_retry_bind(&error, deadline) => {
+                thread::sleep(TCP_BIND_RETRY_SLEEP)
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn should_retry_bind(error: &io::Error, deadline: Instant) -> bool {
+    is_addr_in_use(error) && Instant::now() < deadline
+}
+
+fn is_addr_in_use(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::AddrInUse
+        || matches!(error.raw_os_error(), Some(48 | 98 | 10048))
+}
+
 fn is_ipv6_unspecified(listen: SocketAddr) -> bool {
     matches!(listen, SocketAddr::V6(addr) if addr.ip().is_unspecified())
 }
@@ -127,6 +156,20 @@ fn tcp_listen_backlog() -> i32 {
             read_system_somaxconn(),
         )
     })
+}
+
+fn tcp_bind_retry_timeout() -> Duration {
+    *TCP_BIND_RETRY_TIMEOUT.get_or_init(|| {
+        tcp_bind_retry_timeout_from_env(std::env::var("KELI_CORE_TCP_BIND_RETRY_MILLIS").ok())
+    })
+}
+
+fn tcp_bind_retry_timeout_from_env(env_value: Option<String>) -> Duration {
+    let millis = env_value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TCP_BIND_RETRY_MILLIS)
+        .min(MAX_TCP_BIND_RETRY_MILLIS);
+    Duration::from_millis(millis)
 }
 
 fn tcp_listen_backlog_from_sources(env_value: Option<String>, somaxconn: Option<String>) -> i32 {
@@ -184,6 +227,26 @@ mod tests {
         assert_eq!(
             super::tcp_listen_backlog_from_sources(Some("bad".to_string()), None),
             super::DEFAULT_TCP_LISTEN_BACKLOG
+        );
+    }
+
+    #[test]
+    fn tcp_bind_retry_timeout_defaults_and_clamps() {
+        assert_eq!(
+            super::tcp_bind_retry_timeout_from_env(None),
+            Duration::from_millis(super::DEFAULT_TCP_BIND_RETRY_MILLIS)
+        );
+        assert_eq!(
+            super::tcp_bind_retry_timeout_from_env(Some("0".to_string())),
+            Duration::from_millis(0)
+        );
+        assert_eq!(
+            super::tcp_bind_retry_timeout_from_env(Some("999999".to_string())),
+            Duration::from_millis(super::MAX_TCP_BIND_RETRY_MILLIS)
+        );
+        assert_eq!(
+            super::tcp_bind_retry_timeout_from_env(Some("bad".to_string())),
+            Duration::from_millis(super::DEFAULT_TCP_BIND_RETRY_MILLIS)
         );
     }
 
