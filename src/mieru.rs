@@ -665,11 +665,13 @@ impl MieruReader {
             }
             buffer.extend_from_slice(&temp[..read]);
 
-            for offset in 0..buffer
-                .len()
-                .saturating_sub(NONCE_LEN + ENCRYPTED_METADATA_LEN)
-                + 1
-            {
+            let min_first_segment_len = NONCE_LEN + ENCRYPTED_METADATA_LEN;
+            let scan_offsets = match buffer.len().checked_sub(min_first_segment_len) {
+                Some(max_offset) => max_offset + 1,
+                None => continue,
+            };
+
+            for offset in 0..scan_offsets {
                 let nonce = &buffer[offset..offset + NONCE_LEN];
                 for credential in candidate_credentials_for_nonce(users, nonce) {
                     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -2404,6 +2406,59 @@ mod tests {
         let mut reader = MieruReader::accept(server, &[user]).expect("accept mieru");
 
         assert_eq!(reader.session_id(), 42);
+        let initial = reader.take_initial_segment().expect("initial");
+        assert_eq!(initial.metadata.protocol_type, OPEN_SESSION_REQUEST);
+        assert_eq!(initial.payload, b"ping");
+        sender.join().expect("sender");
+    }
+
+    #[test]
+    fn accepts_first_segment_after_short_initial_fragment() {
+        let user = user();
+        let mut stream_bytes = Vec::new();
+        let mut nonce = [8u8; 24];
+        apply_nonce_user_hint(&mut nonce, &user.uuid);
+        stream_bytes.extend_from_slice(&nonce);
+        let mut write_nonce = nonce;
+        let key = derive_mieru_key(
+            &user.uuid,
+            &user.uuid,
+            rounded_unix_time(super::now_unix_secs()),
+        );
+        let metadata = MieruMetadata {
+            protocol_type: OPEN_SESSION_REQUEST,
+            session_id: 43,
+            sequence: 0,
+            status_code: STATUS_OK,
+            payload_len: 4,
+            prefix_len: 0,
+            suffix_len: 0,
+        };
+        encode_segment_body(
+            &mut stream_bytes,
+            &key,
+            &mut write_nonce,
+            &metadata,
+            b"ping",
+        )
+        .expect("encode");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let sender = thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).expect("connect");
+            client
+                .write_all(&stream_bytes[..4])
+                .expect("write fragment");
+            thread::sleep(Duration::from_millis(50));
+            client
+                .write_all(&stream_bytes[4..])
+                .expect("write remainder");
+        });
+        let (server, _) = listener.accept().expect("accept");
+        let mut reader = MieruReader::accept(server, &[user]).expect("accept mieru");
+
+        assert_eq!(reader.session_id(), 43);
         let initial = reader.take_initial_segment().expect("initial");
         assert_eq!(initial.metadata.protocol_type, OPEN_SESSION_REQUEST);
         assert_eq!(initial.payload, b"ping");
