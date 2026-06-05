@@ -5,7 +5,7 @@ use std::net::{
 };
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,9 +33,9 @@ use crate::socket_bind::bind_dual_stack_tcp_listener;
 use crate::socks5::SocksTarget;
 use crate::stream::{
     copy_count_best_effort, copy_count_best_effort_limited, join_native_blocking_relay,
-    relay_tcp_fast_unlimited_close_on_eof, relay_tcp_limited, spawn_async_relay,
-    spawn_detached_blocking_relay, spawn_detached_native_relay, spawn_named_native_blocking_relay,
-    spawn_tcp_relay_background, RelayActivityDeadline,
+    relay_tcp_fast_unlimited_close_on_eof, relay_tcp_limited, spawn_detached_blocking_relay,
+    spawn_detached_native_relay, spawn_named_native_blocking_relay, spawn_tcp_relay_background,
+    AsyncRelayMetricsGuard, RelayActivityDeadline,
 };
 use crate::tls::{
     relay_tls_stream_with_timeouts, RawTcpStreamAccess, TlsConnection, TlsRelayTimeouts, TlsSocket,
@@ -73,6 +73,7 @@ const VLESS_ROUTE_SLOW_LOG_MS: u128 = 1_000;
 const CLIENT_CLOSE_CONNECT_POLL: Duration = Duration::from_millis(10);
 const VLESS_CONNECT_THREAD_STACK: usize = 256 * 1024;
 const VLESS_ASYNC_RELAY_LABEL: &str = "keli-core-vless-relay";
+const VLESS_ASYNC_RELAY_BUFFER_SIZE: usize = 8 * 1024;
 const VLESS_WEBSOCKET_DETACHED_RELAY_LABEL: &str = "keli-core-vless-ws-relay";
 const VLESS_PLAIN_WEBSOCKET_DETACHED_RELAY_LABEL: &str = "keli-core-vless-plain-ws-relay";
 const VLESS_TLS_DETACHED_RELAY_LABEL: &str = "keli-core-vless-tls-relay";
@@ -3656,6 +3657,7 @@ async fn relay_tcp_streams_async_with_label(
     mut on_upload: impl FnMut(u64) + Send + 'static,
     mut on_download: impl FnMut(u64) + Send + 'static,
 ) -> io::Result<(u64, u64)> {
+    let _metrics = AsyncRelayMetricsGuard::new(label);
     let client_shutdown = Arc::new(clone_tokio_tcp_stream_for_shutdown(&client)?);
     let remote_shutdown = Arc::new(clone_tokio_tcp_stream_for_shutdown(&remote)?);
     let (mut client_read, mut client_write) = client.into_split();
@@ -3663,9 +3665,9 @@ async fn relay_tcp_streams_async_with_label(
     let upload_limiter = limiter.clone();
     let upload_client_shutdown = Arc::clone(&client_shutdown);
     let upload_remote_shutdown = Arc::clone(&remote_shutdown);
-    let upload = spawn_async_relay(label, async move {
+    let upload = async move {
         let mut total = 0u64;
-        let mut buffer = [0u8; 16 * 1024];
+        let mut buffer = [0u8; VLESS_ASYNC_RELAY_BUFFER_SIZE];
         loop {
             let read_result = if let Some(limiter) = upload_limiter.as_deref() {
                 tokio::select! {
@@ -3714,12 +3716,12 @@ async fn relay_tcp_streams_async_with_label(
             on_upload(read as u64);
             total = total.saturating_add(read as u64);
         }
-    })?;
+    };
     let download_client_shutdown = Arc::clone(&client_shutdown);
     let download_remote_shutdown = Arc::clone(&remote_shutdown);
-    let download = spawn_async_relay(label, async move {
+    let download = async move {
         let mut total = 0u64;
-        let mut buffer = [0u8; 16 * 1024];
+        let mut buffer = [0u8; VLESS_ASYNC_RELAY_BUFFER_SIZE];
         loop {
             let read_result = if let Some(limiter) = limiter.as_deref() {
                 tokio::select! {
@@ -3768,10 +3770,8 @@ async fn relay_tcp_streams_async_with_label(
             on_download(read as u64);
             total = total.saturating_add(read as u64);
         }
-    })?;
-    let (upload, download) = tokio::try_join!(upload, download).map_err(|error| {
-        io::Error::new(io::ErrorKind::Other, format!("relay task failed: {error}"))
-    })?;
+    };
+    let (upload, download) = tokio::join!(upload, download);
     Ok((upload?, download?))
 }
 
@@ -3804,12 +3804,15 @@ where
 }
 
 fn vless_async_relay_io_timeout() -> Duration {
-    let seconds = env::var(VLESS_ASYNC_RELAY_IO_TIMEOUT_SECS_ENV)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .unwrap_or(DEFAULT_VLESS_ASYNC_RELAY_IO_TIMEOUT_SECS);
-    Duration::from_secs(seconds)
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let seconds = env::var(VLESS_ASYNC_RELAY_IO_TIMEOUT_SECS_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(DEFAULT_VLESS_ASYNC_RELAY_IO_TIMEOUT_SECS);
+        Duration::from_secs(seconds)
+    })
 }
 
 async fn async_flush_with_timeout<W>(writer: &mut W) -> io::Result<()>
@@ -6227,6 +6230,81 @@ mod tests {
         assert_eq!(records[0].user_uuid, "11111111-1111-1111-1111-111111111111");
         assert_eq!(records[0].upload, 4);
         assert_eq!(records[0].download, 4);
+    }
+
+    #[tokio::test]
+    async fn async_tcp_relay_tracks_one_bidirectional_metric_task() {
+        const TEST_LABEL: &str = "keli-core-vless-relay-single-task-test";
+
+        let client_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("client listener");
+        let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("remote listener");
+        let client_connect = tokio::spawn(tokio::net::TcpStream::connect(
+            client_listener.local_addr().unwrap(),
+        ));
+        let remote_connect = tokio::spawn(tokio::net::TcpStream::connect(
+            remote_listener.local_addr().unwrap(),
+        ));
+        let (client, _) = client_listener.accept().await.expect("client accept");
+        let (remote, _) = remote_listener.accept().await.expect("remote accept");
+        let client_peer = client_connect
+            .await
+            .expect("client connect task")
+            .expect("client connect");
+        let remote_peer = remote_connect
+            .await
+            .expect("remote connect task")
+            .expect("remote connect");
+
+        let relay = tokio::spawn(super::relay_tcp_streams_async_with_label(
+            TEST_LABEL,
+            client,
+            remote,
+            None,
+            |_| {},
+            |_| {},
+        ));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let active = crate::stream::relay_scheduler_metrics_snapshot()
+                .active_async
+                .get(TEST_LABEL)
+                .copied()
+                .unwrap_or(0);
+            if active == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "async relay should track one bidirectional task, active={active}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let active = crate::stream::relay_scheduler_metrics_snapshot()
+            .active_async
+            .get(TEST_LABEL)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(active, 1);
+
+        drop(client_peer);
+        drop(remote_peer);
+        tokio::time::timeout(Duration::from_secs(2), relay)
+            .await
+            .expect("relay timeout")
+            .expect("relay task")
+            .expect("relay result");
+        assert_eq!(
+            crate::stream::relay_scheduler_metrics_snapshot()
+                .active_async
+                .get(TEST_LABEL),
+            None
+        );
     }
 
     #[tokio::test]

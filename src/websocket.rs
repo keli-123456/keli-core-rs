@@ -14,6 +14,7 @@ use crate::tls::{RawTcpStreamAccess, TlsConnection};
 
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_HTTP_HEADER: usize = 16 * 1024;
+const ASYNC_WEBSOCKET_RELAY_BUFFER_SIZE: usize = 6 * 1024;
 const OPCODE_CONTINUATION: u8 = 0x0;
 const OPCODE_TEXT: u8 = 0x1;
 const OPCODE_BINARY: u8 = 0x2;
@@ -258,8 +259,8 @@ pub(crate) fn relay_websocket_tls_stream_stats(
     stats.finish_reason = "completed";
     let mut upload_done = false;
     let mut download_done = false;
-    let mut client_buffer = [0u8; 16 * 1024];
-    let mut remote_buffer = [0u8; 16 * 1024];
+    let mut client_buffer = [0u8; ASYNC_WEBSOCKET_RELAY_BUFFER_SIZE];
+    let mut remote_buffer = [0u8; ASYNC_WEBSOCKET_RELAY_BUFFER_SIZE];
     let mut idle_rounds = 0u8;
     let mut activity_deadline = RelayActivityDeadline::new();
 

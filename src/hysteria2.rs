@@ -813,7 +813,7 @@ impl Hysteria2Server {
                 sessions,
                 message.session_id,
                 &message.target,
-                bandwidth.clone(),
+                &bandwidth,
                 client_ip,
             )
             .await?;
@@ -833,7 +833,7 @@ impl Hysteria2Server {
         sessions: &Arc<Mutex<HashMap<u32, Arc<UdpRelaySession>>>>,
         session_id: u32,
         target: &SocksTarget,
-        bandwidth: DirectionalLimiters,
+        bandwidth: &DirectionalLimiters,
         client_ip: IpAddr,
     ) -> io::Result<(Arc<UdpRelaySession>, SocketAddr)> {
         let existing = {
@@ -846,7 +846,8 @@ impl Hysteria2Server {
         if let Some(session) = existing {
             session.touch();
             if session.target == *target {
-                return Ok((session.clone(), session.target_addr));
+                let target_addr = session.target_addr;
+                return Ok((session, target_addr));
             }
             let target_addr = resolve_udp_target(target, self.config.connect_timeout).await?;
             return Ok((session, target_addr));
@@ -891,6 +892,7 @@ impl Hysteria2Server {
 
         let receiver = session.clone();
         let connection = connection.clone();
+        let bandwidth = bandwidth.clone();
         tokio::spawn(async move {
             let _ = receive_udp_replies(session_id, receiver, connection, bandwidth).await;
         });
@@ -1566,7 +1568,7 @@ fn parse_udp_datagram(input: &[u8]) -> io::Result<UdpDatagram> {
             "truncated hysteria2 udp address",
         ));
     }
-    let address = String::from_utf8(input[offset..offset + address_len].to_vec())
+    let address = std::str::from_utf8(&input[offset..offset + address_len])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid hysteria2 udp address"))?;
     offset += address_len;
 
@@ -1575,7 +1577,7 @@ fn parse_udp_datagram(input: &[u8]) -> io::Result<UdpDatagram> {
         packet_id,
         fragment_id,
         fragment_count,
-        target: parse_target_address(&address)?,
+        target: parse_target_address(address)?,
         data: input[offset..].to_vec(),
     })
 }
@@ -1925,10 +1927,13 @@ fn hy2_preauth_connection_limit(listener_connection_limit: usize) -> usize {
 }
 
 fn hy2_relay_io_timeout() -> Duration {
-    env_duration_seconds(
-        HY2_RELAY_IO_TIMEOUT_SECS_ENV,
-        DEFAULT_HY2_RELAY_IO_TIMEOUT_SECS,
-    )
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        env_duration_seconds(
+            HY2_RELAY_IO_TIMEOUT_SECS_ENV,
+            DEFAULT_HY2_RELAY_IO_TIMEOUT_SECS,
+        )
+    })
 }
 
 fn env_duration_seconds(name: &str, default_seconds: u64) -> Duration {

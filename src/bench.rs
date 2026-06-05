@@ -30,9 +30,11 @@ use crate::shadowsocks::{
 };
 use crate::socks5::{Socks5Server, Socks5ServerConfig, SocksTarget};
 use crate::stream::relay_tcp_fast_unlimited;
+use crate::tls::TlsAcceptor;
 use crate::trojan::{trojan_password_hash, TrojanServer, TrojanServerConfig};
 use crate::tuic::{TuicServer, TuicServerConfig};
 use crate::user::CoreUser;
+use crate::vision::{VisionDecoder, VisionEncoder};
 use crate::vless::{VlessServer, VlessServerConfig};
 use crate::vmess::{connect_vmess_tcp_outbound, VmessServer, VmessServerConfig};
 
@@ -767,7 +769,7 @@ fn bench_quic_runtime_workers() -> usize {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench direct-tcp-proxy-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench anytls-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench naive-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-auth [--streams N] [--requests N]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --core command=HOST:PORT [--core other=HOST:PORT] [--cert CERT.pem] [--cert command=CERT.pem] [--server-name NAME] [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
+        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench direct-tcp-proxy-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench anytls-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench naive-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-vision-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-auth [--streams N] [--requests N]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --core command=HOST:PORT [--core other=HOST:PORT] [--cert CERT.pem] [--cert command=CERT.pem] [--server-name NAME] [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
     );
 }
 
@@ -785,6 +787,9 @@ fn canonical_bench_command(command: &str) -> Option<&'static str> {
         "naive-tcp-stream" | "naive-stream" => Some("naive-tcp-stream"),
         "vless-tcp" => Some("vless-tcp"),
         "vless-tcp-stream" | "vless-stream" => Some("vless-tcp-stream"),
+        "vless-vision-tcp-stream" | "vless-vision-stream" | "vless-vision" => {
+            Some("vless-vision-tcp-stream")
+        }
         "vmess-tcp-stream" | "vmess-stream" => Some("vmess-tcp-stream"),
         "hy2-auth" | "hysteria2-auth" => Some("hy2-auth"),
         "hy2-tcp" | "hysteria2-tcp" => Some("hy2-tcp"),
@@ -809,6 +814,7 @@ fn run_named_bench(command: &str, options: &BenchOptions) -> io::Result<BenchRep
         Some("naive-tcp-stream") => run_naive_tcp_stream_bench(options),
         Some("vless-tcp") => run_vless_tcp_bench(options),
         Some("vless-tcp-stream") => run_vless_tcp_stream_bench(options),
+        Some("vless-vision-tcp-stream") => run_vless_vision_tcp_stream_bench(options),
         Some("vmess-tcp-stream") => run_vmess_tcp_stream_bench(options),
         Some("hy2-tcp") => run_hy2_tcp_bench(options),
         Some("hy2-tcp-stream") => run_hy2_tcp_stream_bench(options),
@@ -2959,6 +2965,51 @@ fn run_external_vless_tcp_stream_bench(
     ))
 }
 
+fn run_vless_vision_tcp_stream_bench(options: &BenchOptions) -> io::Result<BenchReport> {
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let (echo_addr, echo_thread) = start_echo_server(echo_stop.clone())?;
+    let cert = BenchCert::new("vless-vision-bench")?;
+    let core_stop = Arc::new(AtomicBool::new(false));
+    let (core_addr, core_thread) = start_vless_vision_server(&cert, core_stop.clone())?;
+
+    let started = Instant::now();
+    let mut workers = Vec::with_capacity(options.streams);
+    for stream_id in 0..options.streams {
+        let options = options.clone();
+        let cert_der = cert.cert_der.clone();
+        workers.push(thread::spawn(move || {
+            run_vless_vision_tcp_stream_client(core_addr, echo_addr, cert_der, stream_id, &options)
+        }));
+    }
+
+    let (mut latencies, retries, phases) = collect_client_workers(workers, "vless vision stream")?;
+    let elapsed = started.elapsed();
+
+    core_stop.store(true, Ordering::SeqCst);
+    echo_stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(echo_addr);
+    join_server(core_thread)?;
+    join_server(echo_thread)?;
+
+    latencies.sort_unstable();
+    let total_requests = options.streams.saturating_mul(options.requests);
+    let record_bytes = tls_application_data_record_len(options.payload_size);
+    let upload_bytes = (total_requests as u64).saturating_mul(record_bytes as u64);
+    let download_bytes = upload_bytes;
+    Ok(BenchReport::completed_with_phases(
+        "vless-vision-tcp",
+        "tls-vision-raw-connection-per-stream",
+        options,
+        None,
+        upload_bytes,
+        download_bytes,
+        retries,
+        elapsed,
+        &latencies,
+        &phases,
+    ))
+}
+
 fn start_echo_server(
     stop: Arc<AtomicBool>,
 ) -> io::Result<(SocketAddr, thread::JoinHandle<io::Result<()>>)> {
@@ -3334,6 +3385,73 @@ fn start_vmess_server(
             }
         }
         Ok(())
+    });
+    Ok((addr, handle))
+}
+
+fn start_vless_vision_server(
+    cert: &BenchCert,
+    stop: Arc<AtomicBool>,
+) -> io::Result<(SocketAddr, thread::JoinHandle<io::Result<()>>)> {
+    let server = VlessServer::new(VlessServerConfig {
+        node_tag: "bench|vless|vision".to_string(),
+        listen: "127.0.0.1:0".parse().expect("valid listen addr"),
+        users: vec![bench_user()],
+        routes: Vec::new(),
+        flow: "xtls-rprx-vision".to_string(),
+        connect_timeout: Duration::from_secs(3),
+        connection_idle: Duration::from_secs(120),
+        uplink_only: Duration::from_secs(2),
+        downlink_only: Duration::from_secs(4),
+    });
+    let listener = server.bind()?;
+    listener.set_nonblocking(true)?;
+    let addr = listener.local_addr()?;
+    let acceptor = TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[])?;
+    let acceptor = tokio_rustls::TlsAcceptor::from(acceptor.server_config());
+    let handle = thread::spawn(move || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener)?;
+                while !stop.load(Ordering::SeqCst) {
+                    match tokio::time::timeout(Duration::from_millis(20), listener.accept()).await {
+                        Ok(Ok((stream, peer))) => {
+                            let _ = stream.set_nodelay(true);
+                            let server = server.clone();
+                            let acceptor = acceptor.clone();
+                            tokio::spawn(async move {
+                                match acceptor.accept(stream).await {
+                                    Ok(client) => {
+                                        if let Err(error) = server
+                                            .handle_tls_client_async(client, Some(peer.ip()))
+                                            .await
+                                        {
+                                            if !is_expected_bench_disconnect(&error) {
+                                                eprintln!(
+                                                    "bench vless vision server connection error: {error}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        let error = io_other(error);
+                                        if !is_expected_bench_disconnect(&error) {
+                                            eprintln!(
+                                                "bench vless vision tls accept error: {error}"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => {}
+                    }
+                }
+                Ok(())
+            })
     });
     Ok((addr, handle))
 }
@@ -3964,6 +4082,149 @@ fn run_vless_tcp_stream_client(
     Ok(stats)
 }
 
+fn run_vless_vision_tcp_stream_client(
+    core_addr: SocketAddr,
+    echo_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    stream_id: usize,
+    options: &BenchOptions,
+) -> io::Result<ClientStats> {
+    let payload = bench_payload(stream_id, options.payload_size);
+    let record = tls_application_data_record(&payload);
+    let mut response = vec![0u8; record.len()];
+    let mut stats = ClientStats::new(Vec::with_capacity(options.requests), 0);
+
+    let started = Instant::now();
+    let mut socket = TcpStream::connect(core_addr)?;
+    socket.set_nodelay(true)?;
+    socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(10)))?;
+    stats.push_phase("tcp_connect", started.elapsed());
+
+    let started = Instant::now();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert_der).map_err(io_other)?;
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = ServerName::try_from("localhost")
+        .map_err(io_other)?
+        .to_owned();
+    let mut connection =
+        rustls::ClientConnection::new(Arc::new(tls_config), server_name).map_err(io_other)?;
+    while connection.is_handshaking() {
+        connection.complete_io(&mut socket).map_err(io_other)?;
+    }
+    let mut stream = rustls::StreamOwned::new(connection, socket);
+    stats.push_phase("tls_connect", started.elapsed());
+
+    let started = Instant::now();
+    stream.write_all(&vless_tcp_request_with_flow(echo_addr, "xtls-rprx-vision"))?;
+    read_vless_response_header(&mut stream)?;
+    stats.push_phase("auth_request_write", started.elapsed());
+
+    let started = Instant::now();
+    let mut encoder = VisionEncoder::new(BENCH_USER_BYTES);
+    let mut decoder = VisionDecoder::new(BENCH_USER_BYTES);
+    let client_hello = tls_client_hello_like_record();
+    let setup_app_data = tls_application_data_record(b"GET / HTTP/1.1\r\n\r\n");
+    let mut setup_response = vec![0u8; client_hello.len()];
+    let encoded = encoder.encode(&client_hello);
+    stream.write_all(&encoded)?;
+    read_vision_exact(&mut stream, &mut decoder, &mut setup_response)?;
+    if setup_response != client_hello {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "vless vision setup client hello echo mismatch",
+        ));
+    }
+    let encoded = encoder.encode(&setup_app_data);
+    stream.write_all(&encoded)?;
+    let mut setup_response = vec![0u8; setup_app_data.len()];
+    read_vision_exact(&mut stream, &mut decoder, &mut setup_response)?;
+    if setup_response != setup_app_data {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "vless vision setup app data echo mismatch",
+        ));
+    }
+    if !encoder.is_direct_copy() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "vless vision encoder did not enter direct copy",
+        ));
+    }
+    if !decoder.is_direct_copy() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "vless vision decoder did not enter direct copy",
+        ));
+    }
+    stats.push_phase("vision_direct_setup", started.elapsed());
+    let rustls::StreamOwned {
+        conn: _,
+        sock: mut socket,
+    } = stream;
+
+    for request_index in 0..options.requests {
+        let started = Instant::now();
+        socket.write_all(&record).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "vision stream {stream_id} request {} write failed: {error}",
+                    request_index + 1
+                ),
+            )
+        })?;
+        socket.read_exact(&mut response).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "vision stream {stream_id} request {} read failed: {error}",
+                    request_index + 1
+                ),
+            )
+        })?;
+        if response != record {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "vless vision bench echo payload mismatch",
+            ));
+        }
+        let elapsed = started.elapsed();
+        stats.latencies.push(elapsed.as_micros());
+        stats.push_phase("relay_roundtrip", elapsed);
+    }
+
+    Ok(stats)
+}
+
+fn read_vision_exact<R: Read>(
+    stream: &mut R,
+    decoder: &mut VisionDecoder,
+    output: &mut [u8],
+) -> io::Result<()> {
+    let mut offset = 0usize;
+    let mut buffer = [0u8; 16 * 1024];
+    while offset < output.len() {
+        let decoded = decoder.read_decoded(&mut output[offset..])?;
+        if decoded > 0 {
+            offset += decoded;
+            continue;
+        }
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "vless vision stream closed before expected payload",
+            ));
+        }
+        decoder.push(&buffer[..read]);
+    }
+    Ok(())
+}
+
 fn is_retryable_bench_error(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -3973,7 +4234,7 @@ fn is_retryable_bench_error(error: &io::Error) -> bool {
     )
 }
 
-fn read_vless_response_header(stream: &mut TcpStream) -> io::Result<()> {
+fn read_vless_response_header<R: Read>(stream: &mut R) -> io::Result<()> {
     let mut header = [0u8; 2];
     stream.read_exact(&mut header)?;
     if header[0] != 0x00 {
@@ -4320,10 +4581,23 @@ fn vmess_outbound(server: SocketAddr) -> OutboundConfig {
 }
 
 fn vless_tcp_request(target: SocketAddr) -> Vec<u8> {
+    vless_tcp_request_with_flow(target, "")
+}
+
+fn vless_tcp_request_with_flow(target: SocketAddr, flow: &str) -> Vec<u8> {
     let mut request = Vec::with_capacity(24);
     request.push(0x00);
     request.extend_from_slice(&BENCH_USER_BYTES);
-    request.push(0x00);
+    if flow.is_empty() {
+        request.push(0x00);
+    } else {
+        let flow = flow.as_bytes();
+        let addon_len = 2 + flow.len();
+        request.push(addon_len as u8);
+        request.push(0x0a);
+        request.push(flow.len() as u8);
+        request.extend_from_slice(flow);
+    }
     request.push(0x01);
     request.extend_from_slice(&target.port().to_be_bytes());
     match target {
@@ -4337,6 +4611,27 @@ fn vless_tcp_request(target: SocketAddr) -> Vec<u8> {
         }
     }
     request
+}
+
+fn tls_client_hello_like_record() -> Vec<u8> {
+    vec![0x16, 0x03, 0x03, 0x00, 0x02, 0x01, 0x00]
+}
+
+fn tls_application_data_record(payload: &[u8]) -> Vec<u8> {
+    let mut record = Vec::with_capacity(tls_application_data_record_len(payload.len()));
+    record.extend_from_slice(&[
+        0x17,
+        0x03,
+        0x03,
+        (payload.len() >> 8) as u8,
+        payload.len() as u8,
+    ]);
+    record.extend_from_slice(payload);
+    record
+}
+
+fn tls_application_data_record_len(payload_len: usize) -> usize {
+    5usize.saturating_add(payload_len)
 }
 
 fn bench_payload(stream_id: usize, size: usize) -> Vec<u8> {
@@ -5473,9 +5768,9 @@ mod tests {
         run_http_connect_stream_bench, run_hy2_udp_bench, run_naive_tcp_stream_bench,
         run_shadowsocks_tcp_stream_bench, run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench,
         run_tuic_tcp_bench, run_tuic_tcp_stream_bench, run_tuic_udp_bench, run_vless_tcp_bench,
-        run_vless_tcp_stream_bench, run_vmess_tcp_stream_bench, summarize_bench_runs,
-        validate_udp_bench_payload, BenchCert, BenchOptions, BenchPhaseReport, BenchPhaseSummary,
-        BenchReport, BenchSuiteRun, LatencyReport,
+        run_vless_tcp_stream_bench, run_vless_vision_tcp_stream_bench, run_vmess_tcp_stream_bench,
+        summarize_bench_runs, validate_udp_bench_payload, BenchCert, BenchOptions,
+        BenchPhaseReport, BenchPhaseSummary, BenchReport, BenchSuiteRun, LatencyReport,
     };
     use std::net::{SocketAddr, TcpStream};
     use std::path::PathBuf;
@@ -5685,6 +5980,10 @@ mod tests {
         assert_eq!(
             canonical_bench_command("vless-stream"),
             Some("vless-tcp-stream")
+        );
+        assert_eq!(
+            canonical_bench_command("vless-vision"),
+            Some("vless-vision-tcp-stream")
         );
         assert_eq!(
             canonical_bench_command("tuic-stream"),
@@ -6066,6 +6365,30 @@ mod tests {
         assert!(report.download_bytes > 0);
         assert_phase(&report, "tcp_connect");
         assert_phase(&report, "auth_request_write");
+        assert_phase(&report, "relay_roundtrip");
+    }
+
+    #[test]
+    fn runs_vless_vision_tcp_stream_bench_smoke() {
+        let report = run_vless_vision_tcp_stream_bench(&BenchOptions {
+            streams: 1,
+            requests: 2,
+            payload_size: 16,
+        })
+        .expect("bench");
+
+        assert_eq!(report.protocol, "vless-vision-tcp");
+        assert_eq!(report.mode, "tls-vision-raw-connection-per-stream");
+        assert_eq!(report.total_requests, 2);
+        assert_eq!(report.completed_requests, 2);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.error_rate, 0.0);
+        assert_eq!(report.runtime_workers, None);
+        assert!(report.download_bytes > 0);
+        assert_phase(&report, "tcp_connect");
+        assert_phase(&report, "tls_connect");
+        assert_phase(&report, "auth_request_write");
+        assert_phase(&report, "vision_direct_setup");
         assert_phase(&report, "relay_roundtrip");
     }
 
