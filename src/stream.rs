@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -44,6 +44,10 @@ const UNIX_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 256;
 const MIN_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 64;
 const MAX_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 8192;
 const DETACHED_BLOCKING_RELAY_STACK_ENV: &str = "KELI_CORE_DETACHED_RELAY_STACK_KIB";
+const RELAY_MEMORY_TRIM_COMPLETIONS: usize = 1024;
+const RELAY_MEMORY_TRIM_MIN_INTERVAL_SECS: u64 = 60;
+static RELAY_COMPLETIONS_SINCE_TRIM: AtomicUsize = AtomicUsize::new(0);
+static RELAY_MEMORY_TRIM_LAST_SECS: AtomicU64 = AtomicU64::new(0);
 
 pub type BlockingRelayHandle<T> = tokio::task::JoinHandle<T>;
 type NativeRelayTask = Box<dyn FnOnce() + Send + 'static>;
@@ -249,6 +253,7 @@ where
             }
         };
         on_finish(upload, download);
+        maybe_trim_process_memory_after_relay_completion();
     })
 }
 
@@ -323,16 +328,19 @@ impl DetachedBlockingRelayMetricsGuard {
 
 impl Drop for DetachedBlockingRelayMetricsGuard {
     fn drop(&mut self) {
-        let mut active = detached_blocking_relay_metrics()
-            .lock()
-            .expect("detached blocking relay metrics poisoned");
-        let Some(count) = active.get_mut(self.name) else {
-            return;
-        };
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            active.remove(self.name);
+        {
+            let mut active = detached_blocking_relay_metrics()
+                .lock()
+                .expect("detached blocking relay metrics poisoned");
+            let Some(count) = active.get_mut(self.name) else {
+                return;
+            };
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(self.name);
+            }
         }
+        maybe_trim_process_memory_after_relay_completion();
     }
 }
 
@@ -368,16 +376,19 @@ impl NativeRelayMetricsGuard {
 
 impl Drop for NativeRelayMetricsGuard {
     fn drop(&mut self) {
-        let mut active = native_relay_metrics()
-            .lock()
-            .expect("native relay metrics poisoned");
-        let Some(count) = active.get_mut(self.name) else {
-            return;
-        };
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            active.remove(self.name);
+        {
+            let mut active = native_relay_metrics()
+                .lock()
+                .expect("native relay metrics poisoned");
+            let Some(count) = active.get_mut(self.name) else {
+                return;
+            };
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(self.name);
+            }
         }
+        maybe_trim_process_memory_after_relay_completion();
     }
 }
 
@@ -413,17 +424,61 @@ impl AsyncRelayMetricsGuard {
 
 impl Drop for AsyncRelayMetricsGuard {
     fn drop(&mut self) {
-        let mut active = async_relay_metrics()
-            .lock()
-            .expect("async relay metrics poisoned");
-        let Some(count) = active.get_mut(self.name) else {
-            return;
-        };
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            active.remove(self.name);
+        {
+            let mut active = async_relay_metrics()
+                .lock()
+                .expect("async relay metrics poisoned");
+            let Some(count) = active.get_mut(self.name) else {
+                return;
+            };
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(self.name);
+            }
         }
+        maybe_trim_process_memory_after_relay_completion();
     }
+}
+
+fn maybe_trim_process_memory_after_relay_completion() {
+    let completions = RELAY_COMPLETIONS_SINCE_TRIM
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    if completions % RELAY_MEMORY_TRIM_COMPLETIONS != 0 {
+        return;
+    }
+
+    let now = current_unix_seconds();
+    let last = RELAY_MEMORY_TRIM_LAST_SECS.load(Ordering::Acquire);
+    if last != 0 && now.saturating_sub(last) < RELAY_MEMORY_TRIM_MIN_INTERVAL_SECS {
+        return;
+    }
+
+    if RELAY_MEMORY_TRIM_LAST_SECS
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        RELAY_COMPLETIONS_SINCE_TRIM.store(0, Ordering::Relaxed);
+        crate::trim_process_memory();
+    }
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn reset_relay_memory_trim_state() {
+    RELAY_COMPLETIONS_SINCE_TRIM.store(0, Ordering::Relaxed);
+    RELAY_MEMORY_TRIM_LAST_SECS.store(0, Ordering::Release);
+}
+
+#[cfg(test)]
+fn set_relay_memory_trim_last_secs(value: u64) {
+    RELAY_MEMORY_TRIM_LAST_SECS.store(value, Ordering::Release);
 }
 
 fn async_relay_metrics_snapshot() -> BTreeMap<String, usize> {
@@ -603,7 +658,7 @@ fn relay_tcp_streams_async(
     }
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
-    tcp_relay_runtime()?.block_on(async move {
+    let result = tcp_relay_runtime()?.block_on(async move {
         let client = tokio::net::TcpStream::from_std(client)?;
         let remote = tokio::net::TcpStream::from_std(remote)?;
         let (mut client_read, mut client_write) = client.into_split();
@@ -621,7 +676,9 @@ fn relay_tcp_streams_async(
         );
         let (upload, download) = tokio::join!(upload, download);
         Ok((upload, download))
-    })
+    });
+    maybe_trim_process_memory_after_relay_completion();
+    result
 }
 
 fn relay_tcp_streams_unlimited_native(
@@ -652,7 +709,7 @@ fn relay_tcp_streams_unlimited_tokio(
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
 
-    tcp_relay_runtime()?.block_on(async move {
+    let result = tcp_relay_runtime()?.block_on(async move {
         let client = tokio::net::TcpStream::from_std(client)?;
         let remote = tokio::net::TcpStream::from_std(remote)?;
         let (mut client_read, mut client_write) = client.into_split();
@@ -674,7 +731,9 @@ fn relay_tcp_streams_unlimited_tokio(
         );
         let (upload, download) = tokio::join!(upload, download);
         Ok((upload, download))
-    })
+    });
+    maybe_trim_process_memory_after_relay_completion();
+    result
 }
 
 async fn relay_copy_unlimited_async<R, W>(
@@ -1361,6 +1420,35 @@ mod tests {
             super::detached_blocking_relay_stack_size_from_env(Some("99999".to_string()), 256),
             8192 * 1024
         );
+    }
+
+    #[test]
+    fn relay_completion_memory_trim_is_batched_and_interval_limited() {
+        super::reset_relay_memory_trim_state();
+        crate::reset_process_memory_trim_test_count();
+
+        for _ in 0..super::RELAY_MEMORY_TRIM_COMPLETIONS.saturating_sub(1) {
+            super::maybe_trim_process_memory_after_relay_completion();
+        }
+        assert_eq!(crate::process_memory_trim_test_count(), 0);
+
+        super::maybe_trim_process_memory_after_relay_completion();
+        assert_eq!(crate::process_memory_trim_test_count(), 1);
+
+        super::set_relay_memory_trim_last_secs(super::current_unix_seconds());
+        for _ in 0..super::RELAY_MEMORY_TRIM_COMPLETIONS {
+            super::maybe_trim_process_memory_after_relay_completion();
+        }
+        assert_eq!(crate::process_memory_trim_test_count(), 1);
+
+        super::set_relay_memory_trim_last_secs(1);
+        for _ in 0..super::RELAY_MEMORY_TRIM_COMPLETIONS {
+            super::maybe_trim_process_memory_after_relay_completion();
+        }
+        assert_eq!(crate::process_memory_trim_test_count(), 2);
+
+        super::reset_relay_memory_trim_state();
+        crate::reset_process_memory_trim_test_count();
     }
 
     #[test]
