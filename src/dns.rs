@@ -22,6 +22,7 @@ static GOOGLEVIDEO_FALLBACK_CACHE: OnceLock<Mutex<Option<GoogleVideoFallbackEntr
     OnceLock::new();
 static TCP_CONNECT_FAILURE_BACKOFF: OnceLock<Mutex<HashMap<DnsCacheKey, TcpConnectFailureEntry>>> =
     OnceLock::new();
+static TCP_CONNECT_INFLIGHT: OnceLock<Mutex<HashMap<DnsCacheKey, usize>>> = OnceLock::new();
 static DNS_RESOLVE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DNS_SYSTEM_QUERY_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DNS_CONFIGURED_QUERY_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -31,6 +32,7 @@ static DNS_RESOLVE_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DNS_PRIVATE_IP_FILTER_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DNS_PRIVATE_IP_BLOCK_TOTAL: AtomicU64 = AtomicU64::new(0);
 static TCP_CONNECT_BACKOFF_REJECT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TCP_CONNECT_INFLIGHT_REJECT_TOTAL: AtomicU64 = AtomicU64::new(0);
 const DNS_POSITIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const DNS_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(15);
 const GOOGLEVIDEO_FALLBACK_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -40,6 +42,7 @@ const TCP_CONNECT_FAILURE_THRESHOLD: u32 = 3;
 const TCP_CONNECT_FAILURE_WINDOW: Duration = Duration::from_secs(10);
 const TCP_CONNECT_FAILURE_BLOCK_DURATION: Duration = Duration::from_secs(5);
 const TCP_CONNECT_FAILURE_MAX_ENTRIES: usize = 8192;
+const TCP_CONNECT_INFLIGHT_PER_TARGET_LIMIT: usize = 64;
 const TCP_RACE_MAX_CONCURRENT: usize = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +59,10 @@ pub struct DnsMetricsSnapshot {
     pub keli_core_tcp_connect_backoff_reject_total: u64,
     #[serde(default)]
     pub keli_core_tcp_connect_backoff_active_targets: usize,
+    #[serde(default)]
+    pub keli_core_tcp_connect_inflight_reject_total: u64,
+    #[serde(default)]
+    pub keli_core_tcp_connect_inflight_active_targets: usize,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -114,6 +121,9 @@ pub fn dns_metrics_snapshot() -> DnsMetricsSnapshot {
         keli_core_tcp_connect_backoff_reject_total: TCP_CONNECT_BACKOFF_REJECT_TOTAL
             .load(Ordering::Relaxed),
         keli_core_tcp_connect_backoff_active_targets: tcp_connect_backoff_active_targets(),
+        keli_core_tcp_connect_inflight_reject_total: TCP_CONNECT_INFLIGHT_REJECT_TOTAL
+            .load(Ordering::Relaxed),
+        keli_core_tcp_connect_inflight_active_targets: tcp_connect_inflight_active_targets(),
     }
 }
 
@@ -123,6 +133,7 @@ pub fn connect_tcp(host: &str, port: u16, timeout: Duration) -> io::Result<TcpSt
         return Err(error);
     }
     let addrs = resolve_socket_addrs(host, port, timeout)?;
+    let _inflight = tcp_connect_inflight_guard(&backoff_key)?;
     match connect_tcp_addrs(&addrs, timeout) {
         Ok(stream) => {
             record_tcp_connect_success(&backoff_key);
@@ -146,6 +157,7 @@ pub async fn connect_tcp_tokio(
         return Err(error);
     }
     let addrs = resolve_socket_addrs_tokio(host, port, timeout).await?;
+    let _inflight = tcp_connect_inflight_guard(&backoff_key)?;
     match connect_tcp_addrs_tokio(&addrs, timeout).await {
         Ok(stream) => {
             record_tcp_connect_success(&backoff_key);
@@ -577,6 +589,29 @@ fn tcp_connect_failure_backoff() -> &'static Mutex<HashMap<DnsCacheKey, TcpConne
     TCP_CONNECT_FAILURE_BACKOFF.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn tcp_connect_inflight() -> &'static Mutex<HashMap<DnsCacheKey, usize>> {
+    TCP_CONNECT_INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn tcp_connect_inflight_guard(key: &DnsCacheKey) -> io::Result<TcpConnectInflightGuard> {
+    let mut active = tcp_connect_inflight()
+        .lock()
+        .expect("tcp connect inflight map poisoned");
+    let count = active.entry(key.clone()).or_default();
+    if *count >= TCP_CONNECT_INFLIGHT_PER_TARGET_LIMIT {
+        TCP_CONNECT_INFLIGHT_REJECT_TOTAL.fetch_add(1, Ordering::Relaxed);
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "target {}:{} has too many in-flight connect attempts",
+                key.host, key.port
+            ),
+        ));
+    }
+    *count = count.saturating_add(1);
+    Ok(TcpConnectInflightGuard { key: key.clone() })
+}
+
 fn tcp_connect_backoff_error(key: &DnsCacheKey, now: Instant) -> Option<io::Error> {
     let mut entries = tcp_connect_failure_backoff()
         .lock()
@@ -651,10 +686,7 @@ fn record_tcp_connect_failure_error_at(key: &DnsCacheKey, error: &io::Error, now
 }
 
 fn is_transient_tcp_connect_error(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-    )
+    matches!(error.kind(), io::ErrorKind::WouldBlock)
 }
 
 fn clear_tcp_connect_failure_backoff() {
@@ -662,6 +694,16 @@ fn clear_tcp_connect_failure_backoff() {
         cache
             .lock()
             .expect("tcp connect failure backoff poisoned")
+            .clear();
+    }
+}
+
+#[cfg(test)]
+fn clear_tcp_connect_inflight() {
+    if let Some(cache) = TCP_CONNECT_INFLIGHT.get() {
+        cache
+            .lock()
+            .expect("tcp connect inflight map poisoned")
             .clear();
     }
 }
@@ -678,6 +720,32 @@ fn tcp_connect_backoff_active_targets() -> usize {
                 .is_some_and(|blocked_until| now < blocked_until)
         })
         .count()
+}
+
+fn tcp_connect_inflight_active_targets() -> usize {
+    tcp_connect_inflight()
+        .lock()
+        .expect("tcp connect inflight map poisoned")
+        .len()
+}
+
+struct TcpConnectInflightGuard {
+    key: DnsCacheKey,
+}
+
+impl Drop for TcpConnectInflightGuard {
+    fn drop(&mut self) {
+        let mut active = tcp_connect_inflight()
+            .lock()
+            .expect("tcp connect inflight map poisoned");
+        let Some(count) = active.get_mut(&self.key) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            active.remove(&self.key);
+        }
+    }
 }
 
 impl TcpConnectFailureEntry {
@@ -1799,7 +1867,47 @@ mod tests {
     }
 
     #[test]
-    fn tcp_connect_backoff_ignores_transient_timeouts() {
+    fn tcp_connect_inflight_rejects_excess_per_target_and_releases() {
+        let _guard = crate::test_support::network_test_lock();
+        clear_tcp_connect_inflight();
+        let before = dns_metrics_snapshot();
+        let key = dns_cache_key("103.101.191.243", 443);
+        let mut guards = Vec::new();
+
+        for _ in 0..super::TCP_CONNECT_INFLIGHT_PER_TARGET_LIMIT {
+            guards.push(tcp_connect_inflight_guard(&key).expect("inflight guard"));
+        }
+
+        let error = match tcp_connect_inflight_guard(&key) {
+            Ok(_) => panic!("excess in-flight connect should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            error.to_string().contains("too many in-flight"),
+            "unexpected in-flight error: {error}"
+        );
+
+        let after = dns_metrics_snapshot();
+        assert!(
+            after.keli_core_tcp_connect_inflight_reject_total
+                > before.keli_core_tcp_connect_inflight_reject_total
+        );
+        assert_eq!(after.keli_core_tcp_connect_inflight_active_targets, 1);
+
+        guards.pop();
+        let extra = tcp_connect_inflight_guard(&key).expect("released slot should be reusable");
+        drop(extra);
+        drop(guards);
+        assert_eq!(
+            dns_metrics_snapshot().keli_core_tcp_connect_inflight_active_targets,
+            0
+        );
+        clear_tcp_connect_inflight();
+    }
+
+    #[test]
+    fn tcp_connect_backoff_blocks_repeated_timeouts() {
         let _guard = crate::test_support::network_test_lock();
         clear_tcp_connect_failure_backoff();
         let key = dns_cache_key("dns.huhu.icu", 22223);
@@ -1809,6 +1917,28 @@ mod tests {
         record_tcp_connect_failure_error_at(&key, &timeout, now);
         record_tcp_connect_failure_error_at(&key, &timeout, now + Duration::from_secs(1));
         record_tcp_connect_failure_error_at(&key, &timeout, now + Duration::from_secs(2));
+
+        let error = tcp_connect_backoff_error(&key, now + Duration::from_secs(3))
+            .expect("repeated timeouts should be temporarily backed off");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            error.to_string().contains("temporarily backed off"),
+            "unexpected backoff error: {error}"
+        );
+        clear_tcp_connect_failure_backoff();
+    }
+
+    #[test]
+    fn tcp_connect_backoff_ignores_would_block() {
+        let _guard = crate::test_support::network_test_lock();
+        clear_tcp_connect_failure_backoff();
+        let key = dns_cache_key("dns.huhu.icu", 22223);
+        let now = Instant::now();
+        let would_block = io::Error::new(io::ErrorKind::WouldBlock, "connect would block");
+
+        record_tcp_connect_failure_error_at(&key, &would_block, now);
+        record_tcp_connect_failure_error_at(&key, &would_block, now + Duration::from_secs(1));
+        record_tcp_connect_failure_error_at(&key, &would_block, now + Duration::from_secs(2));
 
         assert!(tcp_connect_backoff_error(&key, now + Duration::from_secs(3)).is_none());
         clear_tcp_connect_failure_backoff();
