@@ -673,7 +673,7 @@ impl TrojanServer {
         remote.set_nonblocking(true)?;
         let _connection = self
             .bandwidth
-            .register_tcp_connection(Some(&request.user_uuid), &[&remote])?;
+            .register_tcp_connection(Some(&request.user_uuid), &[reader.tcp_stream()])?;
 
         let relay_started = Instant::now();
         let mut upload = 0u64;

@@ -494,6 +494,10 @@ fn shutdown_websocket_tls_pair(client: &mut WebSocketTlsStream, remote: &TcpStre
 }
 
 impl WebSocketReader {
+    pub(crate) fn tcp_stream(&self) -> &TcpStream {
+        &self.reader
+    }
+
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.reader.set_read_timeout(timeout)
     }

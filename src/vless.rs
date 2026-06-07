@@ -1232,7 +1232,7 @@ impl VlessServer {
     ) -> io::Result<()> {
         let _connection = self
             .bandwidth
-            .register_tcp_connection(Some(&request.user_uuid), &[&remote])?;
+            .register_tcp_connection(Some(&request.user_uuid), &[reader.tcp_stream()])?;
         reader.set_nonblocking(true)?;
         remote.set_nonblocking(true)?;
         let mut download = 0u64;
