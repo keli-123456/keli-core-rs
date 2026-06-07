@@ -937,7 +937,7 @@ fn tcp_relay_half_close_limit(
     }
 }
 
-fn record_tcp_relay_half_close_timeout(upload_done: bool, download_done: bool) {
+pub(crate) fn record_tcp_relay_half_close_timeout(upload_done: bool, download_done: bool) {
     TCP_RELAY_HALF_CLOSE_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
     if upload_done && !download_done {
         TCP_RELAY_DOWNLINK_ONLY_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);

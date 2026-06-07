@@ -136,6 +136,33 @@ pub struct VlessServerConfig {
     pub downlink_only: Duration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VlessTcpRelayTimeouts {
+    uplink_only: Duration,
+    downlink_only: Duration,
+}
+
+impl Default for VlessTcpRelayTimeouts {
+    fn default() -> Self {
+        Self {
+            uplink_only: Duration::from_secs(1),
+            downlink_only: Duration::from_secs(1),
+        }
+    }
+}
+
+impl VlessTcpRelayTimeouts {
+    fn half_close_limit(self, upload_done: bool, download_done: bool) -> Option<Duration> {
+        if upload_done && !download_done {
+            Some(self.downlink_only)
+        } else if download_done && !upload_done {
+            Some(self.uplink_only)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct VlessServer {
     config: VlessServerConfig,
@@ -1105,7 +1132,15 @@ impl VlessServer {
             false,
             None,
         );
-        relay_tcp_streams_async(client, remote, bandwidth, upload_flush, download_flush).await?;
+        relay_tcp_streams_async(
+            client,
+            remote,
+            bandwidth,
+            self.tcp_relay_timeouts(),
+            upload_flush,
+            download_flush,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1540,6 +1575,7 @@ impl VlessServer {
             request.user_id,
             bandwidth,
             true,
+            self.tcp_relay_timeouts(),
             upload_flush,
             download_flush,
         )
@@ -1683,6 +1719,13 @@ impl VlessServer {
     fn tls_relay_timeouts(&self) -> TlsRelayTimeouts {
         TlsRelayTimeouts {
             connection_idle: self.config.connection_idle,
+            uplink_only: self.config.uplink_only,
+            downlink_only: self.config.downlink_only,
+        }
+    }
+
+    fn tcp_relay_timeouts(&self) -> VlessTcpRelayTimeouts {
+        VlessTcpRelayTimeouts {
             uplink_only: self.config.uplink_only,
             downlink_only: self.config.downlink_only,
         }
@@ -3635,6 +3678,7 @@ async fn relay_tcp_streams_async(
     client: tokio::net::TcpStream,
     remote: tokio::net::TcpStream,
     limiter: Option<Arc<BandwidthLimiter>>,
+    timeouts: VlessTcpRelayTimeouts,
     mut on_upload: impl FnMut(u64) + Send + 'static,
     mut on_download: impl FnMut(u64) + Send + 'static,
 ) -> io::Result<(u64, u64)> {
@@ -3643,6 +3687,7 @@ async fn relay_tcp_streams_async(
         client,
         remote,
         limiter,
+        timeouts,
         move |bytes| on_upload(bytes),
         move |bytes| on_download(bytes),
     )
@@ -3654,125 +3699,148 @@ async fn relay_tcp_streams_async_with_label(
     client: tokio::net::TcpStream,
     remote: tokio::net::TcpStream,
     limiter: Option<Arc<BandwidthLimiter>>,
+    timeouts: VlessTcpRelayTimeouts,
     mut on_upload: impl FnMut(u64) + Send + 'static,
     mut on_download: impl FnMut(u64) + Send + 'static,
 ) -> io::Result<(u64, u64)> {
+    enum VlessTcpRelayEvent {
+        Upload(io::Result<usize>),
+        Download(io::Result<usize>),
+        LimiterRevoked,
+        HalfCloseTimeout,
+    }
+
     let _metrics = AsyncRelayMetricsGuard::new(label);
     let client_shutdown = Arc::new(clone_tokio_tcp_stream_for_shutdown(&client)?);
     let remote_shutdown = Arc::new(clone_tokio_tcp_stream_for_shutdown(&remote)?);
     let (mut client_read, mut client_write) = client.into_split();
     let (mut remote_read, mut remote_write) = remote.into_split();
-    let upload_limiter = limiter.clone();
-    let upload_client_shutdown = Arc::clone(&client_shutdown);
-    let upload_remote_shutdown = Arc::clone(&remote_shutdown);
-    let upload = async move {
-        let mut total = 0u64;
-        let mut buffer = [0u8; VLESS_ASYNC_RELAY_BUFFER_SIZE];
-        loop {
-            let read_result = if let Some(limiter) = upload_limiter.as_deref() {
-                tokio::select! {
-                    read = client_read.read(&mut buffer) => read,
-                    _ = wait_limiter_revoke(limiter) => {
-                        on_upload(0);
-                        let _ = remote_write.shutdown().await;
-                        close_tcp_pair(&upload_client_shutdown, &upload_remote_shutdown);
-                        return Ok::<u64, io::Error>(total);
-                    }
+    let mut upload = 0u64;
+    let mut download = 0u64;
+    let mut upload_done = false;
+    let mut download_done = false;
+    let mut half_close_started = None::<Instant>;
+    let mut upload_buffer = [0u8; VLESS_ASYNC_RELAY_BUFFER_SIZE];
+    let mut download_buffer = [0u8; VLESS_ASYNC_RELAY_BUFFER_SIZE];
+
+    while !upload_done || !download_done {
+        let half_close_wait = half_close_started.and_then(|started| {
+            timeouts
+                .half_close_limit(upload_done, download_done)
+                .map(|limit| limit.saturating_sub(started.elapsed()))
+        });
+        if matches!(half_close_wait, Some(wait) if wait.is_zero()) {
+            crate::stream::record_tcp_relay_half_close_timeout(upload_done, download_done);
+            close_tcp_pair(&client_shutdown, &remote_shutdown);
+            break;
+        }
+        let event = tokio::select! {
+            read = client_read.read(&mut upload_buffer), if !upload_done => {
+                VlessTcpRelayEvent::Upload(read)
+            }
+            read = remote_read.read(&mut download_buffer), if !download_done => {
+                VlessTcpRelayEvent::Download(read)
+            }
+            _ = async {
+                if let Some(limiter) = limiter.as_deref() {
+                    wait_limiter_revoke(limiter).await;
+                } else {
+                    std::future::pending::<()>().await;
                 }
-            } else {
-                client_read.read(&mut buffer).await
-            };
-            let read = match read_result {
-                Ok(read) => read,
-                Err(error) => {
-                    on_upload(0);
-                    let _ = remote_write.shutdown().await;
-                    close_tcp_pair(&upload_client_shutdown, &upload_remote_shutdown);
-                    return Err(error);
+            }, if limiter.is_some() => {
+                VlessTcpRelayEvent::LimiterRevoked
+            }
+            _ = async {
+                if let Some(wait) = half_close_wait {
+                    tokio::time::sleep(wait).await;
+                } else {
+                    std::future::pending::<()>().await;
                 }
-            };
-            if read == 0 {
+            }, if half_close_wait.is_some() => {
+                VlessTcpRelayEvent::HalfCloseTimeout
+            }
+        };
+
+        match event {
+            VlessTcpRelayEvent::Upload(Ok(0)) => {
+                upload_done = true;
                 on_upload(0);
                 let _ = remote_write.shutdown().await;
-                close_tcp_pair(&upload_client_shutdown, &upload_remote_shutdown);
-                return Ok::<u64, io::Error>(total);
-            }
-            if let Some(limiter) = upload_limiter.as_deref() {
-                if !limiter.wait_for_async(read).await {
-                    on_upload(0);
-                    let _ = remote_write.shutdown().await;
-                    close_tcp_pair(&upload_client_shutdown, &upload_remote_shutdown);
-                    return Ok::<u64, io::Error>(total);
+                if !download_done && half_close_started.is_none() {
+                    half_close_started = Some(Instant::now());
                 }
             }
-            if let Err(error) =
-                async_write_all_with_timeout(&mut remote_write, &buffer[..read]).await
-            {
-                on_upload(0);
-                let _ = remote_write.shutdown().await;
-                close_tcp_pair(&upload_client_shutdown, &upload_remote_shutdown);
-                return Err(error);
-            }
-            on_upload(read as u64);
-            total = total.saturating_add(read as u64);
-        }
-    };
-    let download_client_shutdown = Arc::clone(&client_shutdown);
-    let download_remote_shutdown = Arc::clone(&remote_shutdown);
-    let download = async move {
-        let mut total = 0u64;
-        let mut buffer = [0u8; VLESS_ASYNC_RELAY_BUFFER_SIZE];
-        loop {
-            let read_result = if let Some(limiter) = limiter.as_deref() {
-                tokio::select! {
-                    read = remote_read.read(&mut buffer) => read,
-                    _ = wait_limiter_revoke(limiter) => {
-                        on_download(0);
-                        let _ = client_write.shutdown().await;
-                        close_tcp_pair(&download_client_shutdown, &download_remote_shutdown);
-                        return Ok::<u64, io::Error>(total);
+            VlessTcpRelayEvent::Upload(Ok(read)) => {
+                if let Some(limiter) = limiter.as_deref() {
+                    if !limiter.wait_for_async(read).await {
+                        close_tcp_pair(&client_shutdown, &remote_shutdown);
+                        break;
                     }
                 }
-            } else {
-                remote_read.read(&mut buffer).await
-            };
-            let read = match read_result {
-                Ok(read) => read,
-                Err(error) => {
+                if let Err(error) =
+                    async_write_all_with_timeout(&mut remote_write, &upload_buffer[..read]).await
+                {
+                    on_upload(0);
                     on_download(0);
-                    let _ = client_write.shutdown().await;
-                    close_tcp_pair(&download_client_shutdown, &download_remote_shutdown);
+                    close_tcp_pair(&client_shutdown, &remote_shutdown);
                     return Err(error);
                 }
-            };
-            if read == 0 {
-                on_download(0);
-                let _ = client_write.shutdown().await;
-                close_tcp_pair(&download_client_shutdown, &download_remote_shutdown);
-                return Ok::<u64, io::Error>(total);
+                on_upload(read as u64);
+                upload = upload.saturating_add(read as u64);
             }
-            if let Some(limiter) = limiter.as_deref() {
-                if !limiter.wait_for_async(read).await {
-                    on_download(0);
-                    let _ = client_write.shutdown().await;
-                    close_tcp_pair(&download_client_shutdown, &download_remote_shutdown);
-                    return Ok::<u64, io::Error>(total);
-                }
-            }
-            if let Err(error) =
-                async_write_all_with_timeout(&mut client_write, &buffer[..read]).await
-            {
+            VlessTcpRelayEvent::Upload(Err(error)) => {
+                on_upload(0);
                 on_download(0);
-                let _ = client_write.shutdown().await;
-                close_tcp_pair(&download_client_shutdown, &download_remote_shutdown);
+                close_tcp_pair(&client_shutdown, &remote_shutdown);
                 return Err(error);
             }
-            on_download(read as u64);
-            total = total.saturating_add(read as u64);
+            VlessTcpRelayEvent::Download(Ok(0)) => {
+                download_done = true;
+                on_download(0);
+                let _ = client_write.shutdown().await;
+                if !upload_done && half_close_started.is_none() {
+                    half_close_started = Some(Instant::now());
+                }
+            }
+            VlessTcpRelayEvent::Download(Ok(read)) => {
+                if let Some(limiter) = limiter.as_deref() {
+                    if !limiter.wait_for_async(read).await {
+                        close_tcp_pair(&client_shutdown, &remote_shutdown);
+                        break;
+                    }
+                }
+                if let Err(error) =
+                    async_write_all_with_timeout(&mut client_write, &download_buffer[..read]).await
+                {
+                    on_upload(0);
+                    on_download(0);
+                    close_tcp_pair(&client_shutdown, &remote_shutdown);
+                    return Err(error);
+                }
+                on_download(read as u64);
+                download = download.saturating_add(read as u64);
+            }
+            VlessTcpRelayEvent::Download(Err(error)) => {
+                on_upload(0);
+                on_download(0);
+                close_tcp_pair(&client_shutdown, &remote_shutdown);
+                return Err(error);
+            }
+            VlessTcpRelayEvent::LimiterRevoked => {
+                close_tcp_pair(&client_shutdown, &remote_shutdown);
+                break;
+            }
+            VlessTcpRelayEvent::HalfCloseTimeout => {
+                crate::stream::record_tcp_relay_half_close_timeout(upload_done, download_done);
+                close_tcp_pair(&client_shutdown, &remote_shutdown);
+                break;
+            }
         }
-    };
-    let (upload, download) = tokio::join!(upload, download);
-    Ok((upload?, download?))
+    }
+
+    on_upload(0);
+    on_download(0);
+    Ok((upload, download))
 }
 
 fn clone_tokio_tcp_stream_for_shutdown(socket: &tokio::net::TcpStream) -> io::Result<TcpStream> {
@@ -3933,6 +4001,7 @@ async fn relay_tls_vision_stream_async<S, FU, FD>(
     user_id: [u8; 16],
     limiter: Option<Arc<BandwidthLimiter>>,
     write_initial_padding: bool,
+    timeouts: VlessTcpRelayTimeouts,
     mut on_upload: FU,
     mut on_download: FD,
 ) -> io::Result<()>
@@ -4047,6 +4116,7 @@ where
                 raw_client.into_raw_tcp_stream(),
                 remote,
                 limiter,
+                timeouts,
                 on_upload,
                 on_download,
             )
@@ -6264,6 +6334,7 @@ mod tests {
             client,
             remote,
             None,
+            super::VlessTcpRelayTimeouts::default(),
             |_| {},
             |_| {},
         ));
@@ -6304,6 +6375,72 @@ mod tests {
                 .active_async
                 .get(TEST_LABEL),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn async_tcp_relay_closes_after_downlink_only_grace() {
+        const TEST_LABEL: &str = "keli-core-vless-relay-half-close-test";
+
+        let client_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("client listener");
+        let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("remote listener");
+        let client_connect = tokio::spawn(tokio::net::TcpStream::connect(
+            client_listener.local_addr().unwrap(),
+        ));
+        let remote_connect = tokio::spawn(tokio::net::TcpStream::connect(
+            remote_listener.local_addr().unwrap(),
+        ));
+        let (client, _) = client_listener.accept().await.expect("client accept");
+        let (remote, _) = remote_listener.accept().await.expect("remote accept");
+        let mut client_peer = client_connect
+            .await
+            .expect("client connect task")
+            .expect("client connect");
+        let _remote_peer = remote_connect
+            .await
+            .expect("remote connect task")
+            .expect("remote connect");
+        let before = crate::stream::relay_scheduler_metrics_snapshot();
+        let started = Instant::now();
+
+        let relay = tokio::spawn(super::relay_tcp_streams_async_with_label(
+            TEST_LABEL,
+            client,
+            remote,
+            None,
+            super::VlessTcpRelayTimeouts {
+                uplink_only: Duration::from_millis(250),
+                downlink_only: Duration::from_millis(80),
+            },
+            |_| {},
+            |_| {},
+        ));
+
+        client_peer.shutdown().await.expect("client half close");
+        let (upload, download) = tokio::time::timeout(Duration::from_secs(2), relay)
+            .await
+            .expect("relay should respect downlink-only grace")
+            .expect("relay task")
+            .expect("relay result");
+        assert_eq!((upload, download), (0, 0));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "relay should close promptly after downlink-only grace"
+        );
+
+        let after = crate::stream::relay_scheduler_metrics_snapshot();
+        assert!(
+            after.tcp_relay_half_close_timeout_total > before.tcp_relay_half_close_timeout_total,
+            "half-close timeout metric should increase"
+        );
+        assert!(
+            after.tcp_relay_downlink_only_timeout_total
+                > before.tcp_relay_downlink_only_timeout_total,
+            "downlink-only timeout metric should increase"
         );
     }
 
