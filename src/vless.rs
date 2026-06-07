@@ -1107,7 +1107,7 @@ impl VlessServer {
     ) -> io::Result<()> {
         let _connection = self
             .bandwidth
-            .register_tokio_tcp_connection(Some(&request.user_uuid), &[&client, &remote])?;
+            .register_tokio_tcp_connection(Some(&request.user_uuid), &[&client])?;
         let upload_traffic = self.traffic.clone();
         let upload_node_tag = self.config.node_tag.clone();
         let upload_user_uuid = request.user_uuid.clone();
@@ -1543,7 +1543,7 @@ impl VlessServer {
 
         let _connection = self.bandwidth.register_tokio_tcp_connection(
             Some(&request.user_uuid),
-            &[client.get_ref().0.raw_tcp_stream(), &remote],
+            &[client.get_ref().0.raw_tcp_stream()],
         )?;
         let upload_traffic = self.traffic.clone();
         let upload_node_tag = self.config.node_tag.clone();
