@@ -3711,8 +3711,8 @@ async fn relay_tcp_streams_async_with_label(
     }
 
     let _metrics = AsyncRelayMetricsGuard::new(label);
-    let client_shutdown = Arc::new(clone_tokio_tcp_stream_for_shutdown(&client)?);
-    let remote_shutdown = Arc::new(clone_tokio_tcp_stream_for_shutdown(&remote)?);
+    let mut client_shutdown = Some(Arc::new(clone_tokio_tcp_stream_for_shutdown(&client)?));
+    let mut remote_shutdown = Some(Arc::new(clone_tokio_tcp_stream_for_shutdown(&remote)?));
     let (mut client_read, client_write) = client.into_split();
     let (mut remote_read, remote_write) = remote.into_split();
     let mut client_write = Some(client_write);
@@ -3771,6 +3771,7 @@ async fn relay_tcp_streams_async_with_label(
                     half_close_started = Some(Instant::now());
                 }
                 shutdown_tcp_write(&remote_shutdown);
+                drop(remote_shutdown.take());
                 drop(remote_write.take());
             }
             VlessTcpRelayEvent::Upload(Ok(read)) => {
@@ -3807,6 +3808,7 @@ async fn relay_tcp_streams_async_with_label(
                     half_close_started = Some(Instant::now());
                 }
                 shutdown_tcp_write(&client_shutdown);
+                drop(client_shutdown.take());
                 drop(client_write.take());
             }
             VlessTcpRelayEvent::Download(Ok(read)) => {
@@ -3857,13 +3859,19 @@ fn clone_tokio_tcp_stream_for_shutdown(socket: &tokio::net::TcpStream) -> io::Re
     Ok(TcpStream::from(SockRef::from(socket).try_clone()?))
 }
 
-fn close_tcp_pair(left: &TcpStream, right: &TcpStream) {
-    let _ = left.shutdown(Shutdown::Both);
-    let _ = right.shutdown(Shutdown::Both);
+fn close_tcp_pair(left: &Option<Arc<TcpStream>>, right: &Option<Arc<TcpStream>>) {
+    if let Some(socket) = left.as_deref() {
+        let _ = socket.shutdown(Shutdown::Both);
+    }
+    if let Some(socket) = right.as_deref() {
+        let _ = socket.shutdown(Shutdown::Both);
+    }
 }
 
-fn shutdown_tcp_write(socket: &TcpStream) {
-    let _ = socket.shutdown(Shutdown::Write);
+fn shutdown_tcp_write(socket: &Option<Arc<TcpStream>>) {
+    if let Some(socket) = socket.as_deref() {
+        let _ = socket.shutdown(Shutdown::Write);
+    }
 }
 
 fn shutdown_cloned_tcp_stream(socket: &Option<TcpStream>) {
@@ -4039,7 +4047,7 @@ where
     let drain_after_client_eof = vless_vision_drain_after_client_eof();
     let client_shutdown =
         clone_tokio_tcp_stream_for_shutdown(client.get_ref().0.raw_tcp_stream()).ok();
-    let remote_shutdown = clone_tokio_tcp_stream_for_shutdown(&remote).ok();
+    let mut remote_shutdown = clone_tokio_tcp_stream_for_shutdown(&remote).ok();
     let mut upload = 0u64;
     let mut download = 0u64;
     let mut upload_done = false;
@@ -4182,6 +4190,7 @@ where
                     vision_decoder.finish();
                 }
                 shutdown_cloned_tcp_stream_write(&remote_shutdown);
+                drop(remote_shutdown.take());
             }
             VisionAsyncRelayEvent::Client(Ok(read)) if uplink_direct => {
                 if trace {
@@ -4221,6 +4230,7 @@ where
                     client_eof_at = Some(Instant::now());
                 }
                 shutdown_cloned_tcp_stream_write(&remote_shutdown);
+                drop(remote_shutdown.take());
             }
             VisionAsyncRelayEvent::Remote(Ok(0)) => {
                 if !downlink_direct {
