@@ -1079,7 +1079,7 @@ impl VlessServer {
     ) -> io::Result<()> {
         let _connection = self
             .bandwidth
-            .register_tcp_connection(Some(&request.user_uuid), &[&client, &remote])?;
+            .register_tcp_connection(Some(&request.user_uuid), &[&client])?;
         let (upload, download) = if request.flow == FLOW_XTLS_RPRX_VISION {
             relay_vision_tcp_streams(client, remote, request.user_id, bandwidth)?
         } else if let Some(limiter) = bandwidth {
@@ -4978,6 +4978,47 @@ mod tests {
             .count()
     }
 
+    #[cfg(unix)]
+    fn parse_proc_tcp4_socket_addr(value: &str) -> Option<std::net::SocketAddr> {
+        let (ip_hex, port_hex) = value.split_once(':')?;
+        let ip = u32::from_str_radix(ip_hex, 16).ok()?;
+        let port = u16::from_str_radix(port_hex, 16).ok()?;
+        Some(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::from(ip.to_le_bytes())),
+            port,
+        ))
+    }
+
+    #[cfg(unix)]
+    fn tcp4_socket_inode_for_pair(
+        local: std::net::SocketAddr,
+        peer: std::net::SocketAddr,
+    ) -> Option<String> {
+        if !matches!(
+            (local, peer),
+            (std::net::SocketAddr::V4(_), std::net::SocketAddr::V4(_))
+        ) {
+            return None;
+        }
+        let table = std::fs::read_to_string("/proc/net/tcp").ok()?;
+        for line in table.lines().skip(1) {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() <= 9 {
+                continue;
+            }
+            let Some(row_local) = parse_proc_tcp4_socket_addr(fields[1]) else {
+                continue;
+            };
+            let Some(row_peer) = parse_proc_tcp4_socket_addr(fields[2]) else {
+                continue;
+            };
+            if row_local == local && row_peer == peer {
+                return Some(fields[9].to_string());
+            }
+        }
+        None
+    }
+
     fn user() -> CoreUser {
         CoreUser {
             id: 1,
@@ -7213,8 +7254,17 @@ mod tests {
             let client_hello_len = client_hello.len();
             let app_data_len = app_data.len();
             let (release_remote_tx, release_remote_rx) = mpsc::channel();
+            #[cfg(unix)]
+            let (remote_pair_tx, remote_pair_rx) = mpsc::channel();
             let echo_thread = thread::spawn(move || {
                 let (mut stream, _) = echo.accept().expect("echo accept");
+                #[cfg(unix)]
+                remote_pair_tx
+                    .send((
+                        stream.peer_addr().expect("echo peer addr"),
+                        stream.local_addr().expect("echo local addr"),
+                    ))
+                    .expect("remote addr pair");
                 let mut first = vec![0u8; client_hello_len];
                 stream.read_exact(&mut first).expect("echo first read");
                 stream.write_all(&first).expect("echo first write");
@@ -7295,6 +7345,23 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             #[cfg(unix)]
+            let remote_inode = {
+                let (remote_local, remote_peer) = remote_pair_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("remote socket addr pair");
+                let deadline = Instant::now() + Duration::from_secs(1);
+                loop {
+                    if let Some(inode) = tcp4_socket_inode_for_pair(remote_local, remote_peer) {
+                        break inode;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "node-side outbound socket inode should be visible in /proc/net/tcp"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            #[cfg(unix)]
             {
                 let server_inode = server_inode_rx
                     .recv_timeout(Duration::from_secs(1))
@@ -7306,6 +7373,25 @@ mod tests {
                 );
             }
 
+            client
+                .sock
+                .shutdown(Shutdown::Write)
+                .expect("client half close");
+            #[cfg(unix)]
+            {
+                let deadline = Instant::now() + Duration::from_millis(250);
+                loop {
+                    let refs = socket_fd_ref_count(&remote_inode);
+                    if refs <= 2 {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "async VLESS Vision raw relay should drop the completed remote write side after upload EOF, refs={refs}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
             drop(client);
             release_remote_tx.send(()).expect("release remote");
             server_task

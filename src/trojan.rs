@@ -593,7 +593,7 @@ impl TrojanServer {
     ) -> io::Result<()> {
         let _connection = self
             .bandwidth
-            .register_tcp_connection(Some(&request.user_uuid), &[&client, &remote])?;
+            .register_tcp_connection(Some(&request.user_uuid), &[&client])?;
         let (upload, download) = match bandwidth {
             Some(limiter) => relay_tcp_limited(client, remote, limiter)?,
             None => relay_tcp_fast_unlimited(client, remote)?,

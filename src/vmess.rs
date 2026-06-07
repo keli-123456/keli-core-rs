@@ -231,7 +231,7 @@ impl VmessServer {
         let remote = self.connect_for_request(&request)?;
         let _connection = self
             .bandwidth
-            .register_tcp_connection(Some(&request.user_uuid), &[&client, &remote])?;
+            .register_tcp_connection(Some(&request.user_uuid), &[&client])?;
         write_response_header(&mut client, &request)?;
         self.relay_split(client, remote, request, bandwidth)
     }

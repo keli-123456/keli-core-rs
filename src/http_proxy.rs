@@ -236,7 +236,7 @@ impl HttpProxyServer {
         client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
         let _connection = self
             .bandwidth
-            .register_tcp_connection(request.user_uuid.as_deref(), &[&client, &remote])?;
+            .register_tcp_connection(request.user_uuid.as_deref(), &[&client])?;
         let (upload, download) = match bandwidth {
             Some(limiter) => relay_tcp_limited(client, remote, limiter)?,
             None => relay_tcp_fast_unlimited(client, remote)?,
@@ -275,7 +275,7 @@ impl HttpProxyServer {
         remote.write_all(&outbound)?;
         let _connection = self
             .bandwidth
-            .register_tcp_connection(request.user_uuid.as_deref(), &[&*client, &remote])?;
+            .register_tcp_connection(request.user_uuid.as_deref(), &[&*client])?;
         let upload = outbound.len() as u64;
         let download = match bandwidth.as_deref() {
             Some(limiter) => copy_count_best_effort_limited(&mut remote, client, Some(limiter)),
