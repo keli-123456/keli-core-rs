@@ -87,6 +87,12 @@ pub struct CoreMetricsSnapshot {
     pub keli_core_native_relay_pending_by_label: BTreeMap<String, usize>,
     #[serde(default)]
     pub keli_core_native_relay_queue_wait_ms_by_label: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub keli_core_tcp_relay_half_close_timeout_total: u64,
+    #[serde(default)]
+    pub keli_core_tcp_relay_uplink_only_timeout_total: u64,
+    #[serde(default)]
+    pub keli_core_tcp_relay_downlink_only_timeout_total: u64,
     pub keli_core_dns: DnsMetricsSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keli_core_quic_resource: Option<QuicResourceSnapshot>,
@@ -174,6 +180,12 @@ impl CoreMetrics {
         snapshot.keli_core_native_relay_pending_by_label = relay.native_pending_by_label;
         snapshot.keli_core_native_relay_queue_wait_ms_by_label =
             relay.native_queue_wait_ms_by_label;
+        snapshot.keli_core_tcp_relay_half_close_timeout_total =
+            relay.tcp_relay_half_close_timeout_total;
+        snapshot.keli_core_tcp_relay_uplink_only_timeout_total =
+            relay.tcp_relay_uplink_only_timeout_total;
+        snapshot.keli_core_tcp_relay_downlink_only_timeout_total =
+            relay.tcp_relay_downlink_only_timeout_total;
         snapshot
     }
 
@@ -764,6 +776,14 @@ mod tests {
         );
         assert!(snapshot.keli_core_native_relay_workers <= 1024);
         assert!(snapshot.keli_core_native_relay_idle <= snapshot.keli_core_native_relay_workers);
+        assert!(
+            snapshot.keli_core_tcp_relay_half_close_timeout_total
+                >= snapshot.keli_core_tcp_relay_downlink_only_timeout_total
+        );
+        assert!(
+            snapshot.keli_core_tcp_relay_half_close_timeout_total
+                >= snapshot.keli_core_tcp_relay_uplink_only_timeout_total
+        );
     }
 
     #[test]

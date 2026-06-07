@@ -46,8 +46,17 @@ const MAX_DETACHED_BLOCKING_RELAY_STACK_KIB: usize = 8192;
 const DETACHED_BLOCKING_RELAY_STACK_ENV: &str = "KELI_CORE_DETACHED_RELAY_STACK_KIB";
 const RELAY_MEMORY_TRIM_COMPLETIONS: usize = 1024;
 const RELAY_MEMORY_TRIM_MIN_INTERVAL_SECS: u64 = 60;
+const TCP_RELAY_UPLINK_ONLY_TIMEOUT_ENV: &str = "KELI_CORE_TCP_RELAY_UPLINK_ONLY_TIMEOUT_SECS";
+const TCP_RELAY_DOWNLINK_ONLY_TIMEOUT_ENV: &str = "KELI_CORE_TCP_RELAY_DOWNLINK_ONLY_TIMEOUT_SECS";
+const TCP_RELAY_DEFAULT_UPLINK_ONLY_TIMEOUT_SECS: u64 = 5;
+const TCP_RELAY_DEFAULT_DOWNLINK_ONLY_TIMEOUT_SECS: u64 = 30;
+const TCP_RELAY_MIN_HALF_CLOSE_TIMEOUT_SECS: u64 = 1;
+const TCP_RELAY_MAX_HALF_CLOSE_TIMEOUT_SECS: u64 = 300;
 static RELAY_COMPLETIONS_SINCE_TRIM: AtomicUsize = AtomicUsize::new(0);
 static RELAY_MEMORY_TRIM_LAST_SECS: AtomicU64 = AtomicU64::new(0);
+static TCP_RELAY_HALF_CLOSE_TIMEOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TCP_RELAY_UPLINK_ONLY_TIMEOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TCP_RELAY_DOWNLINK_ONLY_TIMEOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 pub type BlockingRelayHandle<T> = tokio::task::JoinHandle<T>;
 type NativeRelayTask = Box<dyn FnOnce() + Send + 'static>;
@@ -89,6 +98,36 @@ impl RelayActivityDeadline {
         } else {
             self.idle_since = Instant::now();
             self.one_side_finished_since = None;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TcpRelayTimeouts {
+    uplink_only: Duration,
+    downlink_only: Duration,
+}
+
+impl Default for TcpRelayTimeouts {
+    fn default() -> Self {
+        Self {
+            uplink_only: Duration::from_secs(TCP_RELAY_DEFAULT_UPLINK_ONLY_TIMEOUT_SECS),
+            downlink_only: Duration::from_secs(TCP_RELAY_DEFAULT_DOWNLINK_ONLY_TIMEOUT_SECS),
+        }
+    }
+}
+
+impl TcpRelayTimeouts {
+    fn from_env() -> Self {
+        Self {
+            uplink_only: tcp_relay_half_close_timeout_from_env(
+                std::env::var(TCP_RELAY_UPLINK_ONLY_TIMEOUT_ENV).ok(),
+                TCP_RELAY_DEFAULT_UPLINK_ONLY_TIMEOUT_SECS,
+            ),
+            downlink_only: tcp_relay_half_close_timeout_from_env(
+                std::env::var(TCP_RELAY_DOWNLINK_ONLY_TIMEOUT_ENV).ok(),
+                TCP_RELAY_DEFAULT_DOWNLINK_ONLY_TIMEOUT_SECS,
+            ),
         }
     }
 }
@@ -157,6 +196,9 @@ pub(crate) struct RelaySchedulerMetricsSnapshot {
     pub native_label_soft_limit: usize,
     pub native_pending_by_label: BTreeMap<String, usize>,
     pub native_queue_wait_ms_by_label: BTreeMap<String, u64>,
+    pub tcp_relay_half_close_timeout_total: u64,
+    pub tcp_relay_uplink_only_timeout_total: u64,
+    pub tcp_relay_downlink_only_timeout_total: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -175,6 +217,15 @@ pub fn relay_tcp_streams(client: TcpStream, remote: TcpStream) -> io::Result<(u6
 
 pub fn relay_tcp_fast_unlimited(client: TcpStream, remote: TcpStream) -> io::Result<(u64, u64)> {
     relay_tcp_streams_unlimited_native(client, remote, false)
+}
+
+#[cfg(test)]
+fn relay_tcp_fast_unlimited_with_timeouts(
+    client: TcpStream,
+    remote: TcpStream,
+    timeouts: TcpRelayTimeouts,
+) -> io::Result<(u64, u64)> {
+    relay_tcp_streams_unlimited_tokio(client, remote, false, timeouts)
 }
 
 pub fn relay_tcp_fast_unlimited_close_on_eof(
@@ -206,37 +257,16 @@ where
             tokio::net::TcpStream::from_std(remote),
         ) {
             (Ok(client), Ok(remote)) => {
-                let (mut client_read, mut client_write) = client.into_split();
-                let (mut remote_read, mut remote_write) = remote.into_split();
-                if let Some(limiter) = limiter {
-                    let upload = copy_count_best_effort_limited_async(
-                        &mut client_read,
-                        &mut remote_write,
-                        Some(limiter.as_ref()),
-                    );
-                    let download = copy_count_best_effort_limited_async(
-                        &mut remote_read,
-                        &mut client_write,
-                        Some(limiter.as_ref()),
-                    );
-                    tokio::join!(upload, download)
-                } else {
-                    let upload = relay_copy_unlimited_async(
-                        &mut client_read,
-                        &mut remote_write,
-                        Arc::clone(&client_shutdown),
-                        Arc::clone(&remote_shutdown),
-                        close_peer_on_eof,
-                    );
-                    let download = relay_copy_unlimited_async(
-                        &mut remote_read,
-                        &mut client_write,
-                        Arc::clone(&client_shutdown),
-                        Arc::clone(&remote_shutdown),
-                        close_peer_on_eof,
-                    );
-                    tokio::join!(upload, download)
-                }
+                relay_tcp_bidirectional_async(
+                    client,
+                    remote,
+                    limiter,
+                    Arc::clone(&client_shutdown),
+                    Arc::clone(&remote_shutdown),
+                    close_peer_on_eof,
+                    TcpRelayTimeouts::from_env(),
+                )
+                .await
             }
             (client_result, remote_result) => {
                 if let Ok(client) = client_result {
@@ -532,6 +562,12 @@ pub(crate) fn relay_scheduler_metrics_snapshot() -> RelaySchedulerMetricsSnapsho
         native_label_soft_limit: native.label_soft_limit,
         native_pending_by_label: native.pending_by_label,
         native_queue_wait_ms_by_label: native.queue_wait_ms_by_label,
+        tcp_relay_half_close_timeout_total: TCP_RELAY_HALF_CLOSE_TIMEOUT_TOTAL
+            .load(Ordering::Relaxed),
+        tcp_relay_uplink_only_timeout_total: TCP_RELAY_UPLINK_ONLY_TIMEOUT_TOTAL
+            .load(Ordering::Relaxed),
+        tcp_relay_downlink_only_timeout_total: TCP_RELAY_DOWNLINK_ONLY_TIMEOUT_TOTAL
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -565,6 +601,18 @@ pub(crate) fn format_relay_scheduler_metrics(snapshot: RelaySchedulerMetricsSnap
     for (name, wait_ms) in snapshot.native_queue_wait_ms_by_label {
         fields.push(format!("native_relay_queue_wait_ms.{name}={wait_ms}"));
     }
+    fields.push(format!(
+        "tcp_relay_half_close_timeout_total={}",
+        snapshot.tcp_relay_half_close_timeout_total
+    ));
+    fields.push(format!(
+        "tcp_relay_uplink_only_timeout_total={}",
+        snapshot.tcp_relay_uplink_only_timeout_total
+    ));
+    fields.push(format!(
+        "tcp_relay_downlink_only_timeout_total={}",
+        snapshot.tcp_relay_downlink_only_timeout_total
+    ));
     fields.join(" ")
 }
 
@@ -656,25 +704,23 @@ fn relay_tcp_streams_async(
     if limiter.is_none() {
         return relay_tcp_streams_unlimited_native(client, remote, false);
     }
+    let client_shutdown = Arc::new(client.try_clone()?);
+    let remote_shutdown = Arc::new(remote.try_clone()?);
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
     let result = tcp_relay_runtime()?.block_on(async move {
         let client = tokio::net::TcpStream::from_std(client)?;
         let remote = tokio::net::TcpStream::from_std(remote)?;
-        let (mut client_read, mut client_write) = client.into_split();
-        let (mut remote_read, mut remote_write) = remote.into_split();
-        let upload_limiter = limiter.clone();
-        let upload = copy_count_best_effort_limited_async(
-            &mut client_read,
-            &mut remote_write,
-            upload_limiter.as_deref(),
-        );
-        let download = copy_count_best_effort_limited_async(
-            &mut remote_read,
-            &mut client_write,
-            limiter.as_deref(),
-        );
-        let (upload, download) = tokio::join!(upload, download);
+        let (upload, download) = relay_tcp_bidirectional_async(
+            client,
+            remote,
+            limiter,
+            client_shutdown,
+            remote_shutdown,
+            false,
+            TcpRelayTimeouts::from_env(),
+        )
+        .await;
         Ok((upload, download))
     });
     maybe_trim_process_memory_after_relay_completion();
@@ -686,7 +732,12 @@ fn relay_tcp_streams_unlimited_native(
     remote: TcpStream,
     close_peer_on_eof: bool,
 ) -> io::Result<(u64, u64)> {
-    relay_tcp_streams_unlimited_tokio(client, remote, close_peer_on_eof)
+    relay_tcp_streams_unlimited_tokio(
+        client,
+        remote,
+        close_peer_on_eof,
+        TcpRelayTimeouts::from_env(),
+    )
 }
 
 fn shutdown_tcp_pair(client: Option<&TcpStream>, remote: Option<&TcpStream>) {
@@ -702,6 +753,7 @@ fn relay_tcp_streams_unlimited_tokio(
     client: TcpStream,
     remote: TcpStream,
     close_peer_on_eof: bool,
+    timeouts: TcpRelayTimeouts,
 ) -> io::Result<(u64, u64)> {
     let client_shutdown = Arc::new(client.try_clone()?);
     let remote_shutdown = Arc::new(remote.try_clone()?);
@@ -712,33 +764,109 @@ fn relay_tcp_streams_unlimited_tokio(
     let result = tcp_relay_runtime()?.block_on(async move {
         let client = tokio::net::TcpStream::from_std(client)?;
         let remote = tokio::net::TcpStream::from_std(remote)?;
-        let (mut client_read, mut client_write) = client.into_split();
-        let (mut remote_read, mut remote_write) = remote.into_split();
-
-        let upload = relay_copy_unlimited_async(
-            &mut client_read,
-            &mut remote_write,
-            Arc::clone(&client_shutdown),
-            Arc::clone(&remote_shutdown),
+        let (upload, download) = relay_tcp_bidirectional_async(
+            client,
+            remote,
+            None,
+            client_shutdown,
+            remote_shutdown,
             close_peer_on_eof,
-        );
-        let download = relay_copy_unlimited_async(
-            &mut remote_read,
-            &mut client_write,
-            Arc::clone(&client_shutdown),
-            Arc::clone(&remote_shutdown),
-            close_peer_on_eof,
-        );
-        let (upload, download) = tokio::join!(upload, download);
+            timeouts,
+        )
+        .await;
         Ok((upload, download))
     });
     maybe_trim_process_memory_after_relay_completion();
     result
 }
 
-async fn relay_copy_unlimited_async<R, W>(
-    reader: &mut R,
-    writer: &mut W,
+async fn relay_tcp_bidirectional_async(
+    client: tokio::net::TcpStream,
+    remote: tokio::net::TcpStream,
+    limiter: Option<Arc<BandwidthLimiter>>,
+    client_shutdown: Arc<TcpStream>,
+    remote_shutdown: Arc<TcpStream>,
+    close_peer_on_eof: bool,
+    timeouts: TcpRelayTimeouts,
+) -> (u64, u64) {
+    let (client_read, client_write) = client.into_split();
+    let (remote_read, remote_write) = remote.into_split();
+    let upload_counter = Arc::new(AtomicU64::new(0));
+    let download_counter = Arc::new(AtomicU64::new(0));
+
+    let upload = relay_copy_counted_async(
+        client_read,
+        remote_write,
+        limiter.clone(),
+        Arc::clone(&upload_counter),
+        Arc::clone(&client_shutdown),
+        Arc::clone(&remote_shutdown),
+        close_peer_on_eof,
+    );
+    let download = relay_copy_counted_async(
+        remote_read,
+        client_write,
+        limiter,
+        Arc::clone(&download_counter),
+        Arc::clone(&client_shutdown),
+        Arc::clone(&remote_shutdown),
+        close_peer_on_eof,
+    );
+
+    tokio::pin!(upload);
+    tokio::pin!(download);
+
+    let mut upload_done = false;
+    let mut download_done = false;
+    let mut upload_total = 0u64;
+    let mut download_total = 0u64;
+
+    while !upload_done || !download_done {
+        if let Some(limit) = tcp_relay_half_close_limit(&timeouts, upload_done, download_done) {
+            tokio::select! {
+                total = &mut upload, if !upload_done => {
+                    upload_done = true;
+                    upload_total = total;
+                }
+                total = &mut download, if !download_done => {
+                    download_done = true;
+                    download_total = total;
+                }
+                _ = tokio::time::sleep(limit) => {
+                    record_tcp_relay_half_close_timeout(upload_done, download_done);
+                    shutdown_tcp_pair(Some(&client_shutdown), Some(&remote_shutdown));
+                    break;
+                }
+            }
+        } else {
+            tokio::select! {
+                total = &mut upload, if !upload_done => {
+                    upload_done = true;
+                    upload_total = total;
+                }
+                total = &mut download, if !download_done => {
+                    download_done = true;
+                    download_total = total;
+                }
+            }
+        }
+    }
+
+    if !upload_done {
+        upload_total = upload_counter.load(Ordering::Relaxed);
+    }
+    if !download_done {
+        download_total = download_counter.load(Ordering::Relaxed);
+    }
+    shutdown_tcp_pair(Some(&client_shutdown), Some(&remote_shutdown));
+    (upload_total, download_total)
+}
+
+async fn relay_copy_counted_async<R, W>(
+    mut reader: R,
+    mut writer: W,
+    limiter: Option<Arc<BandwidthLimiter>>,
+    counter: Arc<AtomicU64>,
     client_shutdown: Arc<TcpStream>,
     remote_shutdown: Arc<TcpStream>,
     close_peer_on_eof: bool,
@@ -750,15 +878,40 @@ where
     let mut total = 0u64;
     let mut buffer = [0u8; RELAY_COPY_BUFFER_SIZE];
     loop {
-        let read = match reader.read(&mut buffer).await {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(_) => break,
+        if limiter
+            .as_deref()
+            .map(BandwidthLimiter::is_revoked)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        let read = match limiter.as_deref() {
+            Some(limiter) => {
+                tokio::select! {
+                    read = reader.read(&mut buffer) => match read {
+                        Ok(0) => break,
+                        Ok(read) => read,
+                        Err(_) => break,
+                    },
+                    _ = wait_for_limiter_revoke(limiter) => break,
+                }
+            }
+            None => match reader.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(_) => break,
+            },
         };
+        if let Some(limiter) = limiter.as_deref() {
+            if !limiter.wait_for_async(read).await {
+                break;
+            }
+        }
         if writer.write_all(&buffer[..read]).await.is_err() {
             break;
         }
         total = total.saturating_add(read as u64);
+        counter.store(total, Ordering::Relaxed);
     }
 
     if close_peer_on_eof {
@@ -766,7 +919,44 @@ where
     } else {
         let _ = writer.shutdown().await;
     }
+    counter.store(total, Ordering::Relaxed);
     total
+}
+
+fn tcp_relay_half_close_limit(
+    timeouts: &TcpRelayTimeouts,
+    upload_done: bool,
+    download_done: bool,
+) -> Option<Duration> {
+    if upload_done && !download_done {
+        Some(timeouts.downlink_only)
+    } else if download_done && !upload_done {
+        Some(timeouts.uplink_only)
+    } else {
+        None
+    }
+}
+
+fn record_tcp_relay_half_close_timeout(upload_done: bool, download_done: bool) {
+    TCP_RELAY_HALF_CLOSE_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if upload_done && !download_done {
+        TCP_RELAY_DOWNLINK_ONLY_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    } else if download_done && !upload_done {
+        TCP_RELAY_UPLINK_ONLY_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn tcp_relay_half_close_timeout_from_env(value: Option<String>, default_secs: u64) -> Duration {
+    let seconds = value
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(default_secs)
+        .clamp(
+            TCP_RELAY_MIN_HALF_CLOSE_TIMEOUT_SECS,
+            TCP_RELAY_MAX_HALF_CLOSE_TIMEOUT_SECS,
+        );
+    Duration::from_secs(seconds)
 }
 
 fn tcp_relay_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
@@ -1209,52 +1399,6 @@ fn maybe_log_native_relay_queue_wait(label: &'static str, wait_ms: u64) {
     ));
 }
 
-async fn copy_count_best_effort_limited_async<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    limiter: Option<&BandwidthLimiter>,
-) -> u64
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut total = 0u64;
-    let mut buffer = [0u8; RELAY_COPY_BUFFER_SIZE];
-    loop {
-        if limiter.map(BandwidthLimiter::is_revoked).unwrap_or(false) {
-            break;
-        }
-        let read = match limiter {
-            Some(limiter) => {
-                tokio::select! {
-                    read = reader.read(&mut buffer) => match read {
-                        Ok(0) => break,
-                        Ok(read) => read,
-                        Err(_) => break,
-                    },
-                    _ = wait_for_limiter_revoke(limiter) => break,
-                }
-            }
-            None => match reader.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(read) => read,
-                Err(_) => break,
-            },
-        };
-        if let Some(limiter) = limiter {
-            if !limiter.wait_for_async(read).await {
-                break;
-            }
-        }
-        if writer.write_all(&buffer[..read]).await.is_err() {
-            break;
-        }
-        total = total.saturating_add(read as u64);
-    }
-    let _ = writer.shutdown().await;
-    total
-}
-
 async fn wait_for_limiter_revoke(limiter: &BandwidthLimiter) {
     limiter.wait_revoked().await;
 }
@@ -1419,6 +1563,26 @@ mod tests {
         assert_eq!(
             super::detached_blocking_relay_stack_size_from_env(Some("99999".to_string()), 256),
             8192 * 1024
+        );
+    }
+
+    #[test]
+    fn tcp_relay_half_close_timeout_env_defaults_and_clamps() {
+        assert_eq!(
+            super::tcp_relay_half_close_timeout_from_env(None, 30),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            super::tcp_relay_half_close_timeout_from_env(Some("0".to_string()), 30),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            super::tcp_relay_half_close_timeout_from_env(Some("bad".to_string()), 30),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            super::tcp_relay_half_close_timeout_from_env(Some("9999".to_string()), 30),
+            Duration::from_secs(super::TCP_RELAY_MAX_HALF_CLOSE_TIMEOUT_SECS)
         );
     }
 
@@ -1639,6 +1803,69 @@ mod tests {
             .expect("relay should finish");
         assert_eq!(upload, b"request".len() as u64);
         assert_eq!(download, b"response".len() as u64);
+        remote_peer.join().expect("remote thread");
+    }
+
+    #[test]
+    fn unlimited_tcp_relay_closes_after_downlink_only_grace() {
+        let client_listener = TcpListener::bind("127.0.0.1:0").expect("client bind");
+        let remote_listener = TcpListener::bind("127.0.0.1:0").expect("remote bind");
+        let client_addr = client_listener.local_addr().expect("client addr");
+        let remote_addr = remote_listener.local_addr().expect("remote addr");
+        let client_peer = thread::spawn(move || TcpStream::connect(client_addr).expect("client"));
+        let remote_peer = thread::spawn(move || {
+            let mut stream = TcpStream::connect(remote_addr).expect("remote");
+            let mut captured = Vec::new();
+            stream.read_to_end(&mut captured).expect("remote read");
+            assert_eq!(captured, b"request");
+            thread::sleep(Duration::from_millis(400));
+        });
+        let (client, _) = client_listener.accept().expect("client accept");
+        let (remote, _) = remote_listener.accept().expect("remote accept");
+        let mut client_peer = client_peer.join().expect("client thread");
+        let before = super::relay_scheduler_metrics_snapshot();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let relay = thread::spawn(move || {
+            let result = super::relay_tcp_fast_unlimited_with_timeouts(
+                client,
+                remote,
+                super::TcpRelayTimeouts {
+                    uplink_only: Duration::from_millis(200),
+                    downlink_only: Duration::from_millis(100),
+                },
+            );
+            done_tx.send(result).expect("send relay result");
+        });
+
+        client_peer.write_all(b"request").expect("client write");
+        client_peer
+            .shutdown(Shutdown::Write)
+            .expect("client half close");
+        let (upload, download) = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("relay should exit after downlink-only grace")
+            .expect("relay result");
+        assert_eq!(upload, b"request".len() as u64);
+        assert_eq!(download, 0);
+
+        let after = super::relay_scheduler_metrics_snapshot();
+        assert!(
+            after.tcp_relay_half_close_timeout_total > before.tcp_relay_half_close_timeout_total,
+            "half-close timeout metric should increase"
+        );
+        assert!(
+            after.tcp_relay_downlink_only_timeout_total
+                > before.tcp_relay_downlink_only_timeout_total,
+            "downlink-only timeout metric should increase"
+        );
+
+        client_peer
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("client timeout");
+        let mut byte = [0u8; 1];
+        assert!(matches!(client_peer.read(&mut byte), Ok(0) | Err(_)));
+        relay.join().expect("relay thread");
         remote_peer.join().expect("remote thread");
     }
 
@@ -2040,6 +2267,8 @@ mod tests {
             .insert("keli-core-mieru-session".to_string(), 1);
         snapshot.native_worker_count = 4;
         snapshot.native_pending_count = 3;
+        snapshot.tcp_relay_half_close_timeout_total = 5;
+        snapshot.tcp_relay_downlink_only_timeout_total = 3;
 
         let formatted = super::format_relay_scheduler_metrics(snapshot);
         assert!(formatted.contains("relay_active_native.keli-core-vless-vision-relay=1"));
@@ -2047,5 +2276,7 @@ mod tests {
         assert!(formatted.contains("relay_active_blocking.keli-core-mieru-session=1"));
         assert!(formatted.contains("native_relay_workers=4"));
         assert!(formatted.contains("native_relay_pending=3"));
+        assert!(formatted.contains("tcp_relay_half_close_timeout_total=5"));
+        assert!(formatted.contains("tcp_relay_downlink_only_timeout_total=3"));
     }
 }
