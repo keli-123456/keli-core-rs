@@ -794,7 +794,7 @@ async fn relay_tcp_bidirectional_async(
     let upload_counter = Arc::new(AtomicU64::new(0));
     let download_counter = Arc::new(AtomicU64::new(0));
 
-    let upload = relay_copy_counted_async(
+    let mut upload = Some(Box::pin(relay_copy_counted_async(
         client_read,
         remote_write,
         limiter.clone(),
@@ -802,8 +802,8 @@ async fn relay_tcp_bidirectional_async(
         Arc::clone(&client_shutdown),
         Arc::clone(&remote_shutdown),
         close_peer_on_eof,
-    );
-    let download = relay_copy_counted_async(
+    )));
+    let mut download = Some(Box::pin(relay_copy_counted_async(
         remote_read,
         client_write,
         limiter,
@@ -811,10 +811,7 @@ async fn relay_tcp_bidirectional_async(
         Arc::clone(&client_shutdown),
         Arc::clone(&remote_shutdown),
         close_peer_on_eof,
-    );
-
-    tokio::pin!(upload);
-    tokio::pin!(download);
+    )));
 
     let mut upload_done = false;
     let mut download_done = false;
@@ -824,13 +821,25 @@ async fn relay_tcp_bidirectional_async(
     while !upload_done || !download_done {
         if let Some(limit) = tcp_relay_half_close_limit(&timeouts, upload_done, download_done) {
             tokio::select! {
-                total = &mut upload, if !upload_done => {
+                total = async {
+                    match upload.as_mut() {
+                        Some(future) => future.as_mut().await,
+                        None => std::future::pending::<u64>().await,
+                    }
+                }, if upload.is_some() => {
                     upload_done = true;
                     upload_total = total;
+                    upload = None;
                 }
-                total = &mut download, if !download_done => {
+                total = async {
+                    match download.as_mut() {
+                        Some(future) => future.as_mut().await,
+                        None => std::future::pending::<u64>().await,
+                    }
+                }, if download.is_some() => {
                     download_done = true;
                     download_total = total;
+                    download = None;
                 }
                 _ = tokio::time::sleep(limit) => {
                     record_tcp_relay_half_close_timeout(upload_done, download_done);
@@ -840,13 +849,25 @@ async fn relay_tcp_bidirectional_async(
             }
         } else {
             tokio::select! {
-                total = &mut upload, if !upload_done => {
+                total = async {
+                    match upload.as_mut() {
+                        Some(future) => future.as_mut().await,
+                        None => std::future::pending::<u64>().await,
+                    }
+                }, if upload.is_some() => {
                     upload_done = true;
                     upload_total = total;
+                    upload = None;
                 }
-                total = &mut download, if !download_done => {
+                total = async {
+                    match download.as_mut() {
+                        Some(future) => future.as_mut().await,
+                        None => std::future::pending::<u64>().await,
+                    }
+                }, if download.is_some() => {
                     download_done = true;
                     download_total = total;
+                    download = None;
                 }
             }
         }
@@ -1768,6 +1789,60 @@ mod tests {
             remote_refs <= 2,
             "remote socket should keep at most one shutdown fd clone, got {remote_refs}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn async_relay_drops_finished_direction_future_after_half_close() {
+        let client_listener = TcpListener::bind("127.0.0.1:0").expect("client bind");
+        let remote_listener = TcpListener::bind("127.0.0.1:0").expect("remote bind");
+        let client_addr = client_listener.local_addr().expect("client addr");
+        let remote_addr = remote_listener.local_addr().expect("remote addr");
+        let client_peer = thread::spawn(move || TcpStream::connect(client_addr).expect("client"));
+        let remote_peer = thread::spawn(move || TcpStream::connect(remote_addr).expect("remote"));
+        let (client, _) = client_listener.accept().expect("client accept");
+        let (remote, _) = remote_listener.accept().expect("remote accept");
+        let remote_inode = socket_inode(&remote);
+        let client_peer = client_peer.join().expect("client thread");
+        let remote_peer = remote_peer.join().expect("remote thread");
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let relay = thread::spawn(move || {
+            let result = super::relay_tcp_fast_unlimited_with_timeouts(
+                client,
+                remote,
+                super::TcpRelayTimeouts {
+                    uplink_only: Duration::from_secs(3),
+                    downlink_only: Duration::from_secs(3),
+                },
+            );
+            done_tx.send(result).expect("send relay result");
+        });
+
+        client_peer
+            .shutdown(Shutdown::Write)
+            .expect("client half close");
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let refs = socket_fd_ref_count(&remote_inode);
+            if refs <= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "finished upload future should drop remote writer promptly, refs={refs}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        drop(remote_peer);
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("relay should finish")
+            .expect("relay result");
+        assert_eq!(result, (0, 0));
+        drop(client_peer);
+        relay.join().expect("relay thread");
     }
 
     #[test]
