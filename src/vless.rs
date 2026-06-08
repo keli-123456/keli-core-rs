@@ -1160,7 +1160,6 @@ impl VlessServer {
             relay_vision_split_streams(reader, writer, remote, request.user_id, bandwidth)?
         } else {
             let mut remote_write = remote.try_clone()?;
-            let remote_shutdown = remote.try_clone()?;
             let mut remote_read = remote;
             let _connection = self
                 .bandwidth
@@ -1177,7 +1176,7 @@ impl VlessServer {
                         ),
                         None => copy_count_best_effort(&mut reader, &mut remote_write),
                     };
-                    let _ = remote_shutdown.shutdown(Shutdown::Both);
+                    let _ = remote_write.shutdown(Shutdown::Both);
                     result
                 },
             )?;
@@ -3858,12 +3857,6 @@ fn shutdown_cloned_tcp_stream(socket: &Option<TcpStream>) {
     }
 }
 
-fn shutdown_cloned_tcp_stream_write(socket: &Option<TcpStream>) {
-    if let Some(socket) = socket {
-        let _ = socket.shutdown(Shutdown::Write);
-    }
-}
-
 async fn async_write_all_with_timeout<W>(writer: &mut W, buffer: &[u8]) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -4025,7 +4018,6 @@ where
     let drain_after_client_eof = vless_vision_drain_after_client_eof();
     let client_shutdown =
         clone_tokio_tcp_stream_for_shutdown(client.get_ref().0.raw_tcp_stream()).ok();
-    let mut remote_shutdown = clone_tokio_tcp_stream_for_shutdown(&remote).ok();
     let mut upload = 0u64;
     let mut download = 0u64;
     let mut upload_done = false;
@@ -4058,7 +4050,7 @@ where
             .unwrap_or(false)
         {
             shutdown_cloned_tcp_stream(&client_shutdown);
-            shutdown_cloned_tcp_stream(&remote_shutdown);
+            let _ = remote.shutdown().await;
             break;
         }
 
@@ -4077,7 +4069,7 @@ where
                         upload_done = true;
                         download_done = true;
                         shutdown_cloned_tcp_stream(&client_shutdown);
-                        shutdown_cloned_tcp_stream(&remote_shutdown);
+                        let _ = remote.shutdown().await;
                         continue;
                     }
                 }
@@ -4115,7 +4107,6 @@ where
             on_download(download);
             on_download(0);
             drop(client_shutdown);
-            drop(remote_shutdown);
             let (raw_client, _) = client.into_inner();
             relay_tcp_streams_async_with_label(
                 VLESS_VISION_ASYNC_RELAY_LABEL,
@@ -4135,7 +4126,7 @@ where
             .unwrap_or(false)
         {
             shutdown_cloned_tcp_stream(&client_shutdown);
-            shutdown_cloned_tcp_stream(&remote_shutdown);
+            let _ = remote.shutdown().await;
             break;
         }
 
@@ -4167,8 +4158,7 @@ where
                 if !uplink_direct {
                     vision_decoder.finish();
                 }
-                shutdown_cloned_tcp_stream_write(&remote_shutdown);
-                drop(remote_shutdown.take());
+                let _ = remote.shutdown().await;
             }
             VisionAsyncRelayEvent::Client(Ok(read)) if uplink_direct => {
                 if trace {
@@ -4183,7 +4173,7 @@ where
                         upload_done = true;
                         download_done = true;
                         shutdown_cloned_tcp_stream(&client_shutdown);
-                        shutdown_cloned_tcp_stream(&remote_shutdown);
+                        let _ = remote.shutdown().await;
                         continue;
                     }
                 }
@@ -4207,8 +4197,7 @@ where
                 if client_eof_at.is_none() {
                     client_eof_at = Some(Instant::now());
                 }
-                shutdown_cloned_tcp_stream_write(&remote_shutdown);
-                drop(remote_shutdown.take());
+                let _ = remote.shutdown().await;
             }
             VisionAsyncRelayEvent::Remote(Ok(0)) => {
                 if !downlink_direct {
@@ -4220,7 +4209,7 @@ where
                 download_done = true;
                 upload_done = true;
                 shutdown_cloned_tcp_stream(&client_shutdown);
-                shutdown_cloned_tcp_stream(&remote_shutdown);
+                let _ = remote.shutdown().await;
             }
             VisionAsyncRelayEvent::Remote(Ok(read)) => {
                 if trace {
@@ -4235,7 +4224,7 @@ where
                         download_done = true;
                         upload_done = true;
                         shutdown_cloned_tcp_stream(&client_shutdown);
-                        shutdown_cloned_tcp_stream(&remote_shutdown);
+                        let _ = remote.shutdown().await;
                         continue;
                     }
                 }
@@ -4264,18 +4253,18 @@ where
                 download_done = true;
                 upload_done = true;
                 shutdown_cloned_tcp_stream(&client_shutdown);
-                shutdown_cloned_tcp_stream(&remote_shutdown);
+                let _ = remote.shutdown().await;
             }
             VisionAsyncRelayEvent::DrainTimeout => {
                 shutdown_cloned_tcp_stream(&client_shutdown);
-                shutdown_cloned_tcp_stream(&remote_shutdown);
+                let _ = remote.shutdown().await;
                 break;
             }
         }
     }
 
     shutdown_cloned_tcp_stream(&client_shutdown);
-    shutdown_cloned_tcp_stream(&remote_shutdown);
+    let _ = remote.shutdown().await;
     on_upload(upload);
     on_upload(0);
     on_download(download);
@@ -7382,6 +7371,97 @@ mod tests {
                 "async VLESS Vision relay should switch to the raw TCP fast path"
             );
         });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tls_vision_async_keeps_single_remote_fd_before_raw_fast_path() {
+        super::VLESS_VISION_RAW_RELAY_SWITCHES.store(0, Ordering::SeqCst);
+        let cert = test_cert("vless-vision-async-pre-raw-fd");
+        let remote_listener = TcpListener::bind("127.0.0.1:0").expect("remote bind");
+        let remote_addr = remote_listener.local_addr().expect("remote addr");
+        let (remote_pair_tx, remote_pair_rx) = mpsc::channel();
+        let (release_remote_tx, release_remote_rx) = mpsc::channel();
+        let remote_thread = thread::spawn(move || {
+            let (stream, _) = remote_listener.accept().expect("remote accept");
+            remote_pair_tx
+                .send((
+                    stream.peer_addr().expect("remote peer addr"),
+                    stream.local_addr().expect("remote local addr"),
+                ))
+                .expect("remote addr pair");
+            let _ = release_remote_rx.recv_timeout(Duration::from_secs(3));
+        });
+
+        let server = server_with_flow("xtls-rprx-vision");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("vless bind");
+        let vless_addr = listener.local_addr().expect("vless addr");
+        let acceptor =
+            TlsAcceptor::from_files(&cert.cert_path, &cert.key_path, &[]).expect("tls acceptor");
+        let acceptor = tokio_rustls::TlsAcceptor::from(acceptor.server_config());
+        let server_task = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.expect("vless accept");
+            let client = acceptor.accept(stream).await.expect("tls accept");
+            server
+                .handle_tls_client_async(client, Some(peer.ip()))
+                .await
+        });
+
+        let client_task = tokio::task::spawn_blocking(move || {
+            let mut client = tls_client(vless_addr, cert.cert_der.clone());
+            client
+                .write_all(&vless_request_with_flow(remote_addr, "xtls-rprx-vision"))
+                .expect("client request");
+            let mut response = [0u8; 2];
+            client.read_exact(&mut response).expect("client response");
+            assert_eq!(response, [0x00, 0x00]);
+            client
+        });
+        let client = client_task.await.expect("client task");
+
+        let (remote_local, remote_peer) = remote_pair_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("remote socket addr pair");
+        let remote_inode = {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                if let Some(inode) = tcp4_socket_inode_for_pair(remote_local, remote_peer) {
+                    break inode;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "node-side outbound socket inode should be visible in /proc/net/tcp"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            let refs = socket_fd_ref_count(&remote_inode);
+            if refs <= 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "async VLESS Vision pre-raw relay should keep one remote fd, refs={refs}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            super::VLESS_VISION_RAW_RELAY_SWITCHES.load(Ordering::SeqCst),
+            0,
+            "test must inspect the pre-raw Vision relay stage"
+        );
+
+        drop(client);
+        release_remote_tx.send(()).expect("release remote");
+        server_task
+            .await
+            .expect("server task")
+            .expect("async tls vision relay");
+        remote_thread.join().expect("remote thread");
     }
 
     #[test]

@@ -622,7 +622,6 @@ impl TrojanServer {
         W: Write,
     {
         let mut remote_write = remote.try_clone()?;
-        let remote_shutdown = remote.try_clone()?;
         let mut remote_read = remote;
         let _connection = self
             .bandwidth
@@ -639,7 +638,7 @@ impl TrojanServer {
                     ),
                     None => copy_count_best_effort(&mut reader, &mut remote_write),
                 };
-                let _ = remote_shutdown.shutdown(Shutdown::Write);
+                let _ = remote_write.shutdown(Shutdown::Write);
                 result
             },
         )?;
