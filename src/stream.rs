@@ -245,9 +245,6 @@ pub fn spawn_tcp_relay_background<F>(
 where
     F: FnOnce(u64, u64) + Send + 'static,
 {
-    let client_shutdown = Arc::new(client.try_clone()?);
-    let remote_shutdown = Arc::new(remote.try_clone()?);
-
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
 
@@ -261,8 +258,6 @@ where
                     client,
                     remote,
                     limiter,
-                    Arc::clone(&client_shutdown),
-                    Arc::clone(&remote_shutdown),
                     close_peer_on_eof,
                     TcpRelayTimeouts::from_env(),
                 )
@@ -704,8 +699,6 @@ fn relay_tcp_streams_async(
     if limiter.is_none() {
         return relay_tcp_streams_unlimited_native(client, remote, false);
     }
-    let client_shutdown = Arc::new(client.try_clone()?);
-    let remote_shutdown = Arc::new(remote.try_clone()?);
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
     let result = tcp_relay_runtime()?.block_on(async move {
@@ -715,8 +708,6 @@ fn relay_tcp_streams_async(
             client,
             remote,
             limiter,
-            client_shutdown,
-            remote_shutdown,
             false,
             TcpRelayTimeouts::from_env(),
         )
@@ -740,40 +731,20 @@ fn relay_tcp_streams_unlimited_native(
     )
 }
 
-fn shutdown_tcp_pair(client: Option<&TcpStream>, remote: Option<&TcpStream>) {
-    if let Some(client) = client {
-        let _ = client.shutdown(Shutdown::Both);
-    }
-    if let Some(remote) = remote {
-        let _ = remote.shutdown(Shutdown::Both);
-    }
-}
-
 fn relay_tcp_streams_unlimited_tokio(
     client: TcpStream,
     remote: TcpStream,
     close_peer_on_eof: bool,
     timeouts: TcpRelayTimeouts,
 ) -> io::Result<(u64, u64)> {
-    let client_shutdown = Arc::new(client.try_clone()?);
-    let remote_shutdown = Arc::new(remote.try_clone()?);
-
     client.set_nonblocking(true)?;
     remote.set_nonblocking(true)?;
 
     let result = tcp_relay_runtime()?.block_on(async move {
         let client = tokio::net::TcpStream::from_std(client)?;
         let remote = tokio::net::TcpStream::from_std(remote)?;
-        let (upload, download) = relay_tcp_bidirectional_async(
-            client,
-            remote,
-            None,
-            client_shutdown,
-            remote_shutdown,
-            close_peer_on_eof,
-            timeouts,
-        )
-        .await;
+        let (upload, download) =
+            relay_tcp_bidirectional_async(client, remote, None, close_peer_on_eof, timeouts).await;
         Ok((upload, download))
     });
     maybe_trim_process_memory_after_relay_completion();
@@ -784,8 +755,6 @@ async fn relay_tcp_bidirectional_async(
     client: tokio::net::TcpStream,
     remote: tokio::net::TcpStream,
     limiter: Option<Arc<BandwidthLimiter>>,
-    client_shutdown: Arc<TcpStream>,
-    remote_shutdown: Arc<TcpStream>,
     close_peer_on_eof: bool,
     timeouts: TcpRelayTimeouts,
 ) -> (u64, u64) {
@@ -799,18 +768,12 @@ async fn relay_tcp_bidirectional_async(
         remote_write,
         limiter.clone(),
         Arc::clone(&upload_counter),
-        Arc::clone(&client_shutdown),
-        Arc::clone(&remote_shutdown),
-        close_peer_on_eof,
     )));
     let mut download = Some(Box::pin(relay_copy_counted_async(
         remote_read,
         client_write,
         limiter,
         Arc::clone(&download_counter),
-        Arc::clone(&client_shutdown),
-        Arc::clone(&remote_shutdown),
-        close_peer_on_eof,
     )));
 
     let mut upload_done = false;
@@ -830,6 +793,9 @@ async fn relay_tcp_bidirectional_async(
                     upload_done = true;
                     upload_total = total;
                     upload = None;
+                    if close_peer_on_eof {
+                        break;
+                    }
                 }
                 total = async {
                     match download.as_mut() {
@@ -840,10 +806,12 @@ async fn relay_tcp_bidirectional_async(
                     download_done = true;
                     download_total = total;
                     download = None;
+                    if close_peer_on_eof {
+                        break;
+                    }
                 }
                 _ = tokio::time::sleep(limit) => {
                     record_tcp_relay_half_close_timeout(upload_done, download_done);
-                    shutdown_tcp_pair(Some(&client_shutdown), Some(&remote_shutdown));
                     break;
                 }
             }
@@ -858,6 +826,9 @@ async fn relay_tcp_bidirectional_async(
                     upload_done = true;
                     upload_total = total;
                     upload = None;
+                    if close_peer_on_eof {
+                        break;
+                    }
                 }
                 total = async {
                     match download.as_mut() {
@@ -868,6 +839,9 @@ async fn relay_tcp_bidirectional_async(
                     download_done = true;
                     download_total = total;
                     download = None;
+                    if close_peer_on_eof {
+                        break;
+                    }
                 }
             }
         }
@@ -879,7 +853,6 @@ async fn relay_tcp_bidirectional_async(
     if !download_done {
         download_total = download_counter.load(Ordering::Relaxed);
     }
-    shutdown_tcp_pair(Some(&client_shutdown), Some(&remote_shutdown));
     (upload_total, download_total)
 }
 
@@ -888,9 +861,6 @@ async fn relay_copy_counted_async<R, W>(
     mut writer: W,
     limiter: Option<Arc<BandwidthLimiter>>,
     counter: Arc<AtomicU64>,
-    client_shutdown: Arc<TcpStream>,
-    remote_shutdown: Arc<TcpStream>,
-    close_peer_on_eof: bool,
 ) -> u64
 where
     R: AsyncRead + Unpin,
@@ -935,11 +905,7 @@ where
         counter.store(total, Ordering::Relaxed);
     }
 
-    if close_peer_on_eof {
-        shutdown_tcp_pair(Some(&client_shutdown), Some(&remote_shutdown));
-    } else {
-        let _ = writer.shutdown().await;
-    }
+    let _ = writer.shutdown().await;
     counter.store(total, Ordering::Relaxed);
     total
 }
@@ -1757,7 +1723,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn background_relay_uses_single_shutdown_fd_per_socket() {
+    fn background_relay_keeps_single_fd_per_socket() {
         let client_listener = TcpListener::bind("127.0.0.1:0").expect("client bind");
         let remote_listener = TcpListener::bind("127.0.0.1:0").expect("remote bind");
         let client_addr = client_listener.local_addr().expect("client addr");
@@ -1782,12 +1748,12 @@ mod tests {
         relay.abort();
 
         assert!(
-            client_refs <= 2,
-            "client socket should keep at most one shutdown fd clone, got {client_refs}"
+            client_refs <= 1,
+            "client socket should not keep a shutdown fd clone, got {client_refs}"
         );
         assert!(
-            remote_refs <= 2,
-            "remote socket should keep at most one shutdown fd clone, got {remote_refs}"
+            remote_refs <= 1,
+            "remote socket should not keep a shutdown fd clone, got {remote_refs}"
         );
     }
 
@@ -1825,12 +1791,12 @@ mod tests {
         let deadline = Instant::now() + Duration::from_millis(500);
         loop {
             let refs = socket_fd_ref_count(&remote_inode);
-            if refs <= 2 {
+            if refs <= 1 {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "finished upload future should drop remote writer promptly, refs={refs}"
+                "finished upload side should leave only one remote fd, refs={refs}"
             );
             thread::sleep(Duration::from_millis(10));
         }
