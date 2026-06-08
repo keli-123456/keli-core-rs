@@ -654,6 +654,24 @@ where
     Ok(NativeRelayHandle { receiver })
 }
 
+pub fn spawn_named_native_blocking_relay_async<F, T>(
+    name: &'static str,
+    task: F,
+) -> io::Result<tokio::sync::oneshot::Receiver<thread::Result<T>>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let job = Box::new(move || {
+        let _metrics = NativeRelayMetricsGuard::new(name);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+        let _ = sender.send(result);
+    });
+    native_relay_pool().submit_named(name, job)?;
+    Ok(receiver)
+}
+
 pub fn spawn_detached_native_relay<F, T>(name: &'static str, task: F) -> io::Result<()>
 where
     F: FnOnce() -> T + Send + 'static,
@@ -1992,6 +2010,24 @@ mod tests {
         let handle = spawn_native_blocking_relay(|| 42).expect("spawn native relay");
         let value = join_native_blocking_relay(handle, "native relay panicked").expect("join");
         assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn native_relay_pool_async_receiver_returns_task_result() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let receiver =
+                super::spawn_named_native_blocking_relay_async("test-native-relay-async", || 42)
+                    .expect("spawn async native relay");
+            let value = receiver
+                .await
+                .expect("native relay result sent")
+                .expect("native relay task");
+            assert_eq!(value, 42);
+        });
     }
 
     #[test]

@@ -2769,10 +2769,21 @@ async fn handle_vless_reality_connection_async(
                     return;
                 }
             };
-            let _ = tokio::task::spawn_blocking(move || {
-                fallback_reality_client_to_dest(std_stream, first_record, &gateway)
-            })
-            .await;
+            match crate::stream::spawn_named_native_blocking_relay_async(
+                "keli-core-reality-fallback",
+                move || fallback_reality_client_to_dest(std_stream, first_record, &gateway),
+            ) {
+                Ok(receiver) => {
+                    let _ = receiver.await;
+                }
+                Err(error) => {
+                    if trace {
+                        eprintln!(
+                            "keli-core-rs reality trace: fallback spawn error peer={peer} error={error}"
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -2906,6 +2917,12 @@ pub(crate) struct ConnectionWorkerGroupSnapshot {
     pub(crate) active_async: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TcpAcceptRuntimeMetricsSnapshot {
+    pub(crate) worker_threads: usize,
+    pub(crate) blocking_thread_budget: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConnectionWorkerKind {
     Blocking,
@@ -3002,6 +3019,13 @@ pub(crate) fn connection_worker_metrics_snapshot() -> ConnectionWorkerGroupSnaps
         active_total: active_blocking.saturating_add(active_async),
         active_blocking,
         active_async,
+    }
+}
+
+pub(crate) fn tcp_accept_runtime_metrics_snapshot() -> TcpAcceptRuntimeMetricsSnapshot {
+    TcpAcceptRuntimeMetricsSnapshot {
+        worker_threads: tcp_accept_worker_threads(),
+        blocking_thread_budget: tcp_accept_blocking_threads(),
     }
 }
 

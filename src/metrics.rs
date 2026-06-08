@@ -44,6 +44,10 @@ pub struct CoreMetricsSnapshot {
     #[serde(default)]
     pub keli_core_connection_active_async: usize,
     #[serde(default)]
+    pub keli_core_tcp_accept_worker_threads: usize,
+    #[serde(default)]
+    pub keli_core_tcp_accept_blocking_thread_budget: usize,
+    #[serde(default)]
     pub keli_core_udp_relay_active: BTreeMap<String, usize>,
     #[serde(default)]
     pub keli_core_udp_relay_finished_total: BTreeMap<String, u64>,
@@ -154,6 +158,9 @@ impl CoreMetrics {
         snapshot.keli_core_connection_active_total = connection_workers.active_total;
         snapshot.keli_core_connection_active_blocking = connection_workers.active_blocking;
         snapshot.keli_core_connection_active_async = connection_workers.active_async;
+        let tcp_accept = crate::service::tcp_accept_runtime_metrics_snapshot();
+        snapshot.keli_core_tcp_accept_worker_threads = tcp_accept.worker_threads;
+        snapshot.keli_core_tcp_accept_blocking_thread_budget = tcp_accept.blocking_thread_budget;
         snapshot.keli_core_udp_relay_active = udp_relay_active_snapshot();
         snapshot.keli_core_udp_relay_finished_total = udp_relay_finished_snapshot();
         snapshot.keli_core_process_open_fds = process_open_fd_count();
@@ -784,6 +791,16 @@ mod tests {
             snapshot.keli_core_tcp_relay_half_close_timeout_total
                 >= snapshot.keli_core_tcp_relay_uplink_only_timeout_total
         );
+    }
+
+    #[test]
+    fn snapshots_include_tcp_accept_runtime_budget() {
+        let metrics = CoreMetrics::default();
+
+        let snapshot = metrics.snapshot_with_runtime_metrics(None, None, None);
+
+        assert!(snapshot.keli_core_tcp_accept_worker_threads >= 2);
+        assert!(snapshot.keli_core_tcp_accept_blocking_thread_budget >= 16);
     }
 
     #[test]
