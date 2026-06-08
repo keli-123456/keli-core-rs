@@ -165,6 +165,7 @@ struct NativeRelayPool {
     max_workers: AtomicUsize,
     label_soft_limit: AtomicUsize,
     dynamic_limits: AtomicBool,
+    idle_timeout: Duration,
 }
 
 struct NativeRelayActiveLabelGuard {
@@ -1050,6 +1051,7 @@ impl NativeRelayPool {
             max_workers: AtomicUsize::new(max_workers),
             label_soft_limit: AtomicUsize::new(label_soft_limit.clamp(1, max_workers)),
             dynamic_limits: AtomicBool::new(dynamic_limits),
+            idle_timeout: native_relay_idle_timeout(),
         }
     }
 
@@ -1065,6 +1067,17 @@ impl NativeRelayPool {
             label_soft_limit,
             false,
         )))
+    }
+
+    #[cfg(test)]
+    fn with_limits_and_idle_timeout_for_test(
+        max_workers: usize,
+        label_soft_limit: usize,
+        idle_timeout: Duration,
+    ) -> &'static Self {
+        let mut pool = Self::with_limits(max_workers, label_soft_limit, false);
+        pool.idle_timeout = idle_timeout;
+        Box::leak(Box::new(pool))
     }
 
     #[cfg(test)]
@@ -1194,7 +1207,7 @@ impl NativeRelayPool {
             self.idle_count.fetch_add(1, Ordering::Relaxed);
             let (next_queue, wait_result) = self
                 .ready
-                .wait_timeout(queue, native_relay_idle_timeout())
+                .wait_timeout(queue, self.idle_timeout)
                 .expect("native relay queue lock poisoned");
             self.idle_count.fetch_sub(1, Ordering::Relaxed);
             queue = next_queue;
@@ -1223,8 +1236,11 @@ impl NativeRelayPool {
                 queue.active_by_label.remove(label);
             }
         }
+        let should_wake_waiters = !queue.jobs.is_empty();
         drop(queue);
-        self.ready.notify_all();
+        if should_wake_waiters {
+            self.ready.notify_all();
+        }
     }
 
     fn snapshot(&self) -> NativeRelayPoolSnapshot {
@@ -2256,6 +2272,50 @@ mod tests {
                 >= 10,
             "queue wait should be recorded by label: {snapshot:?}"
         );
+    }
+
+    #[test]
+    fn native_relay_pool_empty_completions_do_not_keep_idle_workers_alive() {
+        let pool = super::NativeRelayPool::with_limits_and_idle_timeout_for_test(
+            4,
+            2,
+            Duration::from_millis(50),
+        );
+        for _ in 0..4 {
+            assert!(pool.spawn_worker());
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pool.snapshot().idle_count < 4 {
+            assert!(
+                Instant::now() < deadline,
+                "workers did not become idle before timeout"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let wake_until = Instant::now() + Duration::from_millis(180);
+        while Instant::now() < wake_until {
+            {
+                let mut queue = pool.queue.lock().expect("native relay queue lock poisoned");
+                queue.active_by_label.insert("empty-completion", 1);
+            }
+            pool.finish_job_label("empty-completion");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = pool.snapshot();
+            if snapshot.worker_count == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "empty completions kept idle workers alive: {snapshot:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
