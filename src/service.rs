@@ -28,7 +28,10 @@ use crate::limits::{
 use crate::mieru::{MieruServer, MieruServerConfig};
 use crate::naive::{NaiveServer, NaiveServerConfig};
 use crate::protocol::Protocol;
-use crate::quic_resources::{QuicResourceSnapshot, SharedQuicConnectionLimiter};
+use crate::quic_resources::{
+    available_parallelism_count, memory_limit_mib, open_file_soft_limit, QuicResourceSnapshot,
+    SharedQuicConnectionLimiter,
+};
 use crate::reality::{
     authenticate_reality_client_hello, decode_reality_private_key, decode_short_id,
     fallback_reality_client_to_dest, generate_reality_temporary_certificate,
@@ -57,6 +60,12 @@ const DEFAULT_CONNECTION_WORKER_STACK_KIB: usize = 2048;
 const DEFAULT_CONNECTION_WORKER_STACK_KIB: usize = 2048;
 const MIN_CONNECTION_WORKER_STACK_KIB: usize = 256;
 const MAX_CONNECTION_WORKER_STACK_KIB: usize = 8192;
+const TCP_ACCEPT_BLOCKING_THREADS_ENV: &str = "KELI_CORE_TCP_ACCEPT_BLOCKING_THREADS";
+const TCP_ACCEPT_BLOCKING_THREADS_MIN: usize = 16;
+const TCP_ACCEPT_BLOCKING_THREADS_PER_CPU: usize = 32;
+const TCP_ACCEPT_BLOCKING_THREAD_MEMORY_MIB: usize = 24;
+const TCP_ACCEPT_BLOCKING_THREAD_FD_BUDGET: usize = 64;
+const TCP_ACCEPT_BLOCKING_RESERVED_FDS: usize = 2048;
 const QUIC_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 static TCP_ACCEPT_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static CONNECTION_WORKER_ACTIVE_BLOCKING: AtomicUsize = AtomicUsize::new(0);
@@ -3215,6 +3224,7 @@ fn tcp_accept_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(tcp_accept_worker_threads())
+        .max_blocking_threads(tcp_accept_blocking_threads())
         .thread_name("keli-core-tcp-accept")
         .enable_io()
         .enable_time()
@@ -3230,10 +3240,48 @@ fn tcp_accept_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
 }
 
 fn tcp_accept_worker_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(4)
-        .clamp(2, 8)
+    available_parallelism_count().clamp(2, 8)
+}
+
+fn tcp_accept_blocking_threads() -> usize {
+    std::env::var(TCP_ACCEPT_BLOCKING_THREADS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|value| value.max(TCP_ACCEPT_BLOCKING_THREADS_MIN))
+        .unwrap_or_else(|| {
+            tcp_accept_blocking_threads_from_resources(
+                available_parallelism_count(),
+                memory_limit_mib(),
+                open_file_soft_limit(),
+            )
+        })
+}
+
+fn tcp_accept_blocking_threads_from_resources(
+    cpu_count: usize,
+    memory_limit_mib: Option<usize>,
+    fd_limit: Option<usize>,
+) -> usize {
+    let cpu_target = cpu_count
+        .max(1)
+        .saturating_mul(TCP_ACCEPT_BLOCKING_THREADS_PER_CPU)
+        .max(TCP_ACCEPT_BLOCKING_THREADS_MIN);
+    let memory_target = memory_limit_mib.map(|limit_mib| {
+        (limit_mib / TCP_ACCEPT_BLOCKING_THREAD_MEMORY_MIB)
+            .max(TCP_ACCEPT_BLOCKING_THREADS_MIN)
+    });
+    let fd_target = fd_limit
+        .and_then(|limit| limit.checked_sub(TCP_ACCEPT_BLOCKING_RESERVED_FDS))
+        .map(|available| {
+            (available / TCP_ACCEPT_BLOCKING_THREAD_FD_BUDGET)
+                .max(TCP_ACCEPT_BLOCKING_THREADS_MIN)
+        });
+
+    [Some(cpu_target), memory_target, fd_target]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(TCP_ACCEPT_BLOCKING_THREADS_MIN)
 }
 
 fn quic_runtime_worker_threads() -> usize {
@@ -3474,6 +3522,34 @@ mod tests {
         assert_eq!(
             super::connection_worker_stack_size_from_env(Some("99999".to_string())),
             8192 * 1024
+        );
+    }
+
+    #[test]
+    fn tcp_accept_blocking_threads_scale_with_resources() {
+        assert_eq!(
+            super::tcp_accept_blocking_threads_from_resources(1, None, None),
+            32
+        );
+        assert_eq!(
+            super::tcp_accept_blocking_threads_from_resources(4, None, None),
+            128
+        );
+        assert_eq!(
+            super::tcp_accept_blocking_threads_from_resources(16, None, None),
+            512
+        );
+        assert_eq!(
+            super::tcp_accept_blocking_threads_from_resources(16, Some(3072), Some(999_999)),
+            128
+        );
+        assert_eq!(
+            super::tcp_accept_blocking_threads_from_resources(16, Some(16), Some(999_999)),
+            16
+        );
+        assert_eq!(
+            super::tcp_accept_blocking_threads_from_resources(16, None, Some(4096)),
+            32
         );
     }
 
