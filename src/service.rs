@@ -3267,14 +3267,12 @@ fn tcp_accept_blocking_threads_from_resources(
         .saturating_mul(TCP_ACCEPT_BLOCKING_THREADS_PER_CPU)
         .max(TCP_ACCEPT_BLOCKING_THREADS_MIN);
     let memory_target = memory_limit_mib.map(|limit_mib| {
-        (limit_mib / TCP_ACCEPT_BLOCKING_THREAD_MEMORY_MIB)
-            .max(TCP_ACCEPT_BLOCKING_THREADS_MIN)
+        (limit_mib / TCP_ACCEPT_BLOCKING_THREAD_MEMORY_MIB).max(TCP_ACCEPT_BLOCKING_THREADS_MIN)
     });
     let fd_target = fd_limit
         .and_then(|limit| limit.checked_sub(TCP_ACCEPT_BLOCKING_RESERVED_FDS))
         .map(|available| {
-            (available / TCP_ACCEPT_BLOCKING_THREAD_FD_BUDGET)
-                .max(TCP_ACCEPT_BLOCKING_THREADS_MIN)
+            (available / TCP_ACCEPT_BLOCKING_THREAD_FD_BUDGET).max(TCP_ACCEPT_BLOCKING_THREADS_MIN)
         });
 
     [Some(cpu_target), memory_target, fd_target]
