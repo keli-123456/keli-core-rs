@@ -90,6 +90,8 @@ pub struct CoreController {
 
 impl CoreController {
     pub fn new() -> Self {
+        crate::apply_process_memory_defaults();
+        crate::stream::start_low_load_memory_trimmer();
         Self {
             runtime: RuntimeState::new(),
             service: None,
