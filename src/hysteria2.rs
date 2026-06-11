@@ -333,9 +333,12 @@ impl Hysteria2Server {
             .saturating_sub(self.preauth_connections.available_permits());
         if active >= hy2_preauth_cpu_pressure_limit(self.preauth_connection_limit)
             && !hy2_preauth_cpu_pressure_allows(
-                self.preauth_connection_limit,
                 active,
-                hy2_cpu_pressure_active(),
+                hy2_preauth_cpu_pressure_limit_from_load_percent_x100(
+                    proc_loadavg_1m_percent_x100(),
+                    self.preauth_connection_limit,
+                    available_parallelism_count(),
+                ),
             )
         {
             return None;
@@ -407,7 +410,10 @@ impl Hysteria2Server {
             Err(_) => {
                 let error =
                     io::Error::new(io::ErrorKind::TimedOut, "hysteria2 handshake timed out");
-                if should_record_hysteria2_cpu_pressure_backoff(&error, hy2_cpu_pressure_active()) {
+                if should_record_hysteria2_cpu_pressure_backoff(
+                    &error,
+                    hy2_cpu_timeout_backoff_active(),
+                ) {
                     self.auth_backoff.record_invalid(client_ip);
                 }
                 return Err(error);
@@ -439,7 +445,7 @@ impl Hysteria2Server {
                     );
                     if should_record_hysteria2_cpu_pressure_backoff(
                         &error,
-                        hy2_cpu_pressure_active(),
+                        hy2_cpu_timeout_backoff_active(),
                     ) {
                         self.auth_backoff.record_invalid(client_ip);
                     }
@@ -1956,12 +1962,59 @@ fn hy2_preauth_cpu_pressure_limit(preauth_connection_limit: usize) -> usize {
         .min(preauth_connection_limit.max(1))
 }
 
-fn hy2_preauth_cpu_pressure_allows(
+fn hy2_preauth_cpu_pressure_allows(active_preauth: usize, effective_limit: usize) -> bool {
+    active_preauth < effective_limit
+}
+
+fn hy2_preauth_cpu_pressure_limit_from_load_percent_x100(
+    load_percent_x100: Option<u64>,
     preauth_connection_limit: usize,
-    active_preauth: usize,
-    cpu_pressure: bool,
-) -> bool {
-    !cpu_pressure || active_preauth < hy2_preauth_cpu_pressure_limit(preauth_connection_limit)
+    cpu_count: usize,
+) -> usize {
+    hy2_preauth_cpu_pressure_limit_from_load_percent_x100_with_threshold(
+        load_percent_x100,
+        preauth_connection_limit,
+        cpu_count,
+        hy2_cpu_pressure_threshold_percent(),
+    )
+}
+
+fn hy2_preauth_cpu_pressure_limit_from_load_percent_x100_with_threshold(
+    load_percent_x100: Option<u64>,
+    preauth_connection_limit: usize,
+    cpu_count: usize,
+    per_cpu_threshold_percent: u64,
+) -> usize {
+    let full_limit = preauth_connection_limit.max(1);
+    let Some(per_cpu_load) = hy2_load_per_cpu_percent_x100(load_percent_x100, cpu_count) else {
+        return full_limit;
+    };
+    let hot_threshold = hy2_cpu_pressure_threshold_percent_x100(per_cpu_threshold_percent);
+    let mid_threshold = hot_threshold.saturating_mul(7) / 8;
+    let warm_threshold = hot_threshold.saturating_mul(3) / 4;
+
+    if per_cpu_load >= hot_threshold {
+        hy2_preauth_cpu_pressure_limit(preauth_connection_limit)
+    } else if per_cpu_load >= mid_threshold {
+        hy2_scaled_preauth_limit(preauth_connection_limit, 1, 2)
+    } else if per_cpu_load >= warm_threshold {
+        hy2_scaled_preauth_limit(preauth_connection_limit, 3, 4)
+    } else {
+        full_limit
+    }
+}
+
+fn hy2_scaled_preauth_limit(
+    preauth_connection_limit: usize,
+    numerator: usize,
+    denominator: usize,
+) -> usize {
+    let full_limit = preauth_connection_limit.max(1);
+    let denominator = denominator.max(1);
+    let scaled = full_limit.saturating_mul(numerator) / denominator;
+    scaled
+        .max(hy2_preauth_cpu_pressure_limit(preauth_connection_limit))
+        .min(full_limit)
 }
 
 fn hy2_relay_io_timeout() -> Duration {
@@ -1974,39 +2027,62 @@ fn hy2_relay_io_timeout() -> Duration {
     })
 }
 
-fn hy2_cpu_pressure_active() -> bool {
-    hy2_cpu_pressure_from_load_percent_x100(
-        proc_loadavg_1m_percent_x100(),
-        available_parallelism_count(),
-    )
-}
-
-fn hy2_cpu_pressure_from_load_percent_x100(
-    load_percent_x100: Option<u64>,
-    cpu_count: usize,
-) -> bool {
-    hy2_cpu_pressure_from_load_percent_x100_with_threshold(
-        load_percent_x100,
-        cpu_count,
-        env::var(HY2_CPU_PRESSURE_BACKOFF_LOAD_PERCENT_ENV)
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_HY2_CPU_PRESSURE_BACKOFF_LOAD_PERCENT),
-    )
-}
-
+#[cfg(test)]
 fn hy2_cpu_pressure_from_load_percent_x100_with_threshold(
     load_percent_x100: Option<u64>,
     cpu_count: usize,
     per_cpu_threshold_percent: u64,
 ) -> bool {
-    let Some(load_percent_x100) = load_percent_x100 else {
+    let Some(per_cpu_load) = hy2_load_per_cpu_percent_x100(load_percent_x100, cpu_count) else {
         return false;
     };
-    let per_cpu_threshold = per_cpu_threshold_percent.clamp(50, 400).saturating_mul(100);
-    let threshold = (cpu_count.max(1) as u64).saturating_mul(per_cpu_threshold);
-    load_percent_x100 >= threshold
+    per_cpu_load >= hy2_cpu_pressure_threshold_percent_x100(per_cpu_threshold_percent)
+}
+
+fn hy2_cpu_timeout_backoff_active() -> bool {
+    hy2_cpu_timeout_backoff_from_load_percent_x100(
+        proc_loadavg_1m_percent_x100(),
+        available_parallelism_count(),
+    )
+}
+
+fn hy2_cpu_timeout_backoff_from_load_percent_x100(
+    load_percent_x100: Option<u64>,
+    cpu_count: usize,
+) -> bool {
+    hy2_cpu_timeout_backoff_from_load_percent_x100_with_threshold(
+        load_percent_x100,
+        cpu_count,
+        hy2_cpu_pressure_threshold_percent(),
+    )
+}
+
+fn hy2_cpu_timeout_backoff_from_load_percent_x100_with_threshold(
+    load_percent_x100: Option<u64>,
+    cpu_count: usize,
+    per_cpu_threshold_percent: u64,
+) -> bool {
+    let Some(per_cpu_load) = hy2_load_per_cpu_percent_x100(load_percent_x100, cpu_count) else {
+        return false;
+    };
+    per_cpu_load
+        >= hy2_cpu_pressure_threshold_percent_x100(per_cpu_threshold_percent).saturating_mul(3) / 4
+}
+
+fn hy2_load_per_cpu_percent_x100(load_percent_x100: Option<u64>, cpu_count: usize) -> Option<u64> {
+    load_percent_x100.map(|load| load / cpu_count.max(1) as u64)
+}
+
+fn hy2_cpu_pressure_threshold_percent() -> u64 {
+    env::var(HY2_CPU_PRESSURE_BACKOFF_LOAD_PERCENT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_HY2_CPU_PRESSURE_BACKOFF_LOAD_PERCENT)
+}
+
+fn hy2_cpu_pressure_threshold_percent_x100(per_cpu_threshold_percent: u64) -> u64 {
+    per_cpu_threshold_percent.clamp(50, 400).saturating_mul(100)
 }
 
 fn proc_loadavg_1m_percent_x100() -> Option<u64> {
@@ -3720,10 +3796,54 @@ mod tests {
         assert_eq!(super::hy2_preauth_cpu_pressure_limit(64), 16);
         assert_eq!(super::hy2_preauth_cpu_pressure_limit(195), 48);
 
-        assert!(super::hy2_preauth_cpu_pressure_allows(64, 0, false));
-        assert!(super::hy2_preauth_cpu_pressure_allows(64, 15, true));
-        assert!(!super::hy2_preauth_cpu_pressure_allows(64, 16, true));
-        assert!(!super::hy2_preauth_cpu_pressure_allows(64, 63, true));
+        assert!(super::hy2_preauth_cpu_pressure_allows(0, 64));
+        assert!(super::hy2_preauth_cpu_pressure_allows(15, 16));
+        assert!(!super::hy2_preauth_cpu_pressure_allows(16, 16));
+        assert!(!super::hy2_preauth_cpu_pressure_allows(63, 16));
+    }
+
+    #[test]
+    fn hysteria2_cpu_pressure_gradually_tightens_preauth_limit() {
+        assert_eq!(
+            hy2_preauth_cpu_pressure_limit_from_load_percent_x100_with_threshold(None, 64, 4, 120),
+            64
+        );
+        assert_eq!(
+            hy2_preauth_cpu_pressure_limit_from_load_percent_x100_with_threshold(
+                Some(350 * 100),
+                64,
+                4,
+                120
+            ),
+            64
+        );
+        assert_eq!(
+            hy2_preauth_cpu_pressure_limit_from_load_percent_x100_with_threshold(
+                Some(365 * 100),
+                64,
+                4,
+                120
+            ),
+            48
+        );
+        assert_eq!(
+            hy2_preauth_cpu_pressure_limit_from_load_percent_x100_with_threshold(
+                Some(430 * 100),
+                64,
+                4,
+                120
+            ),
+            32
+        );
+        assert_eq!(
+            hy2_preauth_cpu_pressure_limit_from_load_percent_x100_with_threshold(
+                Some(490 * 100),
+                64,
+                4,
+                120
+            ),
+            16
+        );
     }
 
     #[test]
@@ -4019,6 +4139,20 @@ mod tests {
             ),
             false
         ));
+    }
+
+    #[test]
+    fn hysteria2_cpu_pressure_timeout_backoff_starts_before_full_saturation() {
+        assert!(
+            !hy2_cpu_timeout_backoff_from_load_percent_x100_with_threshold(Some(350 * 100), 4, 120)
+        );
+        assert!(
+            hy2_cpu_timeout_backoff_from_load_percent_x100_with_threshold(Some(365 * 100), 4, 120)
+        );
+        assert!(
+            hy2_cpu_timeout_backoff_from_load_percent_x100_with_threshold(Some(490 * 100), 4, 120)
+        );
+        assert!(!hy2_cpu_timeout_backoff_from_load_percent_x100_with_threshold(None, 4, 120));
     }
 
     #[test]
