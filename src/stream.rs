@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -1146,8 +1147,8 @@ fn memory_trim_resource_snapshot() -> MemoryTrimResourceSnapshot {
         total_kib: memory_limit_kib.or(meminfo.and_then(|snapshot| snapshot.mem_total_kib)),
         available_kib: meminfo.and_then(|snapshot| snapshot.mem_available_kib),
         swap_used_kib: meminfo.and_then(|snapshot| snapshot.swap_used_kib()),
-        cgroup_current_kib: cgroup_memory_kib("/sys/fs/cgroup/memory.current"),
-        cgroup_peak_kib: cgroup_memory_kib("/sys/fs/cgroup/memory.peak"),
+        cgroup_current_kib: cgroup_memory_kib("memory.current"),
+        cgroup_peak_kib: cgroup_memory_kib("memory.peak"),
     }
 }
 
@@ -1176,7 +1177,15 @@ fn proc_meminfo_snapshot() -> Option<ProcMeminfoSnapshot> {
 }
 
 #[cfg(not(test))]
-fn cgroup_memory_kib(path: &str) -> Option<u64> {
+fn cgroup_memory_kib(file_name: &str) -> Option<u64> {
+    let cgroup_path = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|content| parse_cgroup_v2_path(&content).map(str::to_owned));
+    let path = cgroup_memory_file_path(
+        Path::new("/sys/fs/cgroup"),
+        cgroup_path.as_deref().unwrap_or("/"),
+        file_name,
+    )?;
     let value = std::fs::read_to_string(path).ok()?;
     parse_cgroup_memory_kib(&value)
 }
@@ -1248,6 +1257,40 @@ fn parse_cgroup_memory_kib(value: &str) -> Option<u64> {
     }
     let bytes = trimmed.parse::<u64>().ok()?;
     Some(bytes / 1024)
+}
+
+fn parse_cgroup_v2_path(content: &str) -> Option<&str> {
+    for line in content.lines() {
+        let mut parts = line.splitn(3, ':');
+        let _hierarchy = parts.next()?;
+        let controllers = parts.next()?;
+        let path = parts.next()?.trim();
+        if controllers.is_empty() && !path.is_empty() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn cgroup_memory_file_path(mount: &Path, cgroup_path: &str, file_name: &str) -> Option<PathBuf> {
+    if file_name.is_empty()
+        || file_name.contains('/')
+        || file_name.contains('\\')
+        || file_name.contains("..")
+    {
+        return None;
+    }
+
+    let mut path = PathBuf::from(mount);
+    for component in Path::new(cgroup_path).components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => path.push(part),
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    path.push(file_name);
+    Some(path)
 }
 
 fn parse_proc_status_kib(status: &str, key: &str) -> Option<u64> {
@@ -2769,6 +2812,57 @@ mod tests {
         assert_eq!(snapshot.swap_used_kib(), Some(250_000));
         assert_eq!(super::parse_cgroup_memory_kib("1048576\n"), Some(1024));
         assert_eq!(super::parse_cgroup_memory_kib("max\n"), None);
+    }
+
+    #[test]
+    fn parses_systemd_cgroup_v2_memory_path() {
+        let cgroup = concat!(
+            "11:memory:/legacy\n",
+            "10:cpu,cpuacct:/legacy\n",
+            "0::/system.slice/kelinode.service\n"
+        );
+        assert_eq!(
+            super::parse_cgroup_v2_path(cgroup),
+            Some("/system.slice/kelinode.service")
+        );
+
+        let path = super::cgroup_memory_file_path(
+            std::path::Path::new("sys/fs/cgroup"),
+            "/system.slice/kelinode.service",
+            "memory.current",
+        )
+        .expect("service cgroup memory path");
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("sys/fs/cgroup")
+                .join("system.slice")
+                .join("kelinode.service")
+                .join("memory.current")
+        );
+    }
+
+    #[test]
+    fn cgroup_memory_file_path_stays_under_mount() {
+        assert_eq!(
+            super::cgroup_memory_file_path(
+                std::path::Path::new("sys/fs/cgroup"),
+                "/",
+                "memory.peak"
+            ),
+            Some(std::path::PathBuf::from("sys/fs/cgroup").join("memory.peak"))
+        );
+        assert!(super::cgroup_memory_file_path(
+            std::path::Path::new("sys/fs/cgroup"),
+            "/../escape",
+            "memory.current"
+        )
+        .is_none());
+        assert!(super::cgroup_memory_file_path(
+            std::path::Path::new("sys/fs/cgroup"),
+            "/system.slice/kelinode.service",
+            "../memory.current"
+        )
+        .is_none());
     }
 
     #[test]
