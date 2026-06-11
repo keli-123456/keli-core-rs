@@ -69,6 +69,9 @@ const HY2_AUTH_TIMEOUT_SECS_ENV: &str = "KELI_CORE_HY2_AUTH_TIMEOUT_SECS";
 const DEFAULT_HY2_AUTH_TIMEOUT_SECS: u64 = 10;
 const HY2_RELAY_IO_TIMEOUT_SECS_ENV: &str = "KELI_CORE_HY2_RELAY_IO_TIMEOUT_SECS";
 const DEFAULT_HY2_RELAY_IO_TIMEOUT_SECS: u64 = 15;
+const HY2_CPU_PRESSURE_BACKOFF_LOAD_PERCENT_ENV: &str =
+    "KELI_CORE_HY2_CPU_PRESSURE_BACKOFF_LOAD_PERCENT";
+const DEFAULT_HY2_CPU_PRESSURE_BACKOFF_LOAD_PERCENT: u64 = 120;
 const HY2_SOFTWARE_BANDWIDTH_LIMIT_MAX_MBPS_ENV: &str =
     "KELI_CORE_HY2_SOFTWARE_BANDWIDTH_LIMIT_MAX_MBPS";
 const DEFAULT_HY2_SOFTWARE_BANDWIDTH_LIMIT_MAX_MBPS: u32 = 200;
@@ -325,6 +328,18 @@ impl Hysteria2Server {
     }
 
     fn try_acquire_preauth_slot(&self) -> Option<OwnedSemaphorePermit> {
+        let active = self
+            .preauth_connection_limit
+            .saturating_sub(self.preauth_connections.available_permits());
+        if active >= hy2_preauth_cpu_pressure_limit(self.preauth_connection_limit)
+            && !hy2_preauth_cpu_pressure_allows(
+                self.preauth_connection_limit,
+                active,
+                hy2_cpu_pressure_active(),
+            )
+        {
+            return None;
+        }
         self.preauth_connections.clone().try_acquire_owned().ok()
     }
 
@@ -390,10 +405,12 @@ impl Hysteria2Server {
             Ok(Ok(connection)) => connection,
             Ok(Err(error)) => return Err(io_other(error)),
             Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "hysteria2 handshake timed out",
-                ));
+                let error =
+                    io::Error::new(io::ErrorKind::TimedOut, "hysteria2 handshake timed out");
+                if should_record_hysteria2_cpu_pressure_backoff(&error, hy2_cpu_pressure_active()) {
+                    self.auth_backoff.record_invalid(client_ip);
+                }
+                return Err(error);
             }
         };
 
@@ -416,10 +433,17 @@ impl Hysteria2Server {
                 }
                 Err(_) => {
                     connection.close(0u32.into(), b"auth timeout");
-                    return Err(io::Error::new(
+                    let error = io::Error::new(
                         io::ErrorKind::TimedOut,
                         "hysteria2 authentication timed out",
-                    ));
+                    );
+                    if should_record_hysteria2_cpu_pressure_backoff(
+                        &error,
+                        hy2_cpu_pressure_active(),
+                    ) {
+                        self.auth_backoff.record_invalid(client_ip);
+                    }
+                    return Err(error);
                 }
             };
         drop(preauth_slot);
@@ -1926,6 +1950,20 @@ fn hy2_preauth_connection_limit(listener_connection_limit: usize) -> usize {
         .max(8)
 }
 
+fn hy2_preauth_cpu_pressure_limit(preauth_connection_limit: usize) -> usize {
+    (preauth_connection_limit / 4)
+        .max(8)
+        .min(preauth_connection_limit.max(1))
+}
+
+fn hy2_preauth_cpu_pressure_allows(
+    preauth_connection_limit: usize,
+    active_preauth: usize,
+    cpu_pressure: bool,
+) -> bool {
+    !cpu_pressure || active_preauth < hy2_preauth_cpu_pressure_limit(preauth_connection_limit)
+}
+
 fn hy2_relay_io_timeout() -> Duration {
     static TIMEOUT: OnceLock<Duration> = OnceLock::new();
     *TIMEOUT.get_or_init(|| {
@@ -1934,6 +1972,53 @@ fn hy2_relay_io_timeout() -> Duration {
             DEFAULT_HY2_RELAY_IO_TIMEOUT_SECS,
         )
     })
+}
+
+fn hy2_cpu_pressure_active() -> bool {
+    hy2_cpu_pressure_from_load_percent_x100(
+        proc_loadavg_1m_percent_x100(),
+        available_parallelism_count(),
+    )
+}
+
+fn hy2_cpu_pressure_from_load_percent_x100(
+    load_percent_x100: Option<u64>,
+    cpu_count: usize,
+) -> bool {
+    hy2_cpu_pressure_from_load_percent_x100_with_threshold(
+        load_percent_x100,
+        cpu_count,
+        env::var(HY2_CPU_PRESSURE_BACKOFF_LOAD_PERCENT_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_HY2_CPU_PRESSURE_BACKOFF_LOAD_PERCENT),
+    )
+}
+
+fn hy2_cpu_pressure_from_load_percent_x100_with_threshold(
+    load_percent_x100: Option<u64>,
+    cpu_count: usize,
+    per_cpu_threshold_percent: u64,
+) -> bool {
+    let Some(load_percent_x100) = load_percent_x100 else {
+        return false;
+    };
+    let per_cpu_threshold = per_cpu_threshold_percent.clamp(50, 400).saturating_mul(100);
+    let threshold = (cpu_count.max(1) as u64).saturating_mul(per_cpu_threshold);
+    load_percent_x100 >= threshold
+}
+
+fn proc_loadavg_1m_percent_x100() -> Option<u64> {
+    parse_loadavg_1m_percent_x100(&std::fs::read_to_string("/proc/loadavg").ok()?)
+}
+
+fn parse_loadavg_1m_percent_x100(content: &str) -> Option<u64> {
+    let value = content.split_whitespace().next()?.parse::<f64>().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    Some((value * 10_000.0).round().min(u64::MAX as f64) as u64)
 }
 
 fn env_duration_seconds(name: &str, default_seconds: u64) -> Duration {
@@ -2431,6 +2516,20 @@ fn is_hysteria2_invalid_auth_error(error: &io::Error) -> bool {
 
 fn should_record_hysteria2_auth_backoff(error: &io::Error) -> bool {
     is_hysteria2_invalid_auth_error(error)
+}
+
+fn should_record_hysteria2_cpu_pressure_backoff(error: &io::Error, cpu_pressure: bool) -> bool {
+    should_record_hysteria2_auth_backoff(error)
+        || (cpu_pressure && is_hysteria2_preauth_timeout_error(error))
+}
+
+fn is_hysteria2_preauth_timeout_error(error: &io::Error) -> bool {
+    if error.kind() != io::ErrorKind::TimedOut {
+        return false;
+    }
+    let text = error.to_string();
+    text.contains("hysteria2 handshake timed out")
+        || text.contains("hysteria2 authentication timed out")
 }
 
 fn now_millis() -> u64 {
@@ -3616,6 +3715,18 @@ mod tests {
     }
 
     #[test]
+    fn hysteria2_cpu_pressure_temporarily_tightens_preauth_limit() {
+        assert_eq!(super::hy2_preauth_cpu_pressure_limit(32), 8);
+        assert_eq!(super::hy2_preauth_cpu_pressure_limit(64), 16);
+        assert_eq!(super::hy2_preauth_cpu_pressure_limit(195), 48);
+
+        assert!(super::hy2_preauth_cpu_pressure_allows(64, 0, false));
+        assert!(super::hy2_preauth_cpu_pressure_allows(64, 15, true));
+        assert!(!super::hy2_preauth_cpu_pressure_allows(64, 16, true));
+        assert!(!super::hy2_preauth_cpu_pressure_allows(64, 63, true));
+    }
+
+    #[test]
     fn hysteria2_log_filter_treats_client_closes_as_expected() {
         for message in [
             "Stopped(0)",
@@ -3870,6 +3981,66 @@ mod tests {
             io::ErrorKind::TimedOut,
             "hysteria2 authentication timed out",
         )));
+    }
+
+    #[test]
+    fn hysteria2_cpu_pressure_backoff_records_repeated_timeouts_only_when_hot() {
+        let handshake_timeout =
+            io::Error::new(io::ErrorKind::TimedOut, "hysteria2 handshake timed out");
+        let auth_timeout = io::Error::new(
+            io::ErrorKind::TimedOut,
+            "hysteria2 authentication timed out",
+        );
+        let unrelated_timeout = io::Error::new(
+            io::ErrorKind::TimedOut,
+            "tcp connect timed out target=example.com:443",
+        );
+
+        assert!(!should_record_hysteria2_cpu_pressure_backoff(
+            &handshake_timeout,
+            false
+        ));
+        assert!(should_record_hysteria2_cpu_pressure_backoff(
+            &handshake_timeout,
+            true
+        ));
+        assert!(should_record_hysteria2_cpu_pressure_backoff(
+            &auth_timeout,
+            true
+        ));
+        assert!(!should_record_hysteria2_cpu_pressure_backoff(
+            &unrelated_timeout,
+            true
+        ));
+        assert!(should_record_hysteria2_cpu_pressure_backoff(
+            &io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "invalid hysteria2 authentication"
+            ),
+            false
+        ));
+    }
+
+    #[test]
+    fn hysteria2_cpu_pressure_detects_sustained_host_load() {
+        assert!(!hy2_cpu_pressure_from_load_percent_x100_with_threshold(
+            Some(470 * 100),
+            4,
+            120
+        ));
+        assert!(hy2_cpu_pressure_from_load_percent_x100_with_threshold(
+            Some(490 * 100),
+            4,
+            120
+        ));
+        assert!(hy2_cpu_pressure_from_load_percent_x100_with_threshold(
+            Some(121 * 100),
+            1,
+            120
+        ));
+        assert!(!hy2_cpu_pressure_from_load_percent_x100_with_threshold(
+            None, 4, 120
+        ));
     }
 
     #[test]
