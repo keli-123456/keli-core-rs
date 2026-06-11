@@ -72,6 +72,7 @@ const DEFAULT_HY2_RELAY_IO_TIMEOUT_SECS: u64 = 15;
 const HY2_CPU_PRESSURE_BACKOFF_LOAD_PERCENT_ENV: &str =
     "KELI_CORE_HY2_CPU_PRESSURE_BACKOFF_LOAD_PERCENT";
 const DEFAULT_HY2_CPU_PRESSURE_BACKOFF_LOAD_PERCENT: u64 = 120;
+const HY2_CPU_PRESSURE_AUTH_TIMEOUT_MIN_SECS: u64 = 5;
 const HY2_SOFTWARE_BANDWIDTH_LIMIT_MAX_MBPS_ENV: &str =
     "KELI_CORE_HY2_SOFTWARE_BANDWIDTH_LIMIT_MAX_MBPS";
 const DEFAULT_HY2_SOFTWARE_BANDWIDTH_LIMIT_MAX_MBPS: u32 = 200;
@@ -84,6 +85,11 @@ static HY2_UDP_SESSION_LIMIT: OnceLock<usize> = OnceLock::new();
 struct Hy2ConnectionPermit {
     _global: QuicConnectionPermit,
     _listener: OwnedSemaphorePermit,
+}
+
+struct Hy2PreauthPermit {
+    slot: OwnedSemaphorePermit,
+    auth_timeout: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -327,23 +333,42 @@ impl Hysteria2Server {
         })
     }
 
-    fn try_acquire_preauth_slot(&self) -> Option<OwnedSemaphorePermit> {
+    fn try_acquire_preauth_slot(&self) -> Option<Hy2PreauthPermit> {
         let active = self
             .preauth_connection_limit
             .saturating_sub(self.preauth_connections.available_permits());
-        if active >= hy2_preauth_cpu_pressure_limit(self.preauth_connection_limit)
+        let pressure_limit = hy2_preauth_cpu_pressure_limit(self.preauth_connection_limit);
+        let under_preauth_pressure = active >= pressure_limit;
+        let cpu_count = available_parallelism_count();
+        let load_percent_x100 = under_preauth_pressure
+            .then(proc_loadavg_1m_percent_x100)
+            .flatten();
+        if under_preauth_pressure
             && !hy2_preauth_cpu_pressure_allows(
                 active,
                 hy2_preauth_cpu_pressure_limit_from_load_percent_x100(
-                    proc_loadavg_1m_percent_x100(),
+                    load_percent_x100,
                     self.preauth_connection_limit,
-                    available_parallelism_count(),
+                    cpu_count,
                 ),
             )
         {
             return None;
         }
-        self.preauth_connections.clone().try_acquire_owned().ok()
+        let auth_timeout = if under_preauth_pressure {
+            hy2_auth_timeout_from_load_percent_x100(
+                hy2_auth_timeout(),
+                load_percent_x100,
+                cpu_count,
+            )
+        } else {
+            hy2_auth_timeout()
+        };
+        self.preauth_connections
+            .clone()
+            .try_acquire_owned()
+            .ok()
+            .map(|slot| Hy2PreauthPermit { slot, auth_timeout })
     }
 
     fn log_preauth_limit_reached(&self) {
@@ -388,7 +413,7 @@ impl Hysteria2Server {
     async fn handle_incoming(
         &self,
         incoming: quinn::Incoming,
-        preauth_slot: OwnedSemaphorePermit,
+        preauth_slot: Hy2PreauthPermit,
     ) -> io::Result<()> {
         let client_ip = incoming.remote_address().ip();
         if self.router.source_ip_blocked(Some(client_ip)) {
@@ -404,7 +429,8 @@ impl Hysteria2Server {
         }
 
         let connecting = incoming.accept().map_err(io_other)?;
-        let connection = match tokio::time::timeout(hy2_auth_timeout(), connecting).await {
+        let auth_timeout = preauth_slot.auth_timeout;
+        let connection = match tokio::time::timeout(auth_timeout, connecting).await {
             Ok(Ok(connection)) => connection,
             Ok(Err(error)) => return Err(io_other(error)),
             Err(_) => {
@@ -421,9 +447,7 @@ impl Hysteria2Server {
         };
 
         let auth =
-            match tokio::time::timeout(hy2_auth_timeout(), self.authenticate_http3(&connection))
-                .await
-            {
+            match tokio::time::timeout(auth_timeout, self.authenticate_http3(&connection)).await {
                 Ok(Ok(auth)) => {
                     self.auth_backoff.record_success(client_ip);
                     auth
@@ -452,7 +476,7 @@ impl Hysteria2Server {
                     return Err(error);
                 }
             };
-        drop(preauth_slot);
+        drop(preauth_slot.slot);
         let _session = self.acquire_user_session(auth.user.as_ref(), Some(client_ip))?;
         let bandwidth = self.connection_limiters(
             self.bandwidth.limiter_for(Some(auth.user.as_ref())),
@@ -1942,6 +1966,54 @@ where
 
 fn hy2_auth_timeout() -> Duration {
     env_duration_seconds(HY2_AUTH_TIMEOUT_SECS_ENV, DEFAULT_HY2_AUTH_TIMEOUT_SECS)
+}
+
+fn hy2_auth_timeout_from_load_percent_x100(
+    base_timeout: Duration,
+    load_percent_x100: Option<u64>,
+    cpu_count: usize,
+) -> Duration {
+    hy2_auth_timeout_from_load_percent_x100_with_threshold(
+        base_timeout,
+        load_percent_x100,
+        cpu_count,
+        hy2_cpu_pressure_threshold_percent(),
+    )
+}
+
+fn hy2_auth_timeout_from_load_percent_x100_with_threshold(
+    base_timeout: Duration,
+    load_percent_x100: Option<u64>,
+    cpu_count: usize,
+    per_cpu_threshold_percent: u64,
+) -> Duration {
+    let Some(per_cpu_load) = hy2_load_per_cpu_percent_x100(load_percent_x100, cpu_count) else {
+        return base_timeout;
+    };
+    let hot_threshold = hy2_cpu_pressure_threshold_percent_x100(per_cpu_threshold_percent);
+    let mid_threshold = hot_threshold.saturating_mul(7) / 8;
+    let warm_threshold = hot_threshold.saturating_mul(3) / 4;
+
+    if per_cpu_load >= hot_threshold {
+        hy2_scaled_auth_timeout(base_timeout, 1, 2)
+    } else if per_cpu_load >= mid_threshold {
+        hy2_scaled_auth_timeout(base_timeout, 3, 5)
+    } else if per_cpu_load >= warm_threshold {
+        hy2_scaled_auth_timeout(base_timeout, 3, 4)
+    } else {
+        base_timeout
+    }
+}
+
+fn hy2_scaled_auth_timeout(base_timeout: Duration, numerator: u64, denominator: u64) -> Duration {
+    let base_secs = base_timeout.as_secs().max(1);
+    let denominator = denominator.max(1);
+    let scaled_secs = base_secs
+        .saturating_mul(numerator)
+        .saturating_add(denominator - 1)
+        / denominator;
+    let min_secs = HY2_CPU_PRESSURE_AUTH_TIMEOUT_MIN_SECS.min(base_secs);
+    Duration::from_secs(scaled_secs.max(min_secs).min(base_secs))
 }
 
 fn hy2_preauth_connection_limit(listener_connection_limit: usize) -> usize {
@@ -3843,6 +3915,40 @@ mod tests {
                 120
             ),
             16
+        );
+    }
+
+    #[test]
+    fn hysteria2_cpu_pressure_shortens_preauth_timeout_gradually() {
+        let base = Duration::from_secs(10);
+        assert_eq!(
+            hy2_auth_timeout_from_load_percent_x100_with_threshold(base, None, 4, 120),
+            base
+        );
+        assert_eq!(
+            hy2_auth_timeout_from_load_percent_x100_with_threshold(base, Some(350 * 100), 4, 120),
+            base
+        );
+        assert_eq!(
+            hy2_auth_timeout_from_load_percent_x100_with_threshold(base, Some(365 * 100), 4, 120),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            hy2_auth_timeout_from_load_percent_x100_with_threshold(base, Some(430 * 100), 4, 120),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            hy2_auth_timeout_from_load_percent_x100_with_threshold(base, Some(490 * 100), 4, 120),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            hy2_auth_timeout_from_load_percent_x100_with_threshold(
+                Duration::from_secs(4),
+                Some(490 * 100),
+                4,
+                120
+            ),
+            Duration::from_secs(4)
         );
     }
 
