@@ -68,6 +68,22 @@ const LOW_LOAD_MEMORY_TRIM_LOAD_DROP_STABLE_SECS: u64 = 30;
 const LOW_LOAD_MEMORY_TRIM_LOAD_DROP_COOLDOWN_SECS: u64 = 120;
 #[cfg(not(test))]
 const LOW_LOAD_MEMORY_TRIM_MAX_CPU_PERCENT: u64 = 90;
+#[cfg(not(test))]
+const LOW_LOAD_MEMORY_TRIM_PRESSURE_STABLE_SECS: u64 = 30;
+#[cfg(not(test))]
+const LOW_LOAD_MEMORY_TRIM_PRESSURE_COOLDOWN_SECS: u64 = 60;
+#[cfg(not(test))]
+const LOW_LOAD_MEMORY_TRIM_PRESSURE_AVAILABLE_PERCENT: u64 = 15;
+#[cfg(not(test))]
+const LOW_LOAD_MEMORY_TRIM_PRESSURE_CRITICAL_AVAILABLE_PERCENT: u64 = 8;
+#[cfg(not(test))]
+const LOW_LOAD_MEMORY_TRIM_PRESSURE_RSS_PERCENT: u64 = 45;
+#[cfg(not(test))]
+const LOW_LOAD_MEMORY_TRIM_PRESSURE_CGROUP_PERCENT: u64 = 70;
+#[cfg(not(test))]
+const LOW_LOAD_MEMORY_TRIM_PRESSURE_LOAD_DROP_PERCENT: u64 = 25;
+#[cfg(not(test))]
+const LOW_LOAD_MEMORY_TRIM_PRESSURE_MAX_ROUNDS: u8 = 3;
 const TCP_RELAY_UPLINK_ONLY_TIMEOUT_ENV: &str = "KELI_CORE_TCP_RELAY_UPLINK_ONLY_TIMEOUT_SECS";
 const TCP_RELAY_DOWNLINK_ONLY_TIMEOUT_ENV: &str = "KELI_CORE_TCP_RELAY_DOWNLINK_ONLY_TIMEOUT_SECS";
 const TCP_RELAY_DEFAULT_UPLINK_ONLY_TIMEOUT_SECS: u64 = 5;
@@ -246,6 +262,14 @@ struct LowLoadMemoryTrimTuning {
     load_drop_stable_secs: u64,
     load_drop_cooldown_secs: u64,
     max_cpu_percent_x100: u64,
+    pressure_stable_secs: u64,
+    pressure_cooldown_secs: u64,
+    pressure_available_percent: u64,
+    pressure_critical_available_percent: u64,
+    pressure_rss_percent: u64,
+    pressure_cgroup_percent: u64,
+    pressure_load_drop_percent: u64,
+    pressure_max_rounds: u8,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -256,12 +280,33 @@ struct LowLoadMemoryTrimLoad {
     native_pending: usize,
     rss_kib: Option<u64>,
     cpu_percent_x100: Option<u64>,
+    cpu_count: usize,
+    memory_total_kib: Option<u64>,
+    memory_available_kib: Option<u64>,
+    swap_used_kib: Option<u64>,
+    cgroup_memory_current_kib: Option<u64>,
+    cgroup_memory_peak_kib: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LowLoadMemoryTrimReason {
     LowLoad,
     LoadDrop,
+    MemoryPressure,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LowLoadMemoryPressure {
+    None,
+    Moderate,
+    High,
+    Critical,
+}
+
+impl Default for LowLoadMemoryPressure {
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 #[cfg(not(test))]
@@ -270,6 +315,19 @@ impl LowLoadMemoryTrimReason {
         match self {
             Self::LowLoad => "low_load",
             Self::LoadDrop => "load_drop",
+            Self::MemoryPressure => "memory_pressure",
+        }
+    }
+}
+
+#[cfg(not(test))]
+impl LowLoadMemoryPressure {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Moderate => "moderate",
+            Self::High => "high",
+            Self::Critical => "critical",
         }
     }
 }
@@ -284,6 +342,13 @@ struct LowLoadMemoryTrimDecision {
     native_pending: usize,
     rss_kib: Option<u64>,
     cpu_percent_x100: Option<u64>,
+    cpu_capacity_percent_x100: Option<u64>,
+    memory_pressure: LowLoadMemoryPressure,
+    memory_total_kib: Option<u64>,
+    memory_available_kib: Option<u64>,
+    swap_used_kib: Option<u64>,
+    cgroup_memory_current_kib: Option<u64>,
+    cgroup_memory_peak_kib: Option<u64>,
     stable_secs: u64,
     cooldown_secs: u64,
 }
@@ -292,8 +357,10 @@ struct LowLoadMemoryTrimDecision {
 struct LowLoadMemoryTrimState {
     low_since_secs: Option<u64>,
     drop_since_secs: Option<u64>,
+    pressure_since_secs: Option<u64>,
     last_trim_secs: u64,
     peak_relays: usize,
+    pressure_trim_rounds: u8,
 }
 
 #[cfg(not(test))]
@@ -634,8 +701,10 @@ fn emit_low_load_memory_trim_log(
         concat!(
             "INFO  core   memory adaptive trim reason={} ",
             "active_relays={} peak_relays={} native_workers={} native_idle={} ",
-            "native_pending={} cpu_percent={} rss_before_kib={} rss_after_kib={} ",
-            "stable_secs={} cooldown_secs={}"
+            "native_pending={} cpu_percent={} cpu_capacity_percent={} ",
+            "pressure={} rss_before_kib={} rss_after_kib={} mem_total_kib={} ",
+            "mem_available_kib={} swap_used_kib={} cgroup_current_kib={} ",
+            "cgroup_peak_kib={} stable_secs={} cooldown_secs={}"
         ),
         decision.reason.as_str(),
         decision.active_relays,
@@ -644,8 +713,15 @@ fn emit_low_load_memory_trim_log(
         decision.native_idle,
         decision.native_pending,
         format_percent_x100(decision.cpu_percent_x100),
+        format_percent_x100(decision.cpu_capacity_percent_x100),
+        decision.memory_pressure.as_str(),
         format_optional_u64(rss_before),
         format_optional_u64(rss_after),
+        format_optional_u64(decision.memory_total_kib),
+        format_optional_u64(decision.memory_available_kib),
+        format_optional_u64(decision.swap_used_kib),
+        format_optional_u64(decision.cgroup_memory_current_kib),
+        format_optional_u64(decision.cgroup_memory_peak_kib),
         decision.stable_secs,
         decision.cooldown_secs
     ));
@@ -657,6 +733,7 @@ fn low_load_memory_trim_load_snapshot(cpu_percent_x100: Option<u64>) -> LowLoadM
     let active_relays = sum_metric_counts(&snapshot.active_native)
         .saturating_add(sum_metric_counts(&snapshot.active_async))
         .saturating_add(sum_metric_counts(&snapshot.active_detached_blocking));
+    let memory = memory_trim_resource_snapshot();
 
     LowLoadMemoryTrimLoad {
         active_relays,
@@ -665,6 +742,12 @@ fn low_load_memory_trim_load_snapshot(cpu_percent_x100: Option<u64>) -> LowLoadM
         native_pending: snapshot.native_pending_count,
         rss_kib: process_rss_kib(),
         cpu_percent_x100,
+        cpu_count: available_parallelism_count(),
+        memory_total_kib: memory.total_kib,
+        memory_available_kib: memory.available_kib,
+        swap_used_kib: memory.swap_used_kib,
+        cgroup_memory_current_kib: memory.cgroup_current_kib,
+        cgroup_memory_peak_kib: memory.cgroup_peak_kib,
     }
 }
 
@@ -682,8 +765,17 @@ impl LowLoadMemoryTrimState {
         load: LowLoadMemoryTrimLoad,
         tuning: LowLoadMemoryTrimTuning,
     ) -> Option<LowLoadMemoryTrimDecision> {
-        self.peak_relays = self.peak_relays.max(load.active_relays);
+        if load.active_relays > self.peak_relays {
+            self.peak_relays = load.active_relays;
+            self.pressure_trim_rounds = 0;
+        }
 
+        let memory_pressure = load.memory_pressure(tuning);
+        let pressure_eligible = load.is_memory_pressure_trim(self.peak_relays, tuning);
+        if !pressure_eligible {
+            self.pressure_since_secs = None;
+            self.pressure_trim_rounds = 0;
+        }
         let load_drop_eligible = load.is_load_drop(self.peak_relays, tuning);
         if !load_drop_eligible {
             self.drop_since_secs = None;
@@ -691,6 +783,29 @@ impl LowLoadMemoryTrimState {
         let low_load_eligible = load.is_low(tuning);
         if !low_load_eligible {
             self.low_since_secs = None;
+        }
+
+        if pressure_eligible && self.pressure_trim_rounds < tuning.pressure_max_rounds {
+            let pressure_since = match self.pressure_since_secs {
+                Some(value) => value,
+                None => {
+                    self.pressure_since_secs = Some(now_secs);
+                    now_secs
+                }
+            };
+            let stable_secs = now_secs.saturating_sub(pressure_since);
+            if stable_secs >= tuning.pressure_stable_secs
+                && self.cooldown_elapsed(now_secs, tuning.pressure_cooldown_secs)
+            {
+                return Some(self.record_decision(
+                    now_secs,
+                    load,
+                    tuning.pressure_cooldown_secs,
+                    stable_secs,
+                    LowLoadMemoryTrimReason::MemoryPressure,
+                    memory_pressure,
+                ));
+            }
         }
 
         if load_drop_eligible {
@@ -711,6 +826,7 @@ impl LowLoadMemoryTrimState {
                     tuning.load_drop_cooldown_secs,
                     stable_secs,
                     LowLoadMemoryTrimReason::LoadDrop,
+                    memory_pressure,
                 ));
             }
         }
@@ -744,6 +860,7 @@ impl LowLoadMemoryTrimState {
             tuning.cooldown_secs,
             stable_secs,
             LowLoadMemoryTrimReason::LowLoad,
+            memory_pressure,
         ))
     }
 
@@ -758,6 +875,7 @@ impl LowLoadMemoryTrimState {
         cooldown_secs: u64,
         stable_secs: u64,
         reason: LowLoadMemoryTrimReason,
+        memory_pressure: LowLoadMemoryPressure,
     ) -> LowLoadMemoryTrimDecision {
         let decision = LowLoadMemoryTrimDecision {
             reason,
@@ -768,13 +886,27 @@ impl LowLoadMemoryTrimState {
             native_pending: load.native_pending,
             rss_kib: load.rss_kib,
             cpu_percent_x100: load.cpu_percent_x100,
+            cpu_capacity_percent_x100: load.cpu_capacity_percent_x100(),
+            memory_pressure,
+            memory_total_kib: load.memory_total_kib,
+            memory_available_kib: load.memory_available_kib,
+            swap_used_kib: load.swap_used_kib,
+            cgroup_memory_current_kib: load.cgroup_memory_current_kib,
+            cgroup_memory_peak_kib: load.cgroup_memory_peak_kib,
             stable_secs,
             cooldown_secs,
         };
         self.last_trim_secs = now_secs;
         self.low_since_secs = Some(now_secs);
         self.drop_since_secs = None;
-        self.peak_relays = load.active_relays;
+        if reason == LowLoadMemoryTrimReason::MemoryPressure {
+            self.pressure_trim_rounds = self.pressure_trim_rounds.saturating_add(1);
+            self.pressure_since_secs = Some(now_secs);
+        } else {
+            self.pressure_since_secs = None;
+            self.pressure_trim_rounds = 0;
+            self.peak_relays = load.active_relays;
+        }
         decision
     }
 }
@@ -799,16 +931,96 @@ impl LowLoadMemoryTrimLoad {
             >= (peak_relays as u128).saturating_mul(tuning.load_drop_percent as u128)
     }
 
+    fn is_memory_pressure_trim(self, peak_relays: usize, tuning: LowLoadMemoryTrimTuning) -> bool {
+        if !self.cpu_allows(tuning) || self.native_pending != 0 {
+            return false;
+        }
+        let pressure = self.memory_pressure(tuning);
+        if !matches!(
+            pressure,
+            LowLoadMemoryPressure::High | LowLoadMemoryPressure::Critical
+        ) {
+            return false;
+        }
+        if peak_relays < tuning.peak_relay_min {
+            return self.is_low(tuning);
+        }
+        self.relay_drop_percent(peak_relays)
+            .map(|drop| drop >= tuning.pressure_load_drop_percent)
+            .unwrap_or(false)
+            || self.active_relays <= tuning.active_relay_soft_limit.saturating_mul(4)
+    }
+
     fn cpu_allows(self, tuning: LowLoadMemoryTrimTuning) -> bool {
         self.cpu_percent_x100
-            .map(|percent| percent <= tuning.max_cpu_percent_x100)
+            .map(|percent| {
+                let allowed =
+                    (self.cpu_count.max(1) as u64).saturating_mul(tuning.max_cpu_percent_x100);
+                percent <= allowed
+            })
             .unwrap_or(true)
+    }
+
+    fn cpu_capacity_percent_x100(self) -> Option<u64> {
+        let cpu_count = self.cpu_count.max(1) as u64;
+        self.cpu_percent_x100.map(|percent| percent / cpu_count)
     }
 
     fn rss_high_enough(self, tuning: LowLoadMemoryTrimTuning) -> bool {
         self.rss_kib
             .map(|rss_kib| rss_kib >= tuning.min_rss_kib)
             .unwrap_or(false)
+    }
+
+    fn memory_pressure(self, tuning: LowLoadMemoryTrimTuning) -> LowLoadMemoryPressure {
+        let total_kib = match self.memory_total_kib.filter(|value| *value > 0) {
+            Some(value) => value,
+            None => return LowLoadMemoryPressure::None,
+        };
+        let available_percent = self
+            .memory_available_kib
+            .map(|available| percent_floor(available, total_kib));
+        let rss_percent = self.rss_kib.map(|rss| percent_floor(rss, total_kib));
+        let cgroup_percent = self
+            .cgroup_memory_current_kib
+            .map(|current| percent_floor(current, total_kib));
+        let swap_used = self.swap_used_kib.unwrap_or(0);
+
+        let available_critical = available_percent
+            .map(|percent| percent <= tuning.pressure_critical_available_percent)
+            .unwrap_or(false);
+        let available_low = available_percent
+            .map(|percent| percent <= tuning.pressure_available_percent)
+            .unwrap_or(false);
+        let rss_high = rss_percent
+            .map(|percent| percent >= tuning.pressure_rss_percent)
+            .unwrap_or(false);
+        let cgroup_high = cgroup_percent
+            .map(|percent| percent >= tuning.pressure_cgroup_percent)
+            .unwrap_or(false);
+        let swap_active = swap_used > 0;
+
+        if available_critical && (rss_high || cgroup_high || swap_active) {
+            return LowLoadMemoryPressure::Critical;
+        }
+        if (available_low && (rss_high || cgroup_high || swap_active))
+            || (swap_active && (rss_high || cgroup_high))
+            || (rss_high && cgroup_high)
+        {
+            return LowLoadMemoryPressure::High;
+        }
+        if available_low || rss_high || cgroup_high || swap_active {
+            return LowLoadMemoryPressure::Moderate;
+        }
+        LowLoadMemoryPressure::None
+    }
+
+    fn relay_drop_percent(self, peak_relays: usize) -> Option<u64> {
+        if peak_relays == 0 || self.active_relays >= peak_relays {
+            return None;
+        }
+        let dropped = peak_relays.saturating_sub(self.active_relays) as u128;
+        Some((dropped.saturating_mul(100) / peak_relays as u128).min(u64::MAX as u128) as u64)
     }
 }
 
@@ -857,8 +1069,38 @@ fn low_load_memory_trim_tuning_from_env() -> LowLoadMemoryTrimTuning {
             .clamp(30, 7_200),
         max_cpu_percent_x100: env_u64("KELI_CORE_LOW_LOAD_MEMORY_TRIM_MAX_CPU_PERCENT")
             .unwrap_or(LOW_LOAD_MEMORY_TRIM_MAX_CPU_PERCENT)
-            .clamp(1, 10_000)
+            .clamp(1, 100)
             .saturating_mul(100),
+        pressure_stable_secs: env_u64("KELI_CORE_LOW_LOAD_MEMORY_TRIM_PRESSURE_STABLE_SECS")
+            .unwrap_or(LOW_LOAD_MEMORY_TRIM_PRESSURE_STABLE_SECS)
+            .clamp(10, 3_600),
+        pressure_cooldown_secs: env_u64("KELI_CORE_LOW_LOAD_MEMORY_TRIM_PRESSURE_COOLDOWN_SECS")
+            .unwrap_or(LOW_LOAD_MEMORY_TRIM_PRESSURE_COOLDOWN_SECS)
+            .clamp(20, 7_200),
+        pressure_available_percent: env_u64(
+            "KELI_CORE_LOW_LOAD_MEMORY_TRIM_PRESSURE_AVAILABLE_PERCENT",
+        )
+        .unwrap_or(LOW_LOAD_MEMORY_TRIM_PRESSURE_AVAILABLE_PERCENT)
+        .clamp(1, 90),
+        pressure_critical_available_percent: env_u64(
+            "KELI_CORE_LOW_LOAD_MEMORY_TRIM_PRESSURE_CRITICAL_AVAILABLE_PERCENT",
+        )
+        .unwrap_or(LOW_LOAD_MEMORY_TRIM_PRESSURE_CRITICAL_AVAILABLE_PERCENT)
+        .clamp(1, 90),
+        pressure_rss_percent: env_u64("KELI_CORE_LOW_LOAD_MEMORY_TRIM_PRESSURE_RSS_PERCENT")
+            .unwrap_or(LOW_LOAD_MEMORY_TRIM_PRESSURE_RSS_PERCENT)
+            .clamp(1, 100),
+        pressure_cgroup_percent: env_u64("KELI_CORE_LOW_LOAD_MEMORY_TRIM_PRESSURE_CGROUP_PERCENT")
+            .unwrap_or(LOW_LOAD_MEMORY_TRIM_PRESSURE_CGROUP_PERCENT)
+            .clamp(1, 100),
+        pressure_load_drop_percent: env_u64(
+            "KELI_CORE_LOW_LOAD_MEMORY_TRIM_PRESSURE_LOAD_DROP_PERCENT",
+        )
+        .unwrap_or(LOW_LOAD_MEMORY_TRIM_PRESSURE_LOAD_DROP_PERCENT)
+        .clamp(5, 95),
+        pressure_max_rounds: env_u64("KELI_CORE_LOW_LOAD_MEMORY_TRIM_PRESSURE_MAX_ROUNDS")
+            .unwrap_or(LOW_LOAD_MEMORY_TRIM_PRESSURE_MAX_ROUNDS as u64)
+            .clamp(1, 10) as u8,
     }
 }
 
@@ -879,11 +1121,64 @@ fn env_usize(name: &str) -> Option<usize> {
 }
 
 #[cfg(not(test))]
+#[derive(Clone, Copy, Debug, Default)]
+struct MemoryTrimResourceSnapshot {
+    total_kib: Option<u64>,
+    available_kib: Option<u64>,
+    swap_used_kib: Option<u64>,
+    cgroup_current_kib: Option<u64>,
+    cgroup_peak_kib: Option<u64>,
+}
+
+#[cfg(not(test))]
 fn process_rss_kib() -> Option<u64> {
     parse_proc_status_kib(
         &std::fs::read_to_string("/proc/self/status").ok()?,
         "VmRSS:",
     )
+}
+
+#[cfg(not(test))]
+fn memory_trim_resource_snapshot() -> MemoryTrimResourceSnapshot {
+    let meminfo = proc_meminfo_snapshot();
+    let memory_limit_kib = memory_limit_mib().map(|mib| (mib as u64).saturating_mul(1024));
+    MemoryTrimResourceSnapshot {
+        total_kib: memory_limit_kib.or(meminfo.and_then(|snapshot| snapshot.mem_total_kib)),
+        available_kib: meminfo.and_then(|snapshot| snapshot.mem_available_kib),
+        swap_used_kib: meminfo.and_then(|snapshot| snapshot.swap_used_kib()),
+        cgroup_current_kib: cgroup_memory_kib("/sys/fs/cgroup/memory.current"),
+        cgroup_peak_kib: cgroup_memory_kib("/sys/fs/cgroup/memory.peak"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ProcMeminfoSnapshot {
+    mem_total_kib: Option<u64>,
+    mem_available_kib: Option<u64>,
+    swap_total_kib: Option<u64>,
+    swap_free_kib: Option<u64>,
+}
+
+impl ProcMeminfoSnapshot {
+    fn swap_used_kib(self) -> Option<u64> {
+        Some(
+            self.swap_total_kib?
+                .saturating_sub(self.swap_free_kib.unwrap_or(0)),
+        )
+    }
+}
+
+#[cfg(not(test))]
+fn proc_meminfo_snapshot() -> Option<ProcMeminfoSnapshot> {
+    Some(parse_proc_meminfo_snapshot(
+        &std::fs::read_to_string("/proc/meminfo").ok()?,
+    ))
+}
+
+#[cfg(not(test))]
+fn cgroup_memory_kib(path: &str) -> Option<u64> {
+    let value = std::fs::read_to_string(path).ok()?;
+    parse_cgroup_memory_kib(&value)
 }
 
 #[cfg(not(test))]
@@ -930,11 +1225,43 @@ fn total_cpu_ticks(stat: &str) -> Option<u64> {
     Some(total)
 }
 
+fn parse_proc_meminfo_snapshot(content: &str) -> ProcMeminfoSnapshot {
+    ProcMeminfoSnapshot {
+        mem_total_kib: parse_proc_meminfo_kib(content, "MemTotal:"),
+        mem_available_kib: parse_proc_meminfo_kib(content, "MemAvailable:"),
+        swap_total_kib: parse_proc_meminfo_kib(content, "SwapTotal:"),
+        swap_free_kib: parse_proc_meminfo_kib(content, "SwapFree:"),
+    }
+}
+
+fn parse_proc_meminfo_kib(content: &str, key: &str) -> Option<u64> {
+    let line = content
+        .lines()
+        .find(|line| line.trim_start().starts_with(key))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn parse_cgroup_memory_kib(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("max") {
+        return None;
+    }
+    let bytes = trimmed.parse::<u64>().ok()?;
+    Some(bytes / 1024)
+}
+
 fn parse_proc_status_kib(status: &str, key: &str) -> Option<u64> {
     let line = status
         .lines()
         .find(|line| line.trim_start().starts_with(key))?;
     line.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn percent_floor(value: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    ((value as u128).saturating_mul(100) / total as u128).min(u64::MAX as u128) as u64
 }
 
 #[cfg(not(test))]
@@ -2268,6 +2595,33 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_memory_trim_scales_cpu_budget_with_core_count() {
+        let tuning = low_load_memory_trim_test_tuning();
+        let mut state = super::LowLoadMemoryTrimState::default();
+
+        assert_eq!(
+            state.observe(
+                10,
+                low_load_memory_trim_test_load_with_cpu(1_000, 0, Some(70 * 100)),
+                tuning,
+            ),
+            None
+        );
+
+        let mut load = low_load_memory_trim_test_load_with_cpu(500, 0, Some(150 * 100));
+        load.cpu_count = 4;
+        assert_eq!(state.observe(20, load, tuning), None);
+
+        let mut load = low_load_memory_trim_test_load_with_cpu(500, 0, Some(150 * 100));
+        load.cpu_count = 4;
+        let decision = state
+            .observe(50, load, tuning)
+            .expect("150 percent process CPU should fit inside a 4-core CPU budget");
+        assert_eq!(decision.reason, super::LowLoadMemoryTrimReason::LoadDrop);
+        assert_eq!(decision.cpu_capacity_percent_x100, Some(37 * 100 + 50));
+    }
+
+    #[test]
     fn adaptive_memory_trim_ignores_small_load_drops() {
         let tuning = low_load_memory_trim_test_tuning();
         let mut state = super::LowLoadMemoryTrimState::default();
@@ -2289,6 +2643,132 @@ mod tests {
             None,
             "30 percent drop should not pass the default 40 percent threshold"
         );
+    }
+
+    #[test]
+    fn adaptive_memory_pressure_trim_uses_resource_percentages() {
+        let tuning = low_load_memory_trim_test_tuning();
+        let mut state = super::LowLoadMemoryTrimState::default();
+
+        assert_eq!(
+            state.observe(
+                10,
+                low_load_memory_trim_test_load_with_cpu(2_000, 0, Some(120 * 100)),
+                tuning,
+            ),
+            None
+        );
+
+        let mut load = low_load_memory_trim_test_load_with_cpu(1_000, 0, Some(150 * 100));
+        load.cpu_count = 4;
+        load.rss_kib = Some(9 * 1024 * 1024);
+        load.memory_total_kib = Some(16 * 1024 * 1024);
+        load.memory_available_kib = Some(2 * 1024 * 1024);
+        load.swap_used_kib = Some(256 * 1024);
+        load.cgroup_memory_current_kib = Some(11 * 1024 * 1024);
+        assert_eq!(
+            load.memory_pressure(tuning),
+            super::LowLoadMemoryPressure::High
+        );
+        assert_eq!(state.observe(20, load, tuning), None);
+
+        let decision = state
+            .observe(50, load, tuning)
+            .expect("sustained proportional memory pressure should trim");
+        assert_eq!(
+            decision.reason,
+            super::LowLoadMemoryTrimReason::MemoryPressure
+        );
+        assert_eq!(decision.memory_pressure, super::LowLoadMemoryPressure::High);
+        assert_eq!(decision.memory_total_kib, Some(16 * 1024 * 1024));
+        assert_eq!(decision.memory_available_kib, Some(2 * 1024 * 1024));
+        assert_eq!(decision.cpu_capacity_percent_x100, Some(37 * 100 + 50));
+    }
+
+    #[test]
+    fn adaptive_memory_pressure_waits_for_relay_drop() {
+        let tuning = low_load_memory_trim_test_tuning();
+        let mut state = super::LowLoadMemoryTrimState::default();
+
+        let mut peak = low_load_memory_trim_test_load_with_cpu(2_000, 0, Some(80 * 100));
+        peak.cpu_count = 4;
+        assert_eq!(state.observe(10, peak, tuning), None);
+
+        let mut still_hot = low_load_memory_trim_test_load_with_cpu(1_800, 0, Some(80 * 100));
+        still_hot.cpu_count = 4;
+        still_hot.rss_kib = Some(9 * 1024 * 1024);
+        still_hot.memory_total_kib = Some(16 * 1024 * 1024);
+        still_hot.memory_available_kib = Some(1 * 1024 * 1024);
+        still_hot.swap_used_kib = Some(128 * 1024);
+        still_hot.cgroup_memory_current_kib = Some(11 * 1024 * 1024);
+
+        assert_eq!(
+            state.observe(100, still_hot, tuning),
+            None,
+            "memory pressure should not trim while relay load barely fell"
+        );
+    }
+
+    #[test]
+    fn adaptive_memory_pressure_limits_burst_rounds() {
+        let mut tuning = low_load_memory_trim_test_tuning();
+        tuning.pressure_max_rounds = 2;
+        let mut state = super::LowLoadMemoryTrimState::default();
+
+        assert_eq!(
+            state.observe(
+                10,
+                low_load_memory_trim_test_load_with_cpu(2_000, 0, Some(80 * 100)),
+                tuning,
+            ),
+            None
+        );
+
+        let mut load = low_load_memory_trim_test_load_with_cpu(1_000, 0, Some(80 * 100));
+        load.cpu_count = 4;
+        load.rss_kib = Some(9 * 1024 * 1024);
+        load.memory_total_kib = Some(16 * 1024 * 1024);
+        load.memory_available_kib = Some(1 * 1024 * 1024);
+        load.swap_used_kib = Some(128 * 1024);
+        load.cgroup_memory_current_kib = Some(11 * 1024 * 1024);
+
+        assert_eq!(state.observe(20, load, tuning), None);
+        assert_eq!(
+            state
+                .observe(50, load, tuning)
+                .expect("first pressure trim")
+                .reason,
+            super::LowLoadMemoryTrimReason::MemoryPressure
+        );
+        assert_eq!(state.observe(80, load, tuning), None);
+        assert_eq!(
+            state
+                .observe(110, load, tuning)
+                .expect("second pressure trim")
+                .reason,
+            super::LowLoadMemoryTrimReason::MemoryPressure
+        );
+        assert_eq!(
+            state.observe(170, load, tuning),
+            None,
+            "pressure trim should stop after the configured burst rounds"
+        );
+    }
+
+    #[test]
+    fn parses_memory_resource_files() {
+        let meminfo = concat!(
+            "MemTotal:       4000000 kB\n",
+            "MemAvailable:   800000 kB\n",
+            "SwapTotal:      1000000 kB\n",
+            "SwapFree:        750000 kB\n"
+        );
+        let snapshot = super::parse_proc_meminfo_snapshot(meminfo);
+        assert_eq!(snapshot.mem_total_kib, Some(4_000_000));
+        assert_eq!(snapshot.mem_available_kib, Some(800_000));
+        assert_eq!(snapshot.swap_used_kib(), Some(250_000));
+        assert_eq!(super::parse_cgroup_memory_kib("1048576\n"), Some(1024));
+        assert_eq!(super::parse_cgroup_memory_kib("max\n"), None);
     }
 
     #[test]
@@ -3101,6 +3581,14 @@ mod tests {
             load_drop_stable_secs: 30,
             load_drop_cooldown_secs: 120,
             max_cpu_percent_x100: 90 * 100,
+            pressure_stable_secs: 30,
+            pressure_cooldown_secs: 60,
+            pressure_available_percent: 15,
+            pressure_critical_available_percent: 8,
+            pressure_rss_percent: 45,
+            pressure_cgroup_percent: 70,
+            pressure_load_drop_percent: 25,
+            pressure_max_rounds: 3,
         }
     }
 
@@ -3126,6 +3614,12 @@ mod tests {
             native_pending,
             rss_kib: None,
             cpu_percent_x100,
+            cpu_count: 1,
+            memory_total_kib: None,
+            memory_available_kib: None,
+            swap_used_kib: None,
+            cgroup_memory_current_kib: None,
+            cgroup_memory_peak_kib: None,
         }
     }
 }
