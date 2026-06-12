@@ -3,7 +3,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -43,6 +43,9 @@ const ATYP_IPV6: u8 = 0x02;
 const ATYP_NONE: u8 = 0xff;
 const UDP_DATAGRAM_BUFFER_SIZE: usize = 1024 * 1024;
 const UDP_PACKET_BUFFER_SIZE: usize = 64 * 1024;
+const UDP_FRAGMENT_IDLE_TIMEOUT_MS: u64 = 10_000;
+const UDP_MAX_FRAGMENT_SETS: usize = 4096;
+const UDP_MAX_REASSEMBLED_BYTES: usize = UDP_PACKET_BUFFER_SIZE;
 const QUIC_ENDPOINT_STOP_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug)]
@@ -811,10 +814,21 @@ struct UdpFragmentStore {
 struct UdpFragmentSet {
     target: Option<SocksTarget>,
     parts: Vec<Option<Vec<u8>>>,
+    created_ms: u64,
+    received_bytes: usize,
+    received_parts: usize,
 }
 
 impl UdpFragmentStore {
     fn push(&mut self, packet: UdpPacket) -> io::Result<Option<UdpPacket>> {
+        self.push_with_now(packet, None)
+    }
+
+    fn push_with_now(
+        &mut self,
+        packet: UdpPacket,
+        now_ms: Option<u64>,
+    ) -> io::Result<Option<UdpPacket>> {
         if packet.fragment_total == 0 || packet.fragment_id >= packet.fragment_total {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -825,12 +839,23 @@ impl UdpFragmentStore {
             return Ok(Some(packet));
         }
 
+        let now_ms = now_ms.unwrap_or_else(now_millis);
+        self.prune_expired(now_ms);
         let key = (packet.assoc_id, packet.packet_id);
         let count = packet.fragment_total as usize;
         let index = packet.fragment_id as usize;
+        if !self.fragments.contains_key(&key) && self.fragments.len() >= UDP_MAX_FRAGMENT_SETS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "too many incomplete tuic udp fragment groups",
+            ));
+        }
         let set = self.fragments.entry(key).or_insert_with(|| UdpFragmentSet {
             target: None,
             parts: vec![None; count],
+            created_ms: now_ms,
+            received_bytes: 0,
+            received_parts: 0,
         });
         if set.parts.len() != count {
             self.fragments.remove(&key);
@@ -851,13 +876,26 @@ impl UdpFragmentStore {
             }
             set.target = Some(target);
         }
+        if let Some(previous) = set.parts[index].take() {
+            set.received_bytes = set.received_bytes.saturating_sub(previous.len());
+            set.received_parts = set.received_parts.saturating_sub(1);
+        }
+        if set.received_bytes.saturating_add(packet.payload.len()) > UDP_MAX_REASSEMBLED_BYTES {
+            self.fragments.remove(&key);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tuic udp fragment group is too large",
+            ));
+        }
+        set.received_bytes = set.received_bytes.saturating_add(packet.payload.len());
+        set.received_parts = set.received_parts.saturating_add(1);
         set.parts[index] = Some(packet.payload);
-        if !set.parts.iter().all(Option::is_some) || set.target.is_none() {
+        if set.received_parts != count || set.target.is_none() {
             return Ok(None);
         }
 
         let set = self.fragments.remove(&key).expect("fragment set exists");
-        let mut payload = Vec::new();
+        let mut payload = Vec::with_capacity(set.received_bytes);
         for part in set.parts {
             payload.extend_from_slice(&part.expect("all fragments present"));
         }
@@ -870,6 +908,20 @@ impl UdpFragmentStore {
             payload,
         }))
     }
+
+    fn prune_expired(&mut self, now_ms: u64) -> usize {
+        let before = self.fragments.len();
+        self.fragments
+            .retain(|_, set| now_ms.saturating_sub(set.created_ms) < UDP_FRAGMENT_IDLE_TIMEOUT_MS);
+        before.saturating_sub(self.fragments.len())
+    }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
 }
 
 async fn bind_udp_socket(target_ip: IpAddr) -> io::Result<UdpSocket> {
@@ -968,7 +1020,7 @@ async fn send_udp_packet_fragments(
     let Some(max_size) = connection.max_datagram_size() else {
         return Ok(false);
     };
-    let header_len = encode_udp_packet(assoc_id, packet_id, 1, 0, target, &[])?.len();
+    let header_len = encoded_udp_packet_len(target, 0)?;
     let max_payload = max_size.saturating_sub(header_len);
     if max_payload == 0 {
         return Ok(false);
@@ -1291,6 +1343,16 @@ fn encode_udp_packet(
     Ok(output)
 }
 
+fn encoded_udp_packet_len(target: Option<&SocksTarget>, payload_len: usize) -> io::Result<usize> {
+    if payload_len > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tuic udp packet payload is too large",
+        ));
+    }
+    Ok(10 + encoded_address_len(target)? + payload_len)
+}
+
 fn encode_address(target: Option<&SocksTarget>) -> io::Result<Vec<u8>> {
     let Some(target) = target else {
         return Ok(vec![ATYP_NONE]);
@@ -1320,6 +1382,25 @@ fn encode_address(target: Option<&SocksTarget>) -> io::Result<Vec<u8>> {
     }
     output.extend_from_slice(&target.port.to_be_bytes());
     Ok(output)
+}
+
+fn encoded_address_len(target: Option<&SocksTarget>) -> io::Result<usize> {
+    let Some(target) = target else {
+        return Ok(1);
+    };
+    if let Ok(ip) = target.host.parse::<IpAddr>() {
+        return Ok(match ip {
+            IpAddr::V4(_) => 1 + 4 + 2,
+            IpAddr::V6(_) => 1 + 16 + 2,
+        });
+    }
+    if target.host.len() > u8::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tuic domain is too long",
+        ));
+    }
+    Ok(1 + 1 + target.host.len() + 2)
 }
 
 fn socket_addr_to_target(addr: &SocketAddr) -> SocksTarget {
@@ -1885,6 +1966,35 @@ mod tests {
     }
 
     #[test]
+    fn encoded_tuic_udp_packet_len_matches_encoded_packets() {
+        let targets = [
+            None,
+            Some(SocksTarget {
+                host: "127.0.0.1".to_string(),
+                port: 53,
+            }),
+            Some(SocksTarget {
+                host: "::1".to_string(),
+                port: 53,
+            }),
+            Some(SocksTarget {
+                host: "example.com".to_string(),
+                port: 443,
+            }),
+        ];
+
+        for target in targets.iter() {
+            let payload = b"payload";
+            let encoded = encode_udp_packet(7, 11, 1, 0, target.as_ref(), payload).unwrap();
+
+            assert_eq!(
+                encoded_udp_packet_len(target.as_ref(), payload.len()).unwrap(),
+                encoded.len()
+            );
+        }
+    }
+
+    #[test]
     fn reassembles_tuic_udp_fragments() {
         let target = SocksTarget {
             host: "127.0.0.1".to_string(),
@@ -1917,6 +2027,116 @@ mod tests {
         assert_eq!(packet.fragment_id, 0);
         assert_eq!(packet.target, Some(target));
         assert_eq!(packet.payload, b"hello");
+    }
+
+    #[test]
+    fn tuic_udp_fragment_reassembly_replaces_duplicate_parts() {
+        let target = SocksTarget {
+            host: "127.0.0.1".to_string(),
+            port: 53,
+        };
+        let mut fragments = UdpFragmentStore::default();
+        let old_first = UdpPacket {
+            assoc_id: 7,
+            packet_id: 12,
+            fragment_total: 2,
+            fragment_id: 0,
+            target: Some(target.clone()),
+            payload: b"bad".to_vec(),
+        };
+        let first = UdpPacket {
+            payload: b"he".to_vec(),
+            ..old_first.clone()
+        };
+        let second = UdpPacket {
+            assoc_id: 7,
+            packet_id: 12,
+            fragment_total: 2,
+            fragment_id: 1,
+            target: None,
+            payload: b"llo".to_vec(),
+        };
+
+        assert!(fragments.push(old_first).unwrap().is_none());
+        assert!(fragments.push(first).unwrap().is_none());
+        let packet = fragments
+            .push(second)
+            .unwrap()
+            .expect("duplicate fragment replacement should still complete");
+
+        assert_eq!(packet.target, Some(target));
+        assert_eq!(packet.payload, b"hello");
+    }
+
+    #[test]
+    fn tuic_udp_fragment_store_prunes_expired_groups() {
+        let target = SocksTarget {
+            host: "127.0.0.1".to_string(),
+            port: 53,
+        };
+        let mut fragments = UdpFragmentStore::default();
+        let stale = UdpPacket {
+            assoc_id: 1,
+            packet_id: 10,
+            fragment_total: 2,
+            fragment_id: 0,
+            target: Some(target.clone()),
+            payload: b"stale".to_vec(),
+        };
+        let fresh = UdpPacket {
+            assoc_id: 2,
+            packet_id: 11,
+            fragment_total: 2,
+            fragment_id: 0,
+            target: Some(target),
+            payload: b"fresh".to_vec(),
+        };
+
+        assert!(fragments
+            .push_with_now(stale, Some(1000))
+            .unwrap()
+            .is_none());
+        assert_eq!(fragments.fragments.len(), 1);
+        assert!(fragments
+            .push_with_now(fresh, Some(1001 + UDP_FRAGMENT_IDLE_TIMEOUT_MS))
+            .unwrap()
+            .is_none());
+
+        assert_eq!(fragments.fragments.len(), 1);
+        assert!(fragments.fragments.contains_key(&(2, 11)));
+    }
+
+    #[test]
+    fn tuic_udp_fragment_store_rejects_oversized_groups() {
+        let target = SocksTarget {
+            host: "127.0.0.1".to_string(),
+            port: 53,
+        };
+        let mut fragments = UdpFragmentStore::default();
+        let first = UdpPacket {
+            assoc_id: 1,
+            packet_id: 10,
+            fragment_total: 2,
+            fragment_id: 0,
+            target: Some(target),
+            payload: vec![0u8; UDP_MAX_REASSEMBLED_BYTES],
+        };
+        let second = UdpPacket {
+            assoc_id: 1,
+            packet_id: 10,
+            fragment_total: 2,
+            fragment_id: 1,
+            target: None,
+            payload: vec![1u8],
+        };
+
+        assert!(fragments.push(first).unwrap().is_none());
+        let error = fragments
+            .push(second)
+            .expect_err("oversized reassembled datagram should be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(fragments.fragments.is_empty());
     }
 
     #[test]

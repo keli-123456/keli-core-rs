@@ -1319,6 +1319,7 @@ struct UdpFragmentSet {
     parts: Vec<Option<Vec<u8>>>,
     created_ms: u64,
     received_bytes: usize,
+    received_parts: usize,
 }
 
 impl UdpFragmentStore {
@@ -1357,6 +1358,7 @@ impl UdpFragmentStore {
             parts: vec![None; count],
             created_ms: now_ms,
             received_bytes: 0,
+            received_parts: 0,
         });
         if set.parts.len() != count || set.target != message.target {
             self.fragments.remove(&key);
@@ -1367,6 +1369,7 @@ impl UdpFragmentStore {
         }
         if let Some(previous) = set.parts[index].take() {
             set.received_bytes = set.received_bytes.saturating_sub(previous.len());
+            set.received_parts = set.received_parts.saturating_sub(1);
         }
         if set.received_bytes.saturating_add(message.data.len()) > UDP_MAX_REASSEMBLED_BYTES {
             self.fragments.remove(&key);
@@ -1376,8 +1379,9 @@ impl UdpFragmentStore {
             ));
         }
         set.received_bytes = set.received_bytes.saturating_add(message.data.len());
+        set.received_parts = set.received_parts.saturating_add(1);
         set.parts[index] = Some(message.data);
-        if !set.parts.iter().all(Option::is_some) {
+        if set.received_parts != count {
             return Ok(None);
         }
 
@@ -1470,7 +1474,7 @@ async fn send_udp_datagram_fragments(
     let Some(max_size) = connection.max_datagram_size() else {
         return Ok(false);
     };
-    let header_len = encode_udp_datagram(session_id, packet_id, 0, 1, address, &[])?.len();
+    let header_len = encoded_udp_datagram_len(address, 0)?;
     let max_payload = max_size.saturating_sub(header_len);
     if max_payload == 0 {
         return Ok(false);
@@ -1659,6 +1663,16 @@ fn encode_udp_datagram(
     output.extend_from_slice(address.as_bytes());
     output.extend_from_slice(data);
     Ok(output)
+}
+
+fn encoded_udp_datagram_len(address: &str, data_len: usize) -> io::Result<usize> {
+    if address.is_empty() || address.len() > 4096 || data_len > UDP_PACKET_BUFFER_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid hysteria2 udp datagram field length",
+        ));
+    }
+    Ok(8 + quic_varint_len(address.len() as u64)? + address.len() + data_len)
 }
 
 fn format_socket_addr(addr: &SocketAddr) -> String {
@@ -2232,6 +2246,23 @@ fn encode_varint(value: u64) -> io::Result<Vec<u8>> {
     let mut output = Vec::with_capacity(8);
     append_varint(&mut output, value)?;
     Ok(output)
+}
+
+fn quic_varint_len(value: u64) -> io::Result<usize> {
+    if value < 2u64.pow(6) {
+        Ok(1)
+    } else if value < 2u64.pow(14) {
+        Ok(2)
+    } else if value < 2u64.pow(30) {
+        Ok(4)
+    } else if value < 2u64.pow(62) {
+        Ok(8)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "value too large for QUIC varint",
+        ))
+    }
 }
 
 fn append_varint(output: &mut Vec<u8>, value: u64) -> io::Result<()> {
@@ -3332,6 +3363,8 @@ mod tests {
     fn encodes_quic_varints() {
         assert_eq!(encode_varint(0x3f).unwrap(), vec![0x3f]);
         assert_eq!(encode_varint(0x401).unwrap(), vec![0x44, 0x01]);
+        assert_eq!(quic_varint_len(0x3f).unwrap(), 1);
+        assert_eq!(quic_varint_len(0x401).unwrap(), 2);
     }
 
     #[test]
@@ -3340,6 +3373,10 @@ mod tests {
         let encoded = encode_udp_datagram(7, 11, 0, 1, address, b"dns").unwrap();
         let parsed = parse_udp_datagram(&encoded).unwrap();
 
+        assert_eq!(
+            encoded_udp_datagram_len(address, b"dns".len()).unwrap(),
+            encoded.len()
+        );
         assert_eq!(encoded[8], address.len() as u8);
         assert_eq!(&encoded[9 + address.len()..], b"dns");
         assert_eq!(parsed.session_id, 7);
@@ -3376,6 +3413,32 @@ mod tests {
         assert_eq!(message.packet_id, 12);
         assert_eq!(message.fragment_id, 0);
         assert_eq!(message.fragment_count, 1);
+        assert_eq!(message.data, b"hello");
+    }
+
+    #[test]
+    fn hysteria2_udp_fragment_reassembly_replaces_duplicate_parts() {
+        let mut fragments = UdpFragmentStore::default();
+        let old_first =
+            parse_udp_datagram(&encode_udp_datagram(7, 12, 0, 2, "127.0.0.1:53", b"bad").unwrap())
+                .unwrap();
+        let first =
+            parse_udp_datagram(&encode_udp_datagram(7, 12, 0, 2, "127.0.0.1:53", b"he").unwrap())
+                .unwrap();
+        let second =
+            parse_udp_datagram(&encode_udp_datagram(7, 12, 1, 2, "127.0.0.1:53", b"llo").unwrap())
+                .unwrap();
+
+        assert!(fragments
+            .push_with_now(old_first, Some(100))
+            .unwrap()
+            .is_none());
+        assert!(fragments.push_with_now(first, Some(101)).unwrap().is_none());
+        let message = fragments
+            .push_with_now(second, Some(102))
+            .unwrap()
+            .expect("duplicate fragment replacement should still complete");
+
         assert_eq!(message.data, b"hello");
     }
 
