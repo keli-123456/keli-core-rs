@@ -153,6 +153,21 @@ cargo run --release -- bench external-suite \
 cargo run --release -- bench compare --baseline runtime/bench/go-suite.json --candidate runtime/bench/rust-suite.json --out runtime/bench/go-vs-rust.json
 ```
 
+For release regression gating, run the same compare command with explicit thresholds:
+
+```bash
+cargo run --release -- bench compare \
+  --baseline runtime/bench/go-suite.json \
+  --candidate runtime/bench/rust-suite.json \
+  --out runtime/bench/go-vs-rust.json \
+  --max-throughput-drop-percent 10 \
+  --max-p99-increase-percent 30 \
+  --fail-on-errors \
+  --require-all-baseline-commands
+```
+
+The threshold flags are opt-in. Without them, `bench compare` remains report-only.
+
 `external-suite` starts the local echo target itself and sends that target through the external
 core. It accepts one `--core command=HOST:PORT` mapping per command. The older `--vless-core`
 flag remains as a compatibility shortcut for `vless-tcp` and `vless-tcp-stream` only. External

@@ -241,6 +241,10 @@ struct BenchCompareOptions {
     baseline: PathBuf,
     candidate: PathBuf,
     out: Option<PathBuf>,
+    max_throughput_drop_percent: Option<f64>,
+    max_p99_increase_percent: Option<f64>,
+    fail_on_errors: bool,
+    require_all_baseline_commands: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -428,6 +432,19 @@ fn parse_next_usize(
         .map_err(|_| format!("{option} requires a positive integer"))
 }
 
+fn parse_next_f64(args: &mut impl Iterator<Item = String>, option: &str) -> Result<f64, String> {
+    let value = args
+        .next()
+        .ok_or_else(|| format!("{option} requires a non-negative number"))?;
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| format!("{option} requires a non-negative number"))?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err(format!("{option} requires a non-negative number"));
+    }
+    Ok(parsed)
+}
+
 fn validate_bench_options(options: &BenchOptions) -> Result<(), String> {
     if options.streams == 0 || options.streams > MAX_STREAMS {
         return Err(format!("--streams must be between 1 and {MAX_STREAMS}"));
@@ -516,6 +533,10 @@ fn parse_bench_compare_options(
     let mut baseline = None;
     let mut candidate = None;
     let mut out = None;
+    let mut max_throughput_drop_percent = None;
+    let mut max_p99_increase_percent = None;
+    let mut fail_on_errors = false;
+    let mut require_all_baseline_commands = false;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -537,6 +558,16 @@ fn parse_bench_compare_options(
                         .ok_or_else(|| "--out requires a file path".to_string())?,
                 ));
             }
+            "--max-throughput-drop-percent" => {
+                max_throughput_drop_percent =
+                    Some(parse_next_f64(&mut args, "--max-throughput-drop-percent")?);
+            }
+            "--max-p99-increase-percent" => {
+                max_p99_increase_percent =
+                    Some(parse_next_f64(&mut args, "--max-p99-increase-percent")?);
+            }
+            "--fail-on-errors" => fail_on_errors = true,
+            "--require-all-baseline-commands" => require_all_baseline_commands = true,
             "--help" | "help" => print_bench_usage(),
             other => return Err(format!("unknown bench compare option {other}")),
         }
@@ -545,6 +576,10 @@ fn parse_bench_compare_options(
         baseline: baseline.ok_or_else(|| "--baseline is required".to_string())?,
         candidate: candidate.ok_or_else(|| "--candidate is required".to_string())?,
         out,
+        max_throughput_drop_percent,
+        max_p99_increase_percent,
+        fail_on_errors,
+        require_all_baseline_commands,
     })
 }
 
@@ -769,7 +804,7 @@ fn bench_quic_runtime_workers() -> usize {
 
 fn print_bench_usage() {
     println!(
-        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench direct-tcp-proxy-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench anytls-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench naive-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-vision-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-auth [--streams N] [--requests N]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --core command=HOST:PORT [--core other=HOST:PORT] [--cert CERT.pem] [--cert command=CERT.pem] [--server-name NAME] [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE]"
+        "bench commands:\n  bench direct-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench direct-tcp-proxy-stream [--streams N] [--requests N] [--payload BYTES]\n  bench http-connect-stream [--streams N] [--requests N] [--payload BYTES]\n  bench shadowsocks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench socks-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench trojan-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench anytls-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench naive-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench vless-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vless-vision-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench vmess-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-auth [--streams N] [--requests N]\n  bench hy2-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench hy2-udp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-tcp-stream [--streams N] [--requests N] [--payload BYTES]\n  bench tuic-udp [--streams N] [--requests N] [--payload BYTES]\n  bench suite [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench external-suite --core command=HOST:PORT [--core other=HOST:PORT] [--cert CERT.pem] [--cert command=CERT.pem] [--server-name NAME] [--commands a,b] [--streams N] [--requests N] [--payload BYTES] [--repeats N] [--label NAME] [--out FILE]\n  bench compare --baseline FILE --candidate FILE [--out FILE] [--max-throughput-drop-percent N] [--max-p99-increase-percent N] [--fail-on-errors] [--require-all-baseline-commands]"
     );
 }
 
@@ -1657,6 +1692,7 @@ fn compare_bench_suites(options: &BenchCompareOptions) -> io::Result<BenchCompar
     let baseline = read_bench_suite(&options.baseline)?;
     let candidate = read_bench_suite(&options.candidate)?;
     let mut rows = Vec::new();
+    let mut missing_candidate_commands = Vec::new();
     for baseline_summary in &baseline.summaries {
         if let Some(candidate_summary) = candidate
             .summaries
@@ -1686,14 +1722,19 @@ fn compare_bench_suites(options: &BenchCompareOptions) -> io::Result<BenchCompar
                     &candidate_summary.phases,
                 ),
             });
+        } else {
+            missing_candidate_commands.push(baseline_summary.command.clone());
         }
     }
-    Ok(BenchComparisonReport {
+    let report = BenchComparisonReport {
         schema: "keli-core-bench-comparison-v1".to_string(),
         baseline_label: baseline.label,
         candidate_label: candidate.label,
         rows,
-    })
+    };
+    validate_bench_comparison_gate(options, &report, &missing_candidate_commands)
+        .map_err(io_other)?;
+    Ok(report)
 }
 
 fn compare_phase_summaries(
@@ -1723,6 +1764,56 @@ fn compare_phase_summaries(
             })
         })
         .collect()
+}
+
+fn validate_bench_comparison_gate(
+    options: &BenchCompareOptions,
+    report: &BenchComparisonReport,
+    missing_candidate_commands: &[String],
+) -> Result<(), String> {
+    let mut violations = Vec::new();
+    if options.require_all_baseline_commands {
+        for command in missing_candidate_commands {
+            violations.push(format!("missing candidate command {command}"));
+        }
+    }
+    for row in &report.rows {
+        if let (Some(limit), Some(change)) = (
+            options.max_throughput_drop_percent,
+            row.throughput_change_percent,
+        ) {
+            if change < -limit {
+                violations.push(format!(
+                    "{} throughput dropped {:.2}% below baseline, limit {:.2}%",
+                    row.command, -change, limit
+                ));
+            }
+        }
+        if let (Some(limit), Some(change)) =
+            (options.max_p99_increase_percent, row.p99_change_percent)
+        {
+            if change > limit {
+                violations.push(format!(
+                    "{} p99 increased {:.2}% over baseline, limit {:.2}%",
+                    row.command, change, limit
+                ));
+            }
+        }
+        if options.fail_on_errors && row.candidate_errors_total > 0 {
+            violations.push(format!(
+                "{} candidate errors total {}",
+                row.command, row.candidate_errors_total
+            ));
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "bench comparison gate failed: {}",
+            violations.join("; ")
+        ))
+    }
 }
 
 fn read_bench_suite(path: &Path) -> io::Result<BenchSuiteReport> {
@@ -5761,16 +5852,18 @@ fn join_server(handle: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_bench_command, compare_phase_summaries, parse_bench_options,
-        parse_bench_suite_options, parse_external_bench_suite_options, parse_isolated_bench_stdout,
-        percent_change, run_anytls_tcp_stream_bench, run_direct_tcp_proxy_stream_bench,
-        run_direct_tcp_stream_bench, run_external_vless_tcp_stream_bench,
-        run_http_connect_stream_bench, run_hy2_udp_bench, run_naive_tcp_stream_bench,
-        run_shadowsocks_tcp_stream_bench, run_socks_tcp_stream_bench, run_trojan_tcp_stream_bench,
-        run_tuic_tcp_bench, run_tuic_tcp_stream_bench, run_tuic_udp_bench, run_vless_tcp_bench,
-        run_vless_tcp_stream_bench, run_vless_vision_tcp_stream_bench, run_vmess_tcp_stream_bench,
-        summarize_bench_runs, validate_udp_bench_payload, BenchCert, BenchOptions,
-        BenchPhaseReport, BenchPhaseSummary, BenchReport, BenchSuiteRun, LatencyReport,
+        canonical_bench_command, compare_phase_summaries, parse_bench_compare_options,
+        parse_bench_options, parse_bench_suite_options, parse_external_bench_suite_options,
+        parse_isolated_bench_stdout, percent_change, run_anytls_tcp_stream_bench,
+        run_direct_tcp_proxy_stream_bench, run_direct_tcp_stream_bench,
+        run_external_vless_tcp_stream_bench, run_http_connect_stream_bench, run_hy2_udp_bench,
+        run_naive_tcp_stream_bench, run_shadowsocks_tcp_stream_bench, run_socks_tcp_stream_bench,
+        run_trojan_tcp_stream_bench, run_tuic_tcp_bench, run_tuic_tcp_stream_bench,
+        run_tuic_udp_bench, run_vless_tcp_bench, run_vless_tcp_stream_bench,
+        run_vless_vision_tcp_stream_bench, run_vmess_tcp_stream_bench, summarize_bench_runs,
+        validate_bench_comparison_gate, validate_udp_bench_payload, BenchCert, BenchCompareOptions,
+        BenchComparisonReport, BenchComparisonRow, BenchOptions, BenchPhaseReport,
+        BenchPhaseSummary, BenchReport, BenchSuiteRun, LatencyReport,
     };
     use std::net::{SocketAddr, TcpStream};
     use std::path::PathBuf;
@@ -5834,6 +5927,46 @@ mod tests {
         assert_eq!(options.repeats, 5);
         assert_eq!(options.label, "rust-candidate");
         assert_eq!(options.out, Some(PathBuf::from("runtime/bench/rust.json")));
+    }
+
+    #[test]
+    fn parses_bench_compare_gate_options() {
+        let options = parse_bench_compare_options(
+            [
+                "--baseline",
+                "runtime/bench/baseline.json",
+                "--candidate",
+                "runtime/bench/candidate.json",
+                "--out",
+                "runtime/bench/comparison.json",
+                "--max-throughput-drop-percent",
+                "12.5",
+                "--max-p99-increase-percent",
+                "30",
+                "--fail-on-errors",
+                "--require-all-baseline-commands",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("compare options");
+
+        assert_eq!(
+            options.baseline,
+            PathBuf::from("runtime/bench/baseline.json")
+        );
+        assert_eq!(
+            options.candidate,
+            PathBuf::from("runtime/bench/candidate.json")
+        );
+        assert_eq!(
+            options.out,
+            Some(PathBuf::from("runtime/bench/comparison.json"))
+        );
+        assert_eq!(options.max_throughput_drop_percent, Some(12.5));
+        assert_eq!(options.max_p99_increase_percent, Some(30.0));
+        assert!(options.fail_on_errors);
+        assert!(options.require_all_baseline_commands);
     }
 
     #[test]
@@ -6107,6 +6240,124 @@ mod tests {
         assert_eq!(rows[0].name, "relay_roundtrip");
         assert_eq!(rows[0].p99_change_percent, Some(-20.0));
         assert_eq!(rows[0].avg_change_percent, Some(-20.0));
+    }
+
+    #[test]
+    fn comparison_gate_rejects_throughput_regression() {
+        let options = BenchCompareOptions {
+            baseline: PathBuf::from("baseline.json"),
+            candidate: PathBuf::from("candidate.json"),
+            out: None,
+            max_throughput_drop_percent: Some(10.0),
+            max_p99_increase_percent: None,
+            fail_on_errors: false,
+            require_all_baseline_commands: false,
+        };
+        let report = BenchComparisonReport {
+            schema: "keli-core-bench-comparison-v1".to_string(),
+            baseline_label: "baseline".to_string(),
+            candidate_label: "candidate".to_string(),
+            rows: vec![BenchComparisonRow {
+                command: "vless-tcp-stream".to_string(),
+                baseline_roundtrip_mbps: 100.0,
+                candidate_roundtrip_mbps: 80.0,
+                throughput_change_percent: Some(-20.0),
+                baseline_p99_us: 100.0,
+                candidate_p99_us: 100.0,
+                p99_change_percent: Some(0.0),
+                baseline_errors_total: 0,
+                candidate_errors_total: 0,
+                baseline_retries_total: 0,
+                candidate_retries_total: 0,
+                phases: Vec::new(),
+            }],
+        };
+
+        let error = validate_bench_comparison_gate(&options, &report, &[])
+            .expect_err("throughput regression");
+
+        assert!(error.contains("vless-tcp-stream"));
+        assert!(error.contains("throughput dropped"));
+    }
+
+    #[test]
+    fn comparison_gate_rejects_p99_regression() {
+        let options = BenchCompareOptions {
+            baseline: PathBuf::from("baseline.json"),
+            candidate: PathBuf::from("candidate.json"),
+            out: None,
+            max_throughput_drop_percent: None,
+            max_p99_increase_percent: Some(25.0),
+            fail_on_errors: false,
+            require_all_baseline_commands: false,
+        };
+        let report = synthetic_comparison_report("hy2-tcp-stream", 100.0, 100.0, 100.0, 140.0, 0);
+
+        let error =
+            validate_bench_comparison_gate(&options, &report, &[]).expect_err("p99 regression");
+
+        assert!(error.contains("hy2-tcp-stream"));
+        assert!(error.contains("p99 increased"));
+    }
+
+    #[test]
+    fn comparison_gate_rejects_candidate_errors() {
+        let options = BenchCompareOptions {
+            baseline: PathBuf::from("baseline.json"),
+            candidate: PathBuf::from("candidate.json"),
+            out: None,
+            max_throughput_drop_percent: None,
+            max_p99_increase_percent: None,
+            fail_on_errors: true,
+            require_all_baseline_commands: false,
+        };
+        let report = synthetic_comparison_report("tuic-udp", 100.0, 100.0, 100.0, 100.0, 1);
+
+        let error =
+            validate_bench_comparison_gate(&options, &report, &[]).expect_err("candidate errors");
+
+        assert!(error.contains("tuic-udp"));
+        assert!(error.contains("candidate errors total 1"));
+    }
+
+    #[test]
+    fn comparison_gate_rejects_missing_candidate_command() {
+        let options = BenchCompareOptions {
+            baseline: PathBuf::from("baseline.json"),
+            candidate: PathBuf::from("candidate.json"),
+            out: None,
+            max_throughput_drop_percent: None,
+            max_p99_increase_percent: None,
+            fail_on_errors: false,
+            require_all_baseline_commands: true,
+        };
+        let report =
+            synthetic_comparison_report("trojan-tcp-stream", 100.0, 100.0, 100.0, 100.0, 0);
+        let missing = vec!["vless-tcp-stream".to_string()];
+
+        let error = validate_bench_comparison_gate(&options, &report, &missing)
+            .expect_err("missing candidate command");
+
+        assert!(error.contains("missing candidate command vless-tcp-stream"));
+    }
+
+    #[test]
+    fn comparison_gate_is_disabled_by_default() {
+        let options = BenchCompareOptions {
+            baseline: PathBuf::from("baseline.json"),
+            candidate: PathBuf::from("candidate.json"),
+            out: None,
+            max_throughput_drop_percent: None,
+            max_p99_increase_percent: None,
+            fail_on_errors: false,
+            require_all_baseline_commands: false,
+        };
+        let report =
+            synthetic_comparison_report("vless-tcp-stream", 100.0, 1.0, 100.0, 10_000.0, 3);
+        let missing = vec!["missing-command".to_string()];
+
+        validate_bench_comparison_gate(&options, &report, &missing)
+            .expect("default compare is report-only");
     }
 
     #[test]
@@ -6619,6 +6870,38 @@ mod tests {
             max_us: phase_p99_us,
         }];
         report
+    }
+
+    fn synthetic_comparison_report(
+        command: &str,
+        baseline_roundtrip_mbps: f64,
+        candidate_roundtrip_mbps: f64,
+        baseline_p99_us: f64,
+        candidate_p99_us: f64,
+        candidate_errors_total: usize,
+    ) -> BenchComparisonReport {
+        BenchComparisonReport {
+            schema: "keli-core-bench-comparison-v1".to_string(),
+            baseline_label: "baseline".to_string(),
+            candidate_label: "candidate".to_string(),
+            rows: vec![BenchComparisonRow {
+                command: command.to_string(),
+                baseline_roundtrip_mbps,
+                candidate_roundtrip_mbps,
+                throughput_change_percent: percent_change(
+                    baseline_roundtrip_mbps,
+                    candidate_roundtrip_mbps,
+                ),
+                baseline_p99_us,
+                candidate_p99_us,
+                p99_change_percent: percent_change(baseline_p99_us, candidate_p99_us),
+                baseline_errors_total: 0,
+                candidate_errors_total,
+                baseline_retries_total: 0,
+                candidate_retries_total: 0,
+                phases: Vec::new(),
+            }],
+        }
     }
 
     fn assert_phase(report: &BenchReport, name: &str) {

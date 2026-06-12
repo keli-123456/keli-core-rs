@@ -206,6 +206,21 @@ stream count, request count, payload size, and repeat count:
 cargo run --release -- bench compare --baseline runtime/bench/go-suite.json --candidate runtime/bench/rust-suite.json --out runtime/bench/go-vs-rust.json
 ```
 
+For release gating, keep the same comparison rules and add explicit failure thresholds:
+
+```bash
+cargo run --release -- bench compare \
+  --baseline runtime/bench/go-suite.json \
+  --candidate runtime/bench/rust-suite.json \
+  --out runtime/bench/go-vs-rust.json \
+  --max-throughput-drop-percent 10 \
+  --max-p99-increase-percent 30 \
+  --fail-on-errors \
+  --require-all-baseline-commands
+```
+
+The threshold flags are opt-in. Without them, `bench compare` remains report-only.
+
 The baseline file must use the same `keli-core-bench-suite-v1` schema. Do not claim a
 Go-vs-Rust performance win from single-run output copied from a different host, debug
 build, payload size, stream count, request count, or schema.
