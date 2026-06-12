@@ -2294,12 +2294,14 @@ fn format_trojan_connection_failed_log(
     )
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct TrojanConnectionErrorLogKey {
-    node_tag: String,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TrojanConnectionErrorLogKind {
     scope: &'static str,
     reason: &'static str,
 }
+
+type TrojanConnectionErrorLogStates =
+    HashMap<String, HashMap<TrojanConnectionErrorLogKind, TrojanConnectionErrorLogState>>;
 
 #[derive(Default)]
 struct TrojanConnectionErrorLogState {
@@ -2313,11 +2315,9 @@ fn should_log_trojan_connection_error(
     scope: &'static str,
     reason: &'static str,
 ) -> Option<u64> {
-    static STATE: OnceLock<
-        Mutex<HashMap<TrojanConnectionErrorLogKey, TrojanConnectionErrorLogState>>,
-    > = OnceLock::new();
+    static STATE: OnceLock<Mutex<TrojanConnectionErrorLogStates>> = OnceLock::new();
     let mut states = STATE
-        .get_or_init(|| Mutex::new(HashMap::new()))
+        .get_or_init(|| Mutex::new(TrojanConnectionErrorLogStates::new()))
         .lock()
         .expect("trojan connection error log state poisoned");
     trojan_connection_error_log_decision_at_with_interval(
@@ -2332,7 +2332,7 @@ fn should_log_trojan_connection_error(
 
 #[cfg(test)]
 fn trojan_connection_error_log_decision_at(
-    states: &mut HashMap<TrojanConnectionErrorLogKey, TrojanConnectionErrorLogState>,
+    states: &mut TrojanConnectionErrorLogStates,
     node_tag: &str,
     scope: &'static str,
     reason: &'static str,
@@ -2349,19 +2349,21 @@ fn trojan_connection_error_log_decision_at(
 }
 
 fn trojan_connection_error_log_decision_at_with_interval(
-    states: &mut HashMap<TrojanConnectionErrorLogKey, TrojanConnectionErrorLogState>,
+    states: &mut TrojanConnectionErrorLogStates,
     node_tag: &str,
     scope: &'static str,
     reason: &'static str,
     now_ms: u64,
     interval_ms: u64,
 ) -> Option<u64> {
-    let key = TrojanConnectionErrorLogKey {
-        node_tag: node_tag.to_string(),
-        scope,
-        reason,
-    };
-    let state = states.entry(key).or_default();
+    if !states.contains_key(node_tag) {
+        states.insert(node_tag.to_string(), HashMap::new());
+    }
+    let node_states = states
+        .get_mut(node_tag)
+        .expect("trojan connection error log state should exist");
+    let key = TrojanConnectionErrorLogKind { scope, reason };
+    let state = node_states.entry(key).or_default();
     if !state.has_logged {
         state.has_logged = true;
         state.last_ms = now_ms;
@@ -2530,13 +2532,15 @@ fn is_trojan_benign_client_close_finish(
         || detail.contains("TLS_close_notify")
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct TrojanRelayFinishedLogKey {
-    node_tag: String,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TrojanRelayFinishedLogKind {
     scope: &'static str,
     status: &'static str,
     finish_reason: &'static str,
 }
+
+type TrojanRelayFinishedLogStates =
+    HashMap<String, HashMap<TrojanRelayFinishedLogKind, TrojanRelayFinishedLogState>>;
 
 #[derive(Default)]
 struct TrojanRelayFinishedLogState {
@@ -2551,10 +2555,9 @@ fn should_log_trojan_relay_finished_event(
     status: &'static str,
     finish_reason: &'static str,
 ) -> Option<u64> {
-    static STATE: OnceLock<Mutex<HashMap<TrojanRelayFinishedLogKey, TrojanRelayFinishedLogState>>> =
-        OnceLock::new();
+    static STATE: OnceLock<Mutex<TrojanRelayFinishedLogStates>> = OnceLock::new();
     let mut states = STATE
-        .get_or_init(|| Mutex::new(HashMap::new()))
+        .get_or_init(|| Mutex::new(TrojanRelayFinishedLogStates::new()))
         .lock()
         .expect("trojan relay finished log state poisoned");
     trojan_relay_finished_log_decision_at_with_interval(
@@ -2570,7 +2573,7 @@ fn should_log_trojan_relay_finished_event(
 
 #[cfg(test)]
 fn trojan_relay_finished_log_decision_at(
-    states: &mut HashMap<TrojanRelayFinishedLogKey, TrojanRelayFinishedLogState>,
+    states: &mut TrojanRelayFinishedLogStates,
     node_tag: &str,
     scope: &'static str,
     status: &'static str,
@@ -2589,7 +2592,7 @@ fn trojan_relay_finished_log_decision_at(
 }
 
 fn trojan_relay_finished_log_decision_at_with_interval(
-    states: &mut HashMap<TrojanRelayFinishedLogKey, TrojanRelayFinishedLogState>,
+    states: &mut TrojanRelayFinishedLogStates,
     node_tag: &str,
     scope: &'static str,
     status: &'static str,
@@ -2597,13 +2600,18 @@ fn trojan_relay_finished_log_decision_at_with_interval(
     now_ms: u64,
     interval_ms: u64,
 ) -> Option<u64> {
-    let key = TrojanRelayFinishedLogKey {
-        node_tag: node_tag.to_string(),
+    if !states.contains_key(node_tag) {
+        states.insert(node_tag.to_string(), HashMap::new());
+    }
+    let node_states = states
+        .get_mut(node_tag)
+        .expect("trojan relay finished log state should exist");
+    let key = TrojanRelayFinishedLogKind {
         scope,
         status,
         finish_reason,
     };
-    let state = states.entry(key).or_default();
+    let state = node_states.entry(key).or_default();
     if !state.has_logged {
         state.has_logged = true;
         state.last_ms = now_ms;
