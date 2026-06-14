@@ -1,3 +1,5 @@
+mod allocator;
+
 pub mod abuse;
 pub mod anytls;
 pub mod bench;
